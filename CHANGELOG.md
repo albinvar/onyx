@@ -6,6 +6,61 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Wire format: InnerFrame codec + CBOR MessageEnvelope + property tests
+
+### `onyx_core::wire`
+- Replaced the doc-only stub with two layers of real codec:
+
+#### `InnerFrame` — the plaintext that sits inside the AEAD envelope
+- Byte layout: `type(u16 BE) ‖ pld_len(u16 BE) ‖ payload ‖ zero-pad-to-bucket`. Header is 4 bytes (`INNER_HEADER_LEN`).
+- `encode_padded` picks the smallest bucket from `{256, 1024, 4096}` (DESIGN §5.8) that fits the payload. Payloads larger than `max_payload::LARGE` (4092 B) return an error — callers must chunk at that point.
+- `decode` validates **outer length must equal one of the three buckets** *before* trusting the length prefix. A nonconforming length signals a corrupt or hostile frame even before parsing.
+- `decode` does NOT verify the padding bytes are zero. The AEAD tag already proves the entire bucket (header + payload + padding) is untampered; re-checking would be redundant and would create a place to leak timing on otherwise-uniform plaintext.
+- Hostile-input handling is fuzzed: a property test feeds arbitrary byte slices up to 8 KiB through `decode` and asserts it never panics.
+
+#### `MessageEnvelope` — the CBOR body of a `DELIVER` frame (DESIGN §5.4)
+- Serde-derived CBOR via `ciborium`. Field names pinned with `#[serde(rename = "…")]` so renaming the Rust fields cannot accidentally break the wire format.
+- `from` and `sig` are `Option<ByteBuf>` with `skip_serializing_if = "Option::is_none"` — for the sealed-sender bootstrap envelope they are absent from the encoded CBOR entirely, not encoded as `null`. A test asserts the bootstrap envelope is strictly smaller than the normal one.
+- `room` is also `Option` — `None` for DMs.
+- `from_cbor` rejects unknown protocol versions with `InvalidEncoding`, in addition to the structural CBOR check.
+- `ByteBuf` is used everywhere a `Vec<u8>` would otherwise serialize as a CBOR array-of-integers; this gives the compact byte-string encoding CBOR is supposed to produce.
+
+### Tests (16 new, 57 total in `onyx-core`)
+- **Unit tests for `InnerFrame`:** round-trip with small payload; round-trip empty; round-trip at the boundary of each bucket (SMALL, MEDIUM, LARGE); padding bytes are zero; payload too large rejected; payload at u16 boundary rejected (catches the case where it would be > all buckets); decode rejects unknown bucket size; decode rejects oversized length prefix.
+- **Unit tests for `MessageEnvelope`:** round-trip normal (with `from`/`sig`); round-trip bootstrap (without); bootstrap is smaller than normal (proves `skip_serializing_if` works); rejects unknown protocol version; rejects garbage CBOR.
+- **Property tests (proptest):**
+  - `prop_inner_frame_round_trip` — random `frame_type` and payload up to LARGE → encode → decode → equal.
+  - `prop_inner_frame_decode_no_panic` — arbitrary byte slices up to 8 KiB → decode is never allowed to panic (must always return Result).
+  - `prop_envelope_round_trip` — fully randomised envelope with optional fields randomly present/absent → CBOR round-trip preserves equality.
+
+### Dependencies added
+- `serde = { version = "1", features = ["derive"] }`
+- `serde_bytes = "0.11"`
+- `ciborium = "0.2"`
+- `proptest = "1"` (dev-dependency)
+
+### Architectural decision: split of concerns between `wire` and `transport`
+- `wire.rs` handles plaintext byte layout and CBOR serialization only.
+- `transport.rs` (not yet implemented) will own the AEAD wrap/unwrap, frame-counter nonce derivation, and the read-side stream framing (`len(u16) | AEAD(...)`).
+- This split keeps the `wire` module testable without a transport key and matches the DESIGN §5.1 layer diagram.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ (after fixing three `clippy::cast_possible_truncation` issues — replaced the test pattern with a constant byte and routed the bucket-as-u16 conversion through `u16::try_from`)
+- `cargo test --workspace` ✓ — **41 passing in `onyx-core`** (25 crypto + 16 wire)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓ (advisories ok, bans ok, licenses ok, sources ok)
+
+### Open security gaps (carry-forward)
+- **PQ primitives still not wired into a protocol step.** Now that `wire` has a `MessageEnvelope`, the natural next move is to wire `HybridKem` into the sealed-sender bootstrap path.
+- **`transport.rs` is the next foundational module.** It needs the outer framing + Noise handshake to make `wire` callable end-to-end over a real connection.
+- Supply-chain layer 1 (cargo-deny) is in place; cargo-vet / SBOM / signed releases still pending.
+- No fuzzing / Miri yet (property tests are a partial answer — they cover the codec but not e.g. AEAD edge cases).
+- `ml-kem` upstream-unaudited (mitigated by hybrid composition).
+- 7 of 9 modules still empty (`crypto` + `wire` are real; `identity`, `mls`, `routing`, `storage`, `tor`, `transport`, plus `error` which is real, but everything else is doc-only).
+
+---
+
 ## 2026-05-18 — Supply-chain hardening (cargo-deny)
 
 ### Policy file (`deny.toml`)
