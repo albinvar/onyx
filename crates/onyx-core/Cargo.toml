@@ -28,7 +28,12 @@ openmls_basic_credential = { workspace = true }
 openmls_traits   = { workspace = true }
 arti-client      = { workspace = true }
 tor-rtcompat     = { workspace = true }
+tor-hsservice    = { workspace = true }
+tor-hscrypto     = { workspace = true }
+safelog          = { workspace = true }
 tokio            = { workspace = true }
+futures          = { workspace = true }
+tracing          = { workspace = true }
 rand_core        = { workspace = true }
 zeroize          = { workspace = true }
 subtle           = { workspace = true }

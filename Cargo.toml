@@ -45,13 +45,29 @@ openmls_rust_crypto = "0.5"
 openmls_basic_credential = "0.5"
 openmls_traits   = "0.5"
 
-# Tor — outbound circuits + (later) hidden service publication.
+# Tor — outbound circuits + hidden service publication.
 # arti is a large dep set; bringing it in significantly bumps build time.
-arti-client      = "0.42"
+# `onion-service-service` enables tor-hsservice + keymgr for HS publishing.
+arti-client      = { version = "0.42", features = ["onion-service-service"] }
 tor-rtcompat     = "0.42"
+tor-hsservice    = "0.42"
+tor-hscrypto     = "0.42"
+# safelog gives us the `DisplayRedacted` trait we need to format an
+# HsId as the user-facing `.onion` string (arti deliberately doesn't
+# implement plain `Display` on HsId so accidental log statements don't
+# leak the address).
+safelog          = "0.8"
 
 # Async runtime. Used by arti and by the daemon.
 tokio            = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "fs", "time", "sync", "signal"] }
+# Stream / future utilities (drain the HS rend stream, etc).
+futures          = "0.3"
+# Structured logging for the daemon.
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# CLI argument parsing for binaries.
+clap             = { version = "4", features = ["derive", "env"] }
+anyhow           = "1"
 # Test-only.
 tempfile         = "3"
 rand_core        = { version = "0.6", features = ["getrandom"] }

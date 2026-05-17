@@ -75,6 +75,10 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "CC0-1.0",
+    # Boost Software License 1.0 — OSI-approved, FSF-Libre, permissive.
+    # Pulled in by xxhash-rust (transitive via tor-hsservice). Fully
+    # AGPL-compatible for redistribution.
+    "BSL-1.0",
     # Our own crates.
     "AGPL-3.0-or-later",
 ]

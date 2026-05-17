@@ -6,6 +6,85 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — `onyxd` walks: vault unlock + Tor bootstrap + hidden service publish
+
+### What's new
+This is the **first phase where the system actually runs as a process** instead of a library. `onyxd` now does meaningful work end-to-end: opens an encrypted vault (or creates one), generates a long-term identity if none exists, bootstraps embedded Tor, publishes a v3 hidden service, and idles waiting for connections.
+
+Verified by hand on the dev machine: three back-to-back invocations against the same vault file:
+- **Run 1** (`--no-tor`, fresh path) → creates vault, generates "default" identity, logs fingerprint `6jj4 i4jn x5a6 ym7f 2i4l ewht ksna bolc mygw gehe xdha vswu pyva`.
+- **Run 2** → opens existing vault, loads the same identity (same fingerprint).
+- **Run 3** with wrong passphrase → fails fast with `cryptographic verification failed`, exit code 1. The AEAD canary check is doing its job in the real binary path.
+
+### `onyx_core::tor` — hidden service publication
+- **`TorRuntime::publish_hidden_service(nickname)`** — replaces the previous `NotImplemented` stub. Builds an `OnionServiceConfig` under the given nickname, calls Arti's `launch_onion_service`, returns a `HiddenService` handle.
+- **`HiddenService`** owns the `Arc<RunningOnionService>` (dropping it stops publication) and holds the inbound `Stream<Item = RendRequest>` until a caller takes it.
+  - `onion_address() -> Option<String>` — full `.onion` string, formatted via `safelog::DisplayRedacted::display_unredacted` (Arti deliberately doesn't impl `Display` on `HsId` so accidental log statements don't leak the address — we opt in explicitly because the operator needs the full address to share OOB).
+  - `take_rend_requests() -> Option<Pin<Box<dyn Stream<Item = RendRequest> + Send>>>` — boxed/erased stream of inbound rendezvous requests, taken once.
+- **`InboundRendRequest`** = re-export of `tor_hsservice::RendRequest` so consumers don't depend on `tor-hsservice` directly.
+
+### `onyxd` binary — first real main
+- Tokio runtime via `#[tokio::main]`. Structured logging via `tracing` + `tracing-subscriber` (env-filter, defaults to `info`).
+- **CLI** (clap, derive):
+  - `--vault PATH` (env `ONYX_VAULT`, default `./onyx-state.db`).
+  - `--passphrase` (env `ONYX_PASSPHRASE`, value hidden from `--help`). Strongly documented to pass via env, not command line.
+  - `--no-tor` — skip the Tor bootstrap entirely; useful for smoke-testing vault/identity flow without 30 s of waiting.
+- **Vault lifecycle**: open existing or create new. New vaults use `Argon2Params::FLOOR` (256 MiB default would block startup forever on small machines; we'll add a tunable later).
+- **Identity bootstrap**: if no identity exists in the vault, generates one called "default" and stores it. Future runs load the first stored identity.
+- **Passphrase hygiene**: explicit `drop(args.passphrase)` after derivation. Caveat documented in code: pre-`main()` memory (env var page, kernel argv) is outside our control.
+- **Tor bootstrap → HS publish → drain**:
+  - Logs the assigned `.onion` address (or warns if Arti hasn't assigned one yet).
+  - Spawns a background task that drains the rendezvous-request stream and drops each request. (Frame handling — Noise XK as responder, then `transport::Session` — is the next phase.)
+- **Graceful shutdown** on Ctrl-C: drops `HiddenService` (stops publishing), drops `TorRuntime`, drops `Vault` (zeroizes AEAD key).
+
+### What's intentionally NOT in this phase
+- Per-connection Noise XK handshake against inbound rendezvous requests.
+- `transport::Session` wired onto real `TorStream`s.
+- Local API socket for the CLI to drive.
+- Two-daemon end-to-end smoke test (alice ↔ bob over real Tor circuits).
+- Hidden service key bound to `Identity`'s long-term Ed25519 (Arti's keymgr currently generates a fresh HS key per nickname; binding to our signing key needs an `HsIdKeypair` importer).
+- Interactive passphrase prompt (only env-var input for now).
+
+These land in the next phase.
+
+### Dependencies added
+- `tor-hsservice = "0.42"`, `tor-hscrypto = "0.42"` — pulled by enabling `arti-client`'s `onion-service-service` feature.
+- `safelog = "0.8"` — for the `DisplayRedacted` trait used to format `HsId` as the user-facing onion string. **Note**: pinned `0.8` deliberately because `tor-hscrypto` uses `safelog 0.8.2` internally; initial attempt at `safelog = "0.4"` failed at compile time because there are now two `safelog` versions in the tree and the trait impl on `HsId` belongs to the 0.8 one. Documented in the commit message in case anyone bumps this.
+- `futures = "0.3"` — for `StreamExt` to drain the rendezvous-request stream.
+- `tracing = "0.1"` + `tracing-subscriber = "0.3"` (env-filter + fmt features).
+- `clap = "4"` (derive + env features) — used by `onyxd` now and by `onyx` CLI later.
+- `anyhow = "1"` — error handling in binary code (library code keeps using our typed `Error`).
+
+### Supply-chain: license allowlist update
+- `xxhash-rust 0.8.15` (transitive via `tor-hsservice` → `growable-bloom-filter`) carries `BSL-1.0` (Boost Software License 1.0). Added to `deny.toml`'s allow-list with a note that it's OSI-approved, FSF-Libre, and AGPL-compatible for redistribution.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **109 passing in `onyx-core`** (unchanged from prior phase; no new library tests).
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Manual smoke test** ✓ — daemon vault lifecycle works end-to-end as described above.
+
+### Module status (after this phase)
+
+| Crate | State |
+|---|---|
+| `onyx-core` | all 9 modules real; 109 tests |
+| `onyxd` | **runs**: vault + identity + Tor bootstrap + HS publish; frame handling pending |
+| `onyx` | scaffold only |
+| `onyx-hub` | scaffold only |
+
+### Open security gaps (carry-forward)
+- **Frame handling on inbound HS connections** — rendezvous requests currently dropped. Next phase.
+- **HS key not bound to long-term identity** — Arti's keymgr generates a fresh HS key per nickname; need `HsIdKeypair` importer so fingerprint and onion address are mathematically equivalent (DESIGN §4.1).
+- **No interactive passphrase prompt** — env-var only.
+- **MLS state in memory only** (carry-forward).
+- **Noise transport handshake still classical-only** (carry-forward).
+- **Accepted dep-tree risks**: paste unmaintained, rsa Marvin attack (both documented in `deny.toml`, review by 2026-12-31).
+
+---
+
 ## 2026-05-18 — Tor integration (Arti) — embedded client, bootstrap + outbound dial
 
 ### `onyx_core::tor`
