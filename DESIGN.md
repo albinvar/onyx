@@ -663,7 +663,7 @@ These need decisions before or during Phase 1 implementation:
 
 5. **Stealth onion (client auth).** ~~Default for user hidden services?~~ **Resolved:** required for the onion-web tier (§8.1); optional for peer onions because it complicates "scan a QR code to add me" flows.
 
-6. **Post-quantum.** Add hybrid PQ key exchange now or wait for ecosystem maturity? Recommendation: wait, but design transport layer to be algorithm-agile. The Noise pattern designator and HKDF labels both carry a version string so a future "Noise_XK + ML-KEM-768" pattern can be negotiated without protocol surgery.
+6. **Post-quantum.** ~~Add hybrid PQ key exchange now or wait for ecosystem maturity?~~ **Partially resolved.** Primitives are implemented in `onyx_core::crypto` as an X25519 ‖ ML-KEM-768 hybrid KEM (`HybridKemSecret` / `HybridKemPublic` / `HybridCiphertext` / `HybridSharedSecret`), combined via HKDF-SHA256 with the full ciphertext bound into `info` for transcript integrity. The construction is secure as long as *either* primitive is unbroken (same defence-in-depth as Signal PQXDH / TLS 1.3 `X25519MLKEM768`). **Remaining work:** adopt the hybrid KEM in §5.5 sealed-sender bootstrap (replacing classical HPKE base mode) and in the Noise transport key schedule. The Noise pattern designator and HKDF labels both carry a version string so the "Noise_XK + ML-KEM-768" hybrid can be negotiated without protocol surgery.
 
 7. **Token batch size for §5.5 Tier 2.** Default 64 tokens per SUBSCRIBE. Larger batches = fewer registration round-trips but bigger per-circuit linkability cluster. Worth measuring during Phase 1.
 

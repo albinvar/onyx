@@ -22,6 +22,8 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as AeadRawKey, Nonce as AeadRawNonce};
 use ed25519_dalek::{Signer, Verifier};
 use hkdf::Hkdf;
+use ml_kem::kem::{Decapsulate, Encapsulate, EncapsulationKey as MlKemEk};
+use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -506,6 +508,270 @@ pub fn argon2id_derive(
         .map_err(|_| Error::Internal("Argon2 derivation failed"))
 }
 
+// ── Post-quantum hybrid KEM (X25519 ‖ ML-KEM-768) ──────────────────────────
+//
+// Onyx combines a classical X25519 ephemeral DH with FIPS 203 ML-KEM-768 so
+// the resulting shared secret is secure as long as **either** primitive is
+// unbroken. This is the same defence-in-depth pattern as Signal's PQXDH and
+// the TLS 1.3 `X25519MLKEM768` hybrid group.
+//
+// **Audit status.** The upstream `ml-kem` crate states in its own README that
+// it has not been independently audited. Hybrid composition mitigates this:
+// even a complete break of the PQ implementation degrades us to the security
+// of X25519 alone, which is what unmodified Onyx provided in v0.0.1. We DO
+// rely on the audited X25519 implementation never silently degrading.
+
+/// X25519 public-key half of a hybrid public key or ciphertext.
+pub const HYBRID_CLASSICAL_LEN: usize = 32;
+/// ML-KEM-768 encapsulation-key size (FIPS 203, K=3): 384 K + 32 = 1184 bytes.
+pub const HYBRID_PQ_PUBLIC_LEN: usize = 1184;
+/// ML-KEM-768 ciphertext size (FIPS 203, K=3): 32 (Du K + Dv) = 1088 bytes.
+pub const HYBRID_PQ_CIPHERTEXT_LEN: usize = 1088;
+/// Combined hybrid public-key size on the wire: X25519 pk ‖ ML-KEM EK.
+pub const HYBRID_PUBLIC_LEN: usize = HYBRID_CLASSICAL_LEN + HYBRID_PQ_PUBLIC_LEN;
+/// Combined hybrid ciphertext size on the wire: ephemeral X25519 pk ‖ ML-KEM CT.
+pub const HYBRID_CIPHERTEXT_LEN: usize = HYBRID_CLASSICAL_LEN + HYBRID_PQ_CIPHERTEXT_LEN;
+
+/// HKDF salt for combining the classical and post-quantum shared secrets.
+/// Bumping this string invalidates every prior hybrid derivation, so it only
+/// changes with a protocol-incompatible revision.
+const HYBRID_HKDF_SALT: &[u8] = b"onyx/v1/hybrid-kem";
+
+type PqDecapKey = <MlKem768 as KemCore>::DecapsulationKey;
+type PqEncapKey = MlKemEk<MlKem768Params>;
+type PqCiphertextArray = ml_kem::Ciphertext<MlKem768>;
+
+/// A hybrid KEM secret combining an X25519 long-term identity secret with an
+/// ML-KEM-768 decapsulation key. Both halves zeroize on drop (X25519 via
+/// `x25519-dalek`'s `zeroize` feature, ML-KEM via `ml-kem`'s).
+pub struct HybridKemSecret {
+    classical: x25519_dalek::StaticSecret,
+    post_quantum: PqDecapKey,
+}
+
+impl HybridKemSecret {
+    #[must_use]
+    pub fn generate() -> Self {
+        let classical = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let (post_quantum, _ek) = MlKem768::generate(&mut OsRng);
+        Self {
+            classical,
+            post_quantum,
+        }
+    }
+
+    /// Derive the matching hybrid public key. The PQ encapsulation key is
+    /// embedded in the decapsulation key (FIPS 203 §6.1), so no KeyGen-style
+    /// recomputation is required.
+    #[must_use]
+    pub fn public(&self) -> HybridKemPublic {
+        HybridKemPublic {
+            classical: x25519_dalek::PublicKey::from(&self.classical).to_bytes(),
+            post_quantum: self.post_quantum.encapsulation_key().clone(),
+        }
+    }
+
+    /// Decapsulate a hybrid ciphertext to the combined shared secret.
+    ///
+    /// Note that ML-KEM-768 uses *implicit rejection* — a tampered PQ
+    /// ciphertext does not error, it returns a pseudo-random shared secret.
+    /// In the hybrid construction this is harmless: any tampering of either
+    /// half of the ciphertext changes the combined output, because the entire
+    /// ciphertext bytes are bound into the HKDF `info` field.
+    pub fn decapsulate(&self, ct: &HybridCiphertext) -> Result<HybridSharedSecret> {
+        let their_classical = x25519_dalek::PublicKey::from(ct.classical);
+        let x_ss = self.classical.diffie_hellman(&their_classical);
+
+        let pq_ct_array = PqCiphertextArray::from(ct.post_quantum);
+        let pq_ss = Decapsulate::decapsulate(&self.post_quantum, &pq_ct_array)
+            .map_err(|()| Error::VerificationFailed)?;
+
+        let mut pq_ss_bytes = [0u8; 32];
+        pq_ss_bytes.copy_from_slice(pq_ss.as_ref());
+
+        let combined = combine_hybrid_secrets(&x_ss.to_bytes(), &pq_ss_bytes, ct)?;
+
+        // Zeroize the borrowed-by-value PQ secret bytes; X25519 SharedSecret
+        // zeroizes itself on drop via the dalek zeroize feature.
+        pq_ss_bytes.zeroize();
+
+        Ok(combined)
+    }
+}
+
+impl fmt::Debug for HybridKemSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridKemSecret").finish_non_exhaustive()
+    }
+}
+
+/// A hybrid KEM public key: X25519 long-term pk ‖ ML-KEM-768 encapsulation key.
+/// Not secret; the bytes are safe to publish in routing tables, contact cards,
+/// and onion-service descriptors.
+#[derive(Clone)]
+pub struct HybridKemPublic {
+    classical: [u8; HYBRID_CLASSICAL_LEN],
+    post_quantum: PqEncapKey,
+}
+
+impl HybridKemPublic {
+    /// Encapsulate a fresh shared secret to this public key. Generates an
+    /// ephemeral X25519 keypair (used only for this one encapsulation, then
+    /// dropped + zeroized) and a fresh ML-KEM-768 ciphertext.
+    pub fn encapsulate(&self) -> Result<(HybridCiphertext, HybridSharedSecret)> {
+        // Ephemeral X25519 — `EphemeralSecret` consumes itself on
+        // `diffie_hellman`, so capture the public bytes first.
+        let eph_secret = x25519_dalek::EphemeralSecret::random_from_rng(OsRng);
+        let eph_public_bytes = x25519_dalek::PublicKey::from(&eph_secret).to_bytes();
+        let recipient_classical = x25519_dalek::PublicKey::from(self.classical);
+        let x_ss = eph_secret.diffie_hellman(&recipient_classical);
+
+        // ML-KEM encapsulation.
+        let (pq_ct_array, pq_ss) = Encapsulate::encapsulate(&self.post_quantum, &mut OsRng)
+            .map_err(|()| Error::Internal("ML-KEM encapsulate failed"))?;
+
+        let mut pq_ct_bytes = [0u8; HYBRID_PQ_CIPHERTEXT_LEN];
+        pq_ct_bytes.copy_from_slice(pq_ct_array.as_ref());
+
+        let ct = HybridCiphertext {
+            classical: eph_public_bytes,
+            post_quantum: pq_ct_bytes,
+        };
+
+        let mut pq_ss_bytes = [0u8; 32];
+        pq_ss_bytes.copy_from_slice(pq_ss.as_ref());
+        let combined = combine_hybrid_secrets(&x_ss.to_bytes(), &pq_ss_bytes, &ct)?;
+        pq_ss_bytes.zeroize();
+
+        Ok((ct, combined))
+    }
+
+    /// Wire encoding: X25519 pk (32 B) ‖ ML-KEM-768 EK (1184 B) = 1216 B.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HYBRID_PUBLIC_LEN);
+        out.extend_from_slice(&self.classical);
+        out.extend_from_slice(self.post_quantum.as_bytes().as_ref());
+        out
+    }
+
+    /// Parse a hybrid public key from its wire encoding.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != HYBRID_PUBLIC_LEN {
+            return Err(Error::BufferSize {
+                expected: HYBRID_PUBLIC_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let mut classical = [0u8; HYBRID_CLASSICAL_LEN];
+        classical.copy_from_slice(&bytes[..HYBRID_CLASSICAL_LEN]);
+
+        let pq_slice = &bytes[HYBRID_CLASSICAL_LEN..];
+        let pq_encoded =
+            Encoded::<PqEncapKey>::try_from(pq_slice).map_err(|_| Error::BufferSize {
+                expected: HYBRID_PQ_PUBLIC_LEN,
+                actual: pq_slice.len(),
+            })?;
+        let post_quantum = PqEncapKey::from_bytes(&pq_encoded);
+
+        Ok(Self {
+            classical,
+            post_quantum,
+        })
+    }
+}
+
+impl fmt::Debug for HybridKemPublic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridKemPublic").finish_non_exhaustive()
+    }
+}
+
+/// A hybrid ciphertext: sender's ephemeral X25519 pk ‖ ML-KEM-768 ciphertext.
+#[derive(Clone)]
+pub struct HybridCiphertext {
+    classical: [u8; HYBRID_CLASSICAL_LEN],
+    post_quantum: [u8; HYBRID_PQ_CIPHERTEXT_LEN],
+}
+
+impl HybridCiphertext {
+    /// Wire encoding: ephemeral X25519 pk (32 B) ‖ ML-KEM-768 CT (1088 B) = 1120 B.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HYBRID_CIPHERTEXT_LEN);
+        out.extend_from_slice(&self.classical);
+        out.extend_from_slice(&self.post_quantum);
+        out
+    }
+
+    /// Parse a hybrid ciphertext from its wire encoding.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != HYBRID_CIPHERTEXT_LEN {
+            return Err(Error::BufferSize {
+                expected: HYBRID_CIPHERTEXT_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let mut classical = [0u8; HYBRID_CLASSICAL_LEN];
+        classical.copy_from_slice(&bytes[..HYBRID_CLASSICAL_LEN]);
+        let mut post_quantum = [0u8; HYBRID_PQ_CIPHERTEXT_LEN];
+        post_quantum.copy_from_slice(&bytes[HYBRID_CLASSICAL_LEN..]);
+        Ok(Self {
+            classical,
+            post_quantum,
+        })
+    }
+}
+
+impl fmt::Debug for HybridCiphertext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridCiphertext").finish_non_exhaustive()
+    }
+}
+
+/// 32-byte combined shared secret from the hybrid KEM. Zeroized on drop.
+///
+/// Suitable as input keying material for a follow-on KDF (transport key
+/// schedule, MLS welcome, etc.). Do not use as an AEAD key directly — feed
+/// it through [`hkdf_sha256`] with a use-specific `info` first.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct HybridSharedSecret([u8; 32]);
+
+impl HybridSharedSecret {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HybridSharedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridSharedSecret").finish_non_exhaustive()
+    }
+}
+
+/// Combine the classical and post-quantum shared secrets through HKDF-SHA256.
+/// The entire ciphertext bytes go into `info` so any tampering of either
+/// half of the ciphertext changes the combined output — this is what makes
+/// the hybrid resistant to an attacker substituting one component.
+fn combine_hybrid_secrets(
+    x_ss: &[u8; 32],
+    pq_ss: &[u8; 32],
+    ct: &HybridCiphertext,
+) -> Result<HybridSharedSecret> {
+    let mut ikm = Zeroizing::new([0u8; 64]);
+    ikm[..32].copy_from_slice(x_ss);
+    ikm[32..].copy_from_slice(pq_ss);
+
+    let mut info = Vec::with_capacity(HYBRID_CIPHERTEXT_LEN);
+    info.extend_from_slice(&ct.classical);
+    info.extend_from_slice(&ct.post_quantum);
+
+    let mut out = [0u8; 32];
+    hkdf_sha256(&ikm[..], HYBRID_HKDF_SALT, &info, &mut out)?;
+    Ok(HybridSharedSecret(out))
+}
+
 // ── Constant-time comparison ────────────────────────────────────────────────
 
 /// Constant-time equality. Use this for any comparison whose timing must not
@@ -752,6 +1018,126 @@ mod tests {
         let mut c = [0u8; 32];
         argon2id_derive(b"different passphrase", &salt, &params, &mut c).unwrap();
         assert_ne!(a, c, "different passphrase must yield different output");
+    }
+
+    #[test]
+    fn hybrid_kem_round_trip() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let (ct, ss_send) = pk.encapsulate().unwrap();
+        let ss_recv = sk.decapsulate(&ct).unwrap();
+        assert_eq!(
+            ss_send.as_bytes(),
+            ss_recv.as_bytes(),
+            "encap and decap must produce the same shared secret"
+        );
+    }
+
+    #[test]
+    fn hybrid_kem_different_encaps_differ() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let (_ct1, ss1) = pk.encapsulate().unwrap();
+        let (_ct2, ss2) = pk.encapsulate().unwrap();
+        assert_ne!(
+            ss1.as_bytes(),
+            ss2.as_bytes(),
+            "two fresh encaps to the same recipient must use distinct randomness"
+        );
+    }
+
+    #[test]
+    fn hybrid_kem_wrong_recipient() {
+        let sk_a = HybridKemSecret::generate();
+        let sk_b = HybridKemSecret::generate();
+        let (ct, ss_send) = sk_a.public().encapsulate().unwrap();
+        let ss_recv_wrong = sk_b.decapsulate(&ct).unwrap();
+        assert_ne!(
+            ss_send.as_bytes(),
+            ss_recv_wrong.as_bytes(),
+            "a recipient whose key was not the encapsulation target must derive a different secret"
+        );
+    }
+
+    #[test]
+    fn hybrid_kem_tampered_classical_half() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let (mut ct, ss_send) = pk.encapsulate().unwrap();
+        // Flip one bit in the X25519 ephemeral.
+        ct.classical[0] ^= 0x01;
+        let ss_recv = sk.decapsulate(&ct).unwrap();
+        assert_ne!(
+            ss_send.as_bytes(),
+            ss_recv.as_bytes(),
+            "tampering the classical half must change the combined secret"
+        );
+    }
+
+    #[test]
+    fn hybrid_kem_tampered_pq_half() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let (mut ct, ss_send) = pk.encapsulate().unwrap();
+        // Flip one bit in the PQ ciphertext (ML-KEM implicit rejection +
+        // info-binding both ensure the output differs).
+        ct.post_quantum[0] ^= 0x01;
+        let ss_recv = sk.decapsulate(&ct).unwrap();
+        assert_ne!(
+            ss_send.as_bytes(),
+            ss_recv.as_bytes(),
+            "tampering the PQ half must change the combined secret"
+        );
+    }
+
+    #[test]
+    fn hybrid_kem_public_byte_round_trip() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let bytes = pk.to_bytes();
+        assert_eq!(bytes.len(), HYBRID_PUBLIC_LEN);
+
+        let pk2 = HybridKemPublic::from_bytes(&bytes).unwrap();
+        // We can't compare HybridKemPublic directly (no Eq), so check that
+        // the round-tripped key is usable: encap with it, decap with original sk.
+        let (ct, ss_send) = pk2.encapsulate().unwrap();
+        let ss_recv = sk.decapsulate(&ct).unwrap();
+        assert_eq!(ss_send.as_bytes(), ss_recv.as_bytes());
+    }
+
+    #[test]
+    fn hybrid_kem_ciphertext_byte_round_trip() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let (ct, ss_send) = pk.encapsulate().unwrap();
+        let bytes = ct.to_bytes();
+        assert_eq!(bytes.len(), HYBRID_CIPHERTEXT_LEN);
+
+        let ct2 = HybridCiphertext::from_bytes(&bytes).unwrap();
+        let ss_recv = sk.decapsulate(&ct2).unwrap();
+        assert_eq!(ss_send.as_bytes(), ss_recv.as_bytes());
+    }
+
+    #[test]
+    fn hybrid_kem_rejects_wrong_size_bytes() {
+        assert!(matches!(
+            HybridKemPublic::from_bytes(&[0u8; 10]),
+            Err(Error::BufferSize { .. })
+        ));
+        assert!(matches!(
+            HybridCiphertext::from_bytes(&[0u8; 10]),
+            Err(Error::BufferSize { .. })
+        ));
+    }
+
+    #[test]
+    fn hybrid_kem_size_constants() {
+        // These match FIPS 203 Table 3 for ML-KEM-768 (K=3).
+        assert_eq!(HYBRID_CLASSICAL_LEN, 32);
+        assert_eq!(HYBRID_PQ_PUBLIC_LEN, 1184);
+        assert_eq!(HYBRID_PQ_CIPHERTEXT_LEN, 1088);
+        assert_eq!(HYBRID_PUBLIC_LEN, 1216);
+        assert_eq!(HYBRID_CIPHERTEXT_LEN, 1120);
     }
 
     #[test]

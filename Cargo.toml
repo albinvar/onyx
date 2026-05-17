@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Onyx contributors"]
 repository = "https://github.com/albinvar/onyx"
+license = "AGPL-3.0-or-later"
 
 # Pinned in one place so every crate uses the same version.
 # Higher-level crates (onyxd, onyx, onyx-hub) MUST NOT add raw crypto deps —
@@ -20,6 +21,8 @@ hkdf             = "0.12"
 sha2             = "0.10"
 blake2           = "0.10"
 argon2           = "0.5"
+# Post-quantum KEM (FIPS 203 ML-KEM-768), used in hybrid with X25519 — see crypto.rs.
+ml-kem           = { version = "0.2", features = ["zeroize"] }
 rand_core        = { version = "0.6", features = ["getrandom"] }
 zeroize          = { version = "1", features = ["derive"] }
 subtle           = "2"
