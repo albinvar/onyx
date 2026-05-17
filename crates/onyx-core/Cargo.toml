@@ -22,6 +22,10 @@ argon2           = { workspace = true }
 ml-kem           = { workspace = true }
 snow             = { workspace = true }
 rusqlite         = { workspace = true }
+openmls          = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_traits   = { workspace = true }
 rand_core        = { workspace = true }
 zeroize          = { workspace = true }
 subtle           = { workspace = true }

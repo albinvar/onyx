@@ -6,6 +6,54 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — MLS (RFC 9420) wrapper + RustSec advisory fix
+
+### `onyx_core::mls`
+- New thin wrapper over `openmls` exposing just the operations Onyx needs:
+  - **`MlsParty`** — credential + signature keypair + crypto provider. Each party owns its own in-memory keystore (so two parties in the same process are fully independent for tests). `MlsParty::new`, `key_package_bytes`, `create_group`, `join_from_welcome`.
+  - **`MlsGroupState`** — live group state for one party. `invite`, `encrypt_application`, `decrypt_application`, `export_routing_secret`, `epoch`.
+- **Ciphersuite**: `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519` (RFC 9420 suite 3) — matches the X25519 / ChaCha20-Poly1305 / SHA-256 / Ed25519 algorithm set we already use at every other layer.
+- **MLS-Exporter** wired to `routing.rs`: `export_routing_secret` runs the exporter with the `"onyx/v1/routing"` label and 32-byte output, returning a `[u8; 32]` ready to feed `routing::session_token`. A test asserts both ends of the link (the label string in `mls.rs` must match `routing::MLS_EXPORTER_LABEL`).
+- **Error policy**: openmls's deeply structured per-operation error types collapse to either `Error::VerificationFailed` (when something looks like tampering — currently just `process_message` failures) or `Error::Internal("mls: <label>")` for everything else. Caller-state misuse is treated as "drop the connection."
+
+### Identity binding (carry-forward)
+- v0 generates a **fresh** ED25519 signature keypair per `MlsParty` instead of binding to `crate::identity::Identity`'s long-term key. `SignatureKeyPair` has a from-raw constructor; integration is a follow-up that pairs naturally with persisting MLS state into `Vault`. Documented in the module header.
+
+### Tests (15 new, 106 total in `onyx-core`)
+- Party + KeyPackage + solo-group creation succeed.
+- Welcome round-trip: alice creates → invites bob → bob joins → both at the same epoch.
+- Alice→Bob application message round-trip.
+- Bidirectional traffic.
+- Multiple messages in sequence.
+- Tampered ciphertext rejected with `VerificationFailed`.
+- **Exporter agrees across members at the same epoch** (the fundamental MLS-Exporter property).
+- **Exporter differs across distinct groups** (proves the exporter is not constant).
+- **Exporter→session_token bridge**: alice and bob, both at the same epoch, derive the *same* `session_token(secret, 7)` — this is the cross-module test that proves MLS and routing actually compose.
+- Module-label-consistency test: the exporter label string in `mls.rs` must equal `routing::MLS_EXPORTER_LABEL` bytewise.
+- Malformed welcome / malformed application message rejected safely (no panic).
+
+### Dependency vulnerability fix (RUSTSEC-2026-0072)
+- Initial choice of `openmls = "0.6"` pulled in `hpke-rs-rust-crypto 0.2.0`, which `cargo deny` flagged for RUSTSEC-2026-0072 — *Missing Check for All-Zero X25519 Shared Secret*. The advisory mandates an all-zero DH shared-secret check (per RFC 9180); affected versions silently accept non-contributory key exchanges.
+- Bumped the entire openmls family to the 0.8 line: `openmls 0.8`, `openmls_rust_crypto 0.5`, `openmls_basic_credential 0.5`, `openmls_traits 0.5`. These pull `hpke-rs-rust-crypto 0.6+` which contains the fix.
+- API impact was minimal: `MlsGroup::export_secret` in 0.8 takes `&impl OpenMlsCrypto` instead of `&impl OpenMlsProvider`, so we reach into `provider.crypto()` for the exporter call. Documented inline.
+- This is the first time `cargo deny`'s advisories job actually blocked a merge for us. Worth noting as evidence the gate works — we'd have shipped the vulnerable transitive dep otherwise.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ (after fixing one `manual_let_else` clippy lint on the welcome-extraction match)
+- `cargo test --workspace` ✓ — **106 passing in `onyx-core`** (25 crypto + 16 wire + 15 transport + 9 storage + 9 identity + 17 routing + 15 mls)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓ — `advisories ok, bans ok, licenses ok, sources ok`
+
+### Open security gaps (carry-forward)
+- **MLS state lives only in memory.** Persistence into `Vault` is the natural pairing with binding MLS signature keys to `Identity`. Process restart loses group state for now.
+- **Noise transport handshake still classical-only.**
+- **Daemon-side async I/O still missing.**
+- All earlier gaps unchanged (cargo-vet / SBOM / signed releases / fuzzing / Miri; `ml-kem` / `snow` / `openmls` / bundled SQLite all upstream-unaudited as a whole — mitigated for ml-kem via hybrid composition, not mitigated for the others).
+- **One module still empty**: `tor`. Once that lands and async I/O wires up, `onyxd` can run end-to-end.
+
+---
+
 ## 2026-05-18 — Routing IDs + sealed-sender bootstrap (first PQ-hybrid integration)
 
 ### `onyx_core::routing`

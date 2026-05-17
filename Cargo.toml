@@ -35,6 +35,15 @@ snow             = "0.9"
 # Local encrypted vault. `bundled` compiles SQLite from source so we don't
 # depend on a system library version we can't control.
 rusqlite         = { version = "0.32", features = ["bundled"] }
+# Messaging Layer Security (RFC 9420) — group E2E encryption.
+# We track the 0.8 line because the 0.6 line transitively pulls
+# hpke-rs-rust-crypto 0.2 which has RUSTSEC-2026-0072 (missing all-zero
+# X25519 shared-secret check). 0.8 pulls hpke-rs-rust-crypto 0.6+ which
+# fixes it.
+openmls          = "0.8"
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
+openmls_traits   = "0.5"
 # Test-only.
 tempfile         = "3"
 rand_core        = { version = "0.6", features = ["getrandom"] }
