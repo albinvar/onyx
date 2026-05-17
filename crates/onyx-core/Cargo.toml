@@ -20,6 +20,7 @@ sha2             = { workspace = true }
 blake2           = { workspace = true }
 argon2           = { workspace = true }
 ml-kem           = { workspace = true }
+snow             = { workspace = true }
 rand_core        = { workspace = true }
 zeroize          = { workspace = true }
 subtle           = { workspace = true }

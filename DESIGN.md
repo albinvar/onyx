@@ -292,9 +292,12 @@ Client (initiator)                           Server / Peer (responder)
    ── transport keys derived, channel is now AEAD ──
 ```
 
-After the third message, both sides immediately exchange a **key-confirmation frame**: each side sends an AEAD-encrypted constant ("onyx/1 kc-i" from initiator, "onyx/1 kc-r" from responder) under the new transport key before any application traffic. This gives each side explicit confirmation that the peer derived the same key, closing the implicit-auth gap in some Noise patterns.
+Noise XK provides **explicit mutual authentication** by the end of the third message:
 
-After handshake + key confirmation, both sides have a symmetric key for ChaCha20-Poly1305 framing on the channel.
+- the responder's static key is authenticated to the initiator via the AEAD tag on message 2 (the `ee` DH binds it),
+- the initiator's static key is authenticated to the responder via the AEAD tag on message 3 (the `se` DH binds it).
+
+There is no implicit-auth gap to close, so we do not emit an extra key-confirmation round trip after the handshake (a v0.2-draft of this document mistakenly required one). After message 3 both sides have a symmetric key for ChaCha20-Poly1305 framing on the channel and can immediately exchange application traffic.
 
 ### 5.3 Frame format
 

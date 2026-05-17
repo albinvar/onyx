@@ -29,6 +29,9 @@ blake2           = "0.10"
 argon2           = "0.5"
 # Post-quantum KEM (FIPS 203 ML-KEM-768), used in hybrid with X25519 — see crypto.rs.
 ml-kem           = { version = "0.2", features = ["zeroize"] }
+# Noise Protocol Framework — used for the transport-layer XK handshake.
+# Pinned to the same release line WireGuard ecosystem uses.
+snow             = "0.9"
 rand_core        = { version = "0.6", features = ["getrandom"] }
 zeroize          = { version = "1", features = ["derive"] }
 subtle           = "2"

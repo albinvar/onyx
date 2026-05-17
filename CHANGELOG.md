@@ -6,6 +6,57 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Transport: Noise XK handshake + Session over `snow`
+
+### `onyx_core::transport`
+- Replaced the doc-only stub with three real state machines wrapping the `snow` Noise implementation:
+  - **`Initiator`** — the dialer side of `Noise_XK_25519_ChaChaPoly_BLAKE2s`. Constructor takes our long-term X25519 secret and the peer's expected X25519 public; the pattern's XK shape means the responder's static is pre-known (we always have it from the contact card).
+  - **`Responder`** — the listener side. Constructor takes only our X25519 secret; the initiator's static key is learned in handshake message 3 and exposed as `Session::peer_static_key()` after `into_session()`.
+  - **`Session`** — established transport. `encrypt_frame(&InnerFrame) -> Vec<u8>` and `decrypt_frame(&[u8]) -> InnerFrame`. AEAD nonces are managed internally by snow as monotonic per-direction counters; the application never sees them.
+- **Outer length-prefix framing** is a separate concern handled by `frame_with_length(&[u8]) -> Vec<u8>` and `split_length_prefix(&[u8]) -> (usize, &[u8])`. These exist outside `Session` so the daemon can also use them to chunk a TCP stream into AEAD-sized blobs before decryption.
+- **Layering decision**: this module is sync and has zero I/O. Socket reads/writes belong to `onyxd`. Splitting concerns this way means the handshake and AEAD wrap/unwrap (the security-critical bits) are unit-testable without an async runtime and can be dropped into either a Tokio or thread-per-peer daemon later.
+
+### Error mapping
+- snow's `Error::Decrypt` (tampered tag, wrong key, replay) maps to our `Error::VerificationFailed` — an opaque variant by design, never tell the caller why decryption failed.
+- All other snow errors map to `Error::Internal("Noise transport error")` with a deliberate `_other` binding in the match so a future `tracing::debug!` can capture the variant without changing the shape of the function.
+
+### Key confirmation (DESIGN.md §5.2)
+- v0.2 mistakenly required a post-handshake key-confirmation round trip. Noise XK already provides **explicit mutual authentication** by the end of its third message — responder's static via `ee` on m2, initiator's static via `se` on m3. There is no implicit-auth gap to close.
+- Updated DESIGN §5.2 to drop the key-confirmation language and document the actual authentication chain.
+
+### Tests (15 new, 56 total in `onyx-core`)
+- **Handshake**: completes cleanly; responder learns initiator's authenticated static key.
+- **Application traffic**: single frame round-trip; ten frames in order; bidirectional traffic (alice→bob and bob→alice simultaneously).
+- **Tamper detection**: a single bit-flip in ciphertext returns `VerificationFailed`.
+- **Replay/reorder rejection**: skipping a frame and trying to decrypt the next one returns `VerificationFailed` (snow's per-direction counter is monotonic, not a window).
+- **Wrong-key rejection** (an educational test): when Alice dials Mallory's expected static but actually talks to Bob, the failure surfaces at the responder's `read_handshake(&m1)` — not at the initiator's `read_handshake(&m2)` as one might first expect. Reason: in XK, message 1 already carries an AEAD tag bound to the responder's expected static via the `es` DH. Alice's es uses Mallory's static; Bob's uses his own; the chain keys diverge at step 1, so Bob's decryption of m1 fails. This is the strongest possible outcome — the responder never sees a valid first message and cannot leak any payload back.
+- **Decoder hardening**: `decrypt_frame` rejects inputs shorter than the AEAD tag with `InvalidEncoding` before touching `snow`.
+- **Length-prefix codec**: round-trip; rejects short input (0/1/3 bytes); rejects body longer than `u16::MAX`.
+- **Property tests (proptest)**:
+  - `prop_decrypt_no_panic` — arbitrary bytes never panic the AEAD decoder.
+  - `prop_handshake_no_panic` — arbitrary bytes never panic the responder's handshake decoder.
+  - `prop_length_prefix_round_trip` — length-prefix round-trip for arbitrary bodies up to 8 KiB.
+
+### Dependencies added
+- `snow = "0.9"` (resolved to 0.9.6).
+- snow brings in `aes`, `aes-gcm`, `ctr`, `ghash`, `polyval` transitively (parts of its cipher resolver we don't use directly — XK_25519_ChaChaPoly_BLAKE2s doesn't touch them). `cargo deny check` still passes.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ (after fixing one `cast_possible_truncation` in the length-prefix test, three `similar_names` lints on alice/bob/mallory variable pairs, one `needless_pass_by_value` on `map_noise_err`, and deleting one trivially-true test)
+- `cargo test --workspace` ✓ — **56 passing in `onyx-core`** (25 crypto + 16 wire + 15 transport)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+
+### Open security gaps (carry-forward)
+- **Daemon-side I/O still missing.** Transport is a state machine; `onyxd` needs the actual async TcpStream + Tor circuit plumbing to use it end-to-end.
+- **PQ primitives still not wired in.** Now that `transport` exists, the natural integration point is replacing the `Noise_XK` handshake with a hybrid (`Noise_XKhfs+25519+ML-KEM-768` style) once snow supports it, or running ML-KEM-768 as a separate post-handshake KEM step.
+- Storage (`storage.rs`), identity vault (`identity.rs`), MLS wiring (`mls.rs`), routing (`routing.rs`), and Tor (`tor.rs`) still empty.
+- snow itself: actively maintained, used by WireGuard ecosystem, but not formally audited as a whole. Worth noting in any future security review.
+- All earlier gaps unchanged (cargo-vet, SBOM, signed releases, fuzzing/Miri, `ml-kem` upstream-unaudited).
+
+---
+
 ## 2026-05-18 — Wire format: InnerFrame codec + CBOR MessageEnvelope + property tests
 
 ### `onyx_core::wire`
