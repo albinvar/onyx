@@ -30,9 +30,29 @@ feature-depth = 1
 [advisories]
 version = 2
 yanked = "deny"
+# Don't fail on unmaintained advisories from deep transitive deps — we
+# can't control them. Workspace-direct deps becoming unmaintained DO
+# fail (so we'd notice if e.g. we picked an unmaintained crate ourselves).
+unmaintained = "workspace"
 ignore = [
-    # Add advisory IDs here only with a comment and a sunset date.
-    # Example: { id = "RUSTSEC-XXXX-NNNN", reason = "...", expiration = "2026-12-31" }
+    # RUSTSEC-2024-0436 — `paste` is unmaintained. Transitive via
+    # arti-client → fs-mistrust → pwd-grp → paste. The advisory is
+    # informational; the crate's existing code still works. Re-evaluate
+    # when arti drops the dependency.
+    { id = "RUSTSEC-2024-0436", reason = "[review by 2026-12-31] paste unmaintained; transitive via arti-client → fs-mistrust → pwd-grp. No upstream fix in arti's path yet." },
+
+    # RUSTSEC-2023-0071 — Marvin Attack timing-side-channel on RSA
+    # *decryption*. Transitive via arti-client → tor-key-forge →
+    # ssh-key-fork-arti → rsa. Onyx does not use RSA anywhere on the
+    # hot path: identity is Ed25519, key exchange is X25519 + ML-KEM,
+    # symmetric is ChaCha20-Poly1305. Modern v3 onion services and
+    # Ed25519 directory signing don't use RSA decryption either. The
+    # exposure is bounded to whatever RSA-decryption paths Arti still
+    # exercises internally for legacy Tor compatibility — not within
+    # our threat model. No upstream `rsa` fix is available. Re-evaluate
+    # when the `rsa` crate ships a constant-time PKCS#1 implementation
+    # or when arti drops the transitive dependency.
+    { id = "RUSTSEC-2023-0071", reason = "[review by 2026-12-31] Marvin attack on rsa 0.9 — transitive via arti; no RSA decryption on Onyx's hot path. Documented as an accepted risk in CHANGELOG." },
 ]
 
 # ─── Licenses ──────────────────────────────────────────────────────────────

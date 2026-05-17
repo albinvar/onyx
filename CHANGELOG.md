@@ -6,6 +6,77 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Tor integration (Arti) — embedded client, bootstrap + outbound dial
+
+### `onyx_core::tor`
+- New minimal wrapper over `arti-client` 0.42 (Tor Project's own Rust client). No exec, no system `tor` daemon, no IPC — pure-Rust embedded Tor.
+- **`TorRuntime::bootstrap`** — start Arti with the default config, download consensus, build initial circuits, return a clone-able handle. Cold-cache bootstrap takes 30–60 s; warm-cache is fast. Holds an `Arc<TorClient>` internally so the daemon can share it across worker tasks.
+- **`TorRuntime::dial(host, port) → TorStream`** — outbound dial over a Tor circuit. `host` accepts either a `.onion` address or a clearnet hostname; Arti's `IntoTorAddr` does the right thing.
+- **`TorStream`** — type alias for `arti_client::DataStream`. Arti's `tokio` feature is on by default, so `TorStream` already implements `tokio::io::AsyncRead` + `tokio::io::AsyncWrite`. No adapter needed — `transport::Session` will wrap it directly once the daemon's frame loop exists.
+- **`TorRuntime::publish_hidden_service`** — stub returning `Error::NotImplemented`. Pairing v3 hidden-service publication with our long-term signing key requires `tor-hsservice` and a richer config pass; it ships in the next phase alongside the first `onyxd` async wiring.
+
+### Why this matters
+This is the seventh of nine modules in `onyx-core`, and the **first one that touches the actual network**. Crypto, wire, transport, storage, identity, routing, mls are all pure in-process Rust. With `tor.rs`, the system finally has a way to move bytes between machines. The remaining glue — wrapping `transport::Session` over a `TorStream` and running it inside `onyxd`'s tokio runtime — is the daemon-side work that lands next.
+
+### Dependencies added
+- `arti-client = "0.42"` (defaults include `tokio`, `native-tls`, `compression`)
+- `tor-rtcompat = "0.42"`
+- `tokio = "1"` with `macros, rt-multi-thread, io-util, net, fs, time, sync, signal` features. Used by Arti and (soon) by `onyxd`.
+
+### Forced bumps
+- `rusqlite` bumped from 0.32 → 0.39 because arti's transitive `tor-dirmgr` requires `rusqlite >= 0.36, < 0.40`. No API changes affected our storage module — `cargo test` passed all 106 prior tests on the new version without any edit.
+
+### Tests (3 new, 109 total in `onyx-core`)
+Compilation-only — anything that actually starts Tor needs outbound network and ≥30 s, so it doesn't belong in `cargo test` on a CI runner with no Tor connectivity. End-to-end exercising will be a separate integration suite or `onyxd` smoke tests.
+- `tor_stream_implements_tokio_io` — proves `TorStream: AsyncRead + AsyncWrite`.
+- `tor_runtime_is_send_sync_clone` — proves `TorRuntime` can be shared across worker tasks (it's `Arc`-wrapped internally).
+- `publish_hidden_service_is_stubbed` — placeholder for when the implementation lands.
+
+### Supply-chain hardening: cargo-deny advisories
+
+Two advisories surfaced from arti's transitive dep set. Both are accepted with documented review dates in `deny.toml`:
+
+- **RUSTSEC-2024-0436** — `paste` crate unmaintained. Transitive via `arti-client → fs-mistrust → pwd-grp → paste`. Advisory is informational (no vulnerability); the crate's code still works. We additionally set `unmaintained = "workspace"` in `deny.toml`, which means cargo-deny now only fails on unmaintained crates that ARE workspace members — transitive unmaintained no longer blocks merge. Direct workspace deps still fail loudly. **Review by 2026-12-31.**
+- **RUSTSEC-2023-0071** — Marvin Attack timing side-channel on `rsa` 0.9 *decryption*. Transitive via `arti-client → tor-key-forge → ssh-key-fork-arti → rsa`. **Accepted risk** because Onyx does not use RSA anywhere on the hot path (identity is Ed25519, key exchange is X25519 + ML-KEM-768 hybrid, symmetric is ChaCha20-Poly1305). Modern v3 onion services and Ed25519 directory signing don't use RSA decryption either; the exposure is bounded to whatever legacy paths Arti exercises internally that aren't in Onyx's threat model. No upstream `rsa` fix exists. **Review by 2026-12-31** — re-evaluate when the `rsa` crate ships a constant-time PKCS#1 implementation or when arti drops the transitive dependency.
+
+The honest framing: this is a real vulnerability in our dep tree that we're choosing to live with. It is documented here so the decision is visible.
+
+### Compile-time cost
+First `cargo check --workspace` on a cold cache after adding arti took **35 seconds** (vs. ~5 s before). The Swatinem/rust-cache action in CI absorbs the repeat cost after the first run. Acceptable.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **109 passing in `onyx-core`** (25 crypto + 16 wire + 15 transport + 9 storage + 9 identity + 17 routing + 15 mls + 3 tor)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓ — `advisories ok, bans ok, licenses ok, sources ok`
+
+### Open security gaps (carry-forward)
+- **Hidden service publication not yet wired** — `TorRuntime::publish_hidden_service` returns `NotImplemented`. Lands next phase with daemon async wiring.
+- **Daemon doesn't run yet** — `onyxd` is still the scaffold binary. Next phase: tokio runtime + Tor bootstrap + transport::Session over TorStream → first end-to-end "two daemons talking" demo.
+- **MLS state in memory only** (carried from prior phase).
+- **Noise transport handshake still classical-only** (carried from prior phase).
+- **Accepted dep-tree risks documented above** (paste unmaintained, rsa Marvin attack).
+- All earlier gaps unchanged.
+
+### Module status (after this phase)
+
+| Module | State |
+|---|---|
+| `crypto` | real |
+| `wire` | real |
+| `transport` | real |
+| `storage` | real |
+| `identity` | real |
+| `routing` | real |
+| `mls` | real |
+| `tor` | real (bootstrap + dial); hidden service stubbed |
+| `error` | real |
+
+**All 9 modules in `onyx-core` now have real code.** Next phase is the daemon (`onyxd`) — assembling these pieces into a running process.
+
+---
+
 ## 2026-05-18 — MLS (RFC 9420) wrapper + RustSec advisory fix
 
 ### `onyx_core::mls`
