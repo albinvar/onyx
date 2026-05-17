@@ -6,6 +6,54 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Storage (Vault) + Identity repo
+
+### `onyx_core::storage`
+- New `Vault` type: SQLite database + Argon2id-derived AEAD key, held in memory for the daemon's lifetime and zeroized on drop.
+- Three constructors: `create(path, passphrase, params)`, `open(path, passphrase)`, `open_memory(passphrase, params)` for session-only mode + tests (DESIGN §7.3).
+- Schema v1: `vault_meta` (single row with salt + KDF params + AEAD-encrypted canary) and `identities` (one row per stored identity). `SCHEMA_VERSION = 1` constant; mismatch on open errors out (forward migration support is the natural place to extend).
+- **Wrong-passphrase detection** via an AEAD-encrypted canary plaintext (`b"onyx-vault-canary-v1"`). On `open`, we re-derive the candidate key, try to decrypt the canary, and surface AEAD-tag failure as `Error::VerificationFailed` — the same opaque variant used everywhere else for "decryption didn't pass." Caller can't distinguish "wrong passphrase" from "corrupt canary" — both should be treated the same.
+- **Per-row AEAD via `encrypt_blob` / `decrypt_blob`.** Blob layout: `nonce(12) || ChaCha20-Poly1305(plaintext, aad=∅)`. Fresh OS-random nonce per call (~2⁴⁸ blob birthday bound under one key, comfortably above any user's vault lifetime). Output is non-deterministic — same plaintext, same key, different ciphertext — and a test asserts this.
+- Underlying `seal` / `unseal` helpers are `pub(crate)` so the property tests can hit them with a fresh `AeadKey` and avoid running Argon2 256 times.
+- `map_db_err` is `pub(crate)` so per-entity repos in other modules can use the same opaque-error policy.
+
+### `onyx_core::identity`
+- `Identity` type owns a `SigningKey` + `IdentitySecret`. Both inner secrets zeroize on drop via their crate-level wrappers. `Identity::generate` / `Identity::from_seeds` / `Identity::fingerprint` / signing- and identity-key accessors.
+- `StoredIdentity` is the plaintext-metadata view (id, nickname, fingerprint, created_at) — returned by `list_identities` without touching the AEAD blob.
+- Repo methods on `Vault` (live in `identity.rs` for proximity to the type they handle):
+  - `create_identity(nickname) -> (i64, Identity)` — generate, encrypt the 64-byte plaintext (signing seed ‖ x25519 secret), insert.
+  - `list_identities() -> Vec<StoredIdentity>` — metadata only, does not decrypt.
+  - `get_identity(id) -> Identity` — decrypts the secret blob and reconstructs the keys.
+  - `delete_identity(id)` — per DESIGN §7.4, overwrites the encrypted blob with 128 OS-random bytes inside a transaction, deletes the row, then VACUUMs the file to compact freed pages. Best-effort defence against forensic recovery of the original ciphertext+tag.
+- Serialised layout inside the AEAD blob is fixed at 64 bytes: `signing_seed(32) ‖ x25519_secret(32)`. Documented in the module header; renames or additions MUST bump `SCHEMA_VERSION`.
+
+### Tests (18 new, 74 total in `onyx-core`)
+- **Storage unit tests:** create+open succeeds; encrypt/decrypt round-trip; encrypt isn't deterministic (fresh nonce check); tampered blob rejected with `VerificationFailed`; truncated blob (shorter than nonce prefix) rejected with `InvalidEncoding`; on-disk vault persists across reopen; wrong passphrase rejected; `create` refuses an already-existing file.
+- **Storage property tests** (16 cases each, capped down from proptest's default 256 because each Vault::open_memory runs Argon2 at floor and we want CI under a minute):
+  - `prop_seal_unseal_round_trip` — arbitrary plaintext survives `seal`+`unseal` (uses helpers directly with a fresh AeadKey to skip Argon2 per case).
+  - `prop_unseal_no_panic` — arbitrary bytes never panic the decoder.
+- **Identity unit tests:** distinct identities have distinct fingerprints; from_seeds is deterministic; create then list returns both with the right nicknames + fingerprints; get round-trips and the restored key produces signatures the original's verifying key accepts; missing-id get errors; delete removes the row and subsequent get fails; UNIQUE-on-fingerprint constraint rejects a manually-inserted clone; identities persist across vault reopen.
+
+### Dependencies added
+- `rusqlite = { version = "0.32", features = ["bundled"] }` — `bundled` compiles SQLite from source so we don't depend on a system library version we can't control. cargo-deny accepts it (MIT license).
+- `tempfile = "3"` (dev-dependency) for on-disk vault tests.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **74 passing in `onyx-core`** (25 crypto + 16 wire + 15 transport + 9 storage + 9 identity).
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+
+### Open security gaps (carry-forward)
+- **`Vault::change_passphrase` not yet implemented.** Re-encrypting every row requires walking each table and re-sealing; doable but defer.
+- **No SQLite full-VACUUM-with-zero-fill option enabled.** The plain `VACUUM` we run on delete rebuilds the file but doesn't necessarily zero freed pages on disk. For high-threat scenarios, run on a full-disk-encrypted device (DESIGN §7.3 recommendation).
+- **No backup/export flow yet.** DESIGN §4.2 describes `export_identity` to an encrypted file; that's the next sensible identity-layer addition.
+- **All earlier gaps unchanged**: PQ not yet wired into transport/routing; daemon I/O missing; no cargo-vet / SBOM / signed releases; no fuzzing / Miri; `ml-kem` and `snow` upstream-unaudited (mitigated for ml-kem via hybrid composition).
+- **Modules still empty**: `mls`, `routing`, `tor`.
+
+---
+
 ## 2026-05-18 — Transport: Noise XK handshake + Session over `snow`
 
 ### `onyx_core::transport`

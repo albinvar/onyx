@@ -21,6 +21,7 @@ blake2           = { workspace = true }
 argon2           = { workspace = true }
 ml-kem           = { workspace = true }
 snow             = { workspace = true }
+rusqlite         = { workspace = true }
 rand_core        = { workspace = true }
 zeroize          = { workspace = true }
 subtle           = { workspace = true }
@@ -32,6 +33,7 @@ ciborium         = { workspace = true }
 
 [dev-dependencies]
 proptest         = { workspace = true }
+tempfile         = { workspace = true }
 
 [lints]
 workspace = true
