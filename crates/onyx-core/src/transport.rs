@@ -42,6 +42,7 @@
 //! is being updated to match.
 
 use snow::{Builder, HandshakeState, TransportState, params::NoiseParams};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::crypto::{IdentityPublic, IdentitySecret};
 use crate::error::{Error, Result};
@@ -328,6 +329,126 @@ pub fn split_length_prefix(data: &[u8]) -> Result<(usize, &[u8])> {
     Ok((len, &data[2..2 + len]))
 }
 
+// ── Async I/O bridge ───────────────────────────────────────────────────────
+//
+// Everything above is sync state + codec — no I/O. The helpers below
+// glue that machinery onto any `tokio::io::AsyncRead + AsyncWrite`
+// stream (a Tor circuit, a TcpStream, an in-memory duplex pair, …)
+// using the existing length-prefix framing on the wire.
+//
+// We deliberately keep these as free functions rather than methods on
+// `Session` / `Initiator` / `Responder`. That way the sync types stay
+// usable from non-async test paths (which is what every test in the
+// rest of this file does), and the async surface is the thinnest
+// possible adapter around them.
+
+/// Largest single Noise message we'll accept from the wire.
+///
+/// During handshake the protocol-defined max is 65 535 bytes; in
+/// practice XK messages are < 100 B (m1) and < 50 B (m2/m3) with our
+/// empty payloads. During transport the max we'd ever send is
+/// `bucket::LARGE + AEAD_TAG_LEN = 4 112` bytes. We cap at 65 535 — the
+/// Noise spec ceiling — so a hostile peer can't make us allocate
+/// arbitrarily.
+const MAX_WIRE_MESSAGE: usize = u16::MAX as usize;
+
+/// Read one length-prefixed message from the wire. Returns the body
+/// (length prefix stripped); errors on EOF or if the declared length
+/// exceeds [`MAX_WIRE_MESSAGE`].
+async fn read_lp<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|_| Error::Internal("transport: read length prefix"))?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    if len > MAX_WIRE_MESSAGE {
+        return Err(Error::InvalidEncoding(
+            "transport: declared message length exceeds MAX_WIRE_MESSAGE",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|_| Error::Internal("transport: read body"))?;
+    Ok(body)
+}
+
+/// Write `body` as a length-prefixed message and flush.
+async fn write_lp<W: AsyncWriteExt + Unpin>(stream: &mut W, body: &[u8]) -> Result<()> {
+    let framed = frame_with_length(body)?;
+    stream
+        .write_all(&framed)
+        .await
+        .map_err(|_| Error::Internal("transport: write framed bytes"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|_| Error::Internal("transport: flush"))?;
+    Ok(())
+}
+
+/// Drive the Noise XK handshake to completion on the **initiator** side
+/// over an async stream. Returns the established [`Session`].
+///
+/// Wire order: write m1 → read m2 → write m3 → done.
+pub async fn handshake_initiator<S>(
+    stream: &mut S,
+    our_static: &IdentitySecret,
+    peer_static: &IdentityPublic,
+) -> Result<Session>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut init = Initiator::new(our_static, peer_static)?;
+    let m1 = init.write_handshake()?;
+    write_lp(stream, &m1).await?;
+    let m2 = read_lp(stream).await?;
+    init.read_handshake(&m2)?;
+    let m3 = init.write_handshake()?;
+    write_lp(stream, &m3).await?;
+    init.into_session()
+}
+
+/// Drive the Noise XK handshake to completion on the **responder** side
+/// over an async stream. Returns the established [`Session`].
+///
+/// Wire order: read m1 → write m2 → read m3 → done.
+pub async fn handshake_responder<S>(stream: &mut S, our_static: &IdentitySecret) -> Result<Session>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let mut resp = Responder::new(our_static)?;
+    let m1 = read_lp(stream).await?;
+    resp.read_handshake(&m1)?;
+    let m2 = resp.write_handshake()?;
+    write_lp(stream, &m2).await?;
+    let m3 = read_lp(stream).await?;
+    resp.read_handshake(&m3)?;
+    resp.into_session()
+}
+
+/// Encrypt and send one [`InnerFrame`].
+///
+/// Wire layout: `len(u16) ‖ ChaCha20-Poly1305(type ‖ payload ‖ padding)`.
+pub async fn write_frame<W>(stream: &mut W, session: &mut Session, frame: &InnerFrame) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let ct = session.encrypt_frame(frame)?;
+    write_lp(stream, &ct).await
+}
+
+/// Receive and decrypt one [`InnerFrame`].
+pub async fn read_frame<R>(stream: &mut R, session: &mut Session) -> Result<InnerFrame>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let ct = read_lp(stream).await?;
+    session.decrypt_frame(&ct)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -524,6 +645,70 @@ mod tests {
             frame_with_length(&too_long),
             Err(Error::InvalidEncoding(_))
         ));
+    }
+
+    /// End-to-end exercise of the async path using a tokio in-memory
+    /// duplex pair. Proves handshake_initiator + handshake_responder
+    /// drive XK to completion over a real `AsyncRead+AsyncWrite`, and
+    /// that read_frame + write_frame correctly bridge `Session` to
+    /// async I/O.
+    #[allow(clippy::similar_names)] // alice / bob _sk / _pk are intentional
+    #[tokio::test]
+    async fn async_handshake_and_frame_round_trip() {
+        let alice_sk = IdentitySecret::generate();
+        let bob_sk = IdentitySecret::generate();
+        let bob_pk = bob_sk.public();
+
+        // 64 KiB is comfortably larger than the biggest frame we'd send.
+        let (mut alice_io, mut bob_io) = tokio::io::duplex(65_536);
+
+        let alice_pk_for_assert = alice_sk.public().to_bytes();
+
+        let alice_task = tokio::spawn(async move {
+            let mut session = handshake_initiator(&mut alice_io, &alice_sk, &bob_pk)
+                .await
+                .expect("alice handshake");
+            let frame = InnerFrame {
+                frame_type: FRAME_PING,
+                payload: b"hello bob".to_vec(),
+            };
+            write_frame(&mut alice_io, &mut session, &frame)
+                .await
+                .expect("alice write");
+            let reply = read_frame(&mut alice_io, &mut session)
+                .await
+                .expect("alice read");
+            (session.peer_static_key(), reply)
+        });
+
+        let bob_task = tokio::spawn(async move {
+            let mut session = handshake_responder(&mut bob_io, &bob_sk)
+                .await
+                .expect("bob handshake");
+            let got = read_frame(&mut bob_io, &mut session)
+                .await
+                .expect("bob read");
+            let reply = InnerFrame {
+                frame_type: FRAME_PING,
+                payload: b"hello alice".to_vec(),
+            };
+            write_frame(&mut bob_io, &mut session, &reply)
+                .await
+                .expect("bob write");
+            (session.peer_static_key(), got)
+        });
+
+        let (alice_result, bob_result) = tokio::join!(alice_task, bob_task);
+        let (alice_peer_static, alice_reply) = alice_result.unwrap();
+        let (bob_peer_static, bob_got) = bob_result.unwrap();
+
+        // Each side learned the *other's* static key from the
+        // authenticated handshake.
+        assert_eq!(alice_peer_static, bob_pk.to_bytes());
+        assert_eq!(bob_peer_static, alice_pk_for_assert);
+
+        assert_eq!(bob_got.payload, b"hello bob");
+        assert_eq!(alice_reply.payload, b"hello alice");
     }
 
     proptest! {

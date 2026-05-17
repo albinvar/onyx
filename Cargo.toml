@@ -52,6 +52,9 @@ arti-client      = { version = "0.42", features = ["onion-service-service"] }
 tor-rtcompat     = "0.42"
 tor-hsservice    = "0.42"
 tor-hscrypto     = "0.42"
+# Needed to construct the `Connected` relay-cell reply when accepting
+# an inbound onion-service stream.
+tor-cell         = "0.42"
 # safelog gives us the `DisplayRedacted` trait we need to format an
 # HsId as the user-facing `.onion` string (arti deliberately doesn't
 # implement plain `Display` on HsId so accidental log statements don't

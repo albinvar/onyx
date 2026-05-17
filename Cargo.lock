@@ -2853,6 +2853,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tor-cell",
  "tor-hscrypto",
  "tor-hsservice",
  "tor-rtcompat",
@@ -2873,6 +2874,7 @@ name = "onyxd"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base32",
  "clap",
  "futures",
  "onyx-core",

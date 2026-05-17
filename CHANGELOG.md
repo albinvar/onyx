@@ -6,6 +6,103 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Two-daemon end-to-end: dial, Noise XK, frame round-trip
+
+### What's new
+The daemon now actually **talks**. In one terminal it accepts inbound onion connections, runs Noise XK as responder, decodes one frame, and sends a reply. In another terminal (with `--dial-onion` + `--dial-pubkey`) it dials a peer over Tor, runs Noise XK as initiator, sends a greeting, reads the reply, exits cleanly. Every layer from `crypto` up through `tor` is now exercised in a real two-daemon round-trip.
+
+### `onyx_core::transport` — async I/O bridge
+- `read_lp` / `write_lp` (private) — read/write the `len(u16) || bytes` outer framing over any `tokio::io::AsyncRead`/`AsyncWrite`. `MAX_WIRE_MESSAGE = 65 535` cap so a hostile peer can't make us allocate arbitrarily.
+- `handshake_initiator(stream, our_x25519, peer_x25519) -> Session` — drives XK m1 / m2 / m3 to completion over an async stream and returns a ready `Session`. Pure adapter — the `Initiator` state machine underneath is unchanged.
+- `handshake_responder(stream, our_x25519) -> Session` — same for the responder side.
+- `write_frame(stream, &mut Session, &InnerFrame)` / `read_frame(stream, &mut Session) -> InnerFrame` — encrypt + length-prefix + write (and reverse). The bridge between the sync `Session` codec and an async wire.
+- **Loopback test** (`async_handshake_and_frame_round_trip`): two tasks talking over `tokio::io::duplex(64 KiB)` complete an XK handshake, exchange a frame each way, and assert that both sides learned the *other's* X25519 static key. No Tor required to verify the wiring.
+
+### `onyx_core::tor` — accept inbound streams
+- `HiddenService::take_accept_streams()` — alternative to `take_rend_requests` that returns a `Stream<Item = TorStream>` of already-accepted async streams. Uses `tor_hsservice::handle_rend_requests` to convert each `RendRequest` into a `StreamRequest`, then calls `StreamRequest::accept(Connected::new_empty())` to get back the `DataStream`.
+- Per-stream `accept` failures are logged at `WARN` and the iterator moves on — Arti's HS startup is fragile in the first few minutes and a single bad request shouldn't bring the daemon down.
+- New dep: `tor-cell = "0.42"` (just for `Connected::new_empty()`).
+
+### `onyxd` — two real operating modes
+
+**Startup (both modes):**
+- Logs both the **fingerprint** (Ed25519 signing pubkey, base32) *and* the **X25519 identity public key** (base32, 52 chars — same alphabet as the fingerprint). Operator hands both to a peer who wants to dial.
+
+**Accept mode (default):**
+- Publish the hidden service.
+- Take the accept-stream from the `HiddenService`.
+- For each inbound `TorStream`, spawn a tokio task that runs `handshake_responder`, logs the peer's X25519 pubkey, reads one frame, logs the payload, writes a `b"hello from <our fpr> (responder)"` reply, closes the stream.
+- Ctrl-C cancels the accept loop and shuts everything down.
+
+**Dial mode (`--dial-onion <addr> --dial-pubkey <b32>`):**
+- Skip HS publish entirely.
+- Bootstrap Tor, dial the peer.
+- `handshake_initiator` over the resulting `TorStream`.
+- Write `b"hello from <our fpr> (initiator)"`, read the peer's reply, exit 0.
+- clap `requires` attribute enforces that both flags are passed together — you can't `--dial-onion` without `--dial-pubkey`.
+
+### Two-terminal smoke runbook
+
+After `cargo build --bin onyxd`:
+
+```bash
+# Terminal A
+ONYX_PASSPHRASE='alice-pw' ./target/debug/onyxd --vault /tmp/alice.db
+# Wait for two log lines:
+#   "vault unlocked, identity loaded fingerprint=… identity_pub_b32=<ALICE_X25519>"
+#   "hidden service published … onion=<ALICE_ONION> port=1"
+```
+
+```bash
+# Terminal B — fresh vault, dials alice
+ONYX_PASSPHRASE='bob-pw' ./target/debug/onyxd \
+  --vault /tmp/bob.db \
+  --dial-onion <ALICE_ONION>:1 \
+  --dial-pubkey <ALICE_X25519>
+```
+
+Bob should log:
+```
+INFO onyxd: dialing peer onion… host=<alice>.onion port=1
+INFO onyxd: Tor circuit established; starting Noise XK handshake (initiator)
+INFO onyxd: handshake complete peer_identity_pub_b32=<alice's x25519>
+INFO onyxd: greeting sent; awaiting peer reply
+INFO onyxd: received reply payload="hello from <alice fpr> (responder)" — round-trip complete
+```
+
+Alice should log:
+```
+INFO inbound{local_fpr=…}: onyxd: accepted inbound stream; starting Noise XK handshake (responder)
+INFO inbound{…}: onyxd: handshake complete peer_identity_pub_b32=<bob's x25519>
+INFO inbound{…}: onyxd: received frame frame_type=0x0040 payload="hello from <bob fpr> (initiator)"
+INFO inbound{…}: onyxd: reply written, closing stream
+```
+
+Matching `peer_identity_pub_b32`s on both sides + matching payloads = every layer working: Tor circuit, Noise XK handshake, AEAD framing, InnerFrame codec.
+
+### What this proves end-to-end
+- **Tor**: outbound circuit established, hidden service descriptor published + retrieved + rendezvous completed.
+- **Transport**: Noise XK 3-message handshake over a real network stream; per-direction monotonic AEAD nonces; mutual authentication of X25519 static keys.
+- **Wire**: padded `InnerFrame` survives round-trip with the right frame type and payload.
+- **Identity / storage**: each daemon loaded its long-term X25519 key from a passphrase-protected vault on disk.
+
+### What's still missing (carry-forwards)
+- **HS key not bound to Identity** — Arti's keymgr generates a fresh HS key per nickname; the `.onion` address is unrelated to the fingerprint. Binding requires an `HsIdKeypair` importer.
+- **No contact verification** — the dial path accepts any peer pubkey the operator types. A real client would check `peer_static_key()` against a stored contact after handshake.
+- **One-shot only** — handlers accept one frame and close. Persistent multi-message conversations need a frame loop.
+- **No local API socket** — `--dial` is the temporary one-shot equivalent for testing. Real CLI work lands later.
+- **No sealed-sender bootstrap / MLS wiring** — the frame payload is just bytes (`b"hello from …"`), not a `MessageEnvelope` carrying a `mls_welcome`. Next phase will plug `routing::seal_bootstrap` and `mls::MlsParty` in.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **110 passing in `onyx-core`** (109 prior + 1 new `async_handshake_and_frame_round_trip`).
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Local smoke test** ✓ — daemon logs both fingerprint and identity_pub_b32 at startup; the two-daemon runbook above works on the dev machine.
+
+---
+
 ## 2026-05-18 — `onyxd` walks: vault unlock + Tor bootstrap + hidden service publish
 
 ### What's new

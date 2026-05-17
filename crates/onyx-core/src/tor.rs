@@ -40,9 +40,11 @@
 use std::sync::Arc;
 
 use arti_client::{TorClient, TorClientConfig};
+use futures::StreamExt;
 use safelog::DisplayRedacted;
+use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::config::OnionServiceConfigBuilder;
-use tor_hsservice::{HsNickname, RunningOnionService};
+use tor_hsservice::{HsNickname, RunningOnionService, handle_rend_requests};
 use tor_rtcompat::PreferredRuntime;
 
 use crate::error::{Error, Result};
@@ -188,6 +190,40 @@ impl HiddenService {
         &mut self,
     ) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = InboundRendRequest> + Send>>> {
         self.rend_requests.take()
+    }
+
+    /// Take the inbound stream and convert it into a high-level stream
+    /// of **accepted** [`TorStream`]s. Each yielded stream is ready to
+    /// be handed straight to
+    /// [`crate::transport::handshake_responder`].
+    ///
+    /// Errors during per-stream acceptance (e.g. a rendezvous failure
+    /// or a dropped circuit) are logged to `tracing` and the iterator
+    /// moves on rather than ending the whole accept loop — Arti's HS
+    /// startup is fragile in the first few minutes and a single bad
+    /// request shouldn't bring the daemon down.
+    pub fn take_accept_streams(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn futures::Stream<Item = TorStream> + Send>>> {
+        let rend = self.rend_requests.take()?;
+        // tor-hsservice's helper handles each `RendRequest::accept` and
+        // flattens to a `Stream<StreamRequest>`. We then accept each of
+        // those (with an empty `Connected` reply, which is what Tor
+        // hidden services normally send) to get a `DataStream`.
+        let stream_requests = handle_rend_requests(rend);
+        let accepted = stream_requests.filter_map(|sr| async {
+            match sr.accept(Connected::new_empty()).await {
+                Ok(ds) => Some(ds),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "tor: failed to accept inbound stream request; continuing"
+                    );
+                    None
+                }
+            }
+        });
+        Some(Box::pin(accepted))
     }
 }
 
