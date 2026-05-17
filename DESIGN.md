@@ -374,16 +374,20 @@ inbox_id = BLAKE2b-128(recipient_signing_pk || "onyx/v1/inbox")
 
 This is a 16-byte tag, deterministic from the recipient's long-term signing key. The hub stores this as the user's "front door" queue.
 
-A sender who has only the recipient's fingerprint (i.e. just added them as a contact, no shared session state) computes the same `inbox_id` from the recipient's signing key and sends a **bootstrap envelope** addressed to it. The bootstrap envelope is a *sealed-sender* construction:
+A sender who has only the recipient's fingerprint (i.e. just added them as a contact, no shared session state) computes the same `inbox_id` from the recipient's signing key and sends a **bootstrap envelope** addressed to it. The bootstrap envelope is a *sealed-sender* construction over a **post-quantum hybrid KEM**:
 
 ```
-sealed = X25519-seal(recipient_identity_pk, payload)
-payload = { sender_signing_pk, sender_identity_pk, mls_welcome, signature_over_payload }
+sealed   = hybrid_kem_ciphertext (1120 B) ‖ ChaCha20-Poly1305(plaintext, aad=∅, nonce=0¹²)
+plaintext = CBOR { sender_signing_pk, sender_identity_pk, mls_welcome, signature_over_payload }
 ```
 
-- `X25519-seal` is HPKE base-mode (RFC 9180) with X25519/HKDF-SHA256/ChaCha20-Poly1305. It hides the sender entirely from anyone other than the recipient.
-- The recipient decrypts, verifies the inner signature, learns who's introducing themselves, and processes the MLS welcome.
+- **Hybrid KEM**: `HybridKemSecret` / `HybridKemPublic` from `onyx_core::crypto` — X25519 ‖ ML-KEM-768. The sender encapsulates to the recipient's hybrid public key; the resulting shared secret is HKDF-SHA256-derived into the AEAD key with salt `"onyx/v1/bootstrap-seal"`. Same defence-in-depth pattern as Signal PQXDH and TLS 1.3 `X25519MLKEM768` — the bootstrap is secure as long as *either* X25519 *or* ML-KEM-768 is unbroken. Because each encapsulation produces a fresh shared secret (and therefore a fresh AEAD key), the AEAD nonce is fixed at all-zeros — nonce reuse is impossible by construction.
+- **Inner signature** is over a fixed-layout signing input (independent of CBOR canonicalisation): `"onyx/v1/bootstrap" ‖ sender_signing_pk(32) ‖ sender_identity_pk(32) ‖ u32_BE(mls_welcome_len) ‖ mls_welcome`. The domain separator and the explicit binding of both pubkeys prevent signature reuse across contexts or substitution of identity keys.
+- The recipient decapsulates, decrypts, verifies the inner signature, learns who's introducing themselves, and processes the MLS welcome. `open_bootstrap` returns the typed `(VerifyingKey, IdentityPublic, Vec<u8>)` only after signature verification — callers cannot accidentally consume an unauthenticated payload.
 - The outer DELIVER envelope omits `from` and `sig` (both null) so the hub sees only "something arrived at inbox X."
+- **Size cost**: the sealed blob is ~1 200 B + the MLS welcome, so bootstrap envelopes land in the LARGE padding bucket (4 KiB) — a one-time cost per contact. Subsequent messages run inside MLS at a few hundred bytes each.
+
+This is the first protocol step in Onyx that actually carries post-quantum traffic. (v0.2-draft of this section cited classical HPKE base mode; the hybrid is a strict upgrade.)
 
 **What the hub learns from the introduction inbox:**
 - The inbox is active.
@@ -666,7 +670,7 @@ These need decisions before or during Phase 1 implementation:
 
 5. **Stealth onion (client auth).** ~~Default for user hidden services?~~ **Resolved:** required for the onion-web tier (§8.1); optional for peer onions because it complicates "scan a QR code to add me" flows.
 
-6. **Post-quantum.** ~~Add hybrid PQ key exchange now or wait for ecosystem maturity?~~ **Partially resolved.** Primitives are implemented in `onyx_core::crypto` as an X25519 ‖ ML-KEM-768 hybrid KEM (`HybridKemSecret` / `HybridKemPublic` / `HybridCiphertext` / `HybridSharedSecret`), combined via HKDF-SHA256 with the full ciphertext bound into `info` for transcript integrity. The construction is secure as long as *either* primitive is unbroken (same defence-in-depth as Signal PQXDH / TLS 1.3 `X25519MLKEM768`). **Remaining work:** adopt the hybrid KEM in §5.5 sealed-sender bootstrap (replacing classical HPKE base mode) and in the Noise transport key schedule. The Noise pattern designator and HKDF labels both carry a version string so the "Noise_XK + ML-KEM-768" hybrid can be negotiated without protocol surgery.
+6. **Post-quantum.** ~~Add hybrid PQ key exchange now or wait for ecosystem maturity?~~ **Mostly resolved.** Primitives are implemented in `onyx_core::crypto` as an X25519 ‖ ML-KEM-768 hybrid KEM (`HybridKemSecret` / `HybridKemPublic` / `HybridCiphertext` / `HybridSharedSecret`), combined via HKDF-SHA256 with the full ciphertext bound into `info` for transcript integrity. The construction is secure as long as *either* primitive is unbroken (same defence-in-depth as Signal PQXDH / TLS 1.3 `X25519MLKEM768`). The hybrid is now **in use** in `onyx_core::routing::seal_bootstrap` / `open_bootstrap` for the §5.5 sealed-sender introduction envelope. **Remaining work:** adopt the hybrid KEM in the Noise transport key schedule (§5.2) — likely via `Noise_XKhfs+25519+ML-KEM-768` once the `snow` crate supports it, or as a post-handshake KEM step in the meantime. The Noise pattern designator and HKDF labels both carry a version string so the upgrade can be negotiated without protocol surgery.
 
 7. **Token batch size for §5.5 Tier 2.** Default 64 tokens per SUBSCRIBE. Larger batches = fewer registration round-trips but bigger per-circuit linkability cluster. Worth measuring during Phase 1.
 

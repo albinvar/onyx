@@ -6,6 +6,53 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Routing IDs + sealed-sender bootstrap (first PQ-hybrid integration)
+
+### `onyx_core::routing`
+
+#### Tier 1: introduction inbox
+- `introduction_inbox(&Fingerprint) -> RoutingId` — `BLAKE2b-128(signing_pk ‖ "onyx/v1/inbox")`. 16-byte deterministic routing identifier. Anyone holding the fingerprint can derive it; the residual linkability is documented (DESIGN §5.5).
+
+#### Tier 2: rotating session token (MLS exporter-derived)
+- `session_token(&[u8; 32], u64) -> RoutingId` — `BLAKE2b-128(group_secret ‖ u64_BE(index))`. The MLS-Exporter integration that produces `group_secret` will land in `crate::mls`; for now any 32-byte caller-supplied secret works (used by tests).
+- Big-endian encoding of the index is pinned by a test so an accidental "fix" can't silently shift the namespace.
+
+#### Sealed-sender bootstrap (POST-QUANTUM)
+- **First protocol step in Onyx that actually carries post-quantum traffic.** v0.2-draft DESIGN §5.5 cited classical HPKE base mode (X25519 / HKDF-SHA256 / ChaCha20-Poly1305); this implementation replaces that with the **X25519 ‖ ML-KEM-768 hybrid KEM** from `onyx_core::crypto`. Same defence-in-depth pattern as Signal PQXDH and TLS 1.3 `X25519MLKEM768` — combined secret is secure as long as *either* primitive is unbroken.
+- `seal_bootstrap(sender_signing, sender_identity, mls_welcome, recipient_kem_pub) -> Vec<u8>` and `open_bootstrap(sealed, recipient_kem_secret) -> OpenedBootstrap`.
+- **Inner signature**: domain-separated and over a fixed-layout signing input independent of CBOR canonicalization — `"onyx/v1/bootstrap" ‖ sender_signing_pk(32) ‖ sender_identity_pk(32) ‖ u32_BE(mls_welcome_len) ‖ mls_welcome`. The domain separator prevents an attacker from rebroadcasting bytes signed under a different protocol context; the explicit binding of both pubkeys prevents identity-key substitution attacks.
+- **Wire format**: `KEM_ciphertext(1120 B) ‖ ChaCha20-Poly1305(CBOR_payload, aad=∅, nonce=0¹²)`. The AEAD nonce is fixed at all-zeros because each encapsulation produces a fresh shared secret (and therefore a fresh AEAD key) — nonce reuse is impossible by construction.
+- **API safety**: `open_bootstrap` returns `OpenedBootstrap { sender_signing_pk: VerifyingKey, sender_identity_pk: IdentityPublic, mls_welcome: Vec<u8> }` **only after verifying the inner signature**. Callers cannot accidentally consume an unauthenticated payload.
+- **Size cost**: sealed blob is ~1 200 B + the MLS welcome, so bootstrap envelopes land in the LARGE (4 KiB) padding bucket. One-time per contact; subsequent messages run under MLS at a few hundred bytes each. Test asserts this.
+
+### Tests (17 new, 91 total in `onyx-core`)
+- Inbox: determinism; per-recipient distinctness; output is 16 bytes; differs from raw `BLAKE2b(pk)` (proves the label is mixed in).
+- Token: determinism per (secret, index); differs per index; differs per secret; BE-index encoding pinned to specific bytes.
+- Bootstrap: round-trip; wrong recipient fails; tampered KEM ciphertext fails; tampered AEAD ciphertext fails with `VerificationFailed`; **forged inner signature fails even though the AEAD tag passes** (proves the inner Ed25519 check actually runs); truncated envelope rejected; sealed-blob size lands in LARGE bucket as expected.
+- Property tests (16 cases each, capped to keep KEM ops reasonable):
+  - `prop_bootstrap_round_trip` — random MLS welcome payload survives seal/open.
+  - `prop_open_bootstrap_no_panic` — arbitrary bytes never panic the decoder.
+
+### DESIGN.md
+- §5.5 rewritten to describe the actual hybrid-KEM sealed-sender (not the classical HPKE that was in v0.2-draft). New wire-format diagram, signing-input layout, and size-cost note.
+- §9.6 (post-quantum question) bumped from "partially resolved" → "mostly resolved": primitives are now in use in routing. Only the Noise transport key schedule (§5.2) still uses classical-only handshakes.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **91 passing in `onyx-core`** (25 crypto + 16 wire + 15 transport + 9 storage + 9 identity + 17 routing)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+
+### Open security gaps (carry-forward)
+- **Noise transport handshake is still classical-only.** PQ in transport is the last protocol-level integration; depends on snow gaining a hybrid pattern (or us bolting on a post-handshake KEM step).
+- **`mls` not yet implemented** — Tier-2 tokens currently take a caller-supplied `group_secret` because there's no MLS-Exporter to feed them.
+- **No async daemon I/O yet.**
+- All earlier gaps unchanged (cargo-vet / SBOM / signed releases / fuzzing / Miri; `ml-kem` and `snow` and bundled SQLite upstream-unaudited).
+- Modules still empty: `mls`, `tor`.
+
+---
+
 ## 2026-05-18 — Storage (Vault) + Identity repo
 
 ### `onyx_core::storage`
