@@ -1,0 +1,49 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Onyx contributors"]
+repository = "https://github.com/albinvar/onyx"
+
+# Pinned in one place so every crate uses the same version.
+# Higher-level crates (onyxd, onyx, onyx-hub) MUST NOT add raw crypto deps —
+# all primitive use is funnelled through `onyx_core::crypto`.
+[workspace.dependencies]
+ed25519-dalek    = { version = "2", features = ["rand_core", "zeroize"] }
+x25519-dalek     = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf             = "0.12"
+sha2             = "0.10"
+blake2           = "0.10"
+argon2           = "0.5"
+rand_core        = { version = "0.6", features = ["getrandom"] }
+zeroize          = { version = "1", features = ["derive"] }
+subtle           = "2"
+base32           = "0.5"
+thiserror        = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# pedantic is noisy; selectively allow the ones we don't want
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Prose in doc comments mentions real proper nouns (Tor, SQLite, OpenMLS, etc.).
+# Backticking every one would be noise; we'll backtick selectively in API docs.
+doc_markdown = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

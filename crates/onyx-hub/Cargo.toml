@@ -1,0 +1,18 @@
+[package]
+name = "onyx-hub"
+description = "Onyx hub — optional relay that stores encrypted offline queues and hosts MLS-encrypted rooms. Sees no plaintext."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "onyx-hub"
+path = "src/main.rs"
+
+[dependencies]
+onyx-core = { path = "../onyx-core" }
+
+[lints]
+workspace = true

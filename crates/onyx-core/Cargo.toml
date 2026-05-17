@@ -1,0 +1,28 @@
+[package]
+name = "onyx-core"
+description = "Security-critical core for the Onyx anonymous chat system."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "onyx_core"
+
+[dependencies]
+ed25519-dalek    = { workspace = true }
+x25519-dalek     = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf             = { workspace = true }
+sha2             = { workspace = true }
+blake2           = { workspace = true }
+argon2           = { workspace = true }
+rand_core        = { workspace = true }
+zeroize          = { workspace = true }
+subtle           = { workspace = true }
+base32           = { workspace = true }
+thiserror        = { workspace = true }
+
+[lints]
+workspace = true

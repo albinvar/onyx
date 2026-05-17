@@ -1,0 +1,18 @@
+[package]
+name = "onyxd"
+description = "Onyx daemon — long-running per-user process that owns identity, MLS state, and Tor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "onyxd"
+path = "src/main.rs"
+
+[dependencies]
+onyx-core = { path = "../onyx-core" }
+
+[lints]
+workspace = true

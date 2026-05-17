@@ -1,0 +1,18 @@
+[package]
+name = "onyx"
+description = "Onyx CLI/TUI client — the reference interface against which security guarantees are validated."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "onyx"
+path = "src/main.rs"
+
+[dependencies]
+onyx-core = { path = "../onyx-core" }
+
+[lints]
+workspace = true
