@@ -6,6 +6,44 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Supply-chain hardening (cargo-deny)
+
+### Policy file (`deny.toml`)
+- New workspace-root `deny.toml` covering the four cargo-deny check categories:
+  - **Advisories** (`version = 2`): yanked crates fail; vulnerabilities fail by default; ignore-list is empty and any future addition must carry a comment + expiration date.
+  - **Licenses** (`version = 2`): allowlist of Apache-2.0 (+ LLVM exception), MIT, BSD-2/3-Clause, ISC, Zlib, MPL-2.0, Unicode-DFS-2016, Unicode-3.0, Unlicense, CC0-1.0, plus our own AGPL-3.0-or-later. GPL-family copyleft deps would force re-licensing and are *not* on the allowlist — add only after deliberate review.
+  - **Bans**: `wildcards = "deny"`, `multiple-versions = "warn"` (will tighten to deny once the dep set stabilises), `allow-wildcard-paths = true` for workspace-internal path deps. Empty deny-list — populate when there's a specific reason (e.g., ring vs rustls preference).
+  - **Sources**: only `crates.io`. Unknown registries and unknown git URLs both `deny` — a supply-chain attack vector that bypasses crates.io's auditing.
+- Targets checked: `x86_64-unknown-linux-gnu` (CI), `aarch64-apple-darwin` (dev), `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`.
+
+### Workspace dep refactor (side effect)
+- Moved `onyx-core` into `[workspace.dependencies]` with an explicit `version = "0.0.1"` alongside its `path`. Each binary now consumes it via `{ workspace = true }` instead of `{ path = "../onyx-core" }`.
+- This was forced by cargo-deny: workspace-internal path deps without an explicit version are flagged as wildcards on publishable crates (`crates.io` rejects path-only deps, so cargo-deny does too). `allow-wildcard-paths = true` only applies to non-public crates; ours have `repository` metadata so cargo-deny treats them as public.
+- Bonus: version is now bumpable in one place.
+
+### CI
+- New `deny` job in `.github/workflows/ci.yml` using `EmbarkStudios/cargo-deny-action@v2`. Runs all four checks on every push and PR. Policy violations now block merge.
+
+### Local verification
+- Installed `cargo-deny v0.19.6` via `cargo install --locked`.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`. (License warnings are emitted for allowed-but-unused entries; they are non-blocking and document what we'd accept.)
+- `cargo check --workspace` ✓ (workspace dep refactor doesn't change behaviour, just resolution path).
+
+### Decisions made this session
+- AGPL-3.0-or-later is on the allowlist for our own crates; other GPL-family entries are not (yet).
+- `multiple-versions = "warn"` rather than `"deny"` for now — duplicate crates are unavoidable while the dep set is small and churning. Tighten once it stabilises.
+- Skipped `cargo-vet` in this pass. cargo-deny is the right floor; cargo-vet (Mozilla's audit-chain tool) is more strict than makes sense for a project this young without a track record of audit subscriptions.
+- Skipped `cargo-audit` as a separate job — cargo-deny's advisories check covers the same RustSec database, so running both would be redundant.
+
+### Open security gaps (carry-forward, updated)
+- **Supply-chain layer 1 (cargo-deny) now in place.** Future hardening: `cargo-vet`, SBOM generation (CycloneDX or SPDX), reproducible-build verification, signed release artifacts (minisign or sigstore).
+- **PQ wire-format integration still pending** (§5.5 sealed-sender + Noise key schedule).
+- **No fuzzing, no Miri, no property tests** beyond the 25 unit tests.
+- **`ml-kem` upstream-unaudited.** Mitigated by hybrid composition; not eliminated.
+- **8 of 9 modules still empty.**
+
+---
+
 ## 2026-05-18 — License, CI, post-quantum hybrid KEM (X25519 ‖ ML-KEM-768)
 
 ### License

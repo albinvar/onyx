@@ -13,7 +13,7 @@ name = "onyx"
 path = "src/main.rs"
 
 [dependencies]
-onyx-core = { path = "../onyx-core" }
+onyx-core = { workspace = true }
 
 [lints]
 workspace = true

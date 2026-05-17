@@ -14,6 +14,12 @@ license = "AGPL-3.0-or-later"
 # Higher-level crates (onyxd, onyx, onyx-hub) MUST NOT add raw crypto deps —
 # all primitive use is funnelled through `onyx_core::crypto`.
 [workspace.dependencies]
+# Workspace-internal crates. Path + version means cargo resolves via path
+# locally (no registry round-trip) while cargo-deny / crates.io see an
+# explicit version constraint instead of a wildcard.
+onyx-core = { path = "crates/onyx-core", version = "0.0.1" }
+
+# External crypto primitives.
 ed25519-dalek    = { version = "2", features = ["rand_core", "zeroize"] }
 x25519-dalek     = { version = "2", features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10"

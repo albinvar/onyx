@@ -1,0 +1,96 @@
+# cargo-deny policy for the Onyx workspace.
+#
+# Run locally with:
+#   cargo deny check
+#
+# CI runs `EmbarkStudios/cargo-deny-action@v2` on every push and PR; a
+# policy violation here blocks merge. Tightening this file is preferable
+# to loosening it — every relaxation should be a deliberate decision with
+# a comment explaining why.
+
+[graph]
+# Check all targets we plausibly support. Linux is the CI runner; macOS
+# arm64 is the primary development platform; Windows is included so a
+# Windows-only-dep regression is caught early even if we don't test there.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ─── Advisories ────────────────────────────────────────────────────────────
+# RustSec advisory database. Vulnerabilities and yanked crates fail the
+# build. Unmaintained and notice advisories warn so we notice them but
+# they don't block until we triage.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Add advisory IDs here only with a comment and a sunset date.
+    # Example: { id = "RUSTSEC-XXXX-NNNN", reason = "...", expiration = "2026-12-31" }
+]
+
+# ─── Licenses ──────────────────────────────────────────────────────────────
+# Onyx itself is AGPL-3.0-or-later. We accept permissive licenses from
+# deps (they're compatible with redistribution under AGPL) and reject
+# unknown ones. Copyleft GPL-family deps would force re-licensing; add
+# them only after deliberate review.
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    # Our own crates.
+    "AGPL-3.0-or-later",
+]
+confidence-threshold = 0.93
+
+# Per-crate license clarifications go here if a crate's metadata is
+# ambiguous (e.g., dual-licensed with file globs that cargo-deny can't
+# parse automatically). Currently empty — add entries with a reason.
+exceptions = []
+
+# ─── Bans ──────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"  # tighten to "deny" once the dep set stabilises
+wildcards = "deny"
+# Workspace-internal `{ path = "..." }` deps without a `version = "..."`
+# look like wildcards to cargo-deny. Allow them — they're crates in this
+# repo, not external. Re-evaluate if/when we start publishing crates.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# Crates we forbid outright. Empty for now; populate when we have a
+# specific reason (e.g., ring vs rustls preference).
+deny = []
+
+# Allow specific duplicate versions if upstream churn forces them.
+# Each entry should name the crate and explain why two versions are unavoidable.
+skip = []
+skip-tree = []
+
+# ─── Sources ───────────────────────────────────────────────────────────────
+# Only crates.io. No unknown registries, no random git URLs — those would
+# be a supply-chain attack vector that bypasses crates.io's auditing.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
