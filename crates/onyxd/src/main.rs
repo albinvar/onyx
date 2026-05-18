@@ -5,6 +5,9 @@
 //!   * Own the user's [`onyx_core::identity::Identity`] for the
 //!     lifetime of the process (vault is unlocked at startup with a
 //!     passphrase from the environment).
+//!   * Own a single persistent [`onyx_core::mls::MlsParty`] bound to
+//!     the long-term identity, with state saved to the vault after
+//!     every meaningful change.
 //!   * Run an embedded Tor client and publish the user's v3 hidden
 //!     service so peers can dial in.
 //!   * Maintain outbound connections to peers and hubs via Tor.
@@ -12,34 +15,28 @@
 //!
 //! ## What this revision does
 //!
-//! Phase T1.3 — "make two daemons talk." Beyond the vault + Tor +
-//! HS-publish work already in place:
+//! Phase T2.3 — daemon-side MLS persistence:
 //!
-//!   * On startup, logs both the **fingerprint** *and* the
-//!     **X25519 identity public key** (base32) so the operator can
-//!     hand both to the peer they want to dial.
-//!   * **Default (accept) mode**: publishes the hidden service and
-//!     runs a handler task per inbound stream — Noise XK handshake as
-//!     responder, then read one [`onyx_core::wire::InnerFrame`], log
-//!     it, write a reply, drop the connection.
-//!   * **Dial mode** (`--dial-onion` + `--dial-pubkey`): skips HS
-//!     publish, dials the peer over Tor, runs Noise XK as initiator,
-//!     writes one greeting frame, reads the peer's reply, exits 0.
+//!   * One shared `MlsParty` per daemon, wrapped as
+//!     `Arc<tokio::sync::Mutex<MlsParty>>` so the accept-loop's spawned
+//!     handler tasks can all use it consistently.
+//!   * At startup, load MLS state from the vault if present; otherwise
+//!     create fresh via `MlsParty::from_identity`.
+//!   * After each handler exchange completes, snapshot the party's
+//!     state and save it back to the vault.
+//!   * Logs the loaded state size so persistence is visible.
 //!
-//! ## What's not here yet
-//!
-//! - Local API socket for the CLI to drive (the `--dial` flag is the
-//!   one-shot equivalent for now).
-//! - Persistent connection management (each handler accepts one frame
-//!   and exits).
-//! - HS key bound to long-term `Identity` (Arti's keymgr generates a
-//!   fresh HS key per nickname today).
-//! - Contact verification on the dial path (initiator accepts any peer
-//!   X25519 that decapsulates correctly).
-//! - Sealed-sender bootstrap / MLS Welcome — the frame content here is
-//!   just `b"hello from <fpr>"`, not a real protocol message.
+//! What's NOT here yet:
+//!   * Reusing an existing MLS group across reconnections (every
+//!     handler still bootstraps a fresh group). The persistence
+//!     preserves *historical* group state but doesn't yet route new
+//!     traffic to it.
+//!   * Local API socket for the CLI.
+//!   * Contact verification on dial path.
+//!   * Sealed-sender bootstrap on the daemon path.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
@@ -52,45 +49,54 @@ use onyx_core::storage::Vault;
 use onyx_core::tor::{TorRuntime, TorStream};
 use onyx_core::transport::{handshake_initiator, handshake_responder};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tracing::{Instrument, error, info, info_span, warn};
 
 const DEFAULT_IDENTITY_NICKNAME: &str = "default";
 const HS_NICKNAME: &str = "onyx";
 
-/// Application port on the hidden service. v3 onions multiplex by
-/// virtual port number; we'll pick `1` as Onyx's well-known port for
-/// now. Real protocol would use something like 19940.
+/// Virtual port on the hidden service.
 const ONYX_HS_PORT: u16 = 1;
 
 #[derive(Parser, Debug)]
 #[command(name = "onyxd", version, about = "Onyx daemon")]
 struct Args {
-    /// Path to the encrypted vault file. Created on first run, opened
-    /// thereafter.
+    /// Path to the encrypted vault file.
     #[arg(long, env = "ONYX_VAULT", default_value = "./onyx-state.db")]
     vault: PathBuf,
 
-    /// Vault passphrase. **Strongly recommended** to pass via
-    /// environment variable rather than command line.
+    /// Vault passphrase. Pass via environment variable rather than
+    /// command line.
     #[arg(long, env = "ONYX_PASSPHRASE", hide_env_values = true)]
     passphrase: String,
 
-    /// Skip the Tor bootstrap entirely. Useful for vault/identity
-    /// smoke tests without 30 s of waiting or outbound network.
+    /// Skip the Tor bootstrap entirely.
     #[arg(long)]
     no_tor: bool,
 
     /// **Dial mode**: connect to a peer's onion instead of publishing
-    /// our own hidden service. Pass the address as `<onion>:<port>`,
-    /// e.g. `abc123…xyz.onion:1`.
+    /// our own hidden service.
     #[arg(long, requires = "dial_pubkey")]
     dial_onion: Option<String>,
 
-    /// X25519 identity public key of the peer to dial. Base32 (RFC 4648
-    /// lowercase, no padding) — the same format the daemon prints at
-    /// startup for its own key.
+    /// X25519 identity public key of the peer to dial (base32).
     #[arg(long, requires = "dial_onion")]
     dial_pubkey: Option<String>,
+}
+
+/// Bundle of state every handler needs.
+///
+/// `vault` and `mls_party` both sit behind their own `Mutex`. Lock
+/// order: **always take `mls_party` before `vault`** if you need
+/// both. (A handler usually only takes them in sequence — operate
+/// under the MLS lock, then briefly take the vault lock to persist
+/// — but documenting the policy here makes future deadlocks easier
+/// to catch.)
+struct DaemonState {
+    identity: Identity,
+    identity_id: i64,
+    mls_party: Arc<Mutex<MlsParty>>,
+    vault: Arc<Mutex<Vault>>,
 }
 
 #[tokio::main]
@@ -104,11 +110,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // ── Vault + identity ────────────────────────────────────────────────
+    // ── Vault + identity + MLS state ────────────────────────────────────
     let mut vault =
         open_or_create_vault(&args.vault, args.passphrase.as_bytes()).context("opening vault")?;
 
-    let identity = ensure_default_identity(&mut vault).context("ensuring default identity")?;
+    let (identity_id, identity) =
+        ensure_default_identity(&mut vault).context("ensuring default identity")?;
 
     let fingerprint = identity.fingerprint();
     let identity_pub_b32 = encode_b32(&identity.identity_key().public().to_bytes());
@@ -117,6 +124,30 @@ async fn main() -> anyhow::Result<()> {
         identity_pub_b32 = %identity_pub_b32,
         "vault unlocked, identity loaded"
     );
+
+    // Load or create the persistent MLS party.
+    let mls_party = if let Some(state) = vault
+        .load_mls_state(identity_id)
+        .context("loading MLS state")?
+    {
+        info!(
+            state_bytes = state.len(),
+            "loaded persisted MLS state — resuming previous session's groups"
+        );
+        MlsParty::from_identity_and_state(&identity, &state)
+            .map_err(|e| anyhow::anyhow!("MLS state restore failed: {e}"))?
+    } else {
+        info!("no persisted MLS state; starting fresh");
+        MlsParty::from_identity(&identity)
+            .map_err(|e| anyhow::anyhow!("MLS party create failed: {e}"))?
+    };
+
+    let state = DaemonState {
+        identity,
+        identity_id,
+        mls_party: Arc::new(Mutex::new(mls_party)),
+        vault: Arc::new(Mutex::new(vault)),
+    };
 
     drop(args.passphrase);
 
@@ -133,20 +164,21 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?;
     info!("Tor bootstrap complete");
 
+    let state = Arc::new(state);
+
     if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey) {
-        run_dial_mode(&tor, &identity, onion, pubkey_b32).await?;
+        run_dial_mode(&tor, &state, onion, pubkey_b32).await?;
     } else {
-        run_accept_mode(&tor, identity).await?;
+        run_accept_mode(&tor, state.clone()).await?;
     }
 
     drop(tor);
-    drop(vault);
     Ok(())
 }
 
 // ── Accept mode (default) ──────────────────────────────────────────────────
 
-async fn run_accept_mode(tor: &TorRuntime, identity: Identity) -> anyhow::Result<()> {
+async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::Result<()> {
     let mut hs = tor
         .publish_hidden_service(HS_NICKNAME)
         .map_err(|e| anyhow::anyhow!("hidden service publish failed: {e}"))?;
@@ -165,21 +197,16 @@ async fn run_accept_mode(tor: &TorRuntime, identity: Identity) -> anyhow::Result
         .take_accept_streams()
         .context("HS accept-stream already taken")?;
 
-    // The Identity holds long-term secrets. Share via Arc<Identity>
-    // across spawned handler tasks — Identity is not Clone.
-    let identity = std::sync::Arc::new(identity);
-
     info!("onyxd running in accept mode. Ctrl-C to stop.");
 
-    // Run an accept loop in parallel with Ctrl-C.
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
-            let identity = identity.clone();
-            let our_fpr = identity.fingerprint();
+            let state = state.clone();
+            let our_fpr = state.identity.fingerprint();
             let span = info_span!("inbound", local_fpr = %our_fpr);
             tokio::spawn(
                 async move {
-                    if let Err(e) = handle_inbound(stream, &identity).await {
+                    if let Err(e) = handle_inbound(stream, state).await {
                         warn!(error = %e, "inbound handler failed");
                     }
                 }
@@ -198,9 +225,9 @@ async fn run_accept_mode(tor: &TorRuntime, identity: Identity) -> anyhow::Result
     Ok(())
 }
 
-async fn handle_inbound(mut stream: TorStream, identity: &Identity) -> anyhow::Result<()> {
+async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyhow::Result<()> {
     info!("accepted inbound stream; starting Noise XK handshake (responder)");
-    let mut session = handshake_responder(&mut stream, identity.identity_key())
+    let mut session = handshake_responder(&mut stream, state.identity.identity_key())
         .await
         .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
@@ -210,24 +237,30 @@ async fn handle_inbound(mut stream: TorStream, identity: &Identity) -> anyhow::R
         "Noise XK complete; starting MLS bootstrap (responder)"
     );
 
-    // Each inbound connection gets its own MlsParty for now. Sharing
-    // the MLS identity across connections + persisting it into the
-    // vault is the natural next phase.
-    // Bind the MLS credential to the long-term Identity (same Ed25519
-    // key as Noise authenticated). MLS signature pubkey == fingerprint.
-    let party = MlsParty::from_identity(identity)
-        .map_err(|e| anyhow::anyhow!("mls party from_identity failed: {e}"))?;
-    let reply_text = format!("MLS reply from {} (responder)", identity.fingerprint());
-
-    let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("MLS responder flow failed: {e}"))?;
-    info!(
-        peer_message = %String::from_utf8_lossy(&outcome.peer_message),
-        mls_epoch = outcome.group.epoch(),
-        "MLS round-trip complete (responder); closing stream"
+    let reply_text = format!(
+        "MLS reply from {} (responder)",
+        state.identity.fingerprint()
     );
 
+    // Take the MLS party lock for the duration of the exchange + the
+    // snapshot. Drop it before taking the vault lock to keep our lock
+    // order consistent (MLS first, vault second).
+    let snapshot = {
+        let party = state.mls_party.lock().await;
+        let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("MLS responder flow failed: {e}"))?;
+        info!(
+            peer_message = %String::from_utf8_lossy(&outcome.peer_message),
+            mls_epoch = outcome.group.epoch(),
+            "MLS round-trip complete (responder)"
+        );
+        party
+            .snapshot_state()
+            .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?
+    };
+
+    persist_mls_snapshot(&state, &snapshot).await?;
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -236,12 +269,10 @@ async fn handle_inbound(mut stream: TorStream, identity: &Identity) -> anyhow::R
 
 async fn run_dial_mode(
     tor: &TorRuntime,
-    identity: &Identity,
+    state: &Arc<DaemonState>,
     onion_target: &str,
     peer_pubkey_b32: &str,
 ) -> anyhow::Result<()> {
-    // Split "abc.onion:N" into (host, port). Default to ONYX_HS_PORT
-    // if the caller didn't supply one.
     let (host, port) = match onion_target.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
@@ -262,7 +293,7 @@ async fn run_dial_mode(
         .map_err(|e| anyhow::anyhow!("dial failed: {e}"))?;
     info!("Tor circuit established; starting Noise XK handshake (initiator)");
 
-    let mut session = handshake_initiator(&mut stream, identity.identity_key(), &peer_pub)
+    let mut session = handshake_initiator(&mut stream, state.identity.identity_key(), &peer_pub)
         .await
         .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
@@ -272,22 +303,39 @@ async fn run_dial_mode(
         "Noise XK complete; starting MLS bootstrap (initiator)"
     );
 
-    // Bind the MLS credential to the long-term Identity (same Ed25519
-    // key as Noise authenticated). MLS signature pubkey == fingerprint.
-    let party = MlsParty::from_identity(identity)
-        .map_err(|e| anyhow::anyhow!("mls party from_identity failed: {e}"))?;
-    let greeting = format!("MLS hello from {} (initiator)", identity.fingerprint());
-
-    let outcome = initiator_exchange(&mut stream, &mut session, &party, greeting.as_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
-    info!(
-        peer_reply = %String::from_utf8_lossy(&outcome.peer_reply),
-        mls_epoch = outcome.group.epoch(),
-        "MLS round-trip complete (initiator); exiting"
+    let greeting = format!(
+        "MLS hello from {} (initiator)",
+        state.identity.fingerprint()
     );
 
+    let snapshot = {
+        let party = state.mls_party.lock().await;
+        let outcome = initiator_exchange(&mut stream, &mut session, &party, greeting.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
+        info!(
+            peer_reply = %String::from_utf8_lossy(&outcome.peer_reply),
+            mls_epoch = outcome.group.epoch(),
+            "MLS round-trip complete (initiator)"
+        );
+        party
+            .snapshot_state()
+            .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?
+    };
+
+    persist_mls_snapshot(state, &snapshot).await?;
     let _ = stream.shutdown().await;
+    Ok(())
+}
+
+// ── Persistence helper ────────────────────────────────────────────────────
+
+async fn persist_mls_snapshot(state: &DaemonState, snapshot: &[u8]) -> anyhow::Result<()> {
+    let vault = state.vault.lock().await;
+    vault
+        .save_mls_state(state.identity_id, snapshot)
+        .map_err(|e| anyhow::anyhow!("MLS state save failed: {e}"))?;
+    info!(state_bytes = snapshot.len(), "MLS state persisted to vault");
     Ok(())
 }
 
@@ -311,26 +359,25 @@ fn open_or_create_vault(path: &std::path::Path, passphrase: &[u8]) -> anyhow::Re
     }
 }
 
-fn ensure_default_identity(vault: &mut Vault) -> anyhow::Result<Identity> {
+fn ensure_default_identity(vault: &mut Vault) -> anyhow::Result<(i64, Identity)> {
     let existing = vault
         .list_identities()
         .map_err(|e| anyhow::anyhow!("list identities: {e}"))?;
     if let Some(first) = existing.into_iter().next() {
-        return vault
+        let identity = vault
             .get_identity(first.id)
-            .map_err(|e| anyhow::anyhow!("loading identity {}: {e}", first.id));
+            .map_err(|e| anyhow::anyhow!("loading identity {}: {e}", first.id))?;
+        return Ok((first.id, identity));
     }
     info!("no identity found; generating fresh \"{DEFAULT_IDENTITY_NICKNAME}\" identity");
-    let (_id, identity) = vault
+    let (id, identity) = vault
         .create_identity(DEFAULT_IDENTITY_NICKNAME)
         .map_err(|e| anyhow::anyhow!("create identity: {e}"))?;
-    Ok(identity)
+    Ok((id, identity))
 }
 
 // ── Base32 helpers for 32-byte X25519 pub keys ────────────────────────────
 
-/// Same base32 alphabet the fingerprint uses (RFC 4648 lowercase, no
-/// padding). 32 bytes → 52 characters.
 fn encode_b32(bytes: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, bytes)
 }
