@@ -6,6 +6,61 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Daemon polish: independent Tor state, peer-verified log, resume fallback
+
+Three small but real items, all demonstrated end-to-end on the dev machine.
+
+### 1. `--tor-state-dir <path>` — independent Arti per daemon
+- New CLI flag (env: `ONYX_TOR_STATE_DIR`) on `onyxd` plus a new library entry point `TorRuntime::bootstrap_with_state_dir(&Path)`.
+- Under the hood: `arti_client::config::CfgPath::new_literal(dir)` is fed to the `TorClientConfig` builder's `storage().state_dir(…)` setter. Cache dir keeps the platform default — consensus is shared-safe across daemons.
+- Two daemons on the same host can now run **truly independently**. Before: one always landed in "read-only mode" because both were fighting over Arti's state-file lock.
+- Verified by running alice with `--tor-state-dir ~/.onyx-test/tor-alice` and bob with `--tor-state-dir ~/.onyx-test/tor-bob`; alice published a *fresh* `.onion` (different keystore directory → different HS key), and neither daemon logged the "Another process has the lock" warning that's been present since T1.3.
+
+### 2. Operator caveat: fs-mistrust requires strict perms
+Arti's `fs-mistrust` checks the entire path chain to the state directory for ownership/permissions. macOS `/Users/<you>/...` paths typically fail without `chmod 700` on every link up the chain, *and even then* the check is strict enough to often fail. The standard escape hatch is the env var:
+
+```
+FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1
+```
+
+Until we add a config knob for this (or move to `~/.local/share/onyx/...` with auto-created strict permissions on a fresh path), operators using `--tor-state-dir` outside the platform default may need to set this env var. Documented here so the next debug session is faster.
+
+### 3. Better error surface from Arti
+Before, any Arti error mapped to `Error::Internal("tor: bootstrap failed")` with no detail. Now we additionally `tracing::error!(error = %e, "tor: bootstrap failed")` so the operator can see *why*. (The library API still returns the opaque variant — log discipline is a separate concern from API ergonomics.)
+
+This is what surfaced the fs-mistrust issue above; otherwise it would have looked like a mysterious network failure.
+
+### 4. `peer X25519 matches --dial-pubkey ✓` log line
+Defence-in-depth: Noise XK *should* guarantee that the peer holds the X25519 secret corresponding to the pubkey we passed in. We now assert this explicitly after the handshake (`session.peer_static_key() == peer_pub_bytes`) and log on success. If a future change to the handshake silently weakened this guarantee, we'd notice instead of having it slip through.
+
+Verified in the captured smoke log:
+```
+INFO onyxd: peer X25519 matches --dial-pubkey ✓ peer_identity_pub_b32=jw7n…wmpq
+```
+
+### 5. Initiator-side resume fallback
+- New `Vault::forget_peer_group(identity_id, peer_x25519)` — idempotent DELETE.
+- In the daemon's dial path: after looking up a stored `group_id`, also check `party.load_group(gid)` returns `Some`. If the vault says there's a mapping but the MLS storage doesn't have the group (e.g. snapshot got corrupted, or someone hand-edited the DB), we now log a `WARN`, drop the stale mapping, and fall back to bootstrap. Without this, every subsequent connection would error at the responder when trying to load a non-existent group.
+- New test `storage::peer_group_forget_is_idempotent_and_clears_lookup`.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ (after one `#[allow(clippy::too_many_lines)]` on `run_dial_mode` — the dial flow is one logical sequence and breaking it apart for line count would just trade readability for arbitrary helpers).
+- `cargo test --workspace` ✓ — **122 passing in `onyx-core`** (121 prior + 1 new `peer_group_forget_is_idempotent_and_clears_lookup`).
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Two-daemon smoke test on real Tor with independent state dirs** ✓ — verified above. No "read-only mode" warning on either side.
+
+### Open security gaps (carry-forward)
+- **fs-mistrust env-var workaround needed for custom state dirs.** Pre-release we should add a config knob (`--tor-trust-everyone`) with a clear danger label, or auto-set up the state dir under platform defaults with the right perms.
+- **No CLI / local API socket.** Still the biggest UX gap.
+- **One-shot exchange.** Long-lived conversations need a frame loop.
+- **No sealed-sender on daemon path.**
+- **No schema migration runner.**
+- **Resume failure on responder side still hard-fails** (it now succeeds on the initiator side via the fallback). Responder-side fallback is more involved (it'd require a protocol-level error frame) — deferred.
+
+---
+
 ## 2026-05-18 — MLS group reuse: second connection actually resumes the conversation
 
 ### What's new

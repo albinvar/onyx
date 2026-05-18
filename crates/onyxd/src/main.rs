@@ -74,6 +74,13 @@ struct Args {
     #[arg(long)]
     no_tor: bool,
 
+    /// Override Arti's state directory. Use this to run multiple
+    /// daemons on the same machine — each needs its own directory so
+    /// they don't fight over Arti's state-file lock. If unset, Arti's
+    /// platform default is used.
+    #[arg(long, env = "ONYX_TOR_STATE_DIR")]
+    tor_state_dir: Option<PathBuf>,
+
     /// **Dial mode**: connect to a peer's onion instead of publishing
     /// our own hidden service.
     #[arg(long, requires = "dial_pubkey")]
@@ -158,10 +165,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Tor bootstrap ───────────────────────────────────────────────────
-    info!("bootstrapping Tor (this may take 30-60s on a cold cache)…");
-    let tor = TorRuntime::bootstrap()
-        .await
-        .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?;
+    let tor = if let Some(dir) = args.tor_state_dir.as_deref() {
+        info!(state_dir = %dir.display(), "bootstrapping Tor with custom state directory…");
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating tor state dir {}", dir.display()))?;
+        TorRuntime::bootstrap_with_state_dir(dir)
+            .await
+            .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
+    } else {
+        info!(
+            "bootstrapping Tor with default state directory (this may take 30-60s on a cold cache)…"
+        );
+        TorRuntime::bootstrap()
+            .await
+            .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
+    };
     info!("Tor bootstrap complete");
 
     let state = Arc::new(state);
@@ -274,6 +292,11 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
 
 // ── Dial mode ──────────────────────────────────────────────────────────────
 
+// The dial flow is one logical sequence — parsing flags, dialling,
+// handshaking, deciding bootstrap-vs-resume, running the exchange,
+// persisting. Splitting it for line count would just trade one
+// readable function for several context-stripped helpers.
+#[allow(clippy::too_many_lines)]
 async fn run_dial_mode(
     tor: &TorRuntime,
     state: &Arc<DaemonState>,
@@ -307,8 +330,24 @@ async fn run_dial_mode(
     let peer_static = session.peer_static_key();
     let learned_peer = encode_b32(&peer_static);
 
-    // Do we have a prior MLS group with this peer? If yes, resume;
-    // if no, bootstrap.
+    // Defence in depth: Noise XK *should* guarantee that the peer
+    // holding the secret matches the pubkey we passed in, but assert
+    // it explicitly so any future change to the handshake that
+    // weakened the guarantee would fail loudly here instead of
+    // silently. (`peer_pub_bytes` is what `--dial-pubkey` decoded to.)
+    if peer_static != peer_pub_bytes {
+        return Err(anyhow::anyhow!(
+            "post-Noise peer static key mismatch — handshake should have caught this; \
+             aborting before any application traffic"
+        ));
+    }
+    info!(
+        peer_identity_pub_b32 = %learned_peer,
+        "peer X25519 matches --dial-pubkey ✓"
+    );
+
+    // Do we have a prior MLS group with this peer? If yes, try to
+    // resume; if no, bootstrap.
     let existing_group_id = {
         let vault = state.vault.lock().await;
         vault
@@ -316,16 +355,45 @@ async fn run_dial_mode(
             .map_err(|e| anyhow::anyhow!("peer-group lookup failed: {e}"))?
     };
 
+    // Stale-mapping check: if the vault claims a group_id but our
+    // MLS storage no longer has that group (e.g. snapshot got
+    // corrupted or someone hand-edited the DB), fall back to
+    // bootstrap rather than failing the handshake at the responder.
+    let existing_group_id = if let Some(gid) = existing_group_id {
+        let have_it = {
+            let party = state.mls_party.lock().await;
+            party
+                .load_group(&gid)
+                .map_err(|e| anyhow::anyhow!("local MLS group lookup failed: {e}"))?
+                .is_some()
+        };
+        if have_it {
+            Some(gid)
+        } else {
+            warn!(
+                "vault has a peer→group mapping but the local MLS state is missing; \
+                 dropping stale mapping and falling back to bootstrap"
+            );
+            let vault = state.vault.lock().await;
+            vault
+                .forget_peer_group(state.identity_id, &peer_static)
+                .map_err(|e| anyhow::anyhow!("forget stale peer-group failed: {e}"))?;
+            None
+        }
+    } else {
+        None
+    };
+
     if let Some(gid) = &existing_group_id {
         info!(
             peer_identity_pub_b32 = %learned_peer,
             existing_group_id_bytes = gid.len(),
-            "Noise XK complete; resuming existing MLS group (initiator)"
+            "resuming existing MLS group (initiator)"
         );
     } else {
         info!(
             peer_identity_pub_b32 = %learned_peer,
-            "Noise XK complete; no prior group — bootstrapping (initiator)"
+            "no prior group — bootstrapping (initiator)"
         );
     }
 

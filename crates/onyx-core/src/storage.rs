@@ -323,6 +323,25 @@ impl Vault {
         Ok(())
     }
 
+    /// Delete a previously-recorded peer→group mapping. Used by the
+    /// initiator when a stored `group_id` turns out to be stale (our
+    /// local MLS state for that group no longer exists), so the next
+    /// connection re-bootstraps instead of repeatedly trying to
+    /// resume a group we can't load.
+    ///
+    /// Returns `Ok(())` whether or not a row was present — the call
+    /// is idempotent.
+    pub fn forget_peer_group(&self, identity_id: i64, peer_x25519: &[u8; 32]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM mls_peer_groups \
+                 WHERE identity_id = ? AND peer_x25519 = ?",
+                params![identity_id, peer_x25519.as_slice()],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
     /// Look up the MLS `group_id` we previously recorded for this
     /// peer. Returns `None` if no prior group exists — the caller
     /// should then go through the bootstrap path.
@@ -469,6 +488,25 @@ mod tests {
         let blob2 = b"replacement bytes";
         v.save_mls_state(id, blob2).unwrap();
         assert_eq!(v.load_mls_state(id).unwrap().unwrap(), blob2);
+    }
+
+    #[test]
+    fn peer_group_forget_is_idempotent_and_clears_lookup() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let peer_pub = [0x55u8; 32];
+
+        // Forget when nothing's there: must succeed silently.
+        v.forget_peer_group(id, &peer_pub).unwrap();
+
+        // Record, confirm it's there, forget, confirm it's gone.
+        v.record_peer_group(id, &peer_pub, b"some-group").unwrap();
+        assert!(v.lookup_peer_group(id, &peer_pub).unwrap().is_some());
+        v.forget_peer_group(id, &peer_pub).unwrap();
+        assert!(v.lookup_peer_group(id, &peer_pub).unwrap().is_none());
+
+        // Idempotent on a second call.
+        v.forget_peer_group(id, &peer_pub).unwrap();
     }
 
     #[test]

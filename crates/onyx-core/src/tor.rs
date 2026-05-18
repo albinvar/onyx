@@ -78,17 +78,43 @@ impl TorRuntime {
     /// Async because the bootstrap downloads consensus + builds initial
     /// circuits. On a cold cache this can take 30–60 s; on a warm
     /// cache it's much faster.
-    ///
-    /// # Errors
-    ///
-    /// Surfaces network failures and config-rejection failures as
-    /// [`Error::Internal`] — Arti's error types are typed but we
-    /// collapse them at the boundary to keep our public surface small.
     pub async fn bootstrap() -> Result<Self> {
-        let config = TorClientConfig::default();
-        let client = TorClient::create_bootstrapped(config)
-            .await
-            .map_err(|_| Error::Internal("tor: bootstrap failed"))?;
+        Self::bootstrap_with(None).await
+    }
+
+    /// Start Arti with an explicit state directory (overrides the
+    /// platform default). Use this to run multiple Onyx daemons on
+    /// the same machine without them fighting over Arti's state-file
+    /// lock — each daemon points at a distinct directory.
+    ///
+    /// `cache_dir` keeps the platform default (consensus + descriptors
+    /// are shared-safe to read between daemons even when written by
+    /// only one).
+    pub async fn bootstrap_with_state_dir(state_dir: &std::path::Path) -> Result<Self> {
+        Self::bootstrap_with(Some(state_dir)).await
+    }
+
+    async fn bootstrap_with(state_dir: Option<&std::path::Path>) -> Result<Self> {
+        use arti_client::config::CfgPath;
+
+        let config = if let Some(dir) = state_dir {
+            let mut builder = TorClientConfig::builder();
+            builder.storage().state_dir(CfgPath::new_literal(dir));
+            builder.build().map_err(|e| {
+                tracing::error!(error = %e, "tor: config build failed");
+                Error::Internal("tor: config build failed (see tracing log)")
+            })?
+        } else {
+            TorClientConfig::default()
+        };
+        let client = TorClient::create_bootstrapped(config).await.map_err(|e| {
+            // Bootstrap can fail for many reasons (network blocked,
+            // permission errors on state dir from fs-mistrust, etc).
+            // Log the underlying error before collapsing to our opaque
+            // variant so operators can debug.
+            tracing::error!(error = %e, "tor: bootstrap failed");
+            Error::Internal("tor: bootstrap failed (see tracing log)")
+        })?;
         Ok(Self {
             inner: Arc::new(client),
         })
