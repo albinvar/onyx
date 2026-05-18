@@ -226,6 +226,23 @@ Hub-relayed `msg/v1` messages have **weaker forward-secrecy properties** than di
 
 This tradeoff is the cost of letting "Alice → offline Bob" actually work without prior coordination. Closing the gap requires the planned `mls/v1` variant and a way for the sender to obtain the recipient's MLS KeyPackage out-of-band or via a directory service — neither of which exist today.
 
+### 6.2 `--listen-tcp` / `--dial-tcp` test modes (T7.0)
+
+`onyxd` has two **test-only** flags that bypass Tor entirely and run the full Noise + MLS chat path over plain TCP. Use case: development, local smoke tests, and CI exercises that can't tolerate a 30–60 s Tor bootstrap.
+
+```
+onyxd --listen-tcp 127.0.0.1:7710 ...
+onyxd --dial-tcp 127.0.0.1:7710 --dial-pubkey <pub> ...
+```
+
+**Security implications, stated loudly**:
+
+  * **No anonymity.** A plain TCP socket reveals the IP addresses of both peers to anyone on the network path. This is the whole reason Onyx normally uses Tor. The mode is named `--listen-tcp` and the daemon logs `LISTEN-TCP MODE — NO TOR, NO ANONYMITY. Test/dev only.` at startup so an operator can't miss the warning.
+  * **The Noise + MLS payload encryption still applies.** A passive observer of the TCP traffic sees ciphertext, not plaintext — same as over Tor. The loss is *who is talking to whom*, not *what they're saying*.
+  * **Reach is whatever the OS lets through.** `127.0.0.1` binds are local-only and safe. Binding to `0.0.0.0` would expose the daemon to anything routable to that IP. Operators should always prefer `127.0.0.1:PORT`.
+
+Do not run `--listen-tcp` against real peers. The daemon will not stop you, but the loud log line + this section form the documented contract that this is testing-only.
+
 ---
 
 ## 7. What changes when we get audited

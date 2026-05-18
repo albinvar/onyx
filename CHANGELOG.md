@@ -6,6 +6,111 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T7.0: `--listen-tcp` / `--dial-tcp` test modes — chat without Tor
+
+**The "I just want to test this without 90 seconds of Tor bootstrap" commit.** Two new daemon flags let `onyxd` accept and dial peers over plain TCP on `127.0.0.1` (or anywhere routable, if you really want to). The full Noise XK + MLS chat path is exercised — only the Tor transport is replaced. Anyone working on the codebase can now stand up two daemons + chat between them in **under 5 seconds total**, instead of the 60-90 s + four terminals of the Tor recipe.
+
+This is **test-only**. The mode is loudly warned at daemon startup, in CLI `--help`, and in a new `SECURITY.md` §6.2 section that explicitly says "no anonymity, do not run against real peers."
+
+### Why this matters
+
+Up until today, the smoke-test loop for any chat-related change was:
+
+  1. Edit code, `cargo build --release`.
+  2. Spin up `onyxd` (Terminal 1) with `--vault`, `--passphrase`, `--tor-state-dir`, `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1`, etc.
+  3. Wait 30-60 s for Arti's first-run cache build.
+  4. Copy the onion + identity_pub from the log.
+  5. Spin up a second `onyxd` (Terminal 2) with the same env-var dance + `--dial-onion <paste>` + `--dial-pubkey <paste>`.
+  6. Wait another 30-60 s for the second daemon's Arti to bootstrap.
+  7. Open `onyx tui` against each socket. Finally chat.
+
+After today the loop is:
+
+  1. Edit, `cargo build`.
+  2. `onyxd --listen-tcp 127.0.0.1:7710 ...` (Terminal 1, takes <1 s).
+  3. Copy alice's `identity_pub_b32` from the log (one string, printed on stdout with a complete `--dial-tcp` recipe).
+  4. `onyxd --dial-tcp 127.0.0.1:7710 --dial-pubkey <paste> ...` (Terminal 2, takes <1 s).
+  5. `onyx tui` × 2. Chat.
+
+### Code structure
+
+**Generalised the chat path over the stream type.** `handle_inbound`, `peer_session`, and `drive_peer_session` were hard-coded to `TorStream`. They only use `AsyncRead + AsyncWrite + Unpin + Send`, so all three are now generic over a type parameter `S` with that bound. The Noise handshake, MLS state machine, frame codec, and registry integration are identical whether the underlying stream is a Tor circuit or a `tokio::net::TcpStream`. That's the right factoring anyway — the chat protocol shouldn't care what carries it.
+
+**Extracted `run_dial_session<S>`** from `run_dial_mode`. The MLS bootstrap-or-resume logic (vault lookup, stale-mapping fallback, snapshot persistence, peer→group recording) is non-trivial — duplicating it in a parallel `run_tcp_dial_mode` would have been a maintenance nightmare. Now the Tor path is `tor.dial → run_dial_session` and the TCP path is `TcpStream::connect → run_dial_session`. Single source of truth.
+
+**Two new mode handlers in `main.rs`**:
+
+  * `run_tcp_listen_mode(addr, state, api_socket_path)` — binds a `TcpListener`, accepts streams, spawns `handle_inbound(stream, state)` per connection. Also spawns the API server. On startup logs the literal `--dial-tcp <local_addr> --dial-pubkey <identity_pub_b32>` invocation a peer needs to type — eliminates the most error-prone copy-paste step from the dev loop.
+  * `run_tcp_dial_mode(addr, peer_pubkey_b32, state, api_socket_path)` — `TcpStream::connect`, then `run_dial_session` (same as the Tor path). Spawns the API server alongside so the user can `onyx tui` against the daemon while the chat is live.
+
+**CLI flags**:
+
+  * `--listen-tcp <ADDR>` (env: `ONYX_LISTEN_TCP`). Conflicts with `--dial-onion` and `--dial-tcp`.
+  * `--dial-tcp <ADDR>` (env: `ONYX_DIAL_TCP`). Requires `--dial-pubkey`. Conflicts with `--dial-onion` and `--listen-tcp`.
+
+Both flags imply skipping Tor entirely. clap enforces the mutual exclusion.
+
+### Loud warning at every entry point
+
+At daemon startup if `--listen-tcp` is set:
+
+```
+WARN onyxd: LISTEN-TCP MODE — NO TOR, NO ANONYMITY. Test/dev only.
+            Anyone who can reach this address can speak Noise to this daemon.
+            addr=127.0.0.1:7710
+INFO onyxd: TCP listener bound; accepting connections local_addr=127.0.0.1:7710
+INFO onyxd: share `--dial-tcp 127.0.0.1:7710 --dial-pubkey acgilwcw...` with a peer to chat
+```
+
+The clap `--help` doc for both flags includes the **TEST-ONLY** banner. `SECURITY.md` §6.2 (new) documents the threat-model implications. A user who has these flags on cannot reasonably claim they didn't see a warning.
+
+### End-to-end smoke test (captured live, in this commit)
+
+```
+ALICE_PUB=$(onyx --socket /tmp/onyx-tcp/alice.sock identity \
+              | jq -r .identity_pub_b32)
+# acgilwcwkxczahovuxuducoz2pdoxvmnhgiuntcd3eoj6tuqq5dq
+
+onyxd --vault /tmp/onyx-tcp/bob.db --api-socket /tmp/onyx-tcp/bob.sock \
+      --dial-tcp 127.0.0.1:7710 --dial-pubkey "$ALICE_PUB" &
+# T+0.0s: TCP connected
+# T+0.0s: Noise XK complete
+# T+0.0s: peer X25519 matches --dial-pubkey ✓
+# T+0.0s: no prior group — bootstrapping (initiator)
+# T+0.01s: MLS round-trip complete (initiator)
+# T+0.01s: MLS state persisted to vault state_bytes=8874
+# T+0.01s: conversation registered
+
+# bob's daemon now sees alice as a registered peer:
+echo '{"kind":"Peers"}' | nc -U /tmp/onyx-tcp/bob.sock
+# {"kind":"PeersOk","entries":[{"short_id":"acgilwcw",..."connected":true,...}]}
+
+echo '{"kind":"Send","peer_short":"acgilwcw","text":"hi alice from bob via TCP!"}' \
+  | nc -U /tmp/onyx-tcp/bob.sock
+# {"kind":"SendOk"}
+
+# alice's daemon log:
+# INFO onyxd: chat message sent text=hi alice from bob via TCP!
+```
+
+Total wall-clock: **~3 seconds** including vault creation, identity generation, TCP handshake, Noise XK, MLS bootstrap, and a chat round-trip. The same flow over Tor takes 60–120 seconds and four terminal windows.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓ (after one round of fmt-driven attribute-position cleanup).
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — fixed one `empty_line_after_outer_attr` that fmt introduced by inserting my new section header between `#[allow(too_many_lines)]` and its target function.
+  * `cargo test --workspace` ✓ — **216 total**, unchanged from T6.2 (this commit doesn't add new tests — the new code is a thin shim over already-tested helpers + a manual smoke captured above).
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **`SECURITY.md` §6.2** added explicitly to document that TCP mode is testing-only. A future repo-rules document could reject `--listen-tcp` from production deployments at the CI layer, but that's overkill at v0.
+  * **No CI test exercises TCP mode** — the smoke was manual. Adding an integration test that spawns two daemons via `tokio::process::Command` and walks a chat is a reasonable follow-up.
+  * **The flag implicitly trusts the OS's bind semantics.** A malicious user with shell access could bind `0.0.0.0:7710` and expose the daemon publicly. The daemon doesn't enforce loopback-only; documented in §6.2.
+  * Everything from prior carry-forward lists still open. **T7.1 (single-binary `onyx`) and T7.2 (invite URLs)** are next — together they get the user-side recipe down to one command per side instead of today's two terminals + flag-paste.
+
+---
+
 ## 2026-05-18 — T6.2: in-session KP fetch + `onyx fetch-keypackage` + `onyx send-bootstrap-mls`
 
 T5.2.e shipped the `mls/v1` envelope but required the user to obtain the recipient's `peer_kp_b64` out of band. T6.2 closes that gap: the daemon now fetches KPs from the hub directory (T6.1) over its existing Noise session, with full recipient-side validation against the expected fingerprint. Two new CLI subcommands wrap the path so the entire mls/v1 first-contact flow is now demoable from the shell as a `jq | pipe` 3-liner.

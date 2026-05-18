@@ -52,7 +52,7 @@ use onyx_core::flows::{initiator_exchange, responder_exchange};
 use onyx_core::identity::Identity;
 use onyx_core::mls::{MlsGroupState, MlsParty};
 use onyx_core::storage::Vault;
-use onyx_core::tor::{TorRuntime, TorStream};
+use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{
     Session, handshake_initiator, handshake_responder, read_frame, write_frame,
 };
@@ -117,6 +117,30 @@ struct Args {
     /// at startup. Required with `--hub-onion`.
     #[arg(long, env = "ONYX_HUB_PUBKEY", requires = "hub_onion")]
     hub_pubkey: Option<String>,
+
+    /// **TEST-ONLY** local-TCP listen mode. Accepts plain TCP
+    /// connections at `ADDR` (e.g. `127.0.0.1:7710`) and runs the
+    /// full Noise XK + MLS chat path over them. No Tor, no anonymity,
+    /// no hidden service. Existing in this binary so two daemons on
+    /// `localhost` can be tested without paying the Tor bootstrap
+    /// tax. Mutually exclusive with `--dial-onion` / `--dial-tcp`
+    /// (which are dial modes, not accept modes). Setting this also
+    /// implies `--no-tor`.
+    ///
+    /// Do not run this against real peers — the connection is
+    /// unencrypted at the network layer (only Noise + MLS protect
+    /// the payload) and the daemon's identity is reachable from
+    /// anything that can connect to `ADDR`.
+    #[arg(long, env = "ONYX_LISTEN_TCP", conflicts_with_all = ["dial_onion", "dial_tcp"])]
+    listen_tcp: Option<String>,
+
+    /// **TEST-ONLY** local-TCP dial mode. Connects to a peer's
+    /// `ADDR` (e.g. `127.0.0.1:7710`) over plain TCP instead of
+    /// Tor and runs the dial-side Noise XK + MLS path. Pair with
+    /// `--dial-pubkey`. Implies `--no-tor`.
+    #[arg(long, env = "ONYX_DIAL_TCP", requires = "dial_pubkey",
+          conflicts_with_all = ["dial_onion", "listen_tcp"])]
+    dial_tcp: Option<String>,
 }
 
 /// Bundle of state every handler needs.
@@ -224,6 +248,22 @@ async fn main() -> anyhow::Result<()> {
     drop(args.passphrase);
 
     let api_socket_path = PathBuf::from(&args.api_socket);
+
+    // ── TEST-ONLY local-TCP modes (--listen-tcp / --dial-tcp) ───────────
+    // Skip Tor entirely; useful for testing the chat path on localhost
+    // without paying Tor's bootstrap cost. Loudly logged at startup so
+    // an operator can't miss that anonymity is OFF.
+    if let Some(addr) = args.listen_tcp.as_deref() {
+        return run_tcp_listen_mode(addr, state, api_socket_path).await;
+    }
+    if let Some(addr) = args.dial_tcp.as_deref() {
+        // clap `requires = "dial_pubkey"` guarantees this.
+        let pubkey_b32 = args
+            .dial_pubkey
+            .as_deref()
+            .expect("clap requires dial_pubkey when dial_tcp is set");
+        return run_tcp_dial_mode(addr, pubkey_b32, state, api_socket_path).await;
+    }
 
     if args.no_tor {
         warn!("--no-tor set: skipping Tor; daemon serves only the local API until Ctrl-C");
@@ -436,7 +476,13 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
     Ok(())
 }
 
-async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyhow::Result<()> {
+// Generic over the stream type so both real Tor circuits and (for
+// `--listen-tcp` test mode) plain TCP sockets exercise exactly the
+// same handshake + MLS + chat-loop code path.
+async fn handle_inbound<S>(mut stream: S, state: Arc<DaemonState>) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     info!("accepted inbound stream; starting Noise XK handshake (responder)");
     let mut session = handshake_responder(&mut stream, state.identity.identity_key())
         .await
@@ -496,6 +542,100 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
 // handshaking, deciding bootstrap-vs-resume, running the exchange,
 // persisting. Splitting it for line count would just trade one
 // readable function for several context-stripped helpers.
+
+// ── TEST-ONLY local-TCP modes ─────────────────────────────────────────────
+
+async fn run_tcp_listen_mode(
+    addr: &str,
+    state: Arc<DaemonState>,
+    api_socket_path: PathBuf,
+) -> anyhow::Result<()> {
+    warn!(
+        addr = %addr,
+        "LISTEN-TCP MODE — NO TOR, NO ANONYMITY. Test/dev only. \
+         Anyone who can reach this address can speak Noise to this daemon."
+    );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding TCP listener at {addr}"))?;
+    let local_addr = listener.local_addr().context("local_addr")?;
+    info!(local_addr = %local_addr, "TCP listener bound; accepting connections");
+
+    let identity_pub_b32 = encode_b32(&state.identity.identity_key().public().to_bytes());
+    info!(
+        identity_pub_b32 = %identity_pub_b32,
+        "share `--dial-tcp {local_addr} --dial-pubkey {identity_pub_b32}` with a peer to chat"
+    );
+
+    let api_task = tokio::spawn(api_server::serve_api(
+        api_socket_path,
+        state.clone(),
+        TorState::Disabled,
+    ));
+
+    let accept_state = state.clone();
+    let accept_loop = async move {
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "TCP accept failed; continuing");
+                    continue;
+                }
+            };
+            info!(peer = %peer_addr, "accepted TCP connection");
+            let st = accept_state.clone();
+            let span = info_span!("inbound-tcp", peer = %peer_addr);
+            tokio::spawn(
+                async move {
+                    if let Err(e) = handle_inbound(stream, st).await {
+                        warn!(error = %e, "TCP inbound handler failed");
+                    }
+                }
+                .instrument(span),
+            );
+        }
+    };
+
+    tokio::select! {
+        () = accept_loop => {},
+        () = wait_for_ctrl_c() => info!("shutting down on Ctrl-C"),
+    }
+    api_task.abort();
+    Ok(())
+}
+
+async fn run_tcp_dial_mode(
+    addr: &str,
+    peer_pubkey_b32: &str,
+    state: Arc<DaemonState>,
+    api_socket_path: PathBuf,
+) -> anyhow::Result<()> {
+    warn!(
+        addr = %addr,
+        "DIAL-TCP MODE — NO TOR, NO ANONYMITY. Test/dev only."
+    );
+    let peer_pub_bytes: [u8; 32] =
+        decode_b32_32(peer_pubkey_b32).context("--dial-pubkey must decode to 32 bytes")?;
+
+    let api_task = tokio::spawn(api_server::serve_api(
+        api_socket_path,
+        state.clone(),
+        TorState::Disabled,
+    ));
+
+    info!(addr = %addr, "dialing peer over TCP…");
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("TCP connect to {addr}"))?;
+    info!("TCP connected; starting Noise XK handshake (initiator)");
+
+    let mode_result = run_dial_session(stream, peer_pub_bytes, &state).await;
+
+    api_task.abort();
+    mode_result
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_dial_mode(
     tor: &TorRuntime,
@@ -514,14 +654,32 @@ async fn run_dial_mode(
 
     let peer_pub_bytes: [u8; 32] =
         decode_b32_32(peer_pubkey_b32).context("--dial-pubkey must decode to 32 bytes")?;
-    let peer_pub = IdentityPublic::from_bytes(peer_pub_bytes);
 
     info!(host = %host, port = port, "dialing peer onion…");
-    let mut stream = tor
+    let stream = tor
         .dial(&host, port)
         .await
         .map_err(|e| anyhow::anyhow!("dial failed: {e}"))?;
     info!("Tor circuit established; starting Noise XK handshake (initiator)");
+
+    run_dial_session(stream, peer_pub_bytes, state).await
+}
+
+/// Post-dial body of the initiator path: Noise XK handshake + MLS
+/// bootstrap-or-resume + persistence + long-lived peer session.
+/// Generic over the stream type so both Tor circuits and (for the
+/// `--dial-tcp` test mode) plain TCP sockets reach exactly the same
+/// chat-loop code.
+#[allow(clippy::too_many_lines)]
+async fn run_dial_session<S>(
+    mut stream: S,
+    peer_pub_bytes: [u8; 32],
+    state: &Arc<DaemonState>,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let peer_pub = IdentityPublic::from_bytes(peer_pub_bytes);
 
     let mut session = handshake_initiator(&mut stream, state.identity.identity_key(), &peer_pub)
         .await
@@ -680,13 +838,16 @@ async fn record_peer_group(
 // `EventPeerDisconnected` for any active tail), snapshot+save MLS
 // state, then drain-and-shutdown the Tor stream.
 
-async fn peer_session(
-    mut stream: TorStream,
+async fn peer_session<S>(
+    mut stream: S,
     mut session: Session,
     mut group: MlsGroupState,
     peer_pub: [u8; 32],
     state: Arc<DaemonState>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     let peer_pub_b32 = encode_b32(&peer_pub);
     // Derive the peer's *real* fingerprint by walking the established
     // MLS group's member list and Blake2-hashing whichever member
@@ -754,14 +915,17 @@ async fn derive_peer_fingerprint(
     vk.fingerprint().to_base32_grouped()
 }
 
-async fn drive_peer_session(
-    stream: &mut TorStream,
+async fn drive_peer_session<S>(
+    stream: &mut S,
     session: &mut Session,
     group: &mut MlsGroupState,
     peer_pub: &[u8; 32],
     state: &Arc<DaemonState>,
     outbound_rx: &mut mpsc::Receiver<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
     loop {
         tokio::select! {
             // Inbound: a frame arrived on the Tor stream.
