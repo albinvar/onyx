@@ -6,6 +6,112 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — MLS group reuse: second connection actually resumes the conversation
+
+### What's new
+Reconnecting daemons now **continue the same MLS group** instead of bootstrapping a fresh one every time. Round 1 creates the group and records `(peer_x25519 → group_id)` in the vault. Round 2 looks up that mapping, sends `FRAME_MLS_RESUME` instead of `FRAME_MLS_REQUEST_KP`, and both ends exchange application messages in the existing group with `was_bootstrap=false`. Verified on real Tor on the dev machine; transcript captured below.
+
+### Wire protocol change (initiator now writes first)
+
+Before this phase the responder wrote first (sending an unsolicited KeyPackage). That's incompatible with "the initiator decides whether to reuse" — the responder can't know which path the initiator wants until the initiator says so. New protocol:
+
+**Bootstrap (no prior group)** — 5 frames:
+```
+1. I → R : FRAME_MLS_REQUEST_KP   (empty payload — "I want a fresh group")
+2. R → I : FRAME_MLS_KP            (responder's KeyPackage)
+3. I → R : FRAME_MLS_WELCOME       (welcome from initiator's invite)
+4. I → R : FRAME_MLS_APP           (first encrypted Application)
+5. R → I : FRAME_MLS_APP           (reply)
+```
+
+**Resume (existing group)** — 3 frames:
+```
+1. I → R : FRAME_MLS_RESUME        (payload = group_id bytes)
+2. I → R : FRAME_MLS_APP           (encrypted Application)
+3. R → I : FRAME_MLS_APP           (reply)
+```
+
+The responder reads the first frame and dispatches on type.
+
+### New frame types in `wire.rs`
+- `FRAME_MLS_REQUEST_KP = 0x103` — initiator → responder, empty payload.
+- `FRAME_MLS_RESUME = 0x104` — initiator → responder, payload = group_id bytes.
+
+### Storage schema bumped v2 → v3
+- New `mls_peer_groups` table with PK `(identity_id, peer_x25519)` and columns `group_id BLOB` + `established_at INTEGER`. ON DELETE CASCADE from `identities`.
+- **v2 vaults won't open.** Same caveat as before — v0 has no real users so the migration story is "delete + recreate." Migration runner still TODO.
+- New `Vault::record_peer_group(identity_id, peer_x25519, group_id)` — UPSERT.
+- New `Vault::lookup_peer_group(identity_id, peer_x25519) -> Option<Vec<u8>>`.
+- New test: `peer_group_record_and_lookup` covers record, lookup, UPSERT overwrite, unknown-peer-returns-None.
+
+### `onyx_core::flows` rewrite
+Both `initiator_exchange` and `responder_exchange` are restructured for the dispatch.
+
+- New `ExchangeOutcome { group, peer_message, was_bootstrap }` — unified return for both paths. `was_bootstrap` lets the daemon decide whether to record the peer→group mapping.
+- `initiator_exchange(stream, session, party, existing_group_id: Option<&[u8]>, message)` — `Some(id)` → resume path, `None` → bootstrap path.
+- `responder_exchange(stream, session, party, reply)` — reads first frame, dispatches `REQUEST_KP` → bootstrap, `RESUME` → resume.
+- Internal helpers `initiator_bootstrap` / `initiator_resume` / `responder_bootstrap` / `responder_resume` keep each path readable.
+- Killer test `bootstrap_then_snapshot_then_resume`: phase 1 bootstraps, snapshots both parties, drops everything; phase 2 restores both from the snapshots, initiator passes `Some(group_id)`; both sides report `was_bootstrap == false`; both decrypt new application messages successfully.
+
+### `onyxd` rewiring
+- After Noise XK in dial mode: `vault.lookup_peer_group(identity_id, &peer_static_key)` → `Some(gid)` triggers the resume path, `None` triggers bootstrap. Logged either way.
+- After **bootstrap** (either side): `vault.record_peer_group(identity_id, peer_x25519, group_id)`. Resume paths don't re-record (UPSERT would be a no-op).
+- New helper `record_peer_group(state, peer_x25519, group_id)` parallel to `persist_mls_snapshot`.
+- `responder_exchange` is dispatch-driven, so the responder daemon doesn't need a separate code path — it just calls `responder_exchange` and logs the resulting `was_bootstrap` flag.
+
+### Captured verified transcript (real Tor, dev machine)
+
+**Bob round 1 (bootstrap)**:
+```
+no persisted MLS state; starting fresh
+Tor circuit established; starting Noise XK handshake (initiator)
+Noise XK complete; no prior group — bootstrapping (initiator) peer_identity_pub_b32=r625…qm4q
+MLS round-trip complete (initiator) peer_reply="MLS reply from ohmg…(responder)" mls_epoch=1 was_bootstrap=true
+MLS state persisted to vault state_bytes=8785
+recorded peer→group mapping for future resume group_id_bytes=16
+```
+
+**Bob round 2 (resume, same vault, alice still running)**:
+```
+loaded persisted MLS state — resuming previous session's groups state_bytes=8785
+Tor circuit established; starting Noise XK handshake (initiator)
+Noise XK complete; resuming existing MLS group (initiator) existing_group_id_bytes=16
+MLS round-trip complete (initiator) peer_reply="MLS reply from ohmg…(responder)" mls_epoch=1 was_bootstrap=false
+MLS state persisted to vault state_bytes=8792
+```
+
+**Alice round 2 (responder, same alice process)**:
+```
+accepted inbound stream; starting Noise XK handshake (responder)
+Noise XK complete; awaiting MLS intent from initiator peer_identity_pub_b32=awzb…aava
+MLS round-trip complete (responder) peer_message="MLS hello from dmah…(initiator)" mls_epoch=1 was_bootstrap=false
+```
+
+Both sides report `was_bootstrap=false`. The conversation continued in the same group from round 1.
+
+### Why the responder's log line is generic
+Alice's responder no longer says "bootstrap" or "resume" upfront — she logs `awaiting MLS intent from initiator` because she literally doesn't know which path will be taken until she reads Bob's first MLS frame. The eventual `was_bootstrap=false` in the final log line is the post-dispatch confirmation.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ (after fixing one `single_match_else` lint by converting to `if let / else`)
+- `cargo test --workspace` ✓ — **121 passing in `onyx-core`** (119 prior + 2 new: `flows::bootstrap_then_snapshot_then_resume`, `storage::peer_group_record_and_lookup`; existing `flows::mls_over_noise_round_trip` was renamed/restructured into `flows::bootstrap_round_trip` for the new ExchangeOutcome shape).
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Two-daemon smoke test on real Tor** ✓ — bootstrap → resume transition demonstrated end-to-end.
+
+### Open security gaps (carry-forward)
+- **MLS state stays small even with reuse.** Alice's vault after one bootstrap was 8 KiB; after one resume, 8.5 KiB. Per-group blobs (instead of one giant blob) is a future optimization.
+- **No contact verification on dial.** `--verify-peer-fingerprint` flag would compare `session.peer_static_key()` against an expected fingerprint after handshake.
+- **One-shot exchange.** Handler still exits after one round-trip; persistent long-lived conversations need a frame loop.
+- **No CLI / local API socket.**
+- **No sealed-sender on daemon path.**
+- **Shared Arti state directory.**
+- **No schema migration runner.**
+- **Resume failure cases aren't graceful** — if the initiator's stored group_id has expired from the responder's vault (e.g. responder did a fresh wipe), the responder errors. Real client would fall back to bootstrap. v0 fails loudly so silent drift can't happen.
+
+---
+
 ## 2026-05-18 — `onyxd` actually persists MLS state across restarts (verified)
 
 ### What's new

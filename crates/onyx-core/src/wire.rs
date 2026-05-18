@@ -58,6 +58,17 @@ pub const FRAME_MLS_WELCOME: u16 = 0x101;
 /// directions; safe to send any number of times once both sides are in
 /// the same MLS group at the same epoch.
 pub const FRAME_MLS_APP: u16 = 0x102;
+/// `MLS_REQUEST_KP` — initiator → responder, empty payload. Signals
+/// "I want to bootstrap a fresh MLS group with you; send your
+/// KeyPackage." Sent as the very first frame after Noise XK when the
+/// initiator has no prior MLS group with this peer.
+pub const FRAME_MLS_REQUEST_KP: u16 = 0x103;
+/// `MLS_RESUME` — initiator → responder, payload is the bytes of an
+/// existing MLS `GroupId`. Signals "let's continue using group X
+/// (which both of us should already have state for); next frame is
+/// an `MLS_APP` ciphertext." Sent as the very first frame after Noise
+/// XK when the initiator has a prior MLS group with this peer.
+pub const FRAME_MLS_RESUME: u16 = 0x104;
 
 // ── Padding buckets (DESIGN.md §5.8) ───────────────────────────────────────
 

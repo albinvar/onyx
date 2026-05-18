@@ -231,10 +231,11 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
         .await
         .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
-    let peer_pub_b32 = encode_b32(&session.peer_static_key());
+    let peer_pub = session.peer_static_key();
+    let peer_pub_b32 = encode_b32(&peer_pub);
     info!(
         peer_identity_pub_b32 = %peer_pub_b32,
-        "Noise XK complete; starting MLS bootstrap (responder)"
+        "Noise XK complete; awaiting MLS intent from initiator"
     );
 
     let reply_text = format!(
@@ -245,7 +246,7 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
     // Take the MLS party lock for the duration of the exchange + the
     // snapshot. Drop it before taking the vault lock to keep our lock
     // order consistent (MLS first, vault second).
-    let snapshot = {
+    let (snapshot, group_id, was_bootstrap) = {
         let party = state.mls_party.lock().await;
         let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
             .await
@@ -253,14 +254,20 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
         info!(
             peer_message = %String::from_utf8_lossy(&outcome.peer_message),
             mls_epoch = outcome.group.epoch(),
+            was_bootstrap = outcome.was_bootstrap,
             "MLS round-trip complete (responder)"
         );
-        party
+        let group_id = outcome.group.group_id_bytes();
+        let snap = party
             .snapshot_state()
-            .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?;
+        (snap, group_id, outcome.was_bootstrap)
     };
 
     persist_mls_snapshot(&state, &snapshot).await?;
+    if was_bootstrap {
+        record_peer_group(&state, &peer_pub, &group_id).await?;
+    }
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -297,33 +304,64 @@ async fn run_dial_mode(
         .await
         .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
-    let learned_peer = encode_b32(&session.peer_static_key());
-    info!(
-        peer_identity_pub_b32 = %learned_peer,
-        "Noise XK complete; starting MLS bootstrap (initiator)"
-    );
+    let peer_static = session.peer_static_key();
+    let learned_peer = encode_b32(&peer_static);
+
+    // Do we have a prior MLS group with this peer? If yes, resume;
+    // if no, bootstrap.
+    let existing_group_id = {
+        let vault = state.vault.lock().await;
+        vault
+            .lookup_peer_group(state.identity_id, &peer_static)
+            .map_err(|e| anyhow::anyhow!("peer-group lookup failed: {e}"))?
+    };
+
+    if let Some(gid) = &existing_group_id {
+        info!(
+            peer_identity_pub_b32 = %learned_peer,
+            existing_group_id_bytes = gid.len(),
+            "Noise XK complete; resuming existing MLS group (initiator)"
+        );
+    } else {
+        info!(
+            peer_identity_pub_b32 = %learned_peer,
+            "Noise XK complete; no prior group — bootstrapping (initiator)"
+        );
+    }
 
     let greeting = format!(
         "MLS hello from {} (initiator)",
         state.identity.fingerprint()
     );
 
-    let snapshot = {
+    let (snapshot, group_id, was_bootstrap) = {
         let party = state.mls_party.lock().await;
-        let outcome = initiator_exchange(&mut stream, &mut session, &party, greeting.as_bytes())
-            .await
-            .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
+        let outcome = initiator_exchange(
+            &mut stream,
+            &mut session,
+            &party,
+            existing_group_id.as_deref(),
+            greeting.as_bytes(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
         info!(
-            peer_reply = %String::from_utf8_lossy(&outcome.peer_reply),
+            peer_reply = %String::from_utf8_lossy(&outcome.peer_message),
             mls_epoch = outcome.group.epoch(),
+            was_bootstrap = outcome.was_bootstrap,
             "MLS round-trip complete (initiator)"
         );
-        party
+        let group_id = outcome.group.group_id_bytes();
+        let snap = party
             .snapshot_state()
-            .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?;
+        (snap, group_id, outcome.was_bootstrap)
     };
 
     persist_mls_snapshot(state, &snapshot).await?;
+    if was_bootstrap {
+        record_peer_group(state, &peer_static, &group_id).await?;
+    }
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -336,6 +374,22 @@ async fn persist_mls_snapshot(state: &DaemonState, snapshot: &[u8]) -> anyhow::R
         .save_mls_state(state.identity_id, snapshot)
         .map_err(|e| anyhow::anyhow!("MLS state save failed: {e}"))?;
     info!(state_bytes = snapshot.len(), "MLS state persisted to vault");
+    Ok(())
+}
+
+async fn record_peer_group(
+    state: &DaemonState,
+    peer_x25519: &[u8; 32],
+    group_id: &[u8],
+) -> anyhow::Result<()> {
+    let vault = state.vault.lock().await;
+    vault
+        .record_peer_group(state.identity_id, peer_x25519, group_id)
+        .map_err(|e| anyhow::anyhow!("peer-group record failed: {e}"))?;
+    info!(
+        group_id_bytes = group_id.len(),
+        "recorded peer→group mapping for future resume"
+    );
     Ok(())
 }
 

@@ -43,12 +43,18 @@ use crate::error::{Error, Result};
 /// On-disk schema version. Bumped when migrations land.
 ///
 /// **v1 → v2**: added `mls_state` table for per-identity MLS provider
-/// snapshots. No migration logic; v1 vaults won't open. Since v0 has
-/// no real users, the migration story is "delete the vault and
-/// recreate." This will get a proper migration runner before v0.1.
-pub const SCHEMA_VERSION: i32 = 2;
+/// snapshots.
+///
+/// **v2 → v3**: added `mls_peer_groups` table — per-(identity, peer)
+/// mapping to a shared MLS `GroupId`. Lets the daemon resume an
+/// existing group instead of bootstrapping a fresh one on every
+/// reconnect.
+///
+/// No migration runner yet; old vaults won't open. v0 has no real
+/// users so the migration story is "delete the vault and recreate."
+pub const SCHEMA_VERSION: i32 = 3;
 
-const SCHEMA_V2: &str = "
+const SCHEMA_V3: &str = "
 CREATE TABLE vault_meta (
   id              INTEGER PRIMARY KEY CHECK (id = 1),
   schema_version  INTEGER NOT NULL,
@@ -75,6 +81,19 @@ CREATE TABLE mls_state (
   identity_id     INTEGER PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
   encrypted_blob  BLOB NOT NULL,
   updated_at      INTEGER NOT NULL
+);
+
+-- One row per (our identity, peer X25519 static pubkey). Records the
+-- MLS GroupId we share with that peer so the next reconnect can
+-- resume the group instead of bootstrapping a fresh one. peer_x25519
+-- is the bytes the Noise XK handshake authenticates; group_id is the
+-- bytes from MlsGroupState::group_id_bytes().
+CREATE TABLE mls_peer_groups (
+  identity_id     INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  peer_x25519     BLOB NOT NULL,
+  group_id        BLOB NOT NULL,
+  established_at  INTEGER NOT NULL,
+  PRIMARY KEY (identity_id, peer_x25519)
 );
 ";
 
@@ -209,7 +228,7 @@ impl Vault {
 
     fn initialize(conn: Connection, passphrase: &[u8], params: &Argon2Params) -> Result<Self> {
         params.validate()?;
-        conn.execute_batch(SCHEMA_V2).map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_V3).map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -272,6 +291,55 @@ impl Vault {
             )
             .map_err(map_db_err)?;
         Ok(())
+    }
+
+    /// Record that we share MLS `group_id` with the peer identified by
+    /// `peer_x25519` (their long-term X25519 identity public key —
+    /// what Noise XK authenticates). UPSERT: subsequent calls for the
+    /// same `(identity_id, peer_x25519)` overwrite the group id, so
+    /// re-bootstrapping with the same peer rotates to the new group
+    /// cleanly.
+    pub fn record_peer_group(
+        &self,
+        identity_id: i64,
+        peer_x25519: &[u8; 32],
+        group_id: &[u8],
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO mls_peer_groups (identity_id, peer_x25519, group_id, established_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(identity_id, peer_x25519) DO UPDATE SET \
+                   group_id = excluded.group_id, \
+                   established_at = excluded.established_at",
+                params![identity_id, peer_x25519.as_slice(), group_id, now],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Look up the MLS `group_id` we previously recorded for this
+    /// peer. Returns `None` if no prior group exists — the caller
+    /// should then go through the bootstrap path.
+    pub fn lookup_peer_group(
+        &self,
+        identity_id: i64,
+        peer_x25519: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT group_id FROM mls_peer_groups \
+                 WHERE identity_id = ? AND peer_x25519 = ?",
+                params![identity_id, peer_x25519.as_slice()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(map_db_err)
     }
 
     /// Load and decrypt the MLS state for `identity_id`, returning
@@ -401,6 +469,30 @@ mod tests {
         let blob2 = b"replacement bytes";
         v.save_mls_state(id, blob2).unwrap();
         assert_eq!(v.load_mls_state(id).unwrap().unwrap(), blob2);
+    }
+
+    #[test]
+    fn peer_group_record_and_lookup() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let peer_pub = [0x42u8; 32];
+        let group_id = b"group-bytes-here";
+
+        assert!(v.lookup_peer_group(id, &peer_pub).unwrap().is_none());
+
+        v.record_peer_group(id, &peer_pub, group_id).unwrap();
+        let loaded = v.lookup_peer_group(id, &peer_pub).unwrap();
+        assert_eq!(loaded.as_deref(), Some(&group_id[..]));
+
+        // UPSERT: re-record with a different group_id overwrites.
+        let group_id2 = b"different-group";
+        v.record_peer_group(id, &peer_pub, group_id2).unwrap();
+        let loaded2 = v.lookup_peer_group(id, &peer_pub).unwrap();
+        assert_eq!(loaded2.as_deref(), Some(&group_id2[..]));
+
+        // A different peer key returns None.
+        let other_peer = [0x99u8; 32];
+        assert!(v.lookup_peer_group(id, &other_peer).unwrap().is_none());
     }
 
     #[test]

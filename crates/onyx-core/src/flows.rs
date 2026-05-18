@@ -3,102 +3,121 @@
 //! Once [`crate::transport::handshake_initiator`] /
 //! [`crate::transport::handshake_responder`] has produced an
 //! authenticated [`Session`] between two daemons, both sides need to
-//! bootstrap a shared MLS group before any **content** can travel
-//! end-to-end-encrypted. This module owns that choreography.
+//! either **bootstrap** a fresh MLS group or **resume** an existing
+//! one. This module owns that choreography.
 //!
-//! ## Why an extra layer
+//! ## Wire protocol (initiator writes first)
 //!
-//! Noise XK already gives us:
+//! The initiator decides up front whether to bootstrap or resume,
+//! based on its local state (does it have a record of a prior group
+//! with this peer's X25519 static?). The initiator's **first frame
+//! after Noise XK** announces the choice:
 //!
-//!   * Mutual authentication of long-term X25519 static keys.
-//!   * Forward-secret AEAD framing for the lifetime of the connection.
-//!
-//! On top of that, MLS adds:
-//!
-//!   * A group (1-on-1 at v0 = 2-member group, scales to rooms later).
-//!   * Per-message forward secrecy + post-compromise security via
-//!     ratchet trees and per-commit epoch transitions.
-//!   * A persistent group identity that survives reconnection — the
-//!     Noise channel is bound to one TCP/Tor circuit; MLS state isn't.
-//!
-//! Wrapping MLS inside Noise means even a hub that proxies our frames
-//! sees only encrypted MLS ciphertexts, not even who is sending what
-//! within the connection.
-//!
-//! ## Wire protocol
-//!
-//! After Noise XK completes, this 4-frame exchange runs over the
-//! Session:
-//!
+//! ### Bootstrap (no prior group)
 //! ```text
-//!   1. R → I : FRAME_MLS_KP        (responder's MLS KeyPackage)
-//!   2. I → R : FRAME_MLS_WELCOME   (welcome from initiator's group invite)
-//!   3. I → R : FRAME_MLS_APP       (first encrypted Application message)
-//!   4. R → I : FRAME_MLS_APP       (reply Application message)
+//! 1. I → R : FRAME_MLS_REQUEST_KP  (empty payload)
+//! 2. R → I : FRAME_MLS_KP          (responder's MLS KeyPackage)
+//! 3. I → R : FRAME_MLS_WELCOME     (welcome from initiator's invite)
+//! 4. I → R : FRAME_MLS_APP         (first encrypted Application message)
+//! 5. R → I : FRAME_MLS_APP         (reply)
 //! ```
 //!
-//! After step 4 both sides are members of the same MLS group at the
-//! same epoch. Subsequent `FRAME_MLS_APP` frames can flow freely in
-//! either direction without further state exchange.
+//! ### Resume (existing group)
+//! ```text
+//! 1. I → R : FRAME_MLS_RESUME      (payload = group_id bytes)
+//! 2. I → R : FRAME_MLS_APP         (encrypted Application message)
+//! 3. R → I : FRAME_MLS_APP         (reply)
+//! ```
 //!
-//! ## Identity-binding caveat (v0)
+//! The responder reads the first frame, dispatches on its type, and
+//! runs the matching path. After either path completes both sides
+//! hold an [`MlsGroupState`] for the same group at the same epoch
+//! (bootstrap → epoch 1; resume → whatever epoch the group is on).
 //!
-//! Each [`MlsParty`] currently generates a fresh ED25519 signature
-//! keypair for its MLS credential, separate from the Noise X25519
-//! static. So the MLS credential is *not* yet provably bound to the
-//! same identity that authenticated at the Noise layer. The Noise
-//! handshake provides X25519-static auth; until we bind the MLS
-//! credential to our long-term Ed25519 fingerprint, an attacker who
-//! controls the network between two trusting daemons could not
-//! inject — but a malicious **endpoint** could lie about which MLS
-//! identity it owns. This is fine for the smoke tests; it needs to
-//! land before any release.
+//! ## Identity-binding caveat (carry-forward)
+//!
+//! Each [`MlsParty`] still generates its own ED25519 — see
+//! [`crate::mls`]'s module docs for the binding story.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{Error, Result};
 use crate::mls::{MlsGroupState, MlsParty};
 use crate::transport::{Session, read_frame, write_frame};
-use crate::wire::{FRAME_MLS_APP, FRAME_MLS_KP, FRAME_MLS_WELCOME, InnerFrame};
+use crate::wire::{
+    FRAME_MLS_APP, FRAME_MLS_KP, FRAME_MLS_REQUEST_KP, FRAME_MLS_RESUME, FRAME_MLS_WELCOME,
+    InnerFrame,
+};
 
-/// Result of a successful initiator-side exchange.
+/// Result of a successful flow. Unified across bootstrap and resume.
 #[derive(Debug)]
-pub struct InitiatorExchange {
-    /// The MLS group the initiator has just created and the responder
-    /// has just joined.
+pub struct ExchangeOutcome {
+    /// The MLS group both sides are now operating in.
     pub group: MlsGroupState,
-    /// The decrypted plaintext of the responder's reply message.
-    pub peer_reply: Vec<u8>,
+    /// Decrypted plaintext of the peer's message.
+    pub peer_message: Vec<u8>,
+    /// `true` if this exchange just *created* the group (bootstrap),
+    /// `false` if it *resumed* an existing one. Daemons use this to
+    /// decide whether to call `Vault::record_peer_group`.
+    pub was_bootstrap: bool,
 }
 
-/// Drive the initiator side of the post-Noise MLS bootstrap.
+/// Drive the initiator side.
 ///
-/// Steps (1 → 2 → 3 → 4 in the module-level diagram):
+/// * `existing_group_id = None` → bootstrap path.
+/// * `existing_group_id = Some(id)` → resume path: load that group
+///   from the party's storage, send `FRAME_MLS_RESUME`, exchange
+///   application messages directly.
 ///
-/// 1. Read the responder's KeyPackage.
-/// 2. Create an MLS group, invite the responder using their KP, send
-///    the resulting Welcome message.
-/// 3. Encrypt `greeting` as the first Application message in the
-///    new group and send it.
-/// 4. Read the responder's encrypted reply, decrypt it.
+/// `message` is sent as the initiator's first (encrypted) application
+/// message in the group. The peer's reply is decrypted and returned
+/// in [`ExchangeOutcome::peer_message`].
 pub async fn initiator_exchange<S>(
     stream: &mut S,
     session: &mut Session,
     party: &MlsParty,
-    greeting: &[u8],
-) -> Result<InitiatorExchange>
+    existing_group_id: Option<&[u8]>,
+    message: &[u8],
+) -> Result<ExchangeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // 1. Receive peer's KeyPackage.
+    if let Some(group_id) = existing_group_id {
+        initiator_resume(stream, session, party, group_id, message).await
+    } else {
+        initiator_bootstrap(stream, session, party, message).await
+    }
+}
+
+async fn initiator_bootstrap<S>(
+    stream: &mut S,
+    session: &mut Session,
+    party: &MlsParty,
+    greeting: &[u8],
+) -> Result<ExchangeOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // 1. Signal intent: bootstrap.
+    write_frame(
+        stream,
+        session,
+        &InnerFrame {
+            frame_type: FRAME_MLS_REQUEST_KP,
+            payload: Vec::new(),
+        },
+    )
+    .await?;
+
+    // 2. Receive peer's KeyPackage.
     let kp_frame = read_frame(stream, session).await?;
     if kp_frame.frame_type != FRAME_MLS_KP {
         return Err(Error::InvalidEncoding(
-            "flows::initiator: expected FRAME_MLS_KP from responder",
+            "flows::initiator: expected FRAME_MLS_KP after REQUEST_KP",
         ));
     }
 
-    // 2. Build the group and invite the peer.
+    // 3. Build group, invite, send Welcome.
     let mut group = party.create_group()?;
     let welcome_bytes = group.invite(party, &kp_frame.payload)?;
     write_frame(
@@ -111,7 +130,7 @@ where
     )
     .await?;
 
-    // 3. Send the first encrypted application message in the group.
+    // 4. First encrypted application message.
     let app_ct = group.encrypt_application(party, greeting)?;
     write_frame(
         stream,
@@ -123,46 +142,113 @@ where
     )
     .await?;
 
-    // 4. Receive and decrypt the responder's reply.
+    // 5. Read + decrypt reply.
     let reply_frame = read_frame(stream, session).await?;
     if reply_frame.frame_type != FRAME_MLS_APP {
         return Err(Error::InvalidEncoding(
-            "flows::initiator: expected FRAME_MLS_APP reply from responder",
+            "flows::initiator: expected FRAME_MLS_APP reply",
         ));
     }
-    let peer_reply = group.decrypt_application(party, &reply_frame.payload)?;
+    let peer_message = group.decrypt_application(party, &reply_frame.payload)?;
 
-    Ok(InitiatorExchange { group, peer_reply })
+    Ok(ExchangeOutcome {
+        group,
+        peer_message,
+        was_bootstrap: true,
+    })
 }
 
-/// Result of a successful responder-side exchange.
-#[derive(Debug)]
-pub struct ResponderExchange {
-    /// The MLS group the responder has just joined.
-    pub group: MlsGroupState,
-    /// The decrypted plaintext of the initiator's greeting.
-    pub peer_message: Vec<u8>,
+async fn initiator_resume<S>(
+    stream: &mut S,
+    session: &mut Session,
+    party: &MlsParty,
+    group_id: &[u8],
+    message: &[u8],
+) -> Result<ExchangeOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Load the group BEFORE announcing — if we can't load it, fail
+    // locally rather than starting a session the peer can't complete.
+    let mut group = party.load_group(group_id)?.ok_or(Error::Internal(
+        "flows::initiator: resume requested but group not in storage",
+    ))?;
+
+    // 1. Announce resume.
+    write_frame(
+        stream,
+        session,
+        &InnerFrame {
+            frame_type: FRAME_MLS_RESUME,
+            payload: group_id.to_vec(),
+        },
+    )
+    .await?;
+
+    // 2. Send encrypted application message.
+    let app_ct = group.encrypt_application(party, message)?;
+    write_frame(
+        stream,
+        session,
+        &InnerFrame {
+            frame_type: FRAME_MLS_APP,
+            payload: app_ct,
+        },
+    )
+    .await?;
+
+    // 3. Read + decrypt reply.
+    let reply_frame = read_frame(stream, session).await?;
+    if reply_frame.frame_type != FRAME_MLS_APP {
+        return Err(Error::InvalidEncoding(
+            "flows::initiator: expected FRAME_MLS_APP reply on resume",
+        ));
+    }
+    let peer_message = group.decrypt_application(party, &reply_frame.payload)?;
+
+    Ok(ExchangeOutcome {
+        group,
+        peer_message,
+        was_bootstrap: false,
+    })
 }
 
-/// Drive the responder side of the post-Noise MLS bootstrap.
+/// Drive the responder side.
 ///
-/// Steps (mirror of [`initiator_exchange`]):
-///
-/// 1. Send our KeyPackage to the initiator.
-/// 2. Receive the Welcome and join the group it describes.
-/// 3. Receive the initiator's first encrypted Application message,
-///    decrypt it.
-/// 4. Encrypt `reply` and send it as our first Application message.
+/// Reads the first frame to dispatch:
+/// * `FRAME_MLS_REQUEST_KP` → bootstrap path (send our KP, accept
+///   Welcome, exchange).
+/// * `FRAME_MLS_RESUME` → resume path (load the group named by the
+///   payload, exchange).
 pub async fn responder_exchange<S>(
     stream: &mut S,
     session: &mut Session,
     party: &MlsParty,
     reply: &[u8],
-) -> Result<ResponderExchange>
+) -> Result<ExchangeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // 1. Send our KeyPackage so the initiator can invite us.
+    let first = read_frame(stream, session).await?;
+    match first.frame_type {
+        FRAME_MLS_REQUEST_KP => responder_bootstrap(stream, session, party, reply).await,
+        FRAME_MLS_RESUME => responder_resume(stream, session, party, &first.payload, reply).await,
+        _ => Err(Error::InvalidEncoding(
+            "flows::responder: unexpected first frame type (want REQUEST_KP or RESUME)",
+        )),
+    }
+}
+
+async fn responder_bootstrap<S>(
+    stream: &mut S,
+    session: &mut Session,
+    party: &MlsParty,
+    reply: &[u8],
+) -> Result<ExchangeOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Send our KeyPackage.
     let kp_bytes = party.key_package_bytes()?;
     write_frame(
         stream,
@@ -174,25 +260,25 @@ where
     )
     .await?;
 
-    // 2. Receive the Welcome and join the group.
+    // Receive Welcome + join group.
     let welcome_frame = read_frame(stream, session).await?;
     if welcome_frame.frame_type != FRAME_MLS_WELCOME {
         return Err(Error::InvalidEncoding(
-            "flows::responder: expected FRAME_MLS_WELCOME from initiator",
+            "flows::responder: expected FRAME_MLS_WELCOME",
         ));
     }
     let mut group = party.join_from_welcome(&welcome_frame.payload)?;
 
-    // 3. Receive and decrypt the initiator's first application message.
+    // Receive + decrypt initiator's first application message.
     let app_frame = read_frame(stream, session).await?;
     if app_frame.frame_type != FRAME_MLS_APP {
         return Err(Error::InvalidEncoding(
-            "flows::responder: expected FRAME_MLS_APP from initiator",
+            "flows::responder: expected FRAME_MLS_APP after WELCOME",
         ));
     }
     let peer_message = group.decrypt_application(party, &app_frame.payload)?;
 
-    // 4. Send our encrypted reply.
+    // Encrypt + send our reply.
     let reply_ct = group.encrypt_application(party, reply)?;
     write_frame(
         stream,
@@ -204,9 +290,57 @@ where
     )
     .await?;
 
-    Ok(ResponderExchange {
+    Ok(ExchangeOutcome {
         group,
         peer_message,
+        was_bootstrap: true,
+    })
+}
+
+async fn responder_resume<S>(
+    stream: &mut S,
+    session: &mut Session,
+    party: &MlsParty,
+    group_id: &[u8],
+    reply: &[u8],
+) -> Result<ExchangeOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Load the named group from our storage. If we don't have it,
+    // the connection cannot continue — surface as Internal so the
+    // caller closes the connection. (A real client would probably
+    // fall back to bootstrap; v0 just fails loudly so state drift
+    // doesn't go silent.)
+    let mut group = party.load_group(group_id)?.ok_or(Error::Internal(
+        "flows::responder: resume request names a group we don't have",
+    ))?;
+
+    // Receive + decrypt application message.
+    let app_frame = read_frame(stream, session).await?;
+    if app_frame.frame_type != FRAME_MLS_APP {
+        return Err(Error::InvalidEncoding(
+            "flows::responder: expected FRAME_MLS_APP after RESUME",
+        ));
+    }
+    let peer_message = group.decrypt_application(party, &app_frame.payload)?;
+
+    // Encrypt + send our reply.
+    let reply_ct = group.encrypt_application(party, reply)?;
+    write_frame(
+        stream,
+        session,
+        &InnerFrame {
+            frame_type: FRAME_MLS_APP,
+            payload: reply_ct,
+        },
+    )
+    .await?;
+
+    Ok(ExchangeOutcome {
+        group,
+        peer_message,
+        was_bootstrap: false,
     })
 }
 
@@ -218,20 +352,12 @@ mod tests {
     use crate::crypto::IdentitySecret;
     use crate::transport::{handshake_initiator, handshake_responder};
 
-    /// Full end-to-end exercise of every layer in the daemon's data
-    /// path, minus only the Tor stream itself (which we replace with a
-    /// `tokio::io::duplex` pair):
-    ///
-    ///   * Noise XK handshake produces a [`Session`] on each side.
-    ///   * `responder_exchange` + `initiator_exchange` complete the
-    ///     MLS bootstrap.
-    ///   * Both sides decrypt the other's first MLS Application message
-    ///     and the plaintext matches what was sent.
-    ///   * Both sides end up at MLS epoch 1 (group created at epoch 0,
-    ///     advanced once by the add).
-    #[allow(clippy::similar_names)] // alice / bob _sk / _pk are intentional
+    /// First flow: bootstrap. Same as the original
+    /// `mls_over_noise_round_trip`, modulo the new ExchangeOutcome
+    /// shape and the new bootstrap-direction frames.
+    #[allow(clippy::similar_names)]
     #[tokio::test]
-    async fn mls_over_noise_round_trip() {
+    async fn bootstrap_round_trip() {
         let alice_sk = IdentitySecret::generate();
         let bob_sk = IdentitySecret::generate();
         let bob_pk = bob_sk.public();
@@ -241,45 +367,155 @@ mod tests {
         let alice_task = tokio::spawn(async move {
             let mut session = handshake_initiator(&mut alice_io, &alice_sk, &bob_pk)
                 .await
-                .expect("alice noise");
-            let alice_party = MlsParty::new(b"alice".to_vec()).expect("alice mls");
+                .unwrap();
+            let alice_party = MlsParty::new(b"alice".to_vec()).unwrap();
             let outcome = initiator_exchange(
                 &mut alice_io,
                 &mut session,
                 &alice_party,
-                b"hello bob via mls",
+                None,
+                b"hello bob",
             )
             .await
-            .expect("alice flow");
-            (outcome.group.epoch(), outcome.peer_reply)
+            .unwrap();
+            (
+                outcome.group.epoch(),
+                outcome.peer_message,
+                outcome.was_bootstrap,
+            )
         });
 
         let bob_task = tokio::spawn(async move {
-            let mut session = handshake_responder(&mut bob_io, &bob_sk)
+            let mut session = handshake_responder(&mut bob_io, &bob_sk).await.unwrap();
+            let bob_party = MlsParty::new(b"bob".to_vec()).unwrap();
+            let outcome = responder_exchange(&mut bob_io, &mut session, &bob_party, b"hello alice")
                 .await
-                .expect("bob noise");
-            let bob_party = MlsParty::new(b"bob".to_vec()).expect("bob mls");
-            let outcome = responder_exchange(
-                &mut bob_io,
-                &mut session,
-                &bob_party,
-                b"hello alice via mls",
+                .unwrap();
+            (
+                outcome.group.epoch(),
+                outcome.peer_message,
+                outcome.was_bootstrap,
             )
-            .await
-            .expect("bob flow");
-            (outcome.group.epoch(), outcome.peer_message)
         });
 
-        let (alice_result, bob_result) = tokio::join!(alice_task, bob_task);
-        let (alice_epoch, alice_peer_reply) = alice_result.unwrap();
-        let (bob_epoch, bob_peer_message) = bob_result.unwrap();
+        let (alice, bob) = tokio::join!(alice_task, bob_task);
+        let (alice_epoch, alice_peer, alice_bootstrap) = alice.unwrap();
+        let (bob_epoch, bob_peer, bob_bootstrap) = bob.unwrap();
 
-        assert_eq!(bob_peer_message, b"hello bob via mls");
-        assert_eq!(alice_peer_reply, b"hello alice via mls");
-        assert_eq!(
-            alice_epoch, bob_epoch,
-            "both members must be at the same MLS epoch after the bootstrap"
+        assert_eq!(bob_peer, b"hello bob");
+        assert_eq!(alice_peer, b"hello alice");
+        assert_eq!(alice_epoch, bob_epoch);
+        assert_eq!(alice_epoch, 1);
+        assert!(alice_bootstrap);
+        assert!(bob_bootstrap);
+    }
+
+    /// The killer test for T2.4: bootstrap a group, snapshot both
+    /// parties, drop everything, restore from snapshots, **then
+    /// resume** the same group via the new FRAME_MLS_RESUME path.
+    /// Both sides exchange a new application message in the resumed
+    /// group, decrypt correctly, and report `was_bootstrap == false`.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn bootstrap_then_snapshot_then_resume() {
+        use crate::identity::Identity;
+
+        // Fixed seeds so we can reconstruct the same identities twice
+        // (Identity is intentionally not Clone — secrets aren't
+        // casually duplicated — so we rebuild from the seeds).
+        let alice_signing = [7u8; 32];
+        let alice_x = [8u8; 32];
+        let bob_signing = [17u8; 32];
+        let bob_x_seed = [18u8; 32];
+
+        // ── Round 1: bootstrap ────────────────────────────────────────────
+        let bob_x_pub_round1 = IdentitySecret::from_bytes(bob_x_seed).public();
+        let alice_id1 = Identity::from_seeds(&alice_signing, alice_x);
+        let bob_id1 = Identity::from_seeds(&bob_signing, bob_x_seed);
+        let alice_noise_sk1 = IdentitySecret::from_bytes(alice_x);
+        let bob_noise_sk1 = IdentitySecret::from_bytes(bob_x_seed);
+        let (mut a_io, mut b_io) = tokio::io::duplex(65_536);
+
+        let alice_handle = tokio::spawn(async move {
+            let mut session = handshake_initiator(&mut a_io, &alice_noise_sk1, &bob_x_pub_round1)
+                .await
+                .unwrap();
+            let party = MlsParty::from_identity(&alice_id1).unwrap();
+            let outcome = initiator_exchange(&mut a_io, &mut session, &party, None, b"hello bob 1")
+                .await
+                .unwrap();
+            assert!(outcome.was_bootstrap);
+            let group_id = outcome.group.group_id_bytes();
+            let snap = party.snapshot_state().unwrap();
+            (group_id, (*snap).clone())
+        });
+
+        let bob_handle = tokio::spawn(async move {
+            let mut session = handshake_responder(&mut b_io, &bob_noise_sk1)
+                .await
+                .unwrap();
+            let party = MlsParty::from_identity(&bob_id1).unwrap();
+            let outcome = responder_exchange(&mut b_io, &mut session, &party, b"hello alice 1")
+                .await
+                .unwrap();
+            assert!(outcome.was_bootstrap);
+            let snap = party.snapshot_state().unwrap();
+            (*snap).clone()
+        });
+
+        let (alice_result, bob_state) = tokio::join!(alice_handle, bob_handle);
+        let (group_id_bytes, alice_state) = alice_result.unwrap();
+        let bob_state = bob_state.unwrap();
+        assert!(!group_id_bytes.is_empty());
+
+        // ── Round 2: resume — fresh duplex, parties restored from snapshots ──
+        let bob_x_pub_round2 = IdentitySecret::from_bytes(bob_x_seed).public();
+        let alice_id2 = Identity::from_seeds(&alice_signing, alice_x);
+        let bob_id2 = Identity::from_seeds(&bob_signing, bob_x_seed);
+        let alice_noise_sk2 = IdentitySecret::from_bytes(alice_x);
+        let bob_noise_sk2 = IdentitySecret::from_bytes(bob_x_seed);
+        let (mut a_io, mut b_io) = tokio::io::duplex(65_536);
+
+        let group_id_for_alice = group_id_bytes.clone();
+        let alice2 = tokio::spawn(async move {
+            let mut session = handshake_initiator(&mut a_io, &alice_noise_sk2, &bob_x_pub_round2)
+                .await
+                .unwrap();
+            let party = MlsParty::from_identity_and_state(&alice_id2, &alice_state).unwrap();
+            let outcome = initiator_exchange(
+                &mut a_io,
+                &mut session,
+                &party,
+                Some(&group_id_for_alice),
+                b"hello bob 2 (resumed)",
+            )
+            .await
+            .unwrap();
+            (outcome.peer_message, outcome.was_bootstrap)
+        });
+
+        let bob2 = tokio::spawn(async move {
+            let mut session = handshake_responder(&mut b_io, &bob_noise_sk2)
+                .await
+                .unwrap();
+            let party = MlsParty::from_identity_and_state(&bob_id2, &bob_state).unwrap();
+            let outcome =
+                responder_exchange(&mut b_io, &mut session, &party, b"hello alice 2 (resumed)")
+                    .await
+                    .unwrap();
+            (outcome.peer_message, outcome.was_bootstrap)
+        });
+
+        let (a, b) = tokio::join!(alice2, bob2);
+        let (alice_peer, alice_bootstrap) = a.unwrap();
+        let (bob_peer, bob_bootstrap) = b.unwrap();
+
+        assert!(
+            !alice_bootstrap,
+            "alice resumed; bootstrap flag must be false"
         );
-        assert_eq!(alice_epoch, 1, "epoch should advance from 0 to 1 on add");
+        assert!(!bob_bootstrap, "bob resumed; bootstrap flag must be false");
+        assert_eq!(bob_peer, b"hello bob 2 (resumed)");
+        assert_eq!(alice_peer, b"hello alice 2 (resumed)");
     }
 }
