@@ -26,6 +26,16 @@ pub const FRAME_HELLO: u16 = 0x01;
 /// `HELLO_ACK` — server → client, accept and assign session id.
 pub const FRAME_HELLO_ACK: u16 = 0x02;
 /// `DELIVER` — either direction, MLS-encrypted application message.
+///
+/// **Hub-mode payload layout**: `target_routing_id (16 B) ‖ body`.
+/// The body is opaque to the hub — typically a [`MessageEnvelope`]
+/// CBOR encoding but the hub doesn't parse it. The hub preserves the
+/// target prefix when forwarding to subscribers so a client listening
+/// on more than one routing ID can tell which subscription matched;
+/// the receiving client strips the prefix before decrypting.
+///
+/// **P2P payload layout**: the full [`MessageEnvelope`] CBOR (no
+/// target prefix — the connection itself identifies the peer).
 pub const FRAME_DELIVER: u16 = 0x10;
 /// `ACK` — either direction, acknowledges a DELIVER.
 pub const FRAME_ACK: u16 = 0x11;
@@ -34,6 +44,11 @@ pub const FRAME_FETCH: u16 = 0x20;
 /// `FETCH_RESPONSE` — hub → client, batch of queued messages.
 pub const FRAME_FETCH_RESPONSE: u16 = 0x21;
 /// `SUBSCRIBE` — client → hub, register routing tokens for live delivery.
+///
+/// Payload is **N × 16-byte routing IDs concatenated** (no length
+/// prefix; the outer frame length gives the total). On receipt the
+/// hub registers this connection for live delivery to each routing
+/// ID and immediately flushes any queued messages for them.
 pub const FRAME_SUBSCRIBE: u16 = 0x22;
 /// `ROOM_OP` — client → hub, create/join/leave/admin a room.
 pub const FRAME_ROOM_OP: u16 = 0x30;

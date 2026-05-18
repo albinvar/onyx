@@ -2866,7 +2866,14 @@ dependencies = [
 name = "onyx-hub"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
+ "base32",
+ "clap",
+ "futures",
  "onyx-core",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -6,6 +6,88 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T3.1: `onyx-hub` becomes a real binary (in-memory store-and-forward)
+
+### What landed
+The hub stops being a one-line "scaffold only" stub and starts being an actual server. After this phase a client speaking the hub protocol can:
+
+1. Open a Noise XK session to the hub's identity key.
+2. `SUBSCRIBE` to one or more 16-byte routing IDs.
+3. `DELIVER` opaque payloads addressed to a routing ID and have them either live-routed to currently-connected subscribers or queued and flushed the moment a subscriber arrives.
+
+The hub never sees plaintext — the payloads it shuttles are already MLS-encrypted by the sender — and it never persists anything to disk (queues are in-memory only). Both are deliberate v0 limitations, tracked below.
+
+### `crates/onyx-hub` — new modules
+
+- **`state.rs`** — `HubState` holds three `HashMap`s wrapped behind a `tokio::sync::Mutex` (the hub binary `Arc`s it around per-connection handlers):
+  - `senders: ConnId → mpsc::Sender<Vec<u8>>` — one per live connection; the handler reads from its `rx` and writes out to the wire.
+  - `subscribers: RoutingId → HashSet<ConnId>` — who wants live delivery to each routing ID.
+  - `queues: RoutingId → Vec<Vec<u8>>` — payloads waiting for a subscriber.
+  - `register_conn` → `subscribe` (drains the queue on the spot) → `deliver` (`try_send` to each subscriber; falls back to queue if everyone is full or closed) → `unregister_conn` (also prunes empty subscriber sets). Per-connection mailbox is bounded at **64 payloads** so a slow client can't make the hub buffer unbounded data on their behalf.
+- **`handler.rs`** — `hub_handle_connection<S>` is generic over the stream type. Runs `handshake_responder` from `onyx_core::transport` against the hub's `IdentitySecret`, registers the connection, then enters a `tokio::select!` loop:
+  - frame from client → dispatch on `frame_type`:
+    - `FRAME_SUBSCRIBE` (0x22) → parse N × 16-byte routing IDs, register, flush any drained queue back to this client as a sequence of `FRAME_DELIVER` frames.
+    - `FRAME_DELIVER` (0x10) → peek the 16-byte target prefix, route via `HubState::deliver`. **The full payload (prefix included) is forwarded** — see design note below.
+    - anything else → log + ignore.
+  - message from `rx` → write out as `FRAME_DELIVER`.
+  - On any exit (clean EOF or wire error), unregister the connection so subscriptions are reclaimed.
+- **`main.rs`** — real daemon shape mirroring `onyxd`:
+  - CLI: `--vault`, `--passphrase` (env `ONYX_HUB_PASSPHRASE`), `--no-tor`, `--tor-state-dir`.
+  - Opens / creates an encrypted vault, ensures a default `hub` identity, drops the vault handle (v0 hub keeps no per-conn persisted state), then bootstraps Tor and publishes a v3 hidden service named `onyx-hub` on port 1. Each accepted stream is spawned into `hub_handle_connection` under its own tracing span.
+  - On startup, logs the **hub `.onion`** + the **hub's X25519 public key in base32** — the two pieces a client needs to dial.
+
+### Design choice: hub forwards the target prefix instead of stripping it
+A `FRAME_DELIVER` payload is `target_routing_id (16 B) ‖ body`. There were two reasonable choices for what subscribers see when the hub forwards:
+
+1. Strip the prefix → subscribers receive just `body`. Cleaner if you're subscribed to exactly one routing ID.
+2. Keep the prefix → subscribers receive the same shape the sender sent.
+
+We went with **(2)** because a client that subscribes to multiple routing IDs (their inbox, plus one per active room they're paying attention to, plus per-peer rotating session tokens) needs to know *which* subscription matched in order to dispatch to the right ratchet. The recipient strips the prefix before decrypting; the hub never reads past byte 16. This is now codified in `wire.rs`'s doc on `FRAME_DELIVER`.
+
+The first hub integration test exercised this and failed precisely because the initial implementation stripped the prefix — kept the test in the repo as a regression guard.
+
+### Tests (all under `cargo test -p onyx-hub`)
+- **`state::tests`** — four tokio tests against `HubState` directly, no I/O:
+  - `subscribe_then_deliver_routes_live`
+  - `deliver_then_subscribe_drains_queue`
+  - `multiple_subscribers_all_get_delivery`
+  - `unregister_cleans_up_subscriptions` (also asserts that empty subscriber sets get pruned, not just emptied)
+- **`handler::tests`** — two end-to-end protocol tests using `tokio::io::duplex(65_536)` pairs (no Tor needed):
+  - `subscribe_then_deliver_round_trip` — alice subscribes, bob delivers, alice receives over the wire including the preserved 16-byte target prefix.
+  - `deliver_then_subscribe_drains_queue_over_wire` — bob delivers while no subscriber exists (hub queues), then alice subscribes and the queued message is flushed before her first `read_frame` returns. Also asserts `state.queue_len(&id) == 0` after the drain.
+
+All 6 hub tests pass. All **122** prior `onyx-core` tests still pass.
+
+### Hub protocol payload formats (now codified in `crates/onyx-core/src/wire.rs`)
+- `FRAME_SUBSCRIBE` (0x22): payload = **N × 16 bytes** of routing IDs concatenated. No length prefix — the outer frame length gives the total.
+- `FRAME_DELIVER` (0x10), hub mode: payload = **16-byte target ‖ opaque body**. The body is MLS ciphertext to the hub; the prefix is preserved on forwarding.
+- `FRAME_DELIVER` (0x10), P2P mode: payload = **full `MessageEnvelope` CBOR** (the connection identifies the peer; no routing prefix needed).
+
+### Why no integration test against real Tor in this entry
+The `onyxd` side has no hub-client mode yet (no `--via-hub-onion`, no `--via-hub-pubkey`). Wiring the daemon to actually use the hub as a relay — bootstrap path, sealed-sender envelope, hub-side fan-out to MLS subscribers — is the next phase. This phase only ships the hub server.
+
+### `deny.toml` cleanup deferred
+The `RUSTSEC-2024-0436` (paste) advisory ignore in `deny.toml` now triggers a `warning[advisory-not-detected]` — the dep tree no longer carries it (probably because the `rusqlite 0.32 → 0.39` bump moved past it transitively). The check still passes; cleaning up the stale ignore is a one-line follow-up not worth blocking this phase on.
+
+### Verification
+- `cargo fmt --all --check` ✓ (rustfmt re-flowed a few of the hub files; committed).
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ — fixed three pedantic lints along the way: a `dead_code` on the hub's diagnostic getters (kept them, marked `#[allow]` until the periodic status report exists), a `manual_let_else` in the read-frame branch, and an `incompatible_msrv` for `usize::is_multiple_of` (replaced with `% != 0` — `is_multiple_of` is Rust 1.87, our MSRV is 1.85).
+- `cargo test --workspace` ✓ — 122 in `onyx-core`, 6 in `onyx-hub`.
+- `cargo deny check` ✓ (advisories ok, bans ok, licenses ok, sources ok).
+
+### Open security gaps (carry-forward)
+- **In-memory only**: hub state evaporates on restart. Persistent queues live in DESIGN §6 but are not implemented.
+- **Open registration**: anyone who knows the hub's static key can connect. Invite-only auth (DESIGN §9.1) is unimplemented.
+- **No rate limiting / quotas**: a misbehaving sender can fill subscribers' bounded mailboxes (deliveries then queue, eating hub RAM). v0 acceptable because the hub binary is single-tenant for now.
+- **No `onyxd` hub-client mode** — next phase. Until then the hub is exercised only by the in-tree duplex tests.
+- **No `onyx` CLI / local API socket** still the biggest UX gap.
+- **No sealed-sender on the daemon path** still pending.
+- **500ms drain hack** still in `onyxd` chat loop.
+- **fs-mistrust env-var workaround** still required for custom `--tor-state-dir`.
+- **No schema migration runner.**
+
+---
+
 ## 2026-05-18 — Chat loop: many messages per connection, asymmetric stdin/receive
 
 ### What's new
