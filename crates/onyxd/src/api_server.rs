@@ -205,6 +205,30 @@ async fn dispatch_one_shot(
             let entries = state.conversations.lock().await.list();
             ApiResponse::PeersOk { entries }
         }
+        ApiRequest::History { peer_short, limit } => {
+            // Both sides are small constants; the only failure mode of
+            // these conversions is "value > u32::MAX", which can't happen
+            // for RING_CAPACITY. usize::try_from is infallible on the
+            // platforms we care about but we let it bubble defensively.
+            let ring_cap = u32::try_from(crate::conversations::RING_CAPACITY)
+                .unwrap_or(u32::MAX);
+            let limit_clamped = usize::try_from((*limit).min(ring_cap)).unwrap_or(0);
+            match state
+                .conversations
+                .lock()
+                .await
+                .history(peer_short, limit_clamped)
+            {
+                Some(messages) => ApiResponse::HistoryOk {
+                    peer_short: peer_short.clone(),
+                    messages,
+                },
+                None => ApiResponse::Error {
+                    code: ApiErrorCode::NotReady,
+                    message: format!("no peer with short_id {peer_short}"),
+                },
+            }
+        }
         ApiRequest::Send { peer_short, text } => {
             // Look up the peer's outbound queue, push the text in, and
             // also echo it into the registry as our own outgoing

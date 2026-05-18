@@ -6,6 +6,108 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T4.3: History backfill + real Ed25519 fingerprints
+
+Third in the T4 series. Two carry-forward items from T4.2 closed:
+
+  1. New `Tail` subscribers (and the TUI on every cold start) now backfill the message scrollback from the daemon's per-peer ring buffer instead of starting blank.
+  2. The `PeerInfo::fingerprint` field is now the actual grouped Ed25519 fingerprint of the peer's MLS credential, not the X25519 b32 placeholder.
+
+### `onyx-core::api` — `History` verb
+
+```rust
+ApiRequest::History { peer_short: String, limit: u32 }
+ApiResponse::HistoryOk { peer_short: String, messages: Vec<HistoryEntry> }
+pub struct HistoryEntry { direction, text, ts_unix_ms }
+```
+
+`HistoryEntry` shape matches the daemon's `ChatLine` 1:1 so the response builder is a simple map. Messages come back ordered **oldest → newest**, capped at min(`limit`, `RING_CAPACITY = 200`). Unknown peer → `Error { NotReady }`, distinct from "known peer with empty history" → `HistoryOk { messages: [] }`.
+
+3 new round-trip tests; total `api::tests` = 18.
+
+### `onyxd::conversations` — `history(short_id, limit)`
+
+Reads from the existing per-peer `VecDeque<ChatLine>` ring; works for disconnected peers (history persists even after `mark_disconnected`). Returns `Option<Vec<HistoryEntry>>` — `None` means "no such peer", `Some(vec![])` means "known peer, no messages".
+
+4 new tokio tests (oldest→newest order, limit clamping, unknown-peer-None, disconnected-peer-still-returns-history). Total `conversations::tests` = 11.
+
+`ChatLine`'s `direction` and `ts_unix_ms` fields are no longer marked `#[allow(dead_code)]` — the `history()` reader uses both.
+
+### `onyxd::api_server` — `History` dispatcher
+
+```rust
+ApiRequest::History { peer_short, limit } => {
+    let ring_cap = u32::try_from(RING_CAPACITY).unwrap_or(u32::MAX);
+    let limit_clamped = usize::try_from((*limit).min(ring_cap)).unwrap_or(0);
+    match state.conversations.lock().await.history(peer_short, limit_clamped) {
+        Some(messages) => HistoryOk { peer_short, messages },
+        None => Error { code: NotReady, message: … },
+    }
+}
+```
+
+### `crates/onyx` TUI — automatic backfill
+
+`AppState` gained `backfilled: HashSet<String>` and `ChatLine` gained `ts_unix_ms` for dedup. The 2-second refresh tick now:
+
+  1. Fires `Status` + `Peers` (existing).
+  2. For each peer not in `backfilled`, fires `History { peer_short, limit: 200 }`.
+  3. Merges the reply into `scrollback` via the new `merge_history()`:
+     - dedup history entries by `(ts_unix_ms, text)` against live tail entries that arrived during the round-trip,
+     - prepend the deduped history to the existing scrollback (history is older),
+     - mark the peer backfilled so we don't ask again.
+
+Race-safety walkthrough: if a live `EventMessage` lands between sending `History` and receiving `HistoryOk`, the live entry is already in `scrollback` (pushed by `apply_event`). When the history reply arrives, the live entry's `(ts, text)` is in `live_keys` so the matching history entry is dropped — no duplication. The non-matching older entries get prepended.
+
+2 new TUI tests: `merge_history_dedupes_against_live_entries` and `merge_history_empty_inserts_marker`. Total `tui::snapshot_tests` = 5.
+
+### `onyx-core::mls` — `MlsParty::signing_public_bytes()` + `MlsGroupState::peer_signing_key_bytes()`
+
+`MlsParty` exposes its 32-byte Ed25519 signing pubkey:
+
+```rust
+pub fn signing_public_bytes(&self) -> Vec<u8>
+```
+
+`MlsGroupState` walks `MlsGroup::members()`, filters out the member whose `signature_key` matches ours, and returns the remaining one — but only when there's exactly one such member (i.e. a tidy 2-party group). Solo and >2-party groups return `None` because they're either uninteresting or need a different API surface.
+
+2 new unit tests (2-party round trip in both directions; solo-group returns None). Total `mls::tests` count unchanged here — the additions sit alongside the existing 30-odd MLS tests.
+
+### `onyxd::peer_session` — uses the real fingerprint
+
+After `bootstrap`/`resume` returns the new `MlsGroupState`, `peer_session` now does:
+
+```rust
+let fingerprint = derive_peer_fingerprint(&group, &state, &peer_pub_b32).await;
+let (handle, mut outbound_rx) = state.conversations.lock().await
+    .register(peer_pub, &peer_pub_b32, fingerprint);
+```
+
+`derive_peer_fingerprint`:
+  1. Locks `MlsParty` long enough to grab `signing_public_bytes()`.
+  2. Asks `MlsGroupState::peer_signing_key_bytes()` for the peer's signing key.
+  3. Decodes those 32 bytes as a `VerifyingKey` and computes `.fingerprint().to_base32_grouped()`.
+  4. Falls back to the `peer_pub_b32` placeholder at every failure point (unusual member shapes, malformed bytes, etc.) so the daemon never refuses a session over a fingerprint issue.
+
+End result: `onyx status` against a daemon with a live peer now returns a real `Peer.fingerprint` like `"qrxh nfki d3jb yh4r ipfb pi6m 4rmk 7tex pn5g 6muu f5oc d4ww svba"` instead of the X25519 b32.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — one new lint chased (a usize→u32 cast on `RING_CAPACITY`, now goes via `try_from`).
+  * `cargo test --workspace` ✓ — **142 in `onyx-core`** (+5: 3 api + 2 mls), **11 in `onyxd::conversations`** (+4), **5 in `onyx::tui`** (+2), 6 in `onyx-hub`. **164 total**.
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **Broadcast lag still only logged, not surfaced** as a `BacklogLost { count }` event for the TUI to render.
+  * **Composer can't paste multi-line** — Enter sends, always.
+  * **No graceful drain** of in-flight Tail subscribers on shutdown (broadcast just closes; backoff loop reconnects on the next bind).
+  * **`derive_peer_fingerprint` silently falls back** to the X25519 b32 if the MLS member list isn't 2-party or the bytes don't decode. A logged-warning would be more honest; for v0 the failure is rare enough that silent fallback is acceptable.
+  * Everything from prior carry-forward lists still open (no `Dial` API, no sealed-sender on daemon path, BYE+ACK shutdown protocol, fs-mistrust env-var workaround, no schema migration runner, no SO_PEERCRED).
+
+---
+
 ## 2026-05-18 — T4.2: TUI panes go live (conversation registry + Send/Tail/Peers)
 
 ### What landed

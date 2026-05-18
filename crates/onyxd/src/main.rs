@@ -45,6 +45,7 @@ use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
 use onyx_core::api::{DEFAULT_SOCKET_PATH, MessageDirection, TorState};
+use onyx_core::crypto::VerifyingKey;
 use onyx_core::crypto::{Argon2Params, IdentityPublic};
 use onyx_core::flows::{initiator_exchange, responder_exchange};
 use onyx_core::identity::Identity;
@@ -536,11 +537,12 @@ async fn peer_session(
     state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
     let peer_pub_b32 = encode_b32(&peer_pub);
-    // v0: we don't transmit the peer's Ed25519 signing key separately;
-    // use the same b32 as a placeholder fingerprint in the registry.
-    // When the MLS credential gets surfaced we'll swap this for the
-    // real signing-key fingerprint.
-    let fingerprint = peer_pub_b32.clone();
+    // Derive the peer's *real* fingerprint by walking the established
+    // MLS group's member list and Blake2-hashing whichever member
+    // signing key isn't ours. Falls back to the X25519 b32 if the
+    // group isn't a tidy 2-party one (e.g. multi-party room) or the
+    // bytes don't decode as a valid Ed25519 point.
+    let fingerprint = derive_peer_fingerprint(&group, &state, &peer_pub_b32).await;
 
     let (handle, mut outbound_rx) = {
         let mut reg = state.conversations.lock().await;
@@ -574,6 +576,31 @@ async fn peer_session(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let _ = stream.shutdown().await;
     session_result
+}
+
+/// Try to compute the peer's grouped Ed25519 fingerprint by reading
+/// the just-established MLS group's member list. Returns the
+/// `fallback` (typically `peer_pub_b32`) when anything along the way
+/// doesn't decode cleanly — never panics.
+async fn derive_peer_fingerprint(
+    group: &MlsGroupState,
+    state: &Arc<DaemonState>,
+    fallback: &str,
+) -> String {
+    let our_signing_pub = {
+        let party = state.mls_party.lock().await;
+        party.signing_public_bytes()
+    };
+    let Some(peer_sig_bytes) = group.peer_signing_key_bytes(&our_signing_pub) else {
+        return fallback.to_string();
+    };
+    let Ok(arr) = <[u8; 32]>::try_from(peer_sig_bytes.as_slice()) else {
+        return fallback.to_string();
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(arr) else {
+        return fallback.to_string();
+    };
+    vk.fingerprint().to_base32_grouped()
 }
 
 async fn drive_peer_session(

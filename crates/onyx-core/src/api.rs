@@ -83,6 +83,11 @@ pub enum ApiRequest {
     /// After issuing `Tail`, the client **must not** send further
     /// requests on the same connection — open another one for that.
     Tail,
+    /// Fetch up to `limit` most recent messages from the per-peer
+    /// ring buffer. Used by clients to backfill scrollback after a
+    /// restart or after a tail subscription reconnects. Returns
+    /// [`ApiResponse::HistoryOk`].
+    History { peer_short: String, limit: u32 },
 }
 
 /// One response line on the wire (daemon → client).
@@ -115,6 +120,13 @@ pub enum ApiResponse {
     PeersOk { entries: Vec<PeerInfo> },
     /// Reply to [`ApiRequest::Send`].
     SendOk,
+    /// Reply to [`ApiRequest::History`]. Messages are ordered oldest
+    /// → newest. May be shorter than `limit` if fewer messages exist
+    /// (or empty if the peer has no exchanged messages yet).
+    HistoryOk {
+        peer_short: String,
+        messages: Vec<HistoryEntry>,
+    },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
@@ -164,6 +176,17 @@ pub struct PeerInfo {
     pub last_message_preview: Option<String>,
     /// Daemon wall clock (ms since UNIX epoch) of the last activity.
     pub last_active_unix_ms: u64,
+}
+
+/// One past message in a [`ApiResponse::HistoryOk`] reply.
+///
+/// Shape matches the daemon's internal `ChatLine` exactly so the
+/// `HistoryOk` builder can map the ring buffer 1:1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub direction: MessageDirection,
+    pub text: String,
+    pub ts_unix_ms: u64,
 }
 
 /// Direction of an [`ApiResponse::EventMessage`].
@@ -396,6 +419,47 @@ mod tests {
             let line = encode_response_line(&r).unwrap();
             assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
         }
+    }
+
+    #[test]
+    fn request_round_trip_history() {
+        let r = ApiRequest::History {
+            peer_short: "u5lhmxps".into(),
+            limit: 50,
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_history_ok() {
+        let r = ApiResponse::HistoryOk {
+            peer_short: "u5lhmxps".into(),
+            messages: vec![
+                HistoryEntry {
+                    direction: MessageDirection::Incoming,
+                    text: "hi".into(),
+                    ts_unix_ms: 1_700_000_000_000,
+                },
+                HistoryEntry {
+                    direction: MessageDirection::Outgoing,
+                    text: "hey".into(),
+                    ts_unix_ms: 1_700_000_000_001,
+                },
+            ],
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_history_ok_empty() {
+        let r = ApiResponse::HistoryOk {
+            peer_short: "fresh".into(),
+            messages: vec![],
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
     }
 
     #[test]

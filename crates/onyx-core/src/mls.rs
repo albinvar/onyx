@@ -177,6 +177,14 @@ impl MlsParty {
         })
     }
 
+    /// Public signing key for this party as raw bytes (32 bytes for
+    /// the ed25519 ciphersuite). Used as the "this is me" reference
+    /// when scanning a group's members for the peer.
+    #[must_use]
+    pub fn signing_public_bytes(&self) -> Vec<u8> {
+        self.signature_keys.to_public_vec()
+    }
+
     /// Generate a fresh `KeyPackage` for this party and serialise it.
     /// Send the bytes to a peer who wants to invite us into a group.
     pub fn key_package_bytes(&self) -> Result<Vec<u8>> {
@@ -364,6 +372,30 @@ impl MlsGroupState {
             _ => Err(Error::InvalidEncoding(
                 "mls: processed message is not an ApplicationMessage",
             )),
+        }
+    }
+
+    /// Public signing key of the *other* member of a 2-party group,
+    /// as raw bytes. The argument is our own public signing key —
+    /// the comparison happens here so the caller doesn't need to
+    /// `Eq`-implement the wrapper types. Returns `None` when this
+    /// group isn't a tidy 2-party group (solo, or > 2 members).
+    ///
+    /// v0 Onyx is point-to-point, so a 2-member group is the only
+    /// case the daemon cares about. Multi-party rooms will surface
+    /// peers via a different API.
+    #[must_use]
+    pub fn peer_signing_key_bytes(&self, our_signing_pub: &[u8]) -> Option<Vec<u8>> {
+        let mut peers: Vec<Vec<u8>> = self
+            .group
+            .members()
+            .map(|m| m.signature_key)
+            .filter(|k| k.as_slice() != our_signing_pub)
+            .collect();
+        if peers.len() == 1 {
+            Some(peers.pop().expect("len checked"))
+        } else {
+            None
         }
     }
 
@@ -650,6 +682,31 @@ mod tests {
     fn welcome_round_trip_creates_matching_groups() {
         let (_alice, _bob, alice_group, bob_group) = established_2party();
         assert_eq!(alice_group.epoch(), bob_group.epoch());
+    }
+
+    #[test]
+    fn peer_signing_key_bytes_returns_the_other_member() {
+        let (alice, bob, alice_group, bob_group) = established_2party();
+        let alice_sig = alice.signing_public_bytes();
+        let bob_sig = bob.signing_public_bytes();
+        // From alice's perspective the peer is bob.
+        let from_alice = alice_group
+            .peer_signing_key_bytes(&alice_sig)
+            .expect("2-party group should yield a peer key");
+        assert_eq!(from_alice, bob_sig);
+        // And the reverse.
+        let from_bob = bob_group
+            .peer_signing_key_bytes(&bob_sig)
+            .expect("2-party group should yield a peer key");
+        assert_eq!(from_bob, alice_sig);
+    }
+
+    #[test]
+    fn peer_signing_key_bytes_returns_none_for_solo_group() {
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let group = alice.create_group().unwrap();
+        let alice_sig = alice.signing_public_bytes();
+        assert!(group.peer_signing_key_bytes(&alice_sig).is_none());
     }
 
     #[test]

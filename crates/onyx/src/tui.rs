@@ -39,17 +39,22 @@
 //!   * `Backspace`          — delete one char.
 //!   * any other char       — append to composer.
 //!
+//! ## History backfill
+//!
+//! On each refresh tick the TUI fetches `History` for any peer whose
+//! short_id isn't yet in the `backfilled` set. Replies are merged
+//! into the existing scrollback (deduplicated by `(ts_unix_ms, text)`
+//! against live entries that arrived during the round-trip). Once a
+//! peer is in `backfilled` we don't ask again — live events take
+//! over.
+//!
 //! ## Things deliberately not here yet
 //!
-//!   * Backfill of message history on tail-resume (the registry has
-//!     a ring buffer, but the API has no `History` verb yet — so
-//!     new tail subscribers only see messages from the moment they
-//!     subscribed).
 //!   * Visual indicator of unread per-peer counts beyond the bold
 //!     marker.
 //!   * Wrapping / scrolling for very long messages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -61,7 +66,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use onyx_core::api::{
-    ApiRequest, ApiResponse, MessageDirection, PeerInfo, TorState, decode_response,
+    ApiRequest, ApiResponse, HistoryEntry, MessageDirection, PeerInfo, TorState, decode_response,
     encode_request_line,
 };
 use ratatui::Terminal;
@@ -100,6 +105,9 @@ struct AppState {
     last_send_result: Option<Result<(), String>>,
     /// Visual indicator of whether the tail connection is alive.
     tail_active: bool,
+    /// Set of `short_id`s we've already fetched History for. Prevents
+    /// re-firing the backfill request every refresh tick.
+    backfilled: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +123,9 @@ struct StatusSnapshot {
 struct ChatLine {
     direction: MessageDirection,
     text: String,
+    /// Daemon wall clock at the moment the line was created. Used for
+    /// deduplication when history backfill races with live events.
+    ts_unix_ms: u64,
 }
 
 impl AppState {
@@ -128,6 +139,7 @@ impl AppState {
             composer: String::new(),
             last_send_result: None,
             tail_active: false,
+            backfilled: HashSet::new(),
         }
     }
 
@@ -162,12 +174,16 @@ impl AppState {
                 peer_short,
                 direction,
                 text,
-                ..
+                ts_unix_ms,
             } => {
                 self.scrollback
                     .entry(peer_short)
                     .or_default()
-                    .push(ChatLine { direction, text });
+                    .push(ChatLine {
+                        direction,
+                        text,
+                        ts_unix_ms,
+                    });
                 true
             }
             ApiResponse::EventPeerConnected { peer } => {
@@ -377,6 +393,58 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
     {
         app.apply_peers_snapshot(entries);
     }
+
+    // History backfill for any peer we haven't fetched yet. Cheap to
+    // run every tick because the `backfilled` set short-circuits the
+    // common case.
+    let to_backfill: Vec<String> = app
+        .peers
+        .iter()
+        .filter(|p| !app.backfilled.contains(&p.short_id))
+        .map(|p| p.short_id.clone())
+        .collect();
+    for short in to_backfill {
+        let req = ApiRequest::History {
+            peer_short: short.clone(),
+            limit: 200,
+        };
+        if let Ok(ApiResponse::HistoryOk {
+            peer_short,
+            messages,
+        }) = client::one_shot(socket, &req).await
+        {
+            merge_history(app, &peer_short, messages);
+            app.backfilled.insert(peer_short);
+        }
+        // Any non-Ok or non-HistoryOk: leave unbackfilled, retry next tick.
+    }
+}
+
+/// Merge `messages` (oldest → newest) into the front of the scrollback
+/// for `peer_short`, deduplicating against any already-stored live
+/// entries by `(ts_unix_ms, text)`. Live entries that happened during
+/// the History fetch keep their position at the end of the buffer.
+fn merge_history(app: &mut AppState, peer_short: &str, messages: Vec<HistoryEntry>) {
+    let entry = app.scrollback.entry(peer_short.to_string()).or_default();
+    if messages.is_empty() {
+        return;
+    }
+    let live_keys: HashSet<(u64, String)> = entry
+        .iter()
+        .map(|l| (l.ts_unix_ms, l.text.clone()))
+        .collect();
+    let mut prepend: Vec<ChatLine> = messages
+        .into_iter()
+        .filter(|m| !live_keys.contains(&(m.ts_unix_ms, m.text.clone())))
+        .map(|m| ChatLine {
+            direction: m.direction,
+            text: m.text,
+            ts_unix_ms: m.ts_unix_ms,
+        })
+        .collect();
+    let existing = std::mem::take(entry);
+    prepend.extend(existing);
+    *entry = prepend;
 }
 
 // ── Background tasks ─────────────────────────────────────────────────────
@@ -762,14 +830,17 @@ mod snapshot_tests {
                 ChatLine {
                     direction: MessageDirection::Incoming,
                     text: "hi".into(),
+                    ts_unix_ms: 1_700_000_000_000,
                 },
                 ChatLine {
                     direction: MessageDirection::Outgoing,
                     text: "hey".into(),
+                    ts_unix_ms: 1_700_000_000_010,
                 },
                 ChatLine {
                     direction: MessageDirection::Incoming,
                     text: "how's the audit?".into(),
+                    ts_unix_ms: 1_700_000_000_020,
                 },
             ],
         );
@@ -824,6 +895,57 @@ mod snapshot_tests {
         assert!(snap.contains("how's the audit?"));
         assert!(snap.contains("looking good"));
         assert!(snap.contains("● live"));
+    }
+
+    #[test]
+    fn merge_history_dedupes_against_live_entries() {
+        let mut app = mock_app_with_status(TorState::Ready);
+        // Pretend the live tail already delivered one message.
+        app.scrollback.insert(
+            "u5lhmxps".into(),
+            vec![ChatLine {
+                direction: MessageDirection::Incoming,
+                text: "live-3".into(),
+                ts_unix_ms: 3_000,
+            }],
+        );
+        // History returns three messages including one that matches
+        // the live entry exactly — the dup must drop, not stack.
+        let history = vec![
+            HistoryEntry {
+                direction: MessageDirection::Incoming,
+                text: "old-1".into(),
+                ts_unix_ms: 1_000,
+            },
+            HistoryEntry {
+                direction: MessageDirection::Outgoing,
+                text: "old-2".into(),
+                ts_unix_ms: 2_000,
+            },
+            HistoryEntry {
+                direction: MessageDirection::Incoming,
+                text: "live-3".into(),
+                ts_unix_ms: 3_000,
+            },
+        ];
+        merge_history(&mut app, "u5lhmxps", history);
+        let texts: Vec<&str> = app
+            .scrollback
+            .get("u5lhmxps")
+            .unwrap()
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(texts, ["old-1", "old-2", "live-3"]);
+    }
+
+    #[test]
+    fn merge_history_empty_inserts_marker() {
+        let mut app = mock_app_with_status(TorState::Ready);
+        merge_history(&mut app, "fresh", vec![]);
+        // Entry exists (so we won't keep retrying) but is empty.
+        let s = app.scrollback.get("fresh").unwrap();
+        assert!(s.is_empty());
     }
 
     #[test]

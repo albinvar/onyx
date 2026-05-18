@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use onyx_core::api::{ApiResponse, MessageDirection, PeerInfo};
+use onyx_core::api::{ApiResponse, HistoryEntry, MessageDirection, PeerInfo};
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 /// Per-peer outbound queue depth. The API's `Send` handler `try_send`s
@@ -65,18 +65,12 @@ struct ConversationState {
     last_active_unix_ms: u64,
 }
 
-/// One line in a conversation's ring buffer.
-///
-/// Today the ring is only read by `peer_info_for` (which uses the
-/// most recent `text` as a preview). `direction` and `ts_unix_ms`
-/// are kept for the imminent `History` API verb that will let a
-/// fresh `Tail` subscriber backfill the last N messages.
+/// One line in a conversation's ring buffer. Mirrors the
+/// [`HistoryEntry`] wire shape.
 #[derive(Debug, Clone)]
 pub struct ChatLine {
-    #[allow(dead_code)]
     pub direction: MessageDirection,
     pub text: String,
-    #[allow(dead_code)]
     pub ts_unix_ms: u64,
 }
 
@@ -218,6 +212,31 @@ impl ConversationRegistry {
     #[must_use]
     pub fn list(&self) -> Vec<PeerInfo> {
         self.by_peer.values().map(info_of).collect()
+    }
+
+    /// Most recent `limit` messages for the peer, oldest → newest.
+    /// Returns `None` if no peer with that `short_id` is known —
+    /// distinct from `Some(vec![])`, which means "known peer, no
+    /// messages exchanged yet". Disconnected peers still have
+    /// retrievable history.
+    #[must_use]
+    pub fn history(&self, short_id: &str, limit: usize) -> Option<Vec<HistoryEntry>> {
+        let peer_pub = self.by_short.get(short_id)?;
+        let state = self.by_peer.get(peer_pub)?;
+        let total = state.ring.len();
+        let take_from = total.saturating_sub(limit);
+        Some(
+            state
+                .ring
+                .iter()
+                .skip(take_from)
+                .map(|line| HistoryEntry {
+                    direction: line.direction,
+                    text: line.text.clone(),
+                    ts_unix_ms: line.ts_unix_ms,
+                })
+                .collect(),
+        )
     }
 
     fn peer_info_for(&self, peer_pub: &[u8; 32]) -> Option<PeerInfo> {
@@ -384,5 +403,59 @@ mod tests {
         let (handle, mut rx) = reg.register([6u8; 32], &b32(), "fpr".into());
         handle.outbound_tx.send("hi peer".into()).await.unwrap();
         assert_eq!(rx.recv().await.unwrap(), "hi peer");
+    }
+
+    #[tokio::test]
+    async fn history_returns_messages_oldest_to_newest() {
+        let mut reg = ConversationRegistry::new();
+        let (handle, _rx) = reg.register([10u8; 32], &b32(), "fpr".into());
+        for i in 0..5 {
+            reg.push_message(
+                &handle.peer_pub,
+                MessageDirection::Incoming,
+                format!("m{i}"),
+            );
+        }
+        let hist = reg.history(&handle.short_id, 10).expect("known peer");
+        assert_eq!(hist.len(), 5);
+        let texts: Vec<&str> = hist.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["m0", "m1", "m2", "m3", "m4"]);
+    }
+
+    #[tokio::test]
+    async fn history_limit_returns_only_the_most_recent() {
+        let mut reg = ConversationRegistry::new();
+        let (handle, _rx) = reg.register([11u8; 32], &b32(), "fpr".into());
+        for i in 0..10 {
+            reg.push_message(
+                &handle.peer_pub,
+                MessageDirection::Outgoing,
+                format!("m{i}"),
+            );
+        }
+        let hist = reg.history(&handle.short_id, 3).unwrap();
+        assert_eq!(
+            hist.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["m7", "m8", "m9"]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_unknown_peer_is_none() {
+        let reg = ConversationRegistry::new();
+        assert!(reg.history("nopeer", 10).is_none());
+    }
+
+    #[tokio::test]
+    async fn history_for_disconnected_peer_still_works() {
+        let mut reg = ConversationRegistry::new();
+        let (handle, _rx) = reg.register([12u8; 32], &b32(), "fpr".into());
+        reg.push_message(&handle.peer_pub, MessageDirection::Incoming, "saved".into());
+        reg.mark_disconnected(&handle.peer_pub);
+        let hist = reg.history(&handle.short_id, 10).expect("known peer");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].text, "saved");
+        // But Send-lookup is blocked.
+        assert!(reg.handle_for_short(&handle.short_id).is_none());
     }
 }
