@@ -19,6 +19,7 @@
 
 #![doc(html_no_source)]
 
+pub mod api;
 pub mod crypto;
 pub mod error;
 pub mod flows;

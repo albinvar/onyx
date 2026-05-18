@@ -6,6 +6,114 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T4.1: Local API socket + `onyx` CLI/TUI (multi-pane TUI shell)
+
+### What landed
+
+`onyxd` now holds the only copy of the unlocked vault, identity, MLS state, and Tor circuit, but it stops being unreachable from the rest of the user's terminal session. A new local Unix-domain socket exposes a JSON request/response API, and the `onyx` binary — until now a "scaffold only" stub — becomes a real stateless client with three subcommands:
+
+  * `onyx status`   — JSON dump of daemon liveness + identity + Tor state.
+  * `onyx identity` — JSON dump of the identity key + fingerprint.
+  * `onyx tui`      — interactive multi-pane Ratatui interface (the layout the user picked from the four-pane mockup).
+
+### `onyx-core::api` — protocol module
+
+A new module **on the shared boundary** so the CLI and daemon import the same types. v0 surface is intentionally tiny:
+
+```rust
+pub enum ApiRequest { Status, Identity }
+pub enum ApiResponse {
+    StatusOk { api_version, daemon_version, identity_pub_b32, fingerprint, tor_state },
+    IdentityOk { identity_pub_b32, fingerprint },
+    Error { code: ApiErrorCode, message: String },
+}
+pub enum TorState { Disabled, Ready }
+pub enum ApiErrorCode { UnknownRequest, NotReady, Internal, Malformed }
+```
+
+Wire format is **newline-delimited JSON** (`#[serde(tag="kind")]` for every enum). Reasons codified in the module doc: every line is self-describing, the wire is trivially debuggable from a shell (`nc -U ./onyxd.sock | jq` Just Works), and CBOR stays where it belongs — between daemons over Noise. v0 is request → response only (no multiplexing, no event push, no request IDs); those are next-phase concerns once we wire `send` / `tail`.
+
+`API_VERSION` constant gets bumped any time the shape changes incompatibly. `DEFAULT_SOCKET_PATH = "./onyxd.sock"` — short on purpose (macOS `sun_path` is 104 bytes and `/var/folders/...` already eats most of it) and predictable for the operator.
+
+8 round-trip tests cover every variant, plus a literal-wire-shape test that fails loudly if anyone accidentally renames a tag.
+
+### `onyxd::api_server` — Unix socket + accept loop
+
+New `--api-socket <path>` flag (env `ONYX_API_SOCKET`, default `./onyxd.sock`). On startup:
+
+  1. Remove any stale socket file from a prior crash (bind would otherwise return EADDRINUSE).
+  2. `UnixListener::bind`.
+  3. `chmod 0600` so only the daemon's UID can connect. **Auth is filesystem-permission-based** — no token, no SO_PEERCRED check. The threat model justifies this: if an attacker can read your socket file they can already read your vault.
+  4. Accept loop spawns a per-connection `tokio` task; each task reads NDJSON lines, dispatches via a pure `dispatch(&req, &state, tor_state)`, writes the response.
+  5. On daemon exit, best-effort `remove_file` on the socket path.
+
+The server runs as a `tokio::spawn`'d task **alongside** the existing `run_accept_mode` / `run_dial_mode`, including in `--no-tor` mode. So `onyx status` works regardless of which mode the daemon is in. `DaemonState` gained `pub(crate)` visibility (still internal to onyxd).
+
+### `crates/onyx` — stateless CLI + Ratatui TUI
+
+Replaced the one-line scaffold with a clap-driven binary:
+
+  * `src/client.rs` — `one_shot(socket_path, req) → ApiResponse` over `UnixStream`.
+  * `src/tui.rs` — the four-pane layout (Peers / Conversation / Compose / Status). Background-refreshes the status bar every two seconds from the daemon's API socket. Keys: `q` or `Ctrl-C` to quit, `r` for immediate refresh. Panic-safe terminal restoration.
+  * `src/main.rs` — clap dispatch, exit codes (`0` success, `1` daemon `Error` variant, `2` socket connect failure).
+
+Peers / Conversation / Compose are placeholders in v0 — explicitly labelled "next phase" rather than empty. The chrome and layout are real; the live data behind them lands in T4.2 with the daemon's conversation-state refactor (multiple concurrent dials keyed by peer pub).
+
+New workspace deps: `ratatui = "0.30"`, `crossterm = "0.29"` (0.30 doesn't exist yet on crates.io), `serde_json = "1"`.
+
+### Smoke test (real daemon, captured verbatim)
+
+```
+$ onyxd --vault /tmp/onyx-smoke/onyx-state.db --no-tor \
+        --api-socket /tmp/onyx-smoke/onyxd.sock
+INFO onyxd: vault unlocked, identity loaded
+  fingerprint=6dzx yrut hgez rucw js3g fpdu xggt jn7r 53on aowq iop5 nvmx fk7q
+  identity_pub_b32=fudqeber2e4dutmkw3yahejh6gpemta3k6vx6no55h65pmpmimkq
+WARN onyxd: --no-tor set: skipping Tor; daemon serves only the local API
+INFO onyxd::api_server: API socket bound — `onyx` CLI can connect
+  path=/tmp/onyx-smoke/onyxd.sock  mode=0600
+
+$ ls -la /tmp/onyx-smoke/onyxd.sock
+srw-------@ 1 albinvar wheel 0 May 18 12:44 /tmp/onyx-smoke/onyxd.sock
+
+$ onyx --socket /tmp/onyx-smoke/onyxd.sock status
+{
+  "kind": "StatusOk",
+  "api_version": 1,
+  "daemon_version": "0.0.1",
+  "identity_pub_b32": "fudqeber2e4dutmkw3yahejh6gpemta3k6vx6no55h65pmpmimkq",
+  "fingerprint": "6dzx yrut hgez rucw js3g fpdu xggt jn7r 53on aowq iop5 nvmx fk7q",
+  "tor_state": "disabled"
+}
+
+$ onyx --socket /tmp/onyx-smoke/onyxd.sock identity
+{
+  "kind": "IdentityOk",
+  "identity_pub_b32": "fudqeber2e4dutmkw3yahejh6gpemta3k6vx6no55h65pmpmimkq",
+  "fingerprint": "6dzx yrut hgez rucw js3g fpdu xggt jn7r 53on aowq iop5 nvmx fk7q"
+}
+```
+
+Both responses parse as JSON and the identity fields match what the daemon logged.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — fixed three lints along the way (`map_unwrap_or` → `is_none_or`, `needless_pass_by_value` on `dispatch`, an intermediate `unnecessary_map_or`).
+  * `cargo test --workspace` ✓ — **130 in `onyx-core`** (was 122; 8 new `api::tests`), 6 in `onyx-hub`.
+  * `cargo deny check` (run separately) ✓.
+  * Live smoke test above.
+
+### Open security gaps + carry-forward
+
+  * **TUI panes are placeholders.** Real conversations, message history, and a working composer need the daemon-side conversation-state refactor (one `ConversationHandle` per active peer behind an `Arc<Mutex<HashMap<PeerPub, ...>>>`) plus `Send` / `Tail` / `Subscribe` API verbs. That's T4.2.
+  * **No event push on the API socket** — every request still gets exactly one response. `Tail` will introduce streaming, which means we'll also need request IDs to disambiguate concurrent calls on one connection.
+  * **No SO_PEERCRED / kernel-side auth** — we rely on `0600` permissions only. Adequate for v0; documented in the module.
+  * **Graceful socket cleanup on `SIGTERM`** — only `SIGINT` (`Ctrl-C`) currently triggers the `remove_file`. SIGTERM kills the tokio runtime before the cleanup hook runs. Next start cleans it up via `remove_file` before bind anyway, so this is cosmetic.
+  * Everything from prior CHANGELOG carry-forward lists is still open.
+
+---
+
 ## 2026-05-18 — T3.1: `onyx-hub` becomes a real binary (in-memory store-and-forward)
 
 ### What landed

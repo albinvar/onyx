@@ -35,12 +35,15 @@
 //!   * Contact verification on dial path.
 //!   * Sealed-sender bootstrap on the daemon path.
 
+mod api_server;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
+use onyx_core::api::{DEFAULT_SOCKET_PATH, TorState};
 use onyx_core::crypto::{Argon2Params, IdentityPublic};
 use onyx_core::flows::{initiator_exchange, responder_exchange};
 use onyx_core::identity::Identity;
@@ -92,6 +95,12 @@ struct Args {
     /// X25519 identity public key of the peer to dial (base32).
     #[arg(long, requires = "dial_onion")]
     dial_pubkey: Option<String>,
+
+    /// Path for the local API socket (Unix domain socket) that the
+    /// `onyx` CLI / TUI connects to. The daemon `chmod`s it to
+    /// `0600` after bind. Pass `none` to disable the API entirely.
+    #[arg(long, env = "ONYX_API_SOCKET", default_value = DEFAULT_SOCKET_PATH)]
+    api_socket: String,
 }
 
 /// Bundle of state every handler needs.
@@ -102,11 +111,11 @@ struct Args {
 /// under the MLS lock, then briefly take the vault lock to persist
 /// — but documenting the policy here makes future deadlocks easier
 /// to catch.)
-struct DaemonState {
-    identity: Identity,
-    identity_id: i64,
-    mls_party: Arc<Mutex<MlsParty>>,
-    vault: Arc<Mutex<Vault>>,
+pub(crate) struct DaemonState {
+    pub(crate) identity: Identity,
+    pub(crate) identity_id: i64,
+    pub(crate) mls_party: Arc<Mutex<MlsParty>>,
+    pub(crate) vault: Arc<Mutex<Vault>>,
 }
 
 #[tokio::main]
@@ -152,18 +161,32 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("MLS party create failed: {e}"))?
     };
 
-    let state = DaemonState {
+    let state = Arc::new(DaemonState {
         identity,
         identity_id,
         mls_party: Arc::new(Mutex::new(mls_party)),
         vault: Arc::new(Mutex::new(vault)),
-    };
+    });
 
     drop(args.passphrase);
 
+    let api_socket_path = PathBuf::from(&args.api_socket);
+
     if args.no_tor {
-        warn!("--no-tor set: skipping Tor; daemon will idle until Ctrl-C");
-        wait_for_ctrl_c().await;
+        warn!("--no-tor set: skipping Tor; daemon serves only the local API until Ctrl-C");
+        let api_task = tokio::spawn(api_server::serve_api(
+            api_socket_path,
+            state.clone(),
+            TorState::Disabled,
+        ));
+        tokio::select! {
+            res = api_task => {
+                if let Ok(Err(e)) = res {
+                    warn!(error = %e, "API server stopped with error");
+                }
+            }
+            () = wait_for_ctrl_c() => info!("shutting down on Ctrl-C"),
+        }
         return Ok(());
     }
 
@@ -185,13 +208,25 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("Tor bootstrap complete");
 
-    let state = Arc::new(state);
+    // Bring the API server up before the mode-specific logic so that a
+    // long-running --dial-mode session is still observable via `onyx status`.
+    let api_task = tokio::spawn(api_server::serve_api(
+        api_socket_path,
+        state.clone(),
+        TorState::Ready,
+    ));
 
-    if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey) {
-        run_dial_mode(&tor, &state, onion, pubkey_b32).await?;
+    let mode_result = if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey)
+    {
+        run_dial_mode(&tor, &state, onion, pubkey_b32).await
     } else {
-        run_accept_mode(&tor, state.clone()).await?;
-    }
+        run_accept_mode(&tor, state.clone()).await
+    };
+
+    // Stop the API server so its socket file gets unlinked promptly.
+    api_task.abort();
+    // Surface any mode error after API cleanup so it isn't lost.
+    mode_result?;
 
     drop(tor);
     Ok(())
