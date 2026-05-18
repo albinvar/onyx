@@ -210,8 +210,7 @@ async fn dispatch_one_shot(
             // these conversions is "value > u32::MAX", which can't happen
             // for RING_CAPACITY. usize::try_from is infallible on the
             // platforms we care about but we let it bubble defensively.
-            let ring_cap = u32::try_from(crate::conversations::RING_CAPACITY)
-                .unwrap_or(u32::MAX);
+            let ring_cap = u32::try_from(crate::conversations::RING_CAPACITY).unwrap_or(u32::MAX);
             let limit_clamped = usize::try_from((*limit).min(ring_cap)).unwrap_or(0);
             match state
                 .conversations

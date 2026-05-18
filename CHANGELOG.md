@@ -6,6 +6,106 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.1: `onyxd` becomes a hub client (subscribe + receive)
+
+The `onyx-hub` binary has been sitting idle since T3.1. This phase brings it into the daemon flow as a subscriber: `onyxd --hub-onion HOST[:PORT] --hub-pubkey B32` opens a long-lived authenticated Noise session to the hub, registers a `FRAME_SUBSCRIBE` for the daemon's own introduction-inbox routing id, then loops on `FRAME_DELIVER`. Reconnects on disconnect with 500 ms → 30 s exponential backoff.
+
+This is **half** of hub integration: receiving only. Sending via the hub (sealed-sender envelope to a peer's inbox routing id, hub-forwarded) is T5.2.
+
+### `crates/onyxd/src/hub_client.rs` — new module
+
+```rust
+pub async fn run_hub_session<F>(
+    tor: &TorRuntime,
+    host: &str, port: u16,
+    hub_pubkey: &IdentityPublic,
+    our_identity_sk: &IdentitySecret,
+    subscribe_to: &[RoutingId],
+    mut on_deliver: F,
+) -> anyhow::Result<()>
+where F: FnMut(RoutingId, Vec<u8>),
+```
+
+One function, one session: dial Tor → `handshake_initiator` → write one `FRAME_SUBSCRIBE` carrying N × 16-byte ids → loop reading `FRAME_DELIVER`. The `on_deliver` callback gets `(target, body_after_prefix)` for each delivery. Setup failures return `Err`; peer-closed disconnects return `Ok(())`. Either is a cue for the reconnect loop in `main.rs` to back off and retry.
+
+`parse_host_port("abc.onion:42", default=1) → ("abc.onion", 42)` is also here so the CLI flag parsing and unit tests share one implementation.
+
+3 unit tests for `parse_host_port` (explicit port, default port, garbage rejection).
+
+### `crates/onyxd/src/main.rs` — CLI flags + reconnect loop
+
+Two new `clap` arguments, paired (each requires the other):
+
+```
+--hub-onion <HOST[:PORT]>    [env: ONYX_HUB_ONION]
+--hub-pubkey <B32>           [env: ONYX_HUB_PUBKEY]
+```
+
+When both are set, after Tor bootstrap, `main` spawns a long-lived task that:
+
+  1. Derives our introduction-inbox routing id from our own fingerprint via `onyx_core::routing::introduction_inbox(&Fingerprint)` (already in the library).
+  2. Calls `hub_client::run_hub_session(...)` with that as the only subscribed id.
+  3. On any session end (clean or error), logs, sleeps for the current backoff, then retries. Backoff doubles each cycle, capped at 30 s.
+
+The hub task and the main mode (accept/dial) both share a single `Arc<TorRuntime>`. The task is aborted alongside the API task on shutdown so the Tor circuit doesn't linger past `Ctrl-C`.
+
+In v0 the `on_deliver` callback just logs `target_b32 + body_bytes` — actually routing the delivery into a conversation requires the sealed-sender unwrap and is part of T5.2.
+
+### Lock + lifetime story
+
+`IdentitySecret` deliberately doesn't implement `Clone`, so the hub task can't take `&Identity` across the spawn boundary. We work around by round-tripping the secret through bytes (`*identity_key().to_bytes()` → `IdentitySecret::from_bytes(...)`), getting a freshly-allocated copy that lives in the task's own scope. The bytes are still `Zeroizing` on drop.
+
+`TorRuntime` got wrapped in `Arc` so both the hub task and the existing `run_accept_mode` / `run_dial_mode` share it. No new locking; `tor.dial` and friends are already `&self`-based.
+
+### Verification
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ — `#[allow(clippy::too_many_lines)]` on `main` because adding the hub-task block pushed it from 130 → 140 lines, but the function is still a linear setup sequence and splitting it would just produce context-stripped helpers.
+- `cargo test --workspace` ✓ — **142 in `onyx-core`** (unchanged), **6 in `onyx-hub`** (unchanged), **14 in `onyxd`** (+3 in `hub_client::tests`), 5 in `onyx`. **167 total**.
+- `cargo deny check` ✓.
+- `onyxd --help` confirms both flags surface, both env vars surface, and `clap` rejects `--hub-onion` without `--hub-pubkey` (and vice versa).
+
+### Smoke against a real hub (manual)
+
+End-to-end requires two real Tor circuits (hub + client), so this is the operator's call. The recipe:
+
+```
+# terminal 1 — hub
+ONYX_HUB_PASSPHRASE=hub-pass ./target/debug/onyx-hub \
+  --vault ./hub.db --tor-state-dir ./hub-tor
+# logs:
+#   hub vault unlocked, identity loaded
+#     hub_pub_b32=<HUB_PUB_B32>
+#   hub hidden service published — onion=<HUB_ONION>:1
+
+# terminal 2 — daemon-as-hub-client
+FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
+ONYX_PASSPHRASE=client-pass ./target/debug/onyxd \
+  --vault ./client.db --tor-state-dir ./client-tor \
+  --hub-onion <HUB_ONION>:1 --hub-pubkey <HUB_PUB_B32>
+# logs (expected):
+#   Tor bootstrap complete
+#   hub: our introduction-inbox routing id derived
+#     our_inbox_b32=<16-byte id>
+#   hub: dialling host=<HUB_ONION> port=1
+#   hub: Tor circuit established, starting Noise XK handshake
+#   hub: Noise XK complete; sending SUBSCRIBE
+#   hub: subscription registered, entering receive loop
+```
+
+No `DELIVER` events fire in this T5.1 demo because nothing's sending into our inbox yet — that's T5.2.
+
+### Open security gaps + carry-forward
+
+- **Hub auth is open**: anyone holding the hub's static key can connect and subscribe. Invite-only auth (DESIGN §9.1) still unimplemented on the hub side.
+- **No sealed-sender wrap on the daemon path**: T5.2's job. Until then, even when DELIVER plumbing exists end-to-end the hub would see sender identity in the envelope metadata (currently the code just logs and discards bodies, so this isn't actively leaking).
+- **`on_deliver` discards bodies**: T5.2 wires this into MLS-decrypt + `ConversationRegistry::push_message`.
+- **No History / TUI surface for hub state**: the operator can see the connection in `tracing` logs but `onyx status` doesn't yet report "hub: connected".
+- **Reconnect loop is unconditional**: even if the hub is misconfigured (wrong pubkey), the task just keeps retrying. A fail-after-N-attempts circuit-breaker would be friendlier; deferred.
+- Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T4.3: History backfill + real Ed25519 fingerprints
 
 Third in the T4 series. Two carry-forward items from T4.2 closed:

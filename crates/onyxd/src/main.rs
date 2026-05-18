@@ -37,6 +37,7 @@
 
 mod api_server;
 mod conversations;
+mod hub_client;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -103,6 +104,19 @@ struct Args {
     /// `0600` after bind. Pass `none` to disable the API entirely.
     #[arg(long, env = "ONYX_API_SOCKET", default_value = DEFAULT_SOCKET_PATH)]
     api_socket: String,
+
+    /// **Hub-client mode**: long-lived authenticated session to an
+    /// `onyx-hub` for offline-message subscribe + relay. Pair with
+    /// `--hub-pubkey`. Both flags must be set together. Format is
+    /// `host` (defaults to port 1) or `host:port`. T5.1 supports
+    /// SUBSCRIBE-and-receive only; sending via the hub lands in T5.2.
+    #[arg(long, env = "ONYX_HUB_ONION", requires = "hub_pubkey")]
+    hub_onion: Option<String>,
+
+    /// Hub's X25519 identity public key (base32), printed by `onyx-hub`
+    /// at startup. Required with `--hub-onion`.
+    #[arg(long, env = "ONYX_HUB_PUBKEY", requires = "hub_onion")]
+    hub_pubkey: Option<String>,
 }
 
 /// Bundle of state every handler needs.
@@ -122,6 +136,11 @@ pub(crate) struct DaemonState {
 }
 
 #[tokio::main]
+// Main wires together vault → identity → MLS → Tor → API server →
+// optional hub-client task → main mode (accept or dial) → shutdown.
+// Splitting it for line count would just trade one readable function
+// for a fan of context-free helpers each doing 10 lines of setup.
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -211,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
     };
     info!("Tor bootstrap complete");
+    let tor = Arc::new(tor);
 
     // Bring the API server up before the mode-specific logic so that a
     // long-running --dial-mode session is still observable via `onyx status`.
@@ -219,6 +239,63 @@ async fn main() -> anyhow::Result<()> {
         state.clone(),
         TorState::Ready,
     ));
+
+    // Optional hub-client task: dial the hub, subscribe to our own
+    // inbox routing id, log every DELIVER we receive. Reconnects on
+    // disconnect with exponential backoff. Runs concurrently with the
+    // accept/dial mode below.
+    let hub_task = if let (Some(host_port), Some(pubkey_b32)) =
+        (args.hub_onion.as_ref(), args.hub_pubkey.as_ref())
+    {
+        let (host, port) =
+            hub_client::parse_host_port(host_port, ONYX_HS_PORT).context("--hub-onion")?;
+        let hub_pubkey_bytes = decode_b32_32(pubkey_b32).context("--hub-pubkey")?;
+        let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
+        let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
+        info!(
+            our_inbox_b32 = %encode_b32(&our_inbox),
+            "hub: our introduction-inbox routing id derived"
+        );
+        // IdentitySecret deliberately doesn't impl Clone; round-trip
+        // via bytes to hand a copy to the spawned task without
+        // exposing the StaticSecret type.
+        let our_sk_bytes: [u8; 32] = *state.identity.identity_key().to_bytes();
+        let tor_clone = tor.clone();
+        Some(tokio::spawn(async move {
+            let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(our_sk_bytes);
+            let mut backoff = std::time::Duration::from_millis(500);
+            loop {
+                let result = hub_client::run_hub_session(
+                    &tor_clone,
+                    &host,
+                    port,
+                    &hub_pubkey,
+                    &our_sk,
+                    &[our_inbox],
+                    |target, body| {
+                        // T5.1 stops at "we got a delivery". T5.2 will
+                        // wire this into the sealed-sender unwrap +
+                        // conversation registry.
+                        info!(
+                            target_b32 = %encode_b32(&target),
+                            body_bytes = body.len(),
+                            "hub: received delivery (decode not wired yet)"
+                        );
+                    },
+                )
+                .await;
+                match result {
+                    Ok(()) => info!("hub: session ended cleanly"),
+                    Err(e) => warn!(error = %e, "hub: session ended with error"),
+                }
+                info!(?backoff, "hub: backing off before reconnect");
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
+            }
+        }))
+    } else {
+        None
+    };
 
     let mode_result = if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey)
     {
@@ -229,6 +306,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Stop the API server so its socket file gets unlinked promptly.
     api_task.abort();
+    if let Some(h) = hub_task {
+        h.abort();
+    }
     // Surface any mode error after API cleanup so it isn't lost.
     mode_result?;
 
