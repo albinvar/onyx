@@ -184,6 +184,10 @@ async fn send_one(
 }
 
 /// Handle every verb except `Tail`. Returns a single response.
+//
+// Single match over the API enum; splitting it would just push each
+// arm into a one-line helper and make the dispatch harder to read.
+#[allow(clippy::too_many_lines)]
 async fn dispatch_one_shot(
     req: &ApiRequest,
     state: &DaemonState,
@@ -282,8 +286,16 @@ async fn dispatch_one_shot(
             peer_fingerprint,
             peer_kem_pub_b32,
             peer_kp_b64,
+            initial_text,
         } => {
-            handle_send_bootstrap_mls(peer_fingerprint, peer_kem_pub_b32, peer_kp_b64, state).await
+            handle_send_bootstrap_mls(
+                peer_fingerprint,
+                peer_kem_pub_b32,
+                peer_kp_b64,
+                initial_text.as_deref(),
+                state,
+            )
+            .await
         }
         ApiRequest::FetchPeerKeyPackage { peer_fingerprint } => {
             handle_fetch_peer_keypackage(peer_fingerprint, state).await
@@ -535,8 +547,31 @@ async fn handle_send_bootstrap_mls(
     peer_fingerprint: &str,
     peer_kem_pub_b32: &str,
     peer_kp_b64: &str,
+    initial_text: Option<&str>,
     state: &DaemonState,
 ) -> ApiResponse {
+    // Defensive cap on the optional T7.2-mls-fu intro text. The wire
+    // layer already pads to size buckets (SMALL=256, MEDIUM=1024,
+    // LARGE=4092), so a very long first_message would jump the sealed
+    // envelope from MEDIUM into LARGE — a length leak observable to
+    // anyone watching the daemon↔hub Noise channel. Keeping the cap
+    // small enough that "no intro" and "short intro" land in the same
+    // bucket as the bare Welcome (~1.2-1.5 KB for a 2-party group).
+    // 1 KiB is plenty for a paragraph of introduction text.
+    const FIRST_MESSAGE_MAX_BYTES: usize = 1024;
+    if let Some(text) = initial_text {
+        if text.len() > FIRST_MESSAGE_MAX_BYTES {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: format!(
+                    "initial_text too long ({} bytes; max {FIRST_MESSAGE_MAX_BYTES}) — keep \
+                     intro short to avoid bumping the sealed-envelope size bucket on the wire",
+                    text.len()
+                ),
+            };
+        }
+    }
+
     let Some(hub_outbound) = state.hub_outbound.as_ref() else {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
@@ -629,9 +664,16 @@ async fn handle_send_bootstrap_mls(
         (welcome, group_id, snap)
     };
 
-    // Seal the Welcome inside an mls/v1 BootstrapPayload.
+    // Seal the Welcome inside an mls/v1 BootstrapPayload, optionally
+    // riding an initial plaintext message alongside it (T7.2-mls-fu).
+    // The text is covered by the outer sealed-sender Ed25519 signature
+    // — a MITM cannot tamper with it without invalidating the whole
+    // envelope. It does **not** have MLS PCS (the ratchet only kicks
+    // in for messages sent *inside* the new group from here on); this
+    // is the same caveat as the Welcome itself.
     let payload = onyx_core::routing::BootstrapPayload::MlsWelcome {
         welcome: serde_bytes::ByteBuf::from(welcome_bytes),
+        first_message: initial_text.map(str::to_owned),
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {

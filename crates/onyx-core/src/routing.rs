@@ -148,8 +148,24 @@ pub enum BootstrapPayload {
     /// security. The Welcome itself only authenticates the sender
     /// via the outer sealed-envelope signature (Ed25519 over the
     /// canonical bytes — see `bootstrap_signing_bytes`).
+    ///
+    /// `first_message` is an *optional* plaintext "introduction"
+    /// payload the sender wants delivered alongside the Welcome
+    /// (T7.2-mls-fu). When `Some`, the recipient renders it as the
+    /// first message of the new conversation — same as if the sender
+    /// had immediately followed the Welcome with an app-level message
+    /// — instead of a synthetic placeholder. The text inherits the
+    /// envelope's per-message PFS but, like the Welcome itself,
+    /// predates the MLS ratchet so it does **not** have MLS PCS
+    /// (that kicks in for everything sent *inside* the group from
+    /// here on). Skipped in serialization when `None` so old wire
+    /// payloads round-trip byte-identically.
     #[serde(rename = "mls/v1")]
-    MlsWelcome { welcome: ByteBuf },
+    MlsWelcome {
+        welcome: ByteBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_message: Option<String>,
+    },
 }
 
 impl BootstrapPayload {
@@ -499,6 +515,7 @@ mod tests {
     fn bootstrap_payload_round_trip_mls_welcome() {
         let p = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"opaque-mls-welcome-bytes-from-rfc9420".to_vec()),
+            first_message: None,
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -506,9 +523,40 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_payload_round_trip_mls_welcome_with_first_message() {
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
+            first_message: Some("hi from the invite URL".to_string()),
+        };
+        let bytes = p.to_cbor().expect("encode");
+        let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_mls_welcome_omits_first_message_field_when_none() {
+        // Wire back-compat: a None first_message must serialise to
+        // *exactly* the byte sequence pre-T7.2-mls-fu daemons emit,
+        // so older clients (none today, but future minor-version
+        // daemons that haven't picked up this code yet) can still
+        // decode it.
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"w".to_vec()),
+            first_message: None,
+        };
+        let bytes = p.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("first_message"),
+            "first_message must be skipped from the wire when None; got {bytes:?}"
+        );
+    }
+
+    #[test]
     fn bootstrap_payload_mls_welcome_carries_version_tag() {
         let p = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"w".to_vec()),
+            first_message: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -529,6 +577,7 @@ mod tests {
         let (alice_sign, alice_id, bob_kem, _) = alice_to_bob_setup();
         let payload = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
+            first_message: None,
         };
         let payload_bytes = payload.to_cbor().unwrap();
 

@@ -142,6 +142,16 @@ pub enum ApiRequest {
         peer_fingerprint: String,
         peer_kem_pub_b32: String,
         peer_kp_b64: String,
+        /// Optional plaintext "introduction" message to ride along
+        /// with the MLS Welcome (T7.2-mls-fu). When `Some`, the
+        /// recipient renders it as the first message of the new
+        /// conversation — same as if you'd immediately followed the
+        /// Welcome with an app-level message — instead of a synthetic
+        /// "joined MLS group X" placeholder. `None` keeps the original
+        /// T6.x behaviour. `#[serde(default)]` so older API clients
+        /// that don't know about the field still parse cleanly.
+        #[serde(default)]
+        initial_text: Option<String>,
     },
     /// Fetch the latest published MLS KeyPackage for the named peer
     /// from the hub's directory (T6.1) over the daemon's existing
@@ -608,9 +618,41 @@ mod tests {
             peer_fingerprint: "6dzx yrut hgez rucw ...".into(),
             peer_kem_pub_b32: "longb32stringhere".into(),
             peer_kp_b64: "base64-encoded-mls-key-package-bytes".into(),
+            initial_text: None,
         };
         let line = encode_request_line(&r).unwrap();
         assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_send_bootstrap_mls_with_initial_text() {
+        let r = ApiRequest::SendBootstrapMls {
+            peer_fingerprint: "f".into(),
+            peer_kem_pub_b32: "k".into(),
+            peer_kp_b64: "p".into(),
+            initial_text: Some("hi from the invite URL".into()),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn send_bootstrap_mls_initial_text_back_compat() {
+        // A wire payload from a client predating T7.2-mls-fu would
+        // omit the `initial_text` field entirely. New daemons must
+        // accept that payload and treat it as `initial_text: None`.
+        let legacy_wire = "{\"kind\":\"SendBootstrapMls\",\"peer_fingerprint\":\"f\",\
+                           \"peer_kem_pub_b32\":\"k\",\"peer_kp_b64\":\"p\"}";
+        let parsed = decode_request(legacy_wire).expect("legacy wire decodes");
+        match parsed {
+            ApiRequest::SendBootstrapMls { initial_text, .. } => {
+                assert!(
+                    initial_text.is_none(),
+                    "missing field must default to None for back-compat"
+                );
+            }
+            other => panic!("expected SendBootstrapMls, got {other:?}"),
+        }
     }
 
     #[test]
@@ -658,6 +700,7 @@ mod tests {
             peer_fingerprint: "f".into(),
             peer_kem_pub_b32: "k".into(),
             peer_kp_b64: "p".into(),
+            initial_text: None,
         };
         let line = encode_request_line(&r).unwrap();
         assert!(

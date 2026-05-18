@@ -163,6 +163,12 @@ enum Command {
         /// `onyx fetch-keypackage`.
         #[arg(long)]
         peer_kp_b64: String,
+        /// Optional intro text to ride along with the MLS Welcome
+        /// (T7.2-mls-fu). Max 1024 bytes. When set, the recipient
+        /// sees this as the first message of the new conversation
+        /// instead of a synthetic "joined MLS group" placeholder.
+        #[arg(long)]
+        text: Option<String>,
     },
     /// Look up a peer's published KeyPackage in the hub directory.
     /// Prints the KP bytes as base64 on stdout — suitable for
@@ -328,6 +334,7 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
             peer_fingerprint,
             peer_kem_pub_b32,
             peer_kp_b64,
+            text,
         }) => {
             one_shot_print(
                 &socket,
@@ -335,6 +342,7 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
                     peer_fingerprint,
                     peer_kem_pub_b32,
                     peer_kp_b64,
+                    initial_text: text,
                 },
             )
             .await
@@ -399,15 +407,15 @@ async fn run_invite(socket: &std::path::Path, with_kp: bool) -> anyhow::Result<E
 
 /// Parse an invite URL, then ship a sealed-sender bootstrap to the
 /// recipient with `text` as the payload. Picks the tier from the URL:
-/// MLS-tier (`SendBootstrapMls`, full PCS) when the URL carries a
-/// `kp`, otherwise msg/v1 (`SendBootstrap`, PFS only).
+/// MLS-tier (`SendBootstrapMls`, full PCS, text rides as
+/// `initial_text` inside the same sealed envelope as the Welcome)
+/// when the URL carries a `kp`, otherwise msg/v1 (`SendBootstrap`,
+/// PFS only).
 ///
-/// Note: the existing `SendBootstrapMls` API only ships the MLS
-/// Welcome — it doesn't carry an application message — so the
-/// `--text` payload is *not* delivered on the MLS-tier path. The
-/// introduction completes silently on the recipient's side and chat
-/// starts from their first reply. Extending `SendBootstrapMls` to
-/// carry an inline first message is a separate slice.
+/// On the MLS-tier path, `--text` is capped at 1024 bytes daemon-side
+/// to avoid bumping the sealed envelope from the MEDIUM wire-size
+/// bucket into LARGE — a length-leak signal observable to anyone
+/// watching the daemon↔hub Noise channel.
 async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow::Result<ExitCode> {
     let invite = onyx_core::invite::Invite::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
@@ -417,6 +425,7 @@ async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow
             peer_fingerprint,
             peer_kem_pub_b32: invite.kem_pub_b32,
             peer_kp_b64,
+            initial_text: Some(text),
         }
     } else {
         ApiRequest::SendBootstrap {
@@ -510,10 +519,35 @@ mod tests {
                 peer_fingerprint,
                 peer_kem_pub_b32,
                 peer_kp_b64,
+                text,
             }) => {
                 assert_eq!(peer_fingerprint, "abcd");
                 assert_eq!(peer_kem_pub_b32, "kem");
                 assert_eq!(peer_kp_b64, "kpbase64");
+                assert_eq!(text, None, "--text omitted defaults to None");
+            }
+            other => panic!("expected SendBootstrapMls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_bootstrap_mls_accepts_optional_text() {
+        let args = Args::try_parse_from([
+            "onyx",
+            "send-bootstrap-mls",
+            "--peer-fingerprint",
+            "abcd",
+            "--peer-kem-pub-b32",
+            "kem",
+            "--peer-kp-b64",
+            "kpbase64",
+            "--text",
+            "hi there",
+        ])
+        .expect("parses");
+        match args.cmd {
+            Some(Command::SendBootstrapMls { text, .. }) => {
+                assert_eq!(text.as_deref(), Some("hi there"));
             }
             other => panic!("expected SendBootstrapMls, got {other:?}"),
         }

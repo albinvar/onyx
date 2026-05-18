@@ -6,6 +6,48 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T7.2-mls-fu: MLS-tier invite delivers the `--text` payload as the first message
+
+Closes the known gap left over from T7.2-mls. Before today, `onyx accept <url> --text "hi"` against an MLS-tier (`--with-kp`) invite silently *dropped* the `--text` payload — the recipient saw a synthetic placeholder `"(joined MLS group <id> via hub Welcome)"` instead of the actual introduction. The CLI rustdoc even apologised for it. Today the gap is closed: the text rides inside the same sealed-sender envelope as the Welcome and surfaces as the first message of the new conversation.
+
+What landed:
+
+**T7.2-mls-fu.a — `BootstrapPayload::MlsWelcome` gains `first_message: Option<String>`.** `crates/onyx-core/src/routing.rs`. New field with `#[serde(default, skip_serializing_if = "Option::is_none")]` so:
+  * `None` serialises to *exactly* the same CBOR bytes pre-T7.2-mls-fu daemons emitted — no wire-format break.
+  * `Some(text)` adds a `first_message: "..."` map entry inside the existing `mls/v1`-tagged variant.
+  * Older daemons that don't know the field decode `None` cleanly (`serde(default)` fallback).
+
+  Four new tests: `bootstrap_payload_round_trip_mls_welcome_with_first_message`, `bootstrap_payload_mls_welcome_omits_first_message_field_when_none` (the back-compat byte-shape check — asserts the wire literally does not contain the string "first_message" when the field is None), plus updates to two existing tests to construct with `first_message: None`.
+
+**T7.2-mls-fu.b — `ApiRequest::SendBootstrapMls` gains `initial_text: Option<String>`.** `crates/onyx-core/src/api.rs`. Same `#[serde(default)]` discipline so a legacy client (no `initial_text` field in its JSON) parses cleanly on a new daemon. New test `send_bootstrap_mls_initial_text_back_compat` literally hand-rolls a pre-T7.2-mls-fu wire payload (no `initial_text` key) and asserts new-daemon decode yields `None` rather than failing.
+
+**T7.2-mls-fu.c — daemon plumbing.** `crates/onyx-daemon/src/api_server.rs`:
+  * `handle_send_bootstrap_mls` takes an extra `initial_text: Option<&str>` parameter and writes it into the `BootstrapPayload::MlsWelcome { welcome, first_message }` it seals.
+  * **Defensive 1 KiB cap** on `initial_text` (returns `ApiErrorCode::Malformed` if exceeded). Rationale: the existing wire layer already pads to size buckets (SMALL=256, MEDIUM=1024, LARGE=4092 in `onyx-core/src/wire.rs::max_payload`), and a typical 2-party MLS Welcome lands around 1.2–1.5 KB. Capping the intro at 1 KiB keeps the sealed envelope inside the MEDIUM/LARGE boundary it would occupy without the intro — so adding a short `--text` does *not* push the envelope into the next size bucket, which would otherwise leak "this envelope carries an introduction" to a passive observer of the daemon↔hub Noise channel.
+  * The cap is intentionally smaller than necessary for the bucket math because the Welcome itself varies in size across MLS group flavours; 1 KiB is the conservative ceiling that always preserves bucket parity.
+  
+**T7.2-mls-fu.d — recipient delivers the real message.** `crates/onyx-daemon/src/lib.rs`. The `MlsWelcome` arm of `handle_hub_delivery` now extracts `first_message`. When `Some`, that text is pushed via `push_message_via_hub` as the first entry of the new conversation (`via_hub = true` so the TUI still renders the weaker-tier badge). When `None`, the original synthetic placeholder remains. Telemetry log line gains a `has_first_message` field so operators can see which path fired.
+
+**T7.2-mls-fu.e — CLI plumbs `--text` through MLS-tier accept.** `crates/onyx/src/main.rs`:
+  * `Command::SendBootstrapMls` gains `--text: Option<String>` so the explicit one-shot path (not just `accept`) can ride an intro too. Existing CLI parser test updated; new test `send_bootstrap_mls_accepts_optional_text` covers the new arg.
+  * `run_accept` now passes `text` as `initial_text: Some(text)` on the MLS-tier branch (was previously ignored). The "silently dropped" doc-comment is replaced by a comment explaining the 1 KiB cap + size-bucket reasoning.
+
+Security and anonymity:
+
+  * **Tampering.** `first_message` is covered by the outer sealed-sender Ed25519 signature (`bootstrap_signing_bytes` already hashes the inner payload bytes — verified by reading `routing.rs`). A MITM cannot edit the intro text without invalidating the whole envelope; the recipient drops invalid envelopes silently.
+  * **Forward secrecy.** The text inherits the envelope's per-message PFS (ephemeral X25519 + ML-KEM-768 encapsulation). Same forward-secrecy properties as a `msg/v1` `PlainMessage`.
+  * **Post-compromise security.** The intro **does not** have MLS PCS. It rides in the *same* envelope as the Welcome itself, which by definition predates the ratchet (the MLS ratchet covers traffic *inside* the group — everything sent from the Welcome onwards, but not the Welcome itself). This is documented in the rustdoc on the variant and explicitly noted in `run_accept`'s doc comment.
+  * **Length leak.** Addressed via the 1 KiB cap (see above). Bucket parity preserved.
+  * **No new tampering vector** — the wire-format change is additive and signature-covered.
+
+Vault, threat model, protocol version: no change. Existing `SECURITY.md` §6.1 already covers the "sealed-sender envelope has PFS not PCS for the bootstrap message" caveat — this commit just makes a *useful* payload ride that channel instead of a synthetic placeholder.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (had to add `#[allow(clippy::too_many_lines)]` to `dispatch_one_shot` after the new arm pushed it over 100 lines — the match would only get less readable if split), `cargo test --workspace` **241 passed / 0 failed** (was 236; +5 across routing, api, and CLI tests).
+
+Known gap that remains: timing correlation between sender's `onyx accept` invocation and receiver's `EventMessage` is still observable to anyone watching both endpoints' Tor entry-guard traffic. Defending that needs cover traffic — separate slice, no plans yet.
+
+---
+
 ## 2026-05-18 — T7.2-mls: invite URLs bundle an optional KeyPackage (MLS PCS on first contact)
 
 Follow-on to T7.2. The base T7.2 invite carried only `fp + kem`, so `onyx accept` could only do msg/v1 (PFS only). To get MLS PCS on first contact, the recipient still had to call `fetch-keypackage` and `send-bootstrap-mls` by hand — the very friction T7.2 set out to eliminate. T7.2-mls closes that hole: `onyx invite --with-kp` bundles a fresh MLS KeyPackage into the URL, and `onyx accept` auto-picks the MLS-tier path when it sees one.

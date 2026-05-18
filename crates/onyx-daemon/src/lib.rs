@@ -1068,7 +1068,10 @@ async fn handle_hub_delivery(
                 "hub: msg/v1 delivered into registry"
             );
         }
-        onyx_core::routing::BootstrapPayload::MlsWelcome { welcome } => {
+        onyx_core::routing::BootstrapPayload::MlsWelcome {
+            welcome,
+            first_message,
+        } => {
             // 3'. mls/v1: the sender invited us into a fresh MLS group.
             //     Join the group (creates persistent MLS state on our
             //     side), snapshot to vault so a future direct-dial to
@@ -1114,19 +1117,35 @@ async fn handle_hub_delivery(
                 let mut reg = state.conversations.lock().await;
                 let handle =
                     reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
-                // Push a hub-tagged "joined MLS group via Welcome"
-                // event so the TUI can show *something* happened
-                // even though there's no message text yet.
                 let group_id_b32 = encode_b32(&group.group_id_bytes());
-                reg.push_message_via_hub(
-                    &handle.peer_pub,
-                    MessageDirection::Incoming,
-                    format!("(joined MLS group {group_id_b32} via hub Welcome)"),
-                );
+                // T7.2-mls-fu: when the sender bundled an introduction
+                // text alongside the Welcome (via `onyx accept <url>
+                // --text "..."`), surface that as the first message of
+                // the conversation. Otherwise fall back to the
+                // synthetic "joined" placeholder so the TUI still
+                // shows *something* happened on first contact.
+                //
+                // The text inherits the sealed-envelope's per-message
+                // PFS and is authenticated by the outer Ed25519
+                // signature — but predates the MLS ratchet, so it
+                // shares the Welcome's lack of MLS PCS (the ratchet
+                // covers everything sent *inside* the group from now
+                // on). Same `via_hub` tag either way so the TUI
+                // renders the weaker-tier badge consistently.
+                let (text, has_first_message) = if let Some(intro) = first_message {
+                    (intro, true)
+                } else {
+                    (
+                        format!("(joined MLS group {group_id_b32} via hub Welcome)"),
+                        false,
+                    )
+                };
+                reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text);
                 info!(
                     from_short = %handle.short_id,
                     mls_epoch = group.epoch(),
                     group_id_b32 = %group_id_b32,
+                    has_first_message,
                     "hub: mls/v1 Welcome processed, MLS group joined"
                 );
             }
