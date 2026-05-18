@@ -126,6 +126,13 @@ struct ChatLine {
     /// Daemon wall clock at the moment the line was created. Used for
     /// deduplication when history backfill races with live events.
     ts_unix_ms: u64,
+    /// `true` when this message arrived via the hub (sealed-sender
+    /// envelope, weaker forward-secrecy properties than direct MLS).
+    /// T5.2.f will render the two tiers visually distinct so users
+    /// can read the threat model right — for now it's stored but
+    /// not yet shown.
+    #[allow(dead_code)]
+    via_hub: bool,
 }
 
 impl AppState {
@@ -175,6 +182,7 @@ impl AppState {
                 direction,
                 text,
                 ts_unix_ms,
+                via_hub,
             } => {
                 self.scrollback
                     .entry(peer_short)
@@ -183,6 +191,7 @@ impl AppState {
                         direction,
                         text,
                         ts_unix_ms,
+                        via_hub,
                     });
                 true
             }
@@ -440,6 +449,7 @@ fn merge_history(app: &mut AppState, peer_short: &str, messages: Vec<HistoryEntr
             direction: m.direction,
             text: m.text,
             ts_unix_ms: m.ts_unix_ms,
+            via_hub: m.via_hub,
         })
         .collect();
     let existing = std::mem::take(entry);
@@ -831,16 +841,19 @@ mod snapshot_tests {
                     direction: MessageDirection::Incoming,
                     text: "hi".into(),
                     ts_unix_ms: 1_700_000_000_000,
+                    via_hub: false,
                 },
                 ChatLine {
                     direction: MessageDirection::Outgoing,
                     text: "hey".into(),
                     ts_unix_ms: 1_700_000_000_010,
+                    via_hub: false,
                 },
                 ChatLine {
                     direction: MessageDirection::Incoming,
                     text: "how's the audit?".into(),
                     ts_unix_ms: 1_700_000_000_020,
+                    via_hub: false,
                 },
             ],
         );
@@ -907,36 +920,41 @@ mod snapshot_tests {
                 direction: MessageDirection::Incoming,
                 text: "live-3".into(),
                 ts_unix_ms: 3_000,
+                via_hub: false,
             }],
         );
         // History returns three messages including one that matches
         // the live entry exactly — the dup must drop, not stack.
+        // One history entry is via-hub to verify the tier indicator
+        // round-trips through merge_history.
         let history = vec![
             HistoryEntry {
                 direction: MessageDirection::Incoming,
                 text: "old-1".into(),
                 ts_unix_ms: 1_000,
+                via_hub: true,
             },
             HistoryEntry {
                 direction: MessageDirection::Outgoing,
                 text: "old-2".into(),
                 ts_unix_ms: 2_000,
+                via_hub: false,
             },
             HistoryEntry {
                 direction: MessageDirection::Incoming,
                 text: "live-3".into(),
                 ts_unix_ms: 3_000,
+                via_hub: false,
             },
         ];
         merge_history(&mut app, "u5lhmxps", history);
-        let texts: Vec<&str> = app
-            .scrollback
-            .get("u5lhmxps")
-            .unwrap()
-            .iter()
-            .map(|l| l.text.as_str())
-            .collect();
+        let entries = app.scrollback.get("u5lhmxps").unwrap();
+        let texts: Vec<&str> = entries.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, ["old-1", "old-2", "live-3"]);
+        // Tier preserved through merge: old-1 stays via_hub.
+        assert!(entries[0].via_hub, "history's via_hub must propagate");
+        assert!(!entries[1].via_hub);
+        assert!(!entries[2].via_hub);
     }
 
     #[test]

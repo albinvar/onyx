@@ -342,12 +342,9 @@ fn handle_send_bootstrap(
             message: "encoding BootstrapPayload failed".into(),
         };
     };
-    let Ok(sealed) = onyx_core::routing::seal_bootstrap(
-        our_signing,
-        our_identity_sk,
-        &payload_bytes,
-        &kem_pub,
-    ) else {
+    let Ok(sealed) =
+        onyx_core::routing::seal_bootstrap(our_signing, our_identity_sk, &payload_bytes, &kem_pub)
+    else {
         return ApiResponse::Error {
             code: ApiErrorCode::Internal,
             message: "seal_bootstrap failed".into(),

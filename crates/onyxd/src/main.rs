@@ -281,6 +281,14 @@ async fn main() -> anyhow::Result<()> {
         // via bytes to hand a copy to the spawned task without
         // exposing the StaticSecret type.
         let our_sk_bytes: [u8; 32] = *state.identity.identity_key().to_bytes();
+        // Same trick for the hybrid KEM secret — it doesn't impl Clone
+        // (StaticSecret + ml-kem's DecapsulationKey are both
+        // deliberately non-Clone). Round-trip through bytes once here;
+        // the spawned task reconstructs it inside an Arc so the
+        // per-delivery callback can cheaply hand a reference into
+        // handle_hub_delivery without re-decoding 2.4 KiB every time.
+        let our_kem_bytes: Vec<u8> = state.identity.kem_secret().to_bytes().to_vec();
+        let state_for_hub_task = state.clone();
         let tor_clone = tor.clone();
         // Take the parked receiver. `want_hub == true` implies
         // hub_rx_holder is Some, so this unwrap is sound — but we
@@ -291,6 +299,15 @@ async fn main() -> anyhow::Result<()> {
             .expect("hub_rx_holder is Some when hub_onion+hub_pubkey are both set");
         Some(tokio::spawn(async move {
             let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(our_sk_bytes);
+            // Reconstruct + Arc the KEM secret once per spawned task.
+            // Wrapping in Arc so the per-delivery closure clones the
+            // Arc (cheap) instead of the underlying 2.4 KiB key bytes.
+            let our_kem = std::sync::Arc::new(
+                onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes)
+                    .expect("our own KEM secret must round-trip"),
+            );
+            let state_for_hub_cb = state_for_hub_task.clone();
+            let our_kem_for_cb = our_kem.clone();
             let mut backoff = std::time::Duration::from_millis(500);
             loop {
                 let result = hub_client::run_hub_session(
@@ -302,14 +319,11 @@ async fn main() -> anyhow::Result<()> {
                     &[our_inbox],
                     &mut outbound_rx,
                     |target, body| {
-                        // T5.2.a/b stops at "we got a delivery". T5.2.c+
-                        // will wire this into the sealed-sender unwrap +
-                        // conversation registry.
-                        info!(
-                            target_b32 = %encode_b32(&target),
-                            body_bytes = body.len(),
-                            "hub: received delivery (decode not wired yet)"
-                        );
+                        let state = state_for_hub_cb.clone();
+                        let our_kem = our_kem_for_cb.clone();
+                        async move {
+                            handle_hub_delivery(target, body, &state, &our_kem).await;
+                        }
                     },
                 )
                 .await;
@@ -787,6 +801,63 @@ async fn persist_final_state(state: &Arc<DaemonState>) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("final snapshot failed: {e}"))?
     };
     persist_mls_snapshot(state, &snapshot).await
+}
+
+// ── Hub-delivery decode (T5.2.d) ──────────────────────────────────────────
+//
+// Called from the hub-client's on_deliver closure for every
+// FRAME_DELIVER that arrives addressed to our routing id(s).
+//
+// Security-sensitive: anyone connected to the hub can spam bytes
+// at our inbox. Decode failures are **silent** (debug-level only)
+// so an attacker can't fill operator logs by churning out junk.
+
+async fn handle_hub_delivery(
+    target: onyx_core::routing::RoutingId,
+    body: Vec<u8>,
+    state: &Arc<DaemonState>,
+    our_kem: &onyx_core::crypto::HybridKemSecret,
+) {
+    // 1. Decapsulate + verify the envelope. Failures are expected
+    //    (wrong recipient, tampering, garbage from an attacker
+    //    probing our inbox) — drop silently at debug level so an
+    //    attacker can't fill operator logs by spamming junk.
+    let Ok(opened) = onyx_core::routing::open_bootstrap(&body, our_kem) else {
+        debug!(
+            target_b32 = %encode_b32(&target),
+            body_bytes = body.len(),
+            "hub: delivery did not open as sealed envelope; dropping"
+        );
+        return;
+    };
+
+    // 2. Demultiplex the inner payload by its versioned `v` tag.
+    //    Unknown tags surface here as InvalidEncoding (see
+    //    BootstrapPayload::from_cbor); we drop silently too.
+    let Ok(payload) = onyx_core::routing::BootstrapPayload::from_cbor(&opened.mls_welcome) else {
+        debug!("hub: envelope opened but inner payload did not decode; dropping");
+        return;
+    };
+
+    let sender_x25519: [u8; 32] = opened.sender_identity_pk.to_bytes();
+    let sender_pub_b32 = encode_b32(&sender_x25519);
+    let sender_fingerprint = opened.sender_signing_pk.fingerprint().to_string();
+
+    match payload {
+        onyx_core::routing::BootstrapPayload::PlainMessage { text } => {
+            // 3. Register the sender as a hub-only peer (idempotent),
+            //    then push the message tagged as via-hub so the TUI
+            //    can render the weaker security tier visibly.
+            let mut reg = state.conversations.lock().await;
+            let handle = reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
+            reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text.clone());
+            info!(
+                from_short = %handle.short_id,
+                text_bytes = text.len(),
+                "hub: msg/v1 delivered into registry"
+            );
+        }
+    }
 }
 
 // ── Vault helpers ──────────────────────────────────────────────────────────

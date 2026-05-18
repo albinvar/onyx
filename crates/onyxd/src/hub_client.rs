@@ -72,7 +72,7 @@ pub struct HubOutbound {
 // Bundling them into a struct would just trade one readable function
 // for the same arguments rewritten as fields.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_hub_session<F>(
+pub async fn run_hub_session<F, Fut>(
     tor: &TorRuntime,
     host: &str,
     port: u16,
@@ -83,7 +83,8 @@ pub async fn run_hub_session<F>(
     on_deliver: F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(RoutingId, Vec<u8>),
+    F: FnMut(RoutingId, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
     info!(
         host = %host,
@@ -139,7 +140,7 @@ where
 /// Bidirectional post-handshake loop. Generic over the stream type
 /// so the integration test can drive it via `tokio::io::duplex`
 /// without requiring a Tor circuit.
-async fn serve_session<S, F>(
+async fn serve_session<S, F, Fut>(
     stream: &mut S,
     session: &mut Session,
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
@@ -147,7 +148,8 @@ async fn serve_session<S, F>(
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnMut(RoutingId, Vec<u8>),
+    F: FnMut(RoutingId, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
     loop {
         tokio::select! {
@@ -172,7 +174,7 @@ where
                         let mut target = [0u8; 16];
                         target.copy_from_slice(&frame.payload[..16]);
                         let body = frame.payload[16..].to_vec();
-                        on_deliver(target, body);
+                        on_deliver(target, body).await;
                     }
                     other => {
                         warn!(
@@ -350,7 +352,10 @@ mod tests {
             &mut client_session,
             &mut out_rx,
             move |target, body| {
-                observed_clone.lock().unwrap().push((target, body));
+                let observed = observed_clone.clone();
+                async move {
+                    observed.lock().unwrap().push((target, body));
+                }
             },
         )
         .await;

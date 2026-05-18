@@ -6,6 +6,87 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.2.d: receive-side hub decode — `msg/v1` first-contact end-to-end
+
+The symmetric counterpart to T5.2.c. After this commit, the loop is closed for first-contact hub-relayed delivery: alice's `SendBootstrap` builds a sealed envelope addressed to bob's introduction inbox, the hub forwards on `bob`'s subscription, bob's `handle_hub_delivery` opens the envelope, decodes the inner `BootstrapPayload::PlainMessage`, registers alice as a hub-only peer in the conversation registry, and emits an `EventMessage { via_hub: true }` that the TUI's tail subscription picks up. **As of this commit, "alice sends to offline bob via the hub" actually works end-to-end** — without any direct Noise circuit between them.
+
+The remaining pieces of T5.2 are now narrower in scope:
+- **T5.2.e** — `mls/v1` variant for true PCS on the hub path (requires KeyPackage exchange).
+- **T5.2.f** — TUI visual indicator for `via_hub: true` (data is plumbed; just need styling).
+
+### `hub_client::run_hub_session` — async on_deliver callback
+
+Signature change from `F: FnMut(RoutingId, Vec<u8>)` to `F: FnMut(RoutingId, Vec<u8>) -> Fut, Fut: Future<Output = ()>`. The callback can now `.await` async work (registry locking is `tokio::sync::Mutex` → must be awaited). Existing duplex test updated minimally: closure body wrapped in `async move {}`. New parametric `<F, Fut>` propagated through both the entry point and the post-handshake `serve_session` helper.
+
+### `onyxd::handle_hub_delivery` (new) — the decode path
+
+A short async function called from the hub-task closure for every inbound `FRAME_DELIVER`:
+
+  1. `routing::open_bootstrap(&body, our_kem)` — decapsulate + verify the envelope.
+  2. `BootstrapPayload::from_cbor(&opened.mls_welcome)` — demultiplex by `v` tag.
+  3. Match on the inner variant. `PlainMessage { text }`:
+     - Derive peer `peer_pub` from `opened.sender_identity_pk`, fingerprint from `opened.sender_signing_pk.fingerprint().to_string()`, short id from b32 of `peer_pub`.
+     - `registry.register_hub_only(peer_pub, &pubkey_b32, fingerprint)` — idempotent.
+     - `registry.push_message_via_hub(&peer_pub, Incoming, text)` — emits `EventMessage { via_hub: true }`.
+     - One info-level log line per delivered message.
+
+**Security discipline: silent decode failures.** Steps 1 and 2 both fail silently at `debug!` level (not `warn!`). Reasoning: anyone connected to the hub can send arbitrary bytes addressed to our routing id, and `open_bootstrap` is the integrity gate. If we logged at warn level on every decap/decode failure, a hostile hub or a spammer could fill operator logs by churning out junk. The legitimate signal — "an envelope addressed to us decoded successfully" — gets `info!`; everything else stays at `debug!`. Documented inline at the call site.
+
+### Hub-task wiring in `main.rs`
+
+The hub-task closure captures `Arc<DaemonState>` (cheap) and `Arc<HybridKemSecret>` (constructed once at task entry by round-tripping our KEM bytes through `HybridKemSecret::from_bytes` — same Clone-evasion pattern we use for the identity X25519 secret). Per-delivery closure clones both Arcs and calls `handle_hub_delivery` inside an `async move`.
+
+### `ConversationRegistry::register_hub_only` (new)
+
+Companion to the existing `register`. Differences:
+
+  * Returns just `ConversationHandle` (no `mpsc::Receiver<String>` — there's no `peer_session` task to drain it).
+  * Creates the handle's `outbound_tx` pointing at a channel whose `Receiver` is **dropped immediately**. Any `try_send` into it eventually returns `TrySendError::Closed` — exactly how a peer with a torn-down direct session would behave. The API server's existing `Send` handler returns `NotReady` in that case, so the UX message is at worst "peer disconnected" — adequate for v0; T5.2.f's TUI work will surface a clearer "hub-only — use `SendBootstrap` to reply" hint.
+  * Marks the conversation `connected: false` so `handle_for_short` filters it out of `Send` lookups.
+  * Idempotent: a second `register_hub_only` for the same `peer_pub` returns the existing handle and does **not** fire a duplicate `EventPeerConnected`. Verified by a dedicated test.
+
+### `EventMessage` + `HistoryEntry` + `ChatLine` all gain `via_hub: bool`
+
+Plumbed end-to-end so the tier indicator is preserved across daemon restarts:
+
+  * `ApiResponse::EventMessage` gains `via_hub: bool` with `#[serde(default)]` for wire-format backwards compatibility. Daemon→client wire stays openly extensible.
+  * `ApiResponse::HistoryEntry` likewise. A `History` reply for a peer with hub-relayed messages now correctly tags each as via-hub.
+  * `onyxd::conversations::ChatLine` (the per-peer ring buffer entry) carries `via_hub` too — without it, a TUI restart + `History` backfill would silently downgrade old `via_hub` messages to "looks like direct-MLS". That's a security UX bug we explicitly avoided.
+  * `onyx::tui::ChatLine` (TUI-side mirror) carries it too — `#[allow(dead_code)]` for now since T5.2.f hasn't shipped the renderer. The annotation comments cite the future use to make the intent unambiguous.
+
+The two `push_message` variants on `ConversationRegistry` now share a `push_message_inner(via_hub: bool)` helper — single source of truth for the ring-append + broadcast logic.
+
+### One backwards-compat test added in `onyx-core::api::tests`
+
+`event_message_without_via_hub_defaults_false`: parses a hand-built JSON line **without** the `via_hub` field, asserts the resulting `EventMessage` has `via_hub: false`. Captures the `#[serde(default)]` semantics so a future PR can't accidentally remove the default and break older clients on the wire.
+
+### Registry tests added
+
+Five new tokio tests in `conversations::tests`:
+
+  * `register_hub_only_appears_in_list_as_disconnected` — appears in `list()` with `connected: false`; `handle_for_short` refuses.
+  * `register_hub_only_is_idempotent` — same peer_pub → same short_id, registry size stays at 1.
+  * `register_hub_only_emits_event_peer_connected_once` — exactly one event on first registration; none on the second.
+  * `push_message_via_hub_tags_event` — emitted `EventMessage` carries `via_hub: true`.
+  * `hub_only_handle_send_returns_closed_immediately` — the security-relevant invariant: `outbound_tx.try_send` on a hub-only handle hits `Closed` after at most one buffered message. A future refactor that silently absorbed all sends into a black-hole channel would defeat the entire point of `register_hub_only`; this test catches it.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — chased four `manual_let_else` / `single_match_else` lints in `handle_hub_delivery` and assorted call sites; all converted to `let … else` for consistency with the SECURITY-doc-driven style.
+  * `cargo test --workspace` ✓ — **156 in `onyx-core`** (+1 backwards-compat test for the `via_hub` default), **26 in `onyxd`** (+5 hub-only registry tests), 6 in `onyx-hub`, 5 in `onyx`. **193 total** (+6 since T5.2.c).
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **T5.2.e — `mls/v1` variant** still ahead. Requires the recipient to publish a KeyPackage somewhere (directory in the hub, or out-of-band exchange).
+  * **T5.2.f — TUI tier rendering** still ahead. `via_hub: bool` is now plumbed end-to-end and reaches the TUI's `ChatLine`; only the visual styling is missing. Tracked as `THREAT_MODEL.md` §8.2 #14.
+  * **No CLI affordance for `SendBootstrap` or replying to a hub-only peer.** Still raw NDJSON-only.
+  * **Hub auth still open**; even when a malicious hub can't read content, it can drop or duplicate deliveries.
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T5.2.c: `SendBootstrap` — sealed-sender envelope on the daemon's hub path
 
 The first phase in the T5.2 chain where a real cryptographic payload constructed by the daemon reaches the hub. As of this commit, anyone with `--hub-onion` + `--hub-pubkey` running and a recipient's fingerprint + KEM public can fire `SendBootstrap` over the local API and have a PQ-hybrid sealed envelope land on the hub addressed to the recipient's introduction-inbox routing id. The hub sees the 16-byte target and an opaque sealed blob — exactly what `THREAT_MODEL.md` §2 A2 promises.

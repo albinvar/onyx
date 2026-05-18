@@ -178,11 +178,20 @@ pub enum ApiResponse {
     /// conversation. `direction` distinguishes incoming from
     /// echo-of-our-own-send. `ts_unix_ms` is the daemon's wall clock
     /// at the moment of processing — not the sender's clock.
+    ///
+    /// `via_hub` is `true` when the message arrived via the hub
+    /// (sealed-sender envelope, `BootstrapPayload::PlainMessage`).
+    /// Such messages have **per-message PFS only** — no MLS PCS —
+    /// so the TUI should render them visibly differently
+    /// (T5.2.f). Default `false` (older daemons + direct-MLS path)
+    /// via `#[serde(default)]` for wire-format backwards-compat.
     EventMessage {
         peer_short: String,
         direction: MessageDirection,
         text: String,
         ts_unix_ms: u64,
+        #[serde(default)]
+        via_hub: bool,
     },
     /// A new conversation was registered with the daemon (a peer
     /// dialled in, or `onyxd --dial-*` finished its handshake).
@@ -224,11 +233,19 @@ pub struct PeerInfo {
 ///
 /// Shape matches the daemon's internal `ChatLine` exactly so the
 /// `HistoryOk` builder can map the ring buffer 1:1.
+///
+/// `via_hub` mirrors [`ApiResponse::EventMessage::via_hub`] — `true`
+/// if the message arrived via the hub (weaker forward-secrecy
+/// properties; see `SECURITY.md` §6.1). `#[serde(default)]` so a
+/// daemon that doesn't know about the field returns `false` and
+/// the wire shape stays backwards-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub direction: MessageDirection,
     pub text: String,
     pub ts_unix_ms: u64,
+    #[serde(default)]
+    pub via_hub: bool,
 }
 
 /// Direction of an [`ApiResponse::EventMessage`].
@@ -433,14 +450,33 @@ mod tests {
     #[test]
     fn response_round_trip_event_message_both_directions() {
         for direction in [MessageDirection::Incoming, MessageDirection::Outgoing] {
-            let r = ApiResponse::EventMessage {
-                peer_short: "u5lhmxps".into(),
-                direction,
-                text: "x".into(),
-                ts_unix_ms: 1_700_000_000_001,
-            };
-            let line = encode_response_line(&r).unwrap();
-            assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+            for via_hub in [false, true] {
+                let r = ApiResponse::EventMessage {
+                    peer_short: "u5lhmxps".into(),
+                    direction,
+                    text: "x".into(),
+                    ts_unix_ms: 1_700_000_000_001,
+                    via_hub,
+                };
+                let line = encode_response_line(&r).unwrap();
+                assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+            }
+        }
+    }
+
+    /// Wire-format backwards compatibility: an older serializer that
+    /// omits the new `via_hub` field still decodes as `via_hub:
+    /// false`. Captures the `#[serde(default)]` semantics so a future
+    /// PR can't accidentally remove the default and break older
+    /// clients still on the wire.
+    #[test]
+    fn event_message_without_via_hub_defaults_false() {
+        let legacy = "{\"kind\":\"EventMessage\",\"peer_short\":\"u5lhmxps\",\
+                      \"direction\":\"incoming\",\"text\":\"x\",\"ts_unix_ms\":1}";
+        let parsed = decode_response(legacy).expect("decode legacy line");
+        match parsed {
+            ApiResponse::EventMessage { via_hub, .. } => assert!(!via_hub),
+            other => panic!("expected EventMessage, got {other:?}"),
         }
     }
 
@@ -519,11 +555,13 @@ mod tests {
                     direction: MessageDirection::Incoming,
                     text: "hi".into(),
                     ts_unix_ms: 1_700_000_000_000,
+                    via_hub: false,
                 },
                 HistoryEntry {
                     direction: MessageDirection::Outgoing,
                     text: "hey".into(),
                     ts_unix_ms: 1_700_000_000_001,
+                    via_hub: true,
                 },
             ],
         };

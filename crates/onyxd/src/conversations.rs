@@ -66,12 +66,17 @@ struct ConversationState {
 }
 
 /// One line in a conversation's ring buffer. Mirrors the
-/// [`HistoryEntry`] wire shape.
+/// [`HistoryEntry`] wire shape including `via_hub`, so a fresh
+/// `Tail` subscriber's `History` backfill carries the tier
+/// indicator forward across restarts (otherwise hub-relayed
+/// messages would silently downgrade to "direct-MLS-looking" on
+/// the second daemon launch, which is a security UX bug).
 #[derive(Debug, Clone)]
 pub struct ChatLine {
     pub direction: MessageDirection,
     pub text: String,
     pub ts_unix_ms: u64,
+    pub via_hub: bool,
 }
 
 /// Top-level registry, wrap in `Arc<Mutex<…>>` and clone the `Arc`
@@ -145,6 +150,61 @@ impl ConversationRegistry {
         (handle, outbound_rx)
     }
 
+    /// Register (or no-op if already present) a peer we've only
+    /// observed via the hub — no direct Noise session, no
+    /// `peer_session` task, no transport to reply on. The returned
+    /// handle's `outbound_tx` is wired to a `Receiver` we drop
+    /// immediately, so any `try_send` into it eventually surfaces as
+    /// `TrySendError::Closed` — exactly how a peer with a torn-down
+    /// direct session would behave. The API server's `Send` handler
+    /// returns its existing `NotReady` for that case.
+    ///
+    /// Idempotent: if a registration already exists for `peer_pub`
+    /// (direct or hub-only), we return a clone of the existing handle
+    /// without firing a duplicate `EventPeerConnected`.
+    pub fn register_hub_only(
+        &mut self,
+        peer_pub: [u8; 32],
+        pubkey_b32: &str,
+        fingerprint: String,
+    ) -> ConversationHandle {
+        if let Some(existing) = self.by_peer.get(&peer_pub) {
+            return existing.handle.clone();
+        }
+        let short_id = short_id_of(pubkey_b32);
+        // Drop the Receiver immediately; the Sender's try_send will
+        // return Closed once anyone tries to use it.
+        let (outbound_tx, _drop_rx) = mpsc::channel(1);
+        let handle = ConversationHandle {
+            peer_pub,
+            short_id: short_id.clone(),
+            pubkey_b32: pubkey_b32.to_string(),
+            fingerprint,
+            outbound_tx,
+        };
+        self.by_short.insert(short_id, peer_pub);
+        let state = ConversationState {
+            handle: handle.clone(),
+            // `connected: false` because there's no live direct
+            // session; `handle_for_short` therefore refuses sends
+            // for these peers, which is exactly what we want.
+            connected: false,
+            ring: VecDeque::with_capacity(RING_CAPACITY),
+            last_active_unix_ms: now_unix_ms(),
+        };
+        self.by_peer.insert(peer_pub, state);
+
+        let info = self
+            .peer_info_for(&peer_pub)
+            .expect("just inserted")
+            .clone();
+        let _ = self
+            .events_tx
+            .send(ApiResponse::EventPeerConnected { peer: info });
+
+        handle
+    }
+
     /// Mark a conversation as disconnected (peer closed the stream
     /// or our session task ended) and emit
     /// [`ApiResponse::EventPeerDisconnected`]. We keep the row in
@@ -170,6 +230,35 @@ impl ConversationRegistry {
         direction: MessageDirection,
         text: String,
     ) -> bool {
+        self.push_message_inner(peer_pub, direction, text, false)
+    }
+
+    /// Variant of [`Self::push_message`] for messages that arrived
+    /// via the hub (sealed-sender envelope, not a direct Noise
+    /// session). Same behaviour, but stores + emits with
+    /// `via_hub: true` so both the live `EventMessage` and the
+    /// `History` backfill carry the weaker-security-tier indicator.
+    /// See `SECURITY.md` §6.1 for the PFS/PCS table.
+    pub fn push_message_via_hub(
+        &mut self,
+        peer_pub: &[u8; 32],
+        direction: MessageDirection,
+        text: String,
+    ) -> bool {
+        self.push_message_inner(peer_pub, direction, text, true)
+    }
+
+    /// Shared body for both push_message variants. Storing `via_hub`
+    /// in the ring means a fresh `Tail` subscriber that backfills
+    /// via `History` correctly reconstructs the security tier of
+    /// each historical message.
+    fn push_message_inner(
+        &mut self,
+        peer_pub: &[u8; 32],
+        direction: MessageDirection,
+        text: String,
+        via_hub: bool,
+    ) -> bool {
         let ts_unix_ms = now_unix_ms();
         let short = match self.by_peer.get_mut(peer_pub) {
             Some(state) => {
@@ -180,6 +269,7 @@ impl ConversationRegistry {
                     direction,
                     text: text.clone(),
                     ts_unix_ms,
+                    via_hub,
                 });
                 state.last_active_unix_ms = ts_unix_ms;
                 state.handle.short_id.clone()
@@ -191,6 +281,7 @@ impl ConversationRegistry {
             direction,
             text,
             ts_unix_ms,
+            via_hub,
         });
         true
     }
@@ -234,6 +325,7 @@ impl ConversationRegistry {
                     direction: line.direction,
                     text: line.text.clone(),
                     ts_unix_ms: line.ts_unix_ms,
+                    via_hub: line.via_hub,
                 })
                 .collect(),
         )
@@ -444,6 +536,102 @@ mod tests {
     async fn history_unknown_peer_is_none() {
         let reg = ConversationRegistry::new();
         assert!(reg.history("nopeer", 10).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_hub_only_appears_in_list_as_disconnected() {
+        let mut reg = ConversationRegistry::new();
+        let h = reg.register_hub_only([0x20; 32], &b32(), "fpr".into());
+        assert_eq!(h.short_id.len(), 8);
+        let list = reg.list();
+        assert_eq!(list.len(), 1);
+        // Hub-only peers are "known but not directly connected"; the
+        // TUI must show this distinction so users know `Send` won't
+        // reach them.
+        assert!(!list[0].connected);
+        // `handle_for_short` filters out !connected — `Send` errors.
+        assert!(reg.handle_for_short(&h.short_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_hub_only_is_idempotent() {
+        let mut reg = ConversationRegistry::new();
+        let peer_pub = [0x21; 32];
+        let h1 = reg.register_hub_only(peer_pub, &b32(), "fpr".into());
+        let h2 = reg.register_hub_only(peer_pub, &b32(), "fpr".into());
+        // Same logical peer ⇒ same short_id (and registry size stays at 1).
+        assert_eq!(h1.short_id, h2.short_id);
+        assert_eq!(reg.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn register_hub_only_emits_event_peer_connected_once() {
+        let mut reg = ConversationRegistry::new();
+        let mut events = reg.subscribe_events();
+        let _h = reg.register_hub_only([0x22; 32], &b32(), "fpr".into());
+        match events.recv().await.expect("one event") {
+            ApiResponse::EventPeerConnected { peer } => {
+                assert!(!peer.connected, "hub-only peer surfaces as !connected");
+            }
+            other => panic!("expected EventPeerConnected, got {other:?}"),
+        }
+        // Re-registering must NOT emit a second event (idempotent).
+        let _h2 = reg.register_hub_only([0x22; 32], &b32(), "fpr".into());
+        // tokio::sync::broadcast::Receiver::try_recv returns Empty when nothing else arrived.
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn push_message_via_hub_tags_event() {
+        let mut reg = ConversationRegistry::new();
+        let h = reg.register_hub_only([0x23; 32], &b32(), "fpr".into());
+        let mut events = reg.subscribe_events();
+        reg.push_message_via_hub(
+            &h.peer_pub,
+            MessageDirection::Incoming,
+            "hello from afar".into(),
+        );
+        match events.recv().await.expect("EventMessage") {
+            ApiResponse::EventMessage {
+                peer_short,
+                via_hub,
+                text,
+                ..
+            } => {
+                assert_eq!(peer_short, h.short_id);
+                assert!(via_hub, "must tag the message as via_hub");
+                assert_eq!(text, "hello from afar");
+            }
+            other => panic!("expected EventMessage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_only_handle_send_returns_closed_immediately() {
+        let mut reg = ConversationRegistry::new();
+        let h = reg.register_hub_only([0x24; 32], &b32(), "fpr".into());
+        // The Receiver was dropped inside register_hub_only; any
+        // try_send should hit Closed almost immediately. (It might
+        // succeed once before the channel notices.)
+        let first = h.outbound_tx.try_send("msg".into());
+        let second = h.outbound_tx.try_send("msg".into());
+        // At least one of the two attempts must be Closed — a future
+        // refactor that silently absorbs all messages into a dropped
+        // channel would defeat the whole point of `register_hub_only`.
+        assert!(
+            matches!(
+                first,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ) || matches!(
+                second,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "outbound_tx on a hub-only handle must error Closed; \
+             got first={first:?}, second={second:?}"
+        );
     }
 
     #[tokio::test]
