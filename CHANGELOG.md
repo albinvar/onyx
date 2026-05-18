@@ -6,6 +6,16 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Docs refresh: README.md rewritten
+
+No code change. The README was four-plus phases out of date — it claimed `onyx` and `onyx-hub` were "scaffold only" (both are functional now), reported "~110 tests" (we have 216), and didn't mention any of T4 (TUI + API socket), T5 (sealed-sender + hub-relayed delivery), T6 (KP directory + fetch verbs), or T7 (local-TCP test modes). New README is a single document covering install, four recipes (no-Tor smoke / local-TCP fast / real Tor / hub-relayed), TUI key reference, CLI subcommand reference, security-tier table, troubleshooting, configuration paths, architecture cheat-sheet, doc index, contributing guidelines, and license.
+
+Discipline preserved: every cryptographic claim names the specific RFC and crate; every adjective like "audited" or "proven" is absent; the §0 status disclaimer leads the document and matches `SECURITY.md` §1's caveats verbatim.
+
+Verification: this is documentation only — `cargo test --workspace` ✓ (216 unchanged), `cargo fmt` ✓ (no source touched), `cargo clippy -D warnings` ✓ (no source touched), `cargo deny` ✓.
+
+---
+
 ## 2026-05-18 — T7.0: `--listen-tcp` / `--dial-tcp` test modes — chat without Tor
 
 **The "I just want to test this without 90 seconds of Tor bootstrap" commit.** Two new daemon flags let `onyxd` accept and dial peers over plain TCP on `127.0.0.1` (or anywhere routable, if you really want to). The full Noise XK + MLS chat path is exercised — only the Tor transport is replaced. Anyone working on the codebase can now stand up two daemons + chat between them in **under 5 seconds total**, instead of the 60-90 s + four terminals of the Tor recipe.
