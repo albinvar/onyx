@@ -6,6 +6,100 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.2.c: `SendBootstrap` — sealed-sender envelope on the daemon's hub path
+
+The first phase in the T5.2 chain where a real cryptographic payload constructed by the daemon reaches the hub. As of this commit, anyone with `--hub-onion` + `--hub-pubkey` running and a recipient's fingerprint + KEM public can fire `SendBootstrap` over the local API and have a PQ-hybrid sealed envelope land on the hub addressed to the recipient's introduction-inbox routing id. The hub sees the 16-byte target and an opaque sealed blob — exactly what `THREAT_MODEL.md` §2 A2 promises.
+
+This commit ships only the **sender** path. On receive, the body is still discarded (logged only) — wiring it into the conversation registry is T5.2.d. The intermediate state is deliberate: every piece reviewable in isolation.
+
+### Design decision: payload versioning lives inside the envelope
+
+The sealed-sender envelope (`routing::seal_bootstrap` / `open_bootstrap`) was built earlier for carrying an MLS Welcome message. That works for cases where the sender holds the recipient's MLS KeyPackage out-of-band, but it doesn't work for "Alice → offline Bob" first-contact: Bob has to be online to publish a KeyPackage first.
+
+**The cautious answer**: treat `seal_bootstrap` as the **envelope layer** — opaque bytes in, opaque bytes out — and add a versioned tagged union inside.
+
+New type `routing::BootstrapPayload`:
+
+```rust
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "v")]
+pub enum BootstrapPayload {
+    #[serde(rename = "msg/v1")]
+    PlainMessage { text: String },
+    // Future: MlsWelcome { … } for true PCS on the hub path.
+}
+```
+
+The `#[serde(tag = "v")]` is the explicit version tag. Recipients **refuse unknown tags** rather than downgrade — that's `SECURITY.md` P5 (forward-only protocol compatibility). When the `mls/v1` variant ships, deployments that haven't updated simply reject incoming `mls/v1` envelopes; no risk of an attacker tricking a fresh client into accepting an older format.
+
+**Security tier honesty.** `msg/v1` has per-message PFS (every envelope gets a fresh ephemeral X25519 + ML-KEM-768 encapsulation) but **no PCS**. An attacker who compromises the recipient's long-term KEM secret reads every `msg/v1` envelope sent to that recipient after the compromise until the key rotates. This is a real degradation from direct-MLS conversations and is now documented in three places in the same commit:
+
+  * `SECURITY.md` §6.1 — the wire-payload versioning table with explicit PFS/PCS columns.
+  * `THREAT_MODEL.md` §8.2 — partial closure of item #1 (sender path done) and new item #14 (TUI must visually distinguish tiers).
+  * `routing.rs` `BootstrapPayload` doc — the tier table is also in-source so a reader exploring the module understands the constraint without leaving the file.
+
+Five new tests cover the BootstrapPayload layer specifically (in `crates/onyx-core/src/routing.rs`):
+
+  * Round-trip: encode → decode is the identity for `PlainMessage`.
+  * Wire-shape: the CBOR bytes literally contain `"msg/v1"`, so an accidental tag rename in a future PR breaks loudly here.
+  * Unknown-variant rejection: hand-built CBOR `{"v":"unknown/v99","text":"x"}` decodes as `Error::InvalidEncoding` (P5 enforcement).
+  * Garbage rejection: empty bytes + non-CBOR bytes both error.
+  * **End-to-end inside a sealed envelope**: alice builds a `PlainMessage`, encodes to CBOR, calls `seal_bootstrap` with bob's hybrid KEM public, bob calls `open_bootstrap` then `BootstrapPayload::from_cbor`, and the recovered text + sender signing key match alice's. This is the security-relevant invariant: the inner versioning is preserved across the entire envelope round-trip.
+
+### `onyx-core::api` — new request + response variants
+
+```rust
+ApiRequest::SendBootstrap {
+    peer_fingerprint: String,    // base32-grouped per `onyx identity`
+    peer_kem_pub_b32: String,    // base32 of HybridKemPublic
+    text: String,
+}
+ApiResponse::SendBootstrapOk     // no body; delivery confirmation is async
+```
+
+The response is a distinct variant from `SendOk` even though both are no-payload acks — keeps the wire self-describing so clients and operators can tell which call succeeded from logs alone. **Three new round-trip tests** plus a literal `"kind":"SendBootstrap"` wire-shape assertion. Total `api::tests` now 21.
+
+### `onyxd::api_server::handle_send_bootstrap` — the dispatcher
+
+Six new unit tests covering the full decision tree:
+
+  1. **No hub configured** (daemon launched without `--hub-onion`) → `NotReady`. Operator config issue, not a malformed request.
+  2. **Garbage fingerprint** → `Malformed`.
+  3. **Garbage KEM b32** (invalid base32 alphabet) → `Malformed`.
+  4. **Wrong-length KEM b32** (valid base32 but doesn't decode as `HybridKemPublic`) → `Malformed`.
+  5. **Hub outbound queue full** → `NotReady`. Distinguished from "hub not configured" by the error message; both share the `NotReady` code so clients can retry uniformly.
+  6. **Happy path** → `SendBootstrapOk` **plus** a `HubOutbound` lands on the receiver carrying the recipient's correct introduction-inbox routing id, **plus** bob can decapsulate the body and recover the exact plaintext + assert the sender signing key matches alice's. This is the cryptographic integrity check end-to-end without any network.
+
+Test scaffolding: `handle_send_bootstrap` was refactored to take its dependencies as individual parameters (`our_signing`, `our_identity_sk`, `Option<&Sender>`) rather than the full `DaemonState`. That makes every unhappy path testable without standing up an MLS party or a vault — and the happy-path test is now ~30 lines instead of the ~150 it'd be otherwise. Smaller dependency surface = clearer security review.
+
+### Wiring + dead-code cleanup
+
+`DaemonState.hub_outbound` lost its `#[allow(dead_code)]` annotation — the dispatcher actually reads it now. The doc comment on the field updated to point at the live consumer.
+
+### What this *doesn't* ship
+
+  * **No receiver-side decode**. T5.2.c stops at "the sealed envelope reaches the hub and gets forwarded to whoever is subscribed to the target routing id". The hub_client's `on_deliver` callback still logs the body and discards it. T5.2.d wires `open_bootstrap` + `BootstrapPayload::from_cbor` + conversation registry on receipt.
+  * **No CLI/TUI affordance** to call `SendBootstrap`. For now the only way to invoke it is hand-built NDJSON over the API socket (`echo '{"kind":"SendBootstrap",...}' | nc -U onyxd.sock`). A real `onyx contact send <fpr> <kem> <msg>` subcommand is part of T5.2.f together with the security-tier rendering.
+  * **No real-Tor smoke test**. Two daemons, two Tor circuits, a real hub — runnable manually with the existing binaries, but inline in this CHANGELOG it'd be 30–60 s of bootstrap per daemon. The 6 unit tests + the BootstrapPayload round-trip + the existing T5.2.b duplex test give equivalent confidence in the wire path.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — one round of `manual_let_else` fixes turning four `match { Some/Ok => …, _ => return … }` blocks in the dispatcher into `let … else { return … }`. Cleaner anyway.
+  * `cargo test --workspace` ✓ — **155 in `onyx-core`** (+8 since T5.2.b: 5 BootstrapPayload + 3 api round-trip including wire-shape), **21 in `onyxd`** (+6 SendBootstrap dispatcher), 6 in `onyx-hub`, 5 in `onyx`. **187 total** (+14 since T5.2.b).
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **T5.2.d — receive-side decode** still ahead. Until that lands the daemon receives but discards hub deliveries.
+  * **T5.2.e — `mls/v1` variant** for MLS PCS on the hub path. Requires the recipient to publish a KeyPackage somewhere (directory in the hub, or out-of-band exchange).
+  * **T5.2.f — TUI tier rendering** — the user cannot tell a `msg/v1` from a future `mls/v1` (or from a direct-MLS) without it. New `THREAT_MODEL.md` §8.2 item #14 tracks this as a user-comprehension security issue, not just UX.
+  * **`SendBootstrap` has no CLI affordance** yet. Today exercising it requires raw NDJSON.
+  * **Hub auth is still open** — anyone with the hub's static key can subscribe + send. The sealed envelope means a malicious hub can't read content, but a misconfigured hub can drop or duplicate-deliver.
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T5.2.a + T5.2.b: per-identity hybrid KEM + bidirectional hub client
 
 Two foundational pieces toward hub-relayed sealed-sender delivery (the full chain is T5.2.a → T5.2.f). Neither one ships a new user-visible feature on its own; together they remove every prerequisite blocking T5.2.c (the `SendBootstrap` API verb + on-the-wire envelope). Split deliberately: each piece has small, reviewable security implications, and the project never ends up with a half-wired crypto surface that someone might trust by mistake.

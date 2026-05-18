@@ -88,6 +88,29 @@ pub enum ApiRequest {
     /// restart or after a tail subscription reconnects. Returns
     /// [`ApiResponse::HistoryOk`].
     History { peer_short: String, limit: u32 },
+    /// First-contact send via the hub. Constructs a sealed-sender
+    /// envelope (PQ-hybrid X25519 + ML-KEM-768) carrying a
+    /// `BootstrapPayload::PlainMessage` and ships it to the
+    /// recipient's introduction-inbox routing id over the active
+    /// hub session. Requires the daemon to have been launched with
+    /// `--hub-onion` + `--hub-pubkey`.
+    ///
+    /// **Security tier note.** Messages sent this way have **per-
+    /// message forward secrecy only** (via the ephemeral hybrid
+    /// encapsulation). They do **not** have MLS post-compromise
+    /// security — a future variant (`v: mls/v1`) will carry an MLS
+    /// Welcome to upgrade to a ratcheted group. Until that lands the
+    /// TUI should render hub-relayed messages with explicit visual
+    /// distinction from direct-MLS ones.
+    ///
+    /// `peer_fingerprint` is the base32-grouped form printed by
+    /// `onyx identity`; `peer_kem_pub_b32` is the b32 of the peer's
+    /// hybrid KEM public.
+    SendBootstrap {
+        peer_fingerprint: String,
+        peer_kem_pub_b32: String,
+        text: String,
+    },
 }
 
 /// One response line on the wire (daemon → client).
@@ -141,6 +164,11 @@ pub enum ApiResponse {
         peer_short: String,
         messages: Vec<HistoryEntry>,
     },
+    /// Reply to [`ApiRequest::SendBootstrap`]. The envelope was
+    /// constructed and accepted into the hub's outbound queue;
+    /// delivery confirmation arrives later (out-of-band) when the
+    /// recipient comes online — there is no synchronous ack.
+    SendBootstrapOk,
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
@@ -435,6 +463,41 @@ mod tests {
             let line = encode_response_line(&r).unwrap();
             assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
         }
+    }
+
+    #[test]
+    fn request_round_trip_send_bootstrap() {
+        let r = ApiRequest::SendBootstrap {
+            peer_fingerprint: "6dzx yrut hgez rucw js3g fpdu xggt jn7r ...".into(),
+            peer_kem_pub_b32: "verylongbase32stringgoeshere…".into(),
+            text: "first contact via hub".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_send_bootstrap_ok() {
+        let r = ApiResponse::SendBootstrapOk;
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn send_bootstrap_request_wire_shape() {
+        // Literal-shape assertion: the wire JSON must contain
+        // exactly "SendBootstrap" as the kind. Guards against a
+        // rename slipping through.
+        let r = ApiRequest::SendBootstrap {
+            peer_fingerprint: "f".into(),
+            peer_kem_pub_b32: "k".into(),
+            text: "t".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert!(
+            line.contains("\"kind\":\"SendBootstrap\""),
+            "wire format must carry kind=SendBootstrap; got {line:?}"
+        );
     }
 
     #[test]

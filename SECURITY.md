@@ -208,6 +208,24 @@ For transparency, the algorithms and version pins currently in use. Bumping any 
 
 No algorithm is selectable at runtime. No version is negotiable on the wire.
 
+### 6.1 Wire-payload versioning (T5.2.c onwards)
+
+The sealed-sender envelope's *inner payload* is a versioned tagged union (`routing::BootstrapPayload`). Today only one variant exists:
+
+| `v` tag | variant | PFS | PCS | when used |
+|---|---|---|---|---|
+| `msg/v1` | `PlainMessage { text }` | yes (ephemeral KEM encap) | **no** (no MLS ratchet) | hub-relayed first-contact via `SendBootstrap` |
+| *(planned)* `mls/v1` | `MlsWelcome { … }` | yes | yes | bootstrap an MLS group over the hub |
+
+Recipients **refuse unknown `v` tags** rather than downgrade (P5 enforcement). The TUI is expected to render the tiers with distinct styling so users can read the threat model right; that rendering is tracked as a carry-forward item in `THREAT_MODEL.md` §8.2.
+
+Hub-relayed `msg/v1` messages have **weaker forward-secrecy properties** than direct-MLS conversations:
+
+  * Each `msg/v1` envelope gets its own fresh ephemeral X25519 + ML-KEM-768 encapsulation, so an attacker who later compromises the recipient's long-term KEM secret cannot decrypt past `msg/v1` envelopes they archived **unless** they also have the recipient's archived KEM secret at the moment of receipt. That gives per-message PFS.
+  * There is no ratchet between successive `msg/v1` envelopes. An attacker who compromises the recipient's long-term KEM secret reads every `msg/v1` envelope sent to them after that compromise until the secret is rotated (the recipient gets a new KEM keypair). That's a real degradation from MLS PCS.
+
+This tradeoff is the cost of letting "Alice → offline Bob" actually work without prior coordination. Closing the gap requires the planned `mls/v1` variant and a way for the sender to obtain the recipient's MLS KeyPackage out-of-band or via a directory service — neither of which exist today.
+
 ---
 
 ## 7. What changes when we get audited

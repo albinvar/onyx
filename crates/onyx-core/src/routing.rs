@@ -103,6 +103,64 @@ pub fn session_token(group_secret: &[u8; 32], index: u64) -> RoutingId {
     blake2b_128(&[group_secret.as_slice(), &index.to_be_bytes()])
 }
 
+// ── Sealed-sender inner payload (T5.2.c) ──────────────────────────────────
+//
+// The sealed-sender envelope is the **envelope layer** — opaque bytes
+// in, opaque bytes out. What lives *inside* the envelope is the
+// `BootstrapPayload` enum below, a versioned tagged union that the
+// recipient demultiplexes after `open_bootstrap` verifies the
+// signature.
+//
+// Today only `PlainMessage` ("msg/v1") is implemented; a future
+// variant will carry an MLS Welcome for true post-compromise security
+// on the hub path. The `#[serde(tag = "v")]` is the explicit version
+// tag — per `SECURITY.md` P5 (forward-only protocol compatibility),
+// recipients refuse unknown tags rather than downgrade.
+
+/// Inner payload of a sealed-sender envelope. After `open_bootstrap`
+/// returns the inner bytes, callers `BootstrapPayload::from_cbor`
+/// to recover the typed payload.
+///
+/// ## Security tiers
+///
+/// | variant       | PFS | PCS  | when to use                                       |
+/// |---------------|-----|------|---------------------------------------------------|
+/// | `PlainMessage`| yes | **no** | first-contact, no MLS group available yet       |
+/// | (future `MlsWelcome`) | yes | yes | hands over an MLS Welcome to start a ratchet |
+///
+/// PFS comes from the ephemeral X25519 + ML-KEM-768 encapsulation
+/// every envelope does. PCS requires the recipient to actually start
+/// running an MLS ratchet after the message, which `PlainMessage`
+/// alone does not arrange. The TUI must render the two tiers
+/// differently so users can read the threat model right — that
+/// rendering is T5.2.f.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "v")]
+pub enum BootstrapPayload {
+    /// "msg/v1" — single-shot plaintext message wrapped in the sealed
+    /// envelope. No MLS state is created by sending or receiving.
+    #[serde(rename = "msg/v1")]
+    PlainMessage { text: String },
+}
+
+impl BootstrapPayload {
+    /// Encode as CBOR for embedding in a sealed-sender envelope.
+    pub fn to_cbor(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        ciborium::into_writer(self, &mut out)
+            .map_err(|_| Error::Internal("bootstrap-payload: CBOR encode failed"))?;
+        Ok(out)
+    }
+
+    /// Decode bytes returned by `open_bootstrap` into a typed payload.
+    /// Unknown `v` tags surface as [`Error::InvalidEncoding`] —
+    /// recipients refuse rather than downgrade (`SECURITY.md` P5).
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self> {
+        ciborium::from_reader(bytes)
+            .map_err(|_| Error::InvalidEncoding("bootstrap-payload: CBOR decode failed"))
+    }
+}
+
 // ── Sealed-sender bootstrap ────────────────────────────────────────────────
 
 /// Wire-format bootstrap payload — CBOR-encoded inside the sealed
@@ -363,6 +421,89 @@ mod tests {
         let t = session_token(&secret, 1);
         let expected = blake2b_128(&[secret.as_slice(), &[0, 0, 0, 0, 0, 0, 0, 1]]);
         assert_eq!(t, expected);
+    }
+
+    // ── BootstrapPayload (T5.2.c) ──────────────────────────────────────────
+
+    #[test]
+    fn bootstrap_payload_round_trip_plain_message() {
+        let p = BootstrapPayload::PlainMessage {
+            text: "hello bob — sent through the hub".into(),
+        };
+        let bytes = p.to_cbor().expect("encode");
+        let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_wire_shape_includes_version_tag() {
+        // Literal-shape assertion: the CBOR must contain "msg/v1"
+        // somewhere in its bytes. If anyone renames the serde tag
+        // accidentally this test catches it loudly.
+        let p = BootstrapPayload::PlainMessage { text: "x".into() };
+        let bytes = p.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("msg/v1"),
+            "BootstrapPayload CBOR must carry the 'msg/v1' version tag; got bytes {bytes:?}"
+        );
+        assert!(s.contains('v'), "version field 'v' must appear");
+    }
+
+    #[test]
+    fn bootstrap_payload_unknown_variant_is_rejected() {
+        // Hand-build a CBOR map {"v": "unknown/v99", "text": "x"} using
+        // ciborium::Value, then assert BootstrapPayload refuses to
+        // deserialise it. This is the "no downgrade" property
+        // (SECURITY.md P5).
+        use ciborium::Value as CborValue;
+        let cbor_value = CborValue::Map(vec![
+            (
+                CborValue::Text("v".into()),
+                CborValue::Text("unknown/v99".into()),
+            ),
+            (CborValue::Text("text".into()), CborValue::Text("x".into())),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&cbor_value, &mut bytes).unwrap();
+
+        let err = BootstrapPayload::from_cbor(&bytes)
+            .expect_err("unknown version tag must be rejected, not silently downgraded");
+        // Just check the variant; message is intentionally generic
+        // (no protocol-version oracle leaked to attackers).
+        assert!(matches!(err, Error::InvalidEncoding(_)));
+    }
+
+    #[test]
+    fn bootstrap_payload_garbage_is_rejected() {
+        assert!(matches!(
+            BootstrapPayload::from_cbor(&[]),
+            Err(Error::InvalidEncoding(_))
+        ));
+        assert!(matches!(
+            BootstrapPayload::from_cbor(b"definitely not cbor"),
+            Err(Error::InvalidEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn bootstrap_payload_round_trips_inside_sealed_envelope() {
+        // End-to-end: BootstrapPayload → CBOR → seal_bootstrap →
+        // open_bootstrap → CBOR → BootstrapPayload, identical at both ends.
+        let (alice_sign, alice_id, bob_kem, _unused_mls) = alice_to_bob_setup();
+        let payload = BootstrapPayload::PlainMessage {
+            text: "first-contact via hub".into(),
+        };
+        let payload_bytes = payload.to_cbor().unwrap();
+
+        let sealed =
+            seal_bootstrap(&alice_sign, &alice_id, &payload_bytes, &bob_kem.public()).unwrap();
+        let opened = open_bootstrap(&sealed, &bob_kem).unwrap();
+        assert_eq!(opened.sender_signing_pk, alice_sign.verifying_key());
+        assert_eq!(opened.sender_identity_pk, alice_id.public());
+
+        let recovered = BootstrapPayload::from_cbor(&opened.mls_welcome).unwrap();
+        assert_eq!(recovered, payload);
     }
 
     // ── Sealed-sender bootstrap ────────────────────────────────────────────

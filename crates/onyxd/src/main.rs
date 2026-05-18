@@ -135,10 +135,8 @@ pub(crate) struct DaemonState {
     pub(crate) conversations: conversations::SharedRegistry,
     /// `Some` only when the daemon was launched with `--hub-onion`.
     /// Push [`hub_client::HubOutbound`] here to relay a delivery via
-    /// the hub. Bounded; full-mailbox surfaces as `NotReady`. Not
-    /// yet read by anything — T5.2.c will add a `SendBootstrap` API
-    /// verb that uses it.
-    #[allow(dead_code)]
+    /// the hub. Bounded; full-mailbox surfaces as `NotReady`. Drained
+    /// by `api_server::handle_send_bootstrap` (T5.2.c).
     pub(crate) hub_outbound: Option<mpsc::Sender<hub_client::HubOutbound>>,
 }
 
