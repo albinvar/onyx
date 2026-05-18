@@ -143,6 +143,24 @@ pub enum ApiRequest {
         peer_kem_pub_b32: String,
         peer_kp_b64: String,
     },
+    /// Fetch the latest published MLS KeyPackage for the named peer
+    /// from the hub's directory (T6.1) over the daemon's existing
+    /// hub session. The daemon validates the returned KP's embedded
+    /// Ed25519 signing key against `peer_fingerprint` before
+    /// surfacing it (defends `THREAT_MODEL.md` §8.2 #15 attack
+    /// where a hostile hub directory swaps an attacker's KP under
+    /// the target's routing id).
+    ///
+    /// Returns [`ApiResponse::FetchPeerKeyPackageOk`] with the KP
+    /// bytes in base64, or [`ApiResponse::Error`] with code:
+    ///   * `Malformed` — fingerprint won't parse, or returned KP
+    ///     doesn't validate against it.
+    ///   * `NotReady` — no hub configured, or hub responded
+    ///     "not found" (peer hasn't published yet).
+    ///   * `Internal` — hub session ended before responding.
+    ///
+    /// Requires `--hub-onion` + `--hub-pubkey`.
+    FetchPeerKeyPackage { peer_fingerprint: String },
 }
 
 /// One response line on the wire (daemon → client).
@@ -207,6 +225,11 @@ pub enum ApiResponse {
     /// in base32). The Welcome envelope has been pushed to the hub;
     /// the recipient will join the group the moment they decode it.
     SendBootstrapMlsOk { group_id_b32: String },
+    /// Reply to [`ApiRequest::FetchPeerKeyPackage`] on success.
+    /// `kp_b64` is the standard-base64 encoding of the raw MLS
+    /// KeyPackage bytes — the same shape `SendBootstrapMls` expects
+    /// for its `peer_kp_b64` argument.
+    FetchPeerKeyPackageOk { kp_b64: String },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
@@ -575,6 +598,36 @@ mod tests {
         };
         let line = encode_response_line(&r).unwrap();
         assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_fetch_peer_keypackage() {
+        let r = ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: "6dzx ...".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_fetch_peer_keypackage_ok() {
+        let r = ApiResponse::FetchPeerKeyPackageOk {
+            kp_b64: "base64-encoded-keypackage".into(),
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn fetch_peer_keypackage_wire_shape() {
+        let r = ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: "f".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert!(
+            line.contains("\"kind\":\"FetchPeerKeyPackage\""),
+            "wire must carry kind=FetchPeerKeyPackage; got {line:?}"
+        );
     }
 
     #[test]

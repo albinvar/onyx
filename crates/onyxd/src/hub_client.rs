@@ -38,14 +38,35 @@ use tracing::{debug, info, warn};
 /// large that a hung hub eats unbounded daemon memory.
 pub const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
-/// One outbound delivery: 16-byte target routing id ‖ opaque body.
-/// The body is whatever the daemon wants the hub to deliver to peers
-/// subscribed to `target` — for v0 + T5.2 this will be a sealed-sender
-/// envelope, but `hub_client` is agnostic to the body shape.
-#[derive(Debug, Clone)]
-pub struct HubOutbound {
-    pub target: RoutingId,
-    pub body: Vec<u8>,
+/// One outbound action the daemon wants the hub-client task to take.
+///
+/// Single channel for both deliveries and KP fetches keeps the
+/// serialisation order well-defined: requests are processed in the
+/// order they're pushed, which matters for `FRAME_KP_FETCH` —
+/// `FRAME_KP_RESPONSE` has no request id, so we rely on FIFO ordering
+/// to match a response to the right pending fetch.
+#[derive(Debug)]
+pub enum HubOutbound {
+    /// Push a `FRAME_DELIVER` to the hub. Body is opaque to
+    /// `hub_client` — typically a sealed-sender envelope.
+    Deliver { target: RoutingId, body: Vec<u8> },
+    /// Push a `FRAME_KP_FETCH` to the hub and route the matching
+    /// `FRAME_KP_RESPONSE` back through `responder`. `Some(bytes)` on
+    /// found, `None` on not-found, channel closed if the session
+    /// ended before a response arrived.
+    FetchKp {
+        routing_id: RoutingId,
+        responder: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    },
+}
+
+/// Backwards-compat helper so existing call sites that built a
+/// "deliver this body" outbound don't need to change shape.
+impl HubOutbound {
+    #[must_use]
+    pub fn deliver(target: RoutingId, body: Vec<u8>) -> Self {
+        Self::Deliver { target, body }
+    }
 }
 
 /// Run one hub session: dial → handshake → subscribe → bidirectional loop.
@@ -189,6 +210,13 @@ where
 /// Bidirectional post-handshake loop. Generic over the stream type
 /// so the integration test can drive it via `tokio::io::duplex`
 /// without requiring a Tor circuit.
+///
+/// FIFO ordering invariant: `FRAME_KP_RESPONSE` carries no request
+/// id, so the loop pairs the *Nth* response received with the *Nth*
+/// `FetchKp` we sent. Concurrent `FetchKp`s from multiple API tasks
+/// are serialised at the API-handler level (see
+/// `handle_fetch_peer_keypackage` in `api_server.rs`) so this loop
+/// only ever has at most one outstanding fetch.
 async fn serve_session<S, F, Fut>(
     stream: &mut S,
     session: &mut Session,
@@ -200,6 +228,13 @@ where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    // Queue of pending KP-fetch oneshots, FIFO. Bounded only by the
+    // higher-level serialisation in handle_fetch_peer_keypackage —
+    // see this function's doc-comment.
+    let mut pending_fetches: std::collections::VecDeque<
+        tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    > = std::collections::VecDeque::new();
+
     loop {
         tokio::select! {
             // Inbound frame from the hub.
@@ -208,6 +243,9 @@ where
                     Ok(f) => f,
                     Err(e) => {
                         info!(error = %e, "hub: receive ended (peer closed?)");
+                        // Any still-pending fetches will get None on
+                        // channel close — drop the senders here.
+                        drop(pending_fetches);
                         return Ok(());
                     }
                 };
@@ -225,6 +263,25 @@ where
                         let body = frame.payload[16..].to_vec();
                         on_deliver(target, body).await;
                     }
+                    onyx_core::wire::FRAME_KP_RESPONSE => {
+                        // Payload: 1-byte status (0=found, 1=not-found)
+                        // ‖ optional KP bytes. Resolve the head of the
+                        // FIFO queue.
+                        let Some(responder) = pending_fetches.pop_front() else {
+                            warn!("hub: KP_RESPONSE arrived but no pending fetch; dropping");
+                            continue;
+                        };
+                        let answer = if frame.payload.is_empty() {
+                            None
+                        } else if frame.payload[0] == 0 {
+                            Some(frame.payload[1..].to_vec())
+                        } else {
+                            None
+                        };
+                        // Receiver may have given up if its handler
+                        // task was cancelled; that's fine.
+                        let _ = responder.send(answer);
+                    }
                     other => {
                         warn!(
                             frame_type = format!("{other:#06x}"),
@@ -233,23 +290,43 @@ where
                     }
                 }
             }
-            // Outbound delivery to send to the hub.
+            // Outbound action from the daemon.
             Some(outbound) = outbound_rx.recv() => {
-                let HubOutbound { target, body } = outbound;
-                let mut wire_payload = Vec::with_capacity(16 + body.len());
-                wire_payload.extend_from_slice(&target);
-                wire_payload.extend_from_slice(&body);
-                if let Err(e) = write_frame(
-                    stream,
-                    session,
-                    &InnerFrame {
-                        frame_type: FRAME_DELIVER,
-                        payload: wire_payload,
-                    },
-                ).await {
-                    return Err(anyhow::anyhow!("hub: outbound DELIVER write failed: {e}"));
+                match outbound {
+                    HubOutbound::Deliver { target, body } => {
+                        let mut wire_payload = Vec::with_capacity(16 + body.len());
+                        wire_payload.extend_from_slice(&target);
+                        wire_payload.extend_from_slice(&body);
+                        if let Err(e) = write_frame(
+                            stream,
+                            session,
+                            &InnerFrame {
+                                frame_type: FRAME_DELIVER,
+                                payload: wire_payload,
+                            },
+                        ).await {
+                            return Err(anyhow::anyhow!("hub: outbound DELIVER write failed: {e}"));
+                        }
+                        debug!(body_bytes = body.len(), "hub: outbound DELIVER sent");
+                    }
+                    HubOutbound::FetchKp { routing_id, responder } => {
+                        // Push the oneshot onto the FIFO BEFORE we
+                        // write the frame, so a fast response can't
+                        // race ahead and find an empty queue.
+                        pending_fetches.push_back(responder);
+                        if let Err(e) = write_frame(
+                            stream,
+                            session,
+                            &InnerFrame {
+                                frame_type: onyx_core::wire::FRAME_KP_FETCH,
+                                payload: routing_id.to_vec(),
+                            },
+                        ).await {
+                            return Err(anyhow::anyhow!("hub: outbound KP_FETCH write failed: {e}"));
+                        }
+                        debug!("hub: outbound KP_FETCH sent");
+                    }
                 }
-                debug!(body_bytes = body.len(), "hub: outbound DELIVER sent");
             }
             // Outbound channel closed → daemon shutting down.
             else => {
@@ -377,10 +454,7 @@ mod tests {
         // session loop will pick it up after handling the inbound one.
         let (out_tx, mut out_rx) = mpsc::channel::<HubOutbound>(8);
         out_tx
-            .send(HubOutbound {
-                target: peer_target,
-                body: outbound_body.clone(),
-            })
+            .send(HubOutbound::deliver(peer_target, outbound_body.clone()))
             .await
             .expect("queue outbound");
 

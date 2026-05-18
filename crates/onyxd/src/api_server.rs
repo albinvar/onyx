@@ -285,8 +285,101 @@ async fn dispatch_one_shot(
         } => {
             handle_send_bootstrap_mls(peer_fingerprint, peer_kem_pub_b32, peer_kp_b64, state).await
         }
+        ApiRequest::FetchPeerKeyPackage { peer_fingerprint } => {
+            handle_fetch_peer_keypackage(peer_fingerprint, state).await
+        }
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
     }
+}
+
+/// Fetch a peer's MLS KeyPackage from the hub's T6.1 directory.
+/// Serialises concurrent calls via `state.hub_fetch_lock` because the
+/// `FRAME_KP_RESPONSE` wire format has no request id — see the
+/// `serve_session` doc-comment for the FIFO matching invariant.
+///
+/// **Security-critical** (mirrors `handle_send_bootstrap_mls`):
+/// the returned KP's embedded Ed25519 signing key MUST hash to
+/// `peer_fingerprint` before we hand it back to the caller. Without
+/// this check, a hostile hub directory could feed a CLI user the
+/// attacker's KP, which the user would then paste into
+/// `SendBootstrapMls` and unknowingly invite the attacker.
+/// `THREAT_MODEL.md` §8.2 #15.
+async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonState) -> ApiResponse {
+    let Some(hub_outbound) = state.hub_outbound.as_ref() else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: "hub client is not enabled; relaunch with --hub-onion --hub-pubkey".into(),
+        };
+    };
+    let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer_fingerprint did not parse".into(),
+        };
+    };
+    let target = onyx_core::routing::introduction_inbox(&fp);
+
+    // Hold the hub_fetch_lock across the whole request/response cycle
+    // so the hub-client's FIFO can't get out of order.
+    let _guard = state.hub_fetch_lock.lock().await;
+
+    let (responder_tx, responder_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = hub_outbound.try_send(crate::hub_client::HubOutbound::FetchKp {
+        routing_id: target,
+        responder: responder_tx,
+    }) {
+        return ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: format!("hub outbound queue: {e}"),
+        };
+    }
+
+    match responder_rx.await {
+        Ok(Some(kp_bytes)) => {
+            // SECURITY: validate the returned KP's signing key matches
+            // peer_fingerprint before surfacing.
+            let extracted = {
+                let party = state.mls_party.lock().await;
+                party.peer_signing_pk_from_kp_bytes(&kp_bytes)
+            };
+            let Ok(signing_bytes) = extracted else {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "fetched KP did not validate as a KeyPackage".into(),
+                };
+            };
+            let Ok(vk) = onyx_core::crypto::VerifyingKey::from_bytes(signing_bytes) else {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "fetched KP signing key is not a valid Ed25519 point".into(),
+                };
+            };
+            if vk.fingerprint() != fp {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "fetched KP signing key does not match peer_fingerprint \
+                              — refusing (potential hub-directory tampering)"
+                        .into(),
+                };
+            }
+            ApiResponse::FetchPeerKeyPackageOk {
+                kp_b64: base64_encode(&kp_bytes),
+            }
+        }
+        Ok(None) => ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: "peer has not published a KeyPackage to this hub".into(),
+        },
+        Err(_) => ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: "hub session ended before responding".into(),
+        },
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Build + seal a [`BootstrapPayload::PlainMessage`] for the named
@@ -361,10 +454,7 @@ fn handle_send_bootstrap(
     // Push to the hub-client's outbound queue. `try_send` so we
     // never block the API handler; full mailbox → NotReady.
     let target = onyx_core::routing::introduction_inbox(&fp);
-    match hub_outbound.try_send(crate::hub_client::HubOutbound {
-        target,
-        body: sealed,
-    }) {
+    match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(target, sealed)) {
         Ok(()) => ApiResponse::SendBootstrapOk,
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ApiResponse::Error {
             code: ApiErrorCode::NotReady,
@@ -541,10 +631,7 @@ async fn handle_send_bootstrap_mls(
     }
 
     let target = onyx_core::routing::introduction_inbox(&fp);
-    match hub_outbound.try_send(crate::hub_client::HubOutbound {
-        target,
-        body: sealed,
-    }) {
+    match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(target, sealed)) {
         Ok(()) => ApiResponse::SendBootstrapMlsOk {
             group_id_b32: encode_b32(&group_id_bytes),
         },
@@ -723,16 +810,15 @@ mod tests {
         // invariant: the hub sees exactly which inbox we addressed,
         // nothing about the sender or content.
         let expected_target = onyx_core::routing::introduction_inbox(&bob_fp);
-        assert_eq!(outbound.target, expected_target);
-        assert!(
-            !outbound.body.is_empty(),
-            "sealed envelope must be non-empty"
-        );
+        let crate::hub_client::HubOutbound::Deliver { target, body } = outbound else {
+            panic!("expected Deliver variant, got {outbound:?}");
+        };
+        assert_eq!(target, expected_target);
+        assert!(!body.is_empty(), "sealed envelope must be non-empty");
 
         // End-to-end check: bob can decapsulate + decode and recovers
         // exactly the plaintext we sent.
-        let opened =
-            onyx_core::routing::open_bootstrap(&outbound.body, &bob_kem).expect("bob opens");
+        let opened = onyx_core::routing::open_bootstrap(&body, &bob_kem).expect("bob opens");
         let payload =
             onyx_core::routing::BootstrapPayload::from_cbor(&opened.mls_welcome).expect("decode");
         match payload {

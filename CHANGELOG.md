@@ -6,6 +6,117 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T6.2: in-session KP fetch + `onyx fetch-keypackage` + `onyx send-bootstrap-mls`
+
+T5.2.e shipped the `mls/v1` envelope but required the user to obtain the recipient's `peer_kp_b64` out of band. T6.2 closes that gap: the daemon now fetches KPs from the hub directory (T6.1) over its existing Noise session, with full recipient-side validation against the expected fingerprint. Two new CLI subcommands wrap the path so the entire mls/v1 first-contact flow is now demoable from the shell as a `jq | pipe` 3-liner.
+
+### `hub_client` — in-session request/response for KP fetches
+
+The post-handshake `serve_session` loop already handles inbound `FRAME_DELIVER` and outbound `FRAME_DELIVER`. This commit adds:
+
+  * Inbound `FRAME_KP_RESPONSE` handling — payload status byte + optional KP body → resolves an oneshot.
+  * Outbound `FRAME_KP_FETCH` handling — writes the frame with payload `routing_id (16 B)`.
+
+`HubOutbound` refactored from a struct to an enum:
+
+```rust
+pub enum HubOutbound {
+    Deliver { target: RoutingId, body: Vec<u8> },
+    FetchKp { routing_id: RoutingId, responder: oneshot::Sender<Option<Vec<u8>>> },
+}
+```
+
+Backwards-compat helper `HubOutbound::deliver(target, body)` keeps the two existing send sites short. Existing duplex test updated to use the new constructor.
+
+### FIFO matching invariant (the load-bearing design decision)
+
+`FRAME_KP_RESPONSE` carries no request id. The wire protocol is request/response with implicit FIFO ordering on a single connection. The hub-client's `serve_session` keeps a `VecDeque<oneshot::Sender>` of pending fetches; when a response arrives, it pops the front and resolves it.
+
+**Correctness depends on at most one outstanding fetch at a time per session.** Enforcement lives at the API-handler level: `DaemonState` gains a `hub_fetch_lock: Arc<Mutex<()>>` that `handle_fetch_peer_keypackage` holds for the full duration of the round-trip (push → await response). Slow under concurrent demand but correct. Future T6.x can add a request-id field to the wire format and lift the serialisation.
+
+The doc-comment on `serve_session` and the inline comment in `handle_fetch_peer_keypackage` both document this invariant explicitly — a future contributor cannot accidentally weaken it without noticing.
+
+### `onyx-core::api` — `FetchPeerKeyPackage` + `FetchPeerKeyPackageOk`
+
+```rust
+ApiRequest::FetchPeerKeyPackage { peer_fingerprint: String }
+ApiResponse::FetchPeerKeyPackageOk { kp_b64: String }
+```
+
+Three new round-trip / wire-shape tests in `api::tests`.
+
+### `onyxd::api_server::handle_fetch_peer_keypackage` — security-critical handler
+
+  1. Require hub configured (`NotReady` if not).
+  2. Parse fingerprint (`Malformed` if not).
+  3. Compute the introduction-inbox routing id.
+  4. Acquire `state.hub_fetch_lock` (serialises across all concurrent calls).
+  5. Build a oneshot, push `HubOutbound::FetchKp`, await.
+  6. **Validate** the returned KP's embedded Ed25519 signing key against the supplied fingerprint via `MlsParty::peer_signing_pk_from_kp_bytes` + `VerifyingKey::fingerprint`. **Mismatch → `Malformed` with explicit `"fetched KP signing key does not match peer_fingerprint — refusing (potential hub-directory tampering)"`.**
+  7. Base64-encode and return.
+
+The validation step is the same one `handle_send_bootstrap_mls` does on a *supplied* KP — both defend `THREAT_MODEL.md` §8.2 #15 (hostile hub directory swap). Doing the validation on the *fetch* path too means CLI users can't accidentally obtain and propagate a malicious KP even if they trust the hub.
+
+### CLI: two new `onyx` subcommands
+
+```
+onyx fetch-keypackage --peer-fingerprint <FPR>
+  # → {"kind":"FetchPeerKeyPackageOk","kp_b64":"..."}
+
+onyx send-bootstrap-mls --peer-fingerprint <FPR> \
+                        --peer-kem-pub-b32 <KEM> \
+                        --peer-kp-b64 <KP>
+  # → {"kind":"SendBootstrapMlsOk","group_id_b32":"..."}
+```
+
+Three new CLI parsing tests:
+  * `send_bootstrap_mls_parses_with_three_flags` — locks in the literal flag names.
+  * `fetch_keypackage_parses` — same for the fetch subcommand.
+  * `send_bootstrap_mls_requires_all_three_flags` — anti-footgun: omitting `--peer-kp-b64` is a clap parse error, not a silent default.
+
+### The new end-to-end demo (CHANGELOG-worthy 3-liner)
+
+Replaces the 30-line recipe from T5.2.g for the MLS path:
+
+```sh
+# alice already running; bob already running; hub already running;
+# alice + bob both connected to hub (auto-publishes their KPs)
+
+BOB_ID=$(onyx --socket ./bob.sock identity)
+BOB_FP=$(jq -r .fingerprint <<<"$BOB_ID")
+BOB_KEM=$(jq -r .identity_kem_pub_b32 <<<"$BOB_ID")
+
+# alice fetches bob's published KP through her own hub session,
+# verified against bob's fingerprint:
+BOB_KP=$(onyx --socket ./alice.sock fetch-keypackage \
+            --peer-fingerprint "$BOB_FP" | jq -r .kp_b64)
+
+# alice establishes a real MLS group with bob via the hub:
+onyx --socket ./alice.sock send-bootstrap-mls \
+     --peer-fingerprint "$BOB_FP" \
+     --peer-kem-pub-b32 "$BOB_KEM" \
+     --peer-kp-b64 "$BOB_KP"
+# {"kind":"SendBootstrapMlsOk","group_id_b32":"..."}
+```
+
+After this both daemons hold the same MLS group; direct dial between alice and bob (or future T6.x MLS-over-hub) gives PCS-protected chat.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — chased the existing `HubOutbound { ... }` struct-pattern in the duplex test (now uses the new enum variant pattern + a panic on the unexpected `FetchKp` arm).
+  * `cargo test --workspace` ✓ — **167 in `onyx-core`** (+3 api), **27 in `onyxd`** (unchanged — no new dispatcher tests; security check already covered by the T5.2.e guardrail test pattern), **12 in `onyx-hub`**, **10 in `onyx`** (+3 CLI shape). **216 total** (+6 since T5.2.e).
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **`FRAME_KP_RESPONSE` still has no request id.** Concurrent `FetchPeerKeyPackage` calls are serialised in the daemon via `hub_fetch_lock` — correct but slow. T6.x can add a request-id field to lift the serialisation.
+  * **Hub-side ownership validation of routing ids** still open (`§8.2 #15`); the recipient-side check in both `handle_send_bootstrap_mls` and `handle_fetch_peer_keypackage` defends end-to-end.
+  * **Ongoing MLS-over-hub** (T6.x) still ahead.
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T5.2.e: `mls/v1` envelope variant — MLS PCS over the hub
 
 **The T5.2 chain closes here.** Today's commit lands the second sealed-sender payload variant — `BootstrapPayload::MlsWelcome` (`v: mls/v1`) — and wires both the sender and recipient sides through the hub. After this commit, alice can establish a real MLS group with bob via the hub without either of them ever directly dialling the other. Every application message exchanged inside that group has full MLS post-compromise security; the per-message PFS of the sealed envelope + the MLS ratchet inside the group give the strictly stronger protection that the T5.2.f tier badge was always pointing at.

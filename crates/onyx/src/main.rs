@@ -7,10 +7,12 @@
 //!
 //! ## v0 subcommands
 //!
-//!   * `onyx status`         — daemon liveness + identity + Tor state.
-//!   * `onyx identity`       — just the identity (public key + fingerprint).
-//!   * `onyx send-bootstrap` — first-contact send via hub (msg/v1).
-//!   * `onyx tui`            — open the multi-pane Ratatui interface.
+//!   * `onyx status`             — daemon liveness + identity + Tor state.
+//!   * `onyx identity`           — just the identity (public key + fingerprint).
+//!   * `onyx send-bootstrap`     — first-contact send via hub (msg/v1, PFS only).
+//!   * `onyx send-bootstrap-mls` — first-contact send via hub (mls/v1, full MLS PCS).
+//!   * `onyx fetch-keypackage`   — pull a peer's published KP from the hub directory.
+//!   * `onyx tui`                — open the multi-pane Ratatui interface.
 //!
 //! ## Planned subcommands (see DESIGN.md §4 + §5)
 //!
@@ -86,6 +88,43 @@ enum Command {
         #[arg(long)]
         text: String,
     },
+    /// **MLS-tier** first-contact via the hub. Establishes a real
+    /// 2-party MLS group with the named peer; every application
+    /// message exchanged in that group has full MLS post-compromise
+    /// security.
+    ///
+    /// You need three things about the peer:
+    ///   * `--peer-fingerprint` and `--peer-kem-pub-b32` — out of
+    ///     band, like for `send-bootstrap`.
+    ///   * `--peer-kp-b64` — pull this with
+    ///     `onyx fetch-keypackage --peer-fingerprint X` (which talks
+    ///     to your daemon's hub session to query the directory).
+    ///
+    /// After this call, both you and the peer hold a persistent MLS
+    /// group; subsequent direct dials between you will resume the
+    /// group via the existing T2.x path. Ongoing MLS-over-hub
+    /// (async chat without a direct circuit) is T6.x.
+    SendBootstrapMls {
+        #[arg(long)]
+        peer_fingerprint: String,
+        #[arg(long)]
+        peer_kem_pub_b32: String,
+        /// Recipient's MLS KeyPackage in base64. Get via
+        /// `onyx fetch-keypackage`.
+        #[arg(long)]
+        peer_kp_b64: String,
+    },
+    /// Look up a peer's published KeyPackage in the hub directory.
+    /// Prints the KP bytes as base64 on stdout — suitable for
+    /// piping into `--peer-kp-b64` of `send-bootstrap-mls`.
+    ///
+    /// The daemon validates the returned KP against `peer_fingerprint`
+    /// before surfacing it; a mismatched KP (potential hub-directory
+    /// tampering) surfaces as an `Error { code: malformed }` response.
+    FetchKeypackage {
+        #[arg(long)]
+        peer_fingerprint: String,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +171,28 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
                     peer_kem_pub_b32,
                     text,
                 },
+            )
+            .await
+        }
+        Command::SendBootstrapMls {
+            peer_fingerprint,
+            peer_kem_pub_b32,
+            peer_kp_b64,
+        } => {
+            one_shot_print(
+                &args.socket,
+                ApiRequest::SendBootstrapMls {
+                    peer_fingerprint,
+                    peer_kem_pub_b32,
+                    peer_kp_b64,
+                },
+            )
+            .await
+        }
+        Command::FetchKeypackage { peer_fingerprint } => {
+            one_shot_print(
+                &args.socket,
+                ApiRequest::FetchPeerKeyPackage { peer_fingerprint },
             )
             .await
         }
@@ -193,6 +254,62 @@ mod tests {
             Args::try_parse_from([
                 "onyx",
                 "send-bootstrap",
+                "--peer-fingerprint",
+                "x",
+                "--peer-kem-pub-b32",
+                "y",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn send_bootstrap_mls_parses_with_three_flags() {
+        let args = Args::try_parse_from([
+            "onyx",
+            "send-bootstrap-mls",
+            "--peer-fingerprint",
+            "abcd",
+            "--peer-kem-pub-b32",
+            "kem",
+            "--peer-kp-b64",
+            "kpbase64",
+        ])
+        .expect("parses");
+        match args.cmd {
+            Command::SendBootstrapMls {
+                peer_fingerprint,
+                peer_kem_pub_b32,
+                peer_kp_b64,
+            } => {
+                assert_eq!(peer_fingerprint, "abcd");
+                assert_eq!(peer_kem_pub_b32, "kem");
+                assert_eq!(peer_kp_b64, "kpbase64");
+            }
+            other => panic!("expected SendBootstrapMls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_keypackage_parses() {
+        let args = Args::try_parse_from(["onyx", "fetch-keypackage", "--peer-fingerprint", "abcd"])
+            .expect("parses");
+        match args.cmd {
+            Command::FetchKeypackage { peer_fingerprint } => {
+                assert_eq!(peer_fingerprint, "abcd");
+            }
+            other => panic!("expected FetchKeypackage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_bootstrap_mls_requires_all_three_flags() {
+        // Same anti-footgun discipline as send-bootstrap: omitting
+        // --peer-kp-b64 must be a clap parse error, not a silent default.
+        assert!(
+            Args::try_parse_from([
+                "onyx",
+                "send-bootstrap-mls",
                 "--peer-fingerprint",
                 "x",
                 "--peer-kem-pub-b32",

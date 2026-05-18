@@ -134,10 +134,18 @@ pub(crate) struct DaemonState {
     pub(crate) vault: Arc<Mutex<Vault>>,
     pub(crate) conversations: conversations::SharedRegistry,
     /// `Some` only when the daemon was launched with `--hub-onion`.
-    /// Push [`hub_client::HubOutbound`] here to relay a delivery via
-    /// the hub. Bounded; full-mailbox surfaces as `NotReady`. Drained
-    /// by `api_server::handle_send_bootstrap` (T5.2.c).
+    /// Push [`hub_client::HubOutbound`] here to relay a delivery (or
+    /// to issue a KP fetch) via the hub. Bounded; full-mailbox
+    /// surfaces as `NotReady`. Drained by the hub-client task.
     pub(crate) hub_outbound: Option<mpsc::Sender<hub_client::HubOutbound>>,
+    /// Serialises concurrent `FetchPeerKeyPackage` API calls. The
+    /// `FRAME_KP_RESPONSE` wire format has no request id, so the
+    /// hub-client's FIFO queue is correct only if we never have more
+    /// than one fetch in flight at a time. Hold this mutex across
+    /// the whole fetch (push → await response) — slow but correct.
+    /// Future T6.x can add request-id multiplexing to remove the
+    /// serialisation.
+    pub(crate) hub_fetch_lock: Arc<Mutex<()>>,
 }
 
 #[tokio::main]
@@ -210,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         vault: Arc::new(Mutex::new(vault)),
         conversations: conversations::new_shared(),
         hub_outbound: hub_tx,
+        hub_fetch_lock: Arc::new(Mutex::new(())),
     });
 
     drop(args.passphrase);
