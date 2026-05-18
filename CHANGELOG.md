@@ -6,6 +6,82 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Docs: SECURITY.md + THREAT_MODEL.md §8 implementation status
+
+No code change this entry. Two documents written / updated so future contributors and reviewers can tell at a glance which security claims are *designed*, *implemented*, and *verified*, and what the rules of engagement are for adding features without eroding the guarantees we already make.
+
+### `SECURITY.md` — new file (382 lines)
+
+Eight enforcement principles, each with a rationale, an example violation, and a concrete review check. The principles, in order:
+
+  1. Every cross-network frame is carried inside an established Noise + MLS session.
+  2. All persisted data is sealed under the vault key.
+  3. All identifiers are derived from keys, never assigned by a server.
+  4. All wire metadata goes through the size-bucket shaping pipeline.
+  5. Forward-only protocol compatibility — no downgrade negotiation.
+  6. No optional weakening — "less secure but easier" codepaths must not exist.
+  7. Security-relevant UI state must be visible and unambiguous.
+  8. Audit before feature surface.
+
+Supplemented by:
+
+  * A **PR review checklist** that maps each principle to verifiable criteria a reviewer answers yes/no.
+  * A **vulnerability disclosure policy** pointing reporters at GitHub Security Advisories (no email yet — deliberately, until we have a key-pair for it), with explicit ack/triage/fix timelines (7/30/90 days).
+  * A **cryptographic primitive table** with every algorithm, crate, and version pin currently in use.
+  * A **§1 status disclaimer** that does not mince words: "No external security audit has been conducted. Not by anyone. Not at any depth. … Onyx is not appropriate for any use where the safety, freedom, or livelihood of the user depends on the protocol's security. Use Signal, Briar, or similar mature tools for those situations."
+  * A **scope** section drawing the line between what this document covers (Onyx code and protocols) and what it doesn't (Tor itself, upstream dependencies, OS, hardware).
+  * A **§7 "What changes when we get audited"** section that names which document sections will be rewritten and how. This is here so when we *do* get audited there's no temptation to quietly delete the caveats.
+
+The eight principles are written so they cannot be satisfied by interpretation. P1 says "every new `FRAME_*` constant in `wire.rs` is written and read only via `transport::write_frame` / `read_frame`"; P2 says "no `fs::write` outside `storage.rs`"; P6 says "test-only weakenings are gated behind `#[cfg(test)]` and never compiled into release". Each one is a literal grep-checkable claim, not aspirational language.
+
+### `THREAT_MODEL.md` — §8 added (~90 lines), §2 A5 corrected
+
+**§2 A5 correction.** The threat model previously claimed the local API uses "per-session token" authentication. The shipped code (T4.1, `crates/onyxd/src/api_server.rs::bind_listener`) uses filesystem permissions only (`chmod 0600`). The two defend equivalently against the §2 A5 adversary, but the threat model now matches the implementation. A token-based handshake is now tracked as a future improvement (it would help SO_PEERCRED-less platforms — none of which we currently target — gain equivalent auth). The change is annotated inline so anyone reading the old text can see why the wording moved.
+
+**§8.1 — implementation-status table.** Each defense promised by §2 gets a row with three columns:
+
+  * **D**esigned (specified in `DESIGN.md`)
+  * **I**mplemented (code shipped + smoke-tested)
+  * **V**erified (automated property/round-trip tests)
+
+with a notes column citing the relevant `crates/...` paths. **No row is currently marked `V` by external audit** — that column means "we have internal tests that exercise the security-relevant invariant", and the table opens by saying so. Rows include the daemon-side gaps (sealed-sender not yet wired, PQ hybrid not yet wired, rotating session tokens partial, no idle cover traffic) and the release-engineering gaps (no reproducible builds, no signed releases, one maintainer).
+
+**§8.2 — consolidated carry-forward gaps.** All the open items that accumulated across the per-phase CHANGELOG carry-forward lists, surfaced in one place in rough priority order, with each mapped to the adversary class it affects. Twelve items, including: sealed-sender on the hub path (A2), PQ hybrid wiring (N5), cover traffic (A2 + §5), hub auth (A2/A3), the silent fingerprint fallback (P7), reproducible builds (N4), external review (N4 + §1), schema migration, wire-decoder fuzzing, the onion-web tier (still N6 future work), the macOS fs-mistrust bypass, and the 500 ms drain hack.
+
+The §8.2 list and the per-phase carry-forwards in CHANGELOG must stay in sync. That synchronisation is now a documented review obligation, not an oral tradition.
+
+### Tone discipline
+
+Both documents were written under the user's instruction "always be cautious even with the tiniest detail." Concrete choices that follow from that:
+
+  * Every cryptographic claim names the specific crate + version that backs it. No "we use AEAD" — it's "ChaCha20-Poly1305 via `chacha20poly1305` 0.10".
+  * Every adversary defense distinguishes "designed" from "implemented" from "verified" rather than collapsing them. The reader can always tell which.
+  * No claim of "audited", "proven", "industry-standard", "military-grade", or any other adjective whose meaning collapses on inspection. Where we *do* meet a real standard (RFC 9420 for MLS, RFC 8032 for Ed25519), we name the RFC number.
+  * Where reality contradicted a prior document (the A5 token-vs-permissions mismatch), the contradiction is fixed *and* annotated, so future readers can audit the documentation diff and see what changed.
+  * "Single maintainer + an AI assistant" is named as a trust risk in §8.1 and §1. We do not pretend otherwise.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓ (no Rust source touched).
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ (unchanged from T5.1).
+  * `cargo test --workspace` ✓ — 167 tests pass, unchanged from T5.1.
+  * `cargo deny check` ✓ (unchanged).
+
+No release semantics change; no protocol surface change; no API surface change. Documentation only.
+
+### What this enables
+
+  * Future PRs have a written rubric. "Why are you asking me to add `#[cfg(...)]` here?" → "P6, see SECURITY.md §3."
+  * Future audit conversations have an explicit "this is what is and isn't claimed today" reference, so the auditor knows the boundary up front.
+  * Users assessing whether Onyx fits their threat model have one authoritative answer per defense, including honest "designed but not yet implemented" rows where applicable.
+  * The project's claim space is now grep-checkable: every assertion is in `SECURITY.md` or `THREAT_MODEL.md`, and any code that contradicts an assertion is either a bug in the code or an obsolete assertion to be corrected in the same commit that changed the code.
+
+### Open security gaps + carry-forward
+
+No new gaps. The twelve-item list in `THREAT_MODEL.md` §8.2 is now the canonical roll-up; per-phase CHANGELOG carry-forwards must be reflected there going forward.
+
+---
+
 ## 2026-05-18 — T5.1: `onyxd` becomes a hub client (subscribe + receive)
 
 The `onyx-hub` binary has been sitting idle since T3.1. This phase brings it into the daemon flow as a subscriber: `onyxd --hub-onion HOST[:PORT] --hub-pubkey B32` opens a long-lived authenticated Noise session to the hub, registers a `FRAME_SUBSCRIBE` for the daemon's own introduction-inbox routing id, then loops on `FRAME_DELIVER`. Reconnects on disconnect with 500 ms → 30 s exponential backoff.
