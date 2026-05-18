@@ -876,6 +876,69 @@ async fn handle_hub_delivery(
                 "hub: msg/v1 delivered into registry"
             );
         }
+        onyx_core::routing::BootstrapPayload::MlsWelcome { welcome } => {
+            // 3'. mls/v1: the sender invited us into a fresh MLS group.
+            //     Join the group (creates persistent MLS state on our
+            //     side), snapshot to vault so a future direct-dial to
+            //     this peer can resume the same group, then register
+            //     the peer in the conversation registry as hub-only
+            //     (we have no direct transport yet — but the *MLS
+            //     group* is real and ready).
+            //
+            //     Silent failure on join (debug-level only): a hostile
+            //     hub or attacker could send junk Welcome bytes; we
+            //     don't want to spam operator logs.
+            let join_result = {
+                let party = state.mls_party.lock().await;
+                party.join_from_welcome(welcome.as_ref())
+            };
+            let Ok(group) = join_result else {
+                debug!(
+                    welcome_bytes = welcome.len(),
+                    "hub: mls/v1 Welcome did not join into a group; dropping"
+                );
+                return;
+            };
+
+            // Persist the post-join MLS state so the group survives
+            // a daemon restart.
+            let snapshot_result = {
+                let party = state.mls_party.lock().await;
+                party.snapshot_state()
+            };
+            if let Ok(snap) = snapshot_result {
+                let vault = state.vault.lock().await;
+                if let Err(e) = vault.save_mls_state(state.identity_id, &snap) {
+                    warn!(error = %e, "hub: mls/v1 snapshot save failed");
+                }
+            }
+
+            // Register the peer. They surface as a hub-only
+            // conversation (no direct Tor transport yet), but the
+            // MLS group is real — future direct-dial will lift them
+            // to a live `Direct` conversation via the existing
+            // resume path.
+            {
+                let mut reg = state.conversations.lock().await;
+                let handle =
+                    reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
+                // Push a hub-tagged "joined MLS group via Welcome"
+                // event so the TUI can show *something* happened
+                // even though there's no message text yet.
+                let group_id_b32 = encode_b32(&group.group_id_bytes());
+                reg.push_message_via_hub(
+                    &handle.peer_pub,
+                    MessageDirection::Incoming,
+                    format!("(joined MLS group {group_id_b32} via hub Welcome)"),
+                );
+                info!(
+                    from_short = %handle.short_id,
+                    mls_epoch = group.epoch(),
+                    group_id_b32 = %group_id_b32,
+                    "hub: mls/v1 Welcome processed, MLS group joined"
+                );
+            }
+        }
     }
 }
 

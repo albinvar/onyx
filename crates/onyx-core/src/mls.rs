@@ -202,6 +202,31 @@ impl MlsParty {
             .map_err(internal("mls: KeyPackage serialise failed"))
     }
 
+    /// Extract the Ed25519 signing public-key bytes embedded in a
+    /// serialised KeyPackage, **without** committing to inviting the
+    /// publisher into any group. Callers should hash the returned
+    /// bytes via [`crate::crypto::VerifyingKey::fingerprint`] and
+    /// compare against the expected fingerprint *before* using the
+    /// KP for any group operation — defends against a hostile
+    /// directory (e.g. `THREAT_MODEL.md` §8.2 #15: hub does not
+    /// validate publisher ownership of a routing id).
+    ///
+    /// Fails with [`Error::InvalidEncoding`] if the bytes don't
+    /// deserialise as a TLS-encoded KeyPackage; with
+    /// [`Error::VerificationFailed`] if the KP doesn't validate
+    /// (signature, lifetime, ciphersuite, etc.). The successful
+    /// path returns exactly 32 bytes (Ed25519 pubkey).
+    pub fn peer_signing_pk_from_kp_bytes(&self, kp_bytes: &[u8]) -> Result<[u8; 32]> {
+        let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(kp_bytes)
+            .map_err(|_| Error::InvalidEncoding("mls: peer KeyPackage not TLS-encoded"))?;
+        let kp = kp_in
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|_| Error::VerificationFailed)?;
+        let sig_bytes = kp.leaf_node().signature_key().as_slice();
+        <[u8; 32]>::try_from(sig_bytes)
+            .map_err(|_| Error::InvalidEncoding("mls: KeyPackage signing key not 32 bytes"))
+    }
+
     /// Create a new MLS group containing only this party.
     pub fn create_group(&self) -> Result<MlsGroupState> {
         let group = MlsGroup::new(
@@ -707,6 +732,35 @@ mod tests {
         let group = alice.create_group().unwrap();
         let alice_sig = alice.signing_public_bytes();
         assert!(group.peer_signing_key_bytes(&alice_sig).is_none());
+    }
+
+    #[test]
+    fn peer_signing_pk_from_kp_bytes_round_trips_with_kp_signing_key() {
+        // Build bob, get his serialised KP, extract the embedded
+        // signing public key, verify it matches bob's own signing
+        // public bytes. This is the security-relevant invariant:
+        // a SendBootstrapMls dispatcher uses this helper to verify
+        // a fetched KP matches the expected fingerprint *before*
+        // inviting the publisher into the group.
+        let (alice, bob) = alice_and_bob();
+        let bob_kp_bytes = bob.key_package_bytes().expect("kp serialise");
+        let bob_signing = bob.signing_public_bytes();
+
+        let extracted = alice
+            .peer_signing_pk_from_kp_bytes(&bob_kp_bytes)
+            .expect("extract signing pk from kp");
+        assert_eq!(extracted.as_slice(), bob_signing.as_slice());
+    }
+
+    #[test]
+    fn peer_signing_pk_from_kp_bytes_rejects_garbage() {
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        assert!(alice.peer_signing_pk_from_kp_bytes(&[]).is_err());
+        assert!(
+            alice
+                .peer_signing_pk_from_kp_bytes(b"definitely not a TLS-encoded KeyPackage")
+                .is_err()
+        );
     }
 
     #[test]

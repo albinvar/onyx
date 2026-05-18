@@ -111,6 +111,38 @@ pub enum ApiRequest {
         peer_kem_pub_b32: String,
         text: String,
     },
+    /// **MLS-tier** first-contact send via the hub. Constructs a fresh
+    /// 2-party MLS group with self + the named peer (using the peer's
+    /// supplied KeyPackage), wraps the resulting Welcome in a
+    /// `BootstrapPayload::MlsWelcome` (`v: mls/v1`) sealed-sender
+    /// envelope, and ships it to the recipient's introduction-inbox
+    /// routing id over the hub.
+    ///
+    /// After the recipient comes online and decodes the envelope,
+    /// both sides share an MLS group with full post-compromise
+    /// security on every subsequent application message exchanged in
+    /// that group — a strict upgrade over [`Self::SendBootstrap`]'s
+    /// `msg/v1` tier.
+    ///
+    /// **What the recipient needs out-of-band**: the sender's
+    /// fingerprint (to authenticate the sealed envelope's outer
+    /// signature). What the *sender* needs:
+    ///   * `peer_fingerprint` — to compute the recipient's
+    ///     introduction-inbox routing id.
+    ///   * `peer_kem_pub_b32` — to seal under the recipient's hybrid
+    ///     KEM public key.
+    ///   * `peer_kp_b64` — the recipient's MLS KeyPackage bytes,
+    ///     base64-encoded. The daemon validates the KP's embedded
+    ///     Ed25519 signing key against `peer_fingerprint` before
+    ///     inviting (defends against a hostile hub that swapped a
+    ///     different KP into the directory).
+    ///
+    /// Requires `--hub-onion` + `--hub-pubkey`.
+    SendBootstrapMls {
+        peer_fingerprint: String,
+        peer_kem_pub_b32: String,
+        peer_kp_b64: String,
+    },
 }
 
 /// One response line on the wire (daemon → client).
@@ -169,6 +201,12 @@ pub enum ApiResponse {
     /// delivery confirmation arrives later (out-of-band) when the
     /// recipient comes online — there is no synchronous ack.
     SendBootstrapOk,
+    /// Reply to [`ApiRequest::SendBootstrapMls`]. The new MLS group
+    /// is fully established on our side; `group_id_b32` is the
+    /// group's stable identifier (echo of `MlsGroupState::group_id_bytes`
+    /// in base32). The Welcome envelope has been pushed to the hub;
+    /// the recipient will join the group the moment they decode it.
+    SendBootstrapMlsOk { group_id_b32: String },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
@@ -517,6 +555,40 @@ mod tests {
         let r = ApiResponse::SendBootstrapOk;
         let line = encode_response_line(&r).unwrap();
         assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_send_bootstrap_mls() {
+        let r = ApiRequest::SendBootstrapMls {
+            peer_fingerprint: "6dzx yrut hgez rucw ...".into(),
+            peer_kem_pub_b32: "longb32stringhere".into(),
+            peer_kp_b64: "base64-encoded-mls-key-package-bytes".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_send_bootstrap_mls_ok() {
+        let r = ApiResponse::SendBootstrapMlsOk {
+            group_id_b32: "longb32groupid".into(),
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn send_bootstrap_mls_request_wire_shape() {
+        let r = ApiRequest::SendBootstrapMls {
+            peer_fingerprint: "f".into(),
+            peer_kem_pub_b32: "k".into(),
+            peer_kp_b64: "p".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert!(
+            line.contains("\"kind\":\"SendBootstrapMls\""),
+            "wire must carry kind=SendBootstrapMls; got {line:?}"
+        );
     }
 
     #[test]

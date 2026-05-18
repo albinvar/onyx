@@ -126,14 +126,14 @@ pub fn session_token(group_secret: &[u8; 32], index: u64) -> RoutingId {
 /// | variant       | PFS | PCS  | when to use                                       |
 /// |---------------|-----|------|---------------------------------------------------|
 /// | `PlainMessage`| yes | **no** | first-contact, no MLS group available yet       |
-/// | (future `MlsWelcome`) | yes | yes | hands over an MLS Welcome to start a ratchet |
+/// | `MlsWelcome`  | yes | **yes** (post-Welcome) | hands the recipient an MLS Welcome to start a ratchet — every subsequent message exchanged inside that group has full MLS PCS |
 ///
 /// PFS comes from the ephemeral X25519 + ML-KEM-768 encapsulation
 /// every envelope does. PCS requires the recipient to actually start
-/// running an MLS ratchet after the message, which `PlainMessage`
-/// alone does not arrange. The TUI must render the two tiers
-/// differently so users can read the threat model right — that
-/// rendering is T5.2.f.
+/// running an MLS ratchet after the message: `PlainMessage` alone
+/// does not arrange that; `MlsWelcome` does. The TUI renders the
+/// `[hub]` badge on every `via_hub` message; future polish (T6.x)
+/// may differentiate `msg/v1` vs `mls/v1` more loudly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "v")]
 pub enum BootstrapPayload {
@@ -141,6 +141,15 @@ pub enum BootstrapPayload {
     /// envelope. No MLS state is created by sending or receiving.
     #[serde(rename = "msg/v1")]
     PlainMessage { text: String },
+    /// "mls/v1" — carries an MLS Welcome message (RFC 9420). Once
+    /// the recipient calls `MlsParty::join_from_welcome` on the
+    /// inner bytes both parties share an MLS group; every subsequent
+    /// application message in that group has full MLS post-compromise
+    /// security. The Welcome itself only authenticates the sender
+    /// via the outer sealed-envelope signature (Ed25519 over the
+    /// canonical bytes — see `bootstrap_signing_bytes`).
+    #[serde(rename = "mls/v1")]
+    MlsWelcome { welcome: ByteBuf },
 }
 
 impl BootstrapPayload {
@@ -484,6 +493,50 @@ mod tests {
             BootstrapPayload::from_cbor(b"definitely not cbor"),
             Err(Error::InvalidEncoding(_))
         ));
+    }
+
+    #[test]
+    fn bootstrap_payload_round_trip_mls_welcome() {
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"opaque-mls-welcome-bytes-from-rfc9420".to_vec()),
+        };
+        let bytes = p.to_cbor().expect("encode");
+        let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_mls_welcome_carries_version_tag() {
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"w".to_vec()),
+        };
+        let bytes = p.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("mls/v1"),
+            "mls/v1 variant must carry its version tag; got bytes {bytes:?}"
+        );
+        // Crucial: must NOT also contain msg/v1 (would mean both tags
+        // got serialised, indicating a serde misconfiguration).
+        assert!(
+            !s.contains("msg/v1"),
+            "mls/v1 variant must not leak msg/v1 tag; got {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_payload_mls_welcome_round_trips_inside_sealed_envelope() {
+        let (alice_sign, alice_id, bob_kem, _) = alice_to_bob_setup();
+        let payload = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
+        };
+        let payload_bytes = payload.to_cbor().unwrap();
+
+        let sealed =
+            seal_bootstrap(&alice_sign, &alice_id, &payload_bytes, &bob_kem.public()).unwrap();
+        let opened = open_bootstrap(&sealed, &bob_kem).unwrap();
+        let recovered = BootstrapPayload::from_cbor(&opened.mls_welcome).unwrap();
+        assert_eq!(recovered, payload);
     }
 
     #[test]

@@ -3164,9 +3164,11 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base32",
+ "base64",
  "clap",
  "futures",
  "onyx-core",
+ "serde_bytes",
  "tokio",
  "tracing",
  "tracing-subscriber",

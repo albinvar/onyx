@@ -6,6 +6,108 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.2.e: `mls/v1` envelope variant — MLS PCS over the hub
+
+**The T5.2 chain closes here.** Today's commit lands the second sealed-sender payload variant — `BootstrapPayload::MlsWelcome` (`v: mls/v1`) — and wires both the sender and recipient sides through the hub. After this commit, alice can establish a real MLS group with bob via the hub without either of them ever directly dialling the other. Every application message exchanged inside that group has full MLS post-compromise security; the per-message PFS of the sealed envelope + the MLS ratchet inside the group give the strictly stronger protection that the T5.2.f tier badge was always pointing at.
+
+### Honest scope statement up front
+
+This commit ships **group establishment over hub**, not **chat-over-hub**. After alice does `SendBootstrapMls`, both daemons have a persistent 2-party MLS group; alice's vault has the post-invite snapshot, bob's vault has the post-join snapshot. **What's still missing**: a wire format for ongoing MLS application messages routed over the hub (using per-epoch session-token routing ids per DESIGN §5.5 Tier 2). Today, after the Welcome lands, the only way for the two to actually exchange MLS-protected messages is for one of them to direct-dial the other — at which point the existing T2.x "resume MLS group" path takes over and the conversation is fully MLS-protected. That's a real intermediate state. The CHANGELOG calls it out so nobody is misled into thinking T5.2.e gives async MLS chat.
+
+T6.x will lift this: an `MlsAppOverHub` wire variant + session-token routing addressing → fully async MLS-protected chat without ever needing a Tor circuit between the peers.
+
+### `onyx-core::routing` — new variant
+
+```rust
+pub enum BootstrapPayload {
+    #[serde(rename = "msg/v1")]
+    PlainMessage { text: String },
+    #[serde(rename = "mls/v1")]
+    MlsWelcome { welcome: ByteBuf },  // new
+}
+```
+
+The `#[serde(tag = "v")]` discrimination means unknown tags still get refused (P5 enforcement — verified by the existing `bootstrap_payload_unknown_variant_is_rejected` test). Three new tests this commit:
+
+  * `bootstrap_payload_round_trip_mls_welcome` — encode/decode is the identity.
+  * `bootstrap_payload_mls_welcome_carries_version_tag` — literal bytes contain `"mls/v1"` AND do **not** contain `"msg/v1"` (catches a serde misconfig where both tags get emitted).
+  * `bootstrap_payload_mls_welcome_round_trips_inside_sealed_envelope` — end-to-end through `seal_bootstrap` + `open_bootstrap` + `from_cbor`, asserting both the recovered payload and the verified sender signing key match.
+
+### `onyx-core::mls` — new helper for KP signing-key extraction
+
+```rust
+pub fn peer_signing_pk_from_kp_bytes(&self, kp_bytes: &[u8]) -> Result<[u8; 32]>
+```
+
+Deserialises a KeyPackage, validates it (signature, lifetime, ciphersuite), extracts the embedded Ed25519 signing public key. This is the building block for the **recipient-side fingerprint validation** of T5.2.e — defending against the `THREAT_MODEL.md` §8.2 #15 attack where a hostile hub directory swaps an attacker's KP under the target's routing id.
+
+Two new tests: round-trip with bob's KP (extracted matches `bob.signing_public_bytes()`), and garbage rejection.
+
+### `onyx-core::api` — `SendBootstrapMls` request + `SendBootstrapMlsOk` response
+
+```rust
+ApiRequest::SendBootstrapMls {
+    peer_fingerprint: String,    // expected — used to validate the KP we're about to invite from
+    peer_kem_pub_b32: String,    // recipient's hybrid KEM public, for sealing
+    peer_kp_b64: String,         // recipient's MLS KeyPackage bytes, base64
+}
+ApiResponse::SendBootstrapMlsOk { group_id_b32: String }  // echoes the new group's stable id
+```
+
+Wire-shape and round-trip tests added.
+
+### `onyxd::api_server::handle_send_bootstrap_mls` — the dispatcher
+
+Linear `parse → validate → build → seal → persist → push` sequence:
+
+  1. Require `hub_outbound: Some` (NotReady if not).
+  2. Parse fingerprint, base32-decode KEM, base64-decode KP. Each → `Malformed` on failure.
+  3. **Validate the KP's signing key vs. the supplied fingerprint** — calls `MlsParty::peer_signing_pk_from_kp_bytes`, hashes the result via `VerifyingKey::fingerprint`, compares to `peer_fingerprint`. Mismatch → `Malformed` with the explicit message `"KP signing key does not match peer_fingerprint — refusing to invite (potential hub-directory tampering)"`. **This is the security-critical step**; the rest of the chain is mechanical.
+  4. Take the MLS party lock, `create_group` (solo), `invite(peer_kp)` (returns Welcome bytes), snapshot.
+  5. Wrap the Welcome in `BootstrapPayload::MlsWelcome` → CBOR → `seal_bootstrap`.
+  6. Persist the post-invite MLS snapshot in the vault (so the group survives a daemon restart).
+  7. Push to `hub_outbound` addressed to the peer's introduction-inbox routing id.
+
+One regression-guardrail test in api_server::tests: `send_bootstrap_mls_validation_step_exists` does a literal source-grep for the `vk.fingerprint() != fp` check and the refusal error message. If a future refactor moves or renames the validation step it must update both the implementation AND this guardrail.
+
+### `onyxd::handle_hub_delivery` — new `MlsWelcome` arm
+
+Extends the existing `match payload { … }`:
+
+  * `PlainMessage` (existing) → `register_hub_only` + `push_message_via_hub`.
+  * **`MlsWelcome { welcome }`** (new) →
+    1. Try `MlsParty::join_from_welcome` (silent debug-level drop on failure, anti-log-spam).
+    2. Snapshot the post-join MLS state and persist to vault (`save_mls_state`).
+    3. Register the sender in the conversation registry as `register_hub_only` (hub-only peer with no live transport, but the MLS group is real and ready).
+    4. Push a hub-tagged event into the registry: `"(joined MLS group {group_id_b32} via hub Welcome)"`. The TUI's `[hub]` badge from T5.2.f renders this just like a `msg/v1` message, so the user sees the join immediately.
+
+### What this enables (and what it still doesn't)
+
+  * **End-to-end demo** (manual; the binaries support it): alice publishes her KP on hub connect (T6.1), bob fetches alice's KP from hub (currently via direct connect; T6.x adds in-session FETCH from the API), bob calls `SendBootstrapMls` against alice, alice's `handle_hub_delivery` joins the MLS group, both vaults now hold the same MLS group. Subsequent direct dial by either side resumes the group via the T2.x path → MLS-protected chat.
+  * Doesn't enable: bob types a message in his TUI and alice (offline-via-hub) reads it later. That requires T6.x's MLS-over-hub wire format.
+
+### `THREAT_MODEL.md` §8.2 #1 updated
+
+Now reflects end-to-end closure of both `msg/v1` (PFS) and `mls/v1` (PCS-via-MLS) paths. The remaining gap (ongoing MLS app messages over hub) is named explicitly. §8.2 item count stays at 15.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — three `manual_let_else` cleanups + one `too_many_lines` allowance on `handle_send_bootstrap_mls` with justification + a `match_wildcard_for_single_variants` lint resolved by explicit enumeration of `BootstrapPayload::MlsWelcome` in the test panic arm.
+  * `cargo test --workspace` ✓ — **164 in `onyx-core`** (+8: 3 BootstrapPayload variant + 3 SendBootstrapMls api + 2 mls peer_signing_pk), **27 in `onyxd`** (+1: dispatcher guardrail), 12 in `onyx-hub`, 7 in `onyx`. **210 total** (+9 since T6.1).
+  * `cargo deny check` ✓.
+  * New workspace dep: `base64 = "0.22"` (was transitive via openmls but now used directly for `peer_kp_b64` decoding — explicit dep makes the surface visible per the project's discipline).
+
+### Open security gaps + carry-forward
+
+  * **T6.x — MLS-over-hub wire format** for ongoing app messages, addressed via per-epoch session-token routing ids. Without it, post-Welcome chat between peers who've never direct-dialled requires one of them to come online via Tor first.
+  * **No `FetchPeerKeyPackage` API verb yet** — the user has to obtain `peer_kp_b64` out of band (or via a custom shell pipeline against the hub). T6.x or a near-term polish commit will add it.
+  * **No CLI affordance for `SendBootstrapMls`** — same shell-only as T5.2.c was before T5.2.g. A `onyx send-bootstrap-mls` subcommand is a small follow-up.
+  * **`THREAT_MODEL.md` §8.2 #15 still open** — hub doesn't validate publisher ownership of routing ids. Mitigation is the recipient-side check in `handle_send_bootstrap_mls`, which is now the security-critical step in the path.
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T6.1: KeyPackage directory on the hub
 
 Foundational commit that unblocks two distinct next steps: **T5.2.e** (the `mls/v1` envelope variant with true PCS over the hub) and **T6.3** (multi-party rooms/channels). Both need the same capability: a sender must be able to obtain a recipient's MLS KeyPackage *before* constructing a Welcome message — and recipients aren't necessarily online at send time.
