@@ -44,11 +44,14 @@ use futures::StreamExt;
 use onyx_core::crypto::{Argon2Params, IdentityPublic};
 use onyx_core::flows::{initiator_exchange, responder_exchange};
 use onyx_core::identity::Identity;
-use onyx_core::mls::MlsParty;
+use onyx_core::mls::{MlsGroupState, MlsParty};
 use onyx_core::storage::Vault;
 use onyx_core::tor::{TorRuntime, TorStream};
-use onyx_core::transport::{handshake_initiator, handshake_responder};
-use tokio::io::AsyncWriteExt;
+use onyx_core::transport::{
+    Session, handshake_initiator, handshake_responder, read_frame, write_frame,
+};
+use onyx_core::wire::{FRAME_MLS_APP, InnerFrame};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{Instrument, error, info, info_span, warn};
 
@@ -264,7 +267,7 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
     // Take the MLS party lock for the duration of the exchange + the
     // snapshot. Drop it before taking the vault lock to keep our lock
     // order consistent (MLS first, vault second).
-    let (snapshot, group_id, was_bootstrap) = {
+    let (snapshot, group_id, was_bootstrap, group) = {
         let party = state.mls_party.lock().await;
         let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
             .await
@@ -273,21 +276,26 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
             peer_message = %String::from_utf8_lossy(&outcome.peer_message),
             mls_epoch = outcome.group.epoch(),
             was_bootstrap = outcome.was_bootstrap,
-            "MLS round-trip complete (responder)"
+            "MLS round-trip complete (responder); entering chat receive loop"
         );
         let group_id = outcome.group.group_id_bytes();
         let snap = party
             .snapshot_state()
             .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?;
-        (snap, group_id, outcome.was_bootstrap)
+        (snap, group_id, outcome.was_bootstrap, outcome.group)
     };
 
+    // Persist the post-bootstrap state immediately so a crash mid-chat
+    // doesn't lose the group setup. Subsequent in-chat messages
+    // re-snapshot on disconnect.
     persist_mls_snapshot(&state, &snapshot).await?;
     if was_bootstrap {
         record_peer_group(&state, &peer_pub, &group_id).await?;
     }
-    let _ = stream.shutdown().await;
-    Ok(())
+
+    // Enter the long-lived receive loop. Decrypts incoming MLS app
+    // messages and prints them. Exits cleanly on peer disconnect.
+    chat_loop_responder(stream, session, group, state, peer_pub_b32).await
 }
 
 // ── Dial mode ──────────────────────────────────────────────────────────────
@@ -402,7 +410,7 @@ async fn run_dial_mode(
         state.identity.fingerprint()
     );
 
-    let (snapshot, group_id, was_bootstrap) = {
+    let (snapshot, group_id, was_bootstrap, group) = {
         let party = state.mls_party.lock().await;
         let outcome = initiator_exchange(
             &mut stream,
@@ -417,21 +425,23 @@ async fn run_dial_mode(
             peer_reply = %String::from_utf8_lossy(&outcome.peer_message),
             mls_epoch = outcome.group.epoch(),
             was_bootstrap = outcome.was_bootstrap,
-            "MLS round-trip complete (initiator)"
+            "MLS round-trip complete (initiator); entering interactive chat loop"
         );
         let group_id = outcome.group.group_id_bytes();
         let snap = party
             .snapshot_state()
             .map_err(|e| anyhow::anyhow!("MLS snapshot failed: {e}"))?;
-        (snap, group_id, outcome.was_bootstrap)
+        (snap, group_id, outcome.was_bootstrap, outcome.group)
     };
 
     persist_mls_snapshot(state, &snapshot).await?;
     if was_bootstrap {
         record_peer_group(state, &peer_static, &group_id).await?;
     }
-    let _ = stream.shutdown().await;
-    Ok(())
+
+    // Enter the interactive chat loop: stdin lines → encrypt → send;
+    // peer frames → decrypt → print. Exits on stdin EOF or peer close.
+    chat_loop_initiator(stream, session, group, state.clone()).await
 }
 
 // ── Persistence helper ────────────────────────────────────────────────────
@@ -459,6 +469,171 @@ async fn record_peer_group(
         "recorded peer→group mapping for future resume"
     );
     Ok(())
+}
+
+// ── Chat loops ────────────────────────────────────────────────────────────
+//
+// After bootstrap/resume completes (and the daemons have exchanged a
+// greeting + reply as proof of liveness), both sides enter a chat
+// loop that lets the MLS conversation continue across many messages.
+//
+// Dial mode = interactive chat: stdin → encrypt → send AND peer →
+// decrypt → print, multiplexed via `tokio::select!`. Exits on stdin
+// EOF (Ctrl-D) or peer disconnect.
+//
+// Accept mode = receive loop: peer → decrypt → print. We deliberately
+// don't read stdin in accept mode because tokio::io::stdin() can't
+// be cleanly multiplexed across many handler tasks; v0 keeps it
+// asymmetric (dialer types, acceptor receives). Bidirectional chat
+// belongs to the future CLI/local-API layer.
+//
+// Both loops snapshot+save MLS state on exit so the ratchet state
+// survives the chat closing.
+
+async fn chat_loop_initiator(
+    mut stream: TorStream,
+    mut session: Session,
+    mut group: MlsGroupState,
+    state: Arc<DaemonState>,
+) -> anyhow::Result<()> {
+    eprintln!();
+    eprintln!("  ─── chat started — type to send, Ctrl-D (or EOF) to exit ───");
+    eprintln!();
+
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+
+    loop {
+        tokio::select! {
+            // Peer sent us a frame.
+            res = read_frame(&mut stream, &mut session) => {
+                match res {
+                    Ok(frame) => {
+                        if frame.frame_type != FRAME_MLS_APP {
+                            warn!(
+                                frame_type = format!("{:#06x}", frame.frame_type),
+                                "ignoring unexpected frame type from peer"
+                            );
+                            continue;
+                        }
+                        let plaintext = {
+                            let party = state.mls_party.lock().await;
+                            group
+                                .decrypt_application(&party, &frame.payload)
+                                .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
+                        };
+                        println!("  [peer] {}", String::from_utf8_lossy(&plaintext));
+                    }
+                    Err(e) => {
+                        info!(error = %e, "peer side closed; ending chat");
+                        break;
+                    }
+                }
+            }
+            // Stdin produced a line (or EOF).
+            res = lines.next_line() => {
+                match res {
+                    Ok(Some(line)) if line.is_empty() => {
+                        // Skip blank lines without sending an empty
+                        // MLS application message.
+                    }
+                    Ok(Some(line)) => {
+                        let ct = {
+                            let party = state.mls_party.lock().await;
+                            group
+                                .encrypt_application(&party, line.as_bytes())
+                                .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
+                        };
+                        write_frame(
+                            &mut stream,
+                            &mut session,
+                            &InnerFrame {
+                                frame_type: FRAME_MLS_APP,
+                                payload: ct,
+                            },
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+                        info!(text = %line, "chat message sent");
+                    }
+                    Ok(None) => {
+                        info!("stdin EOF; ending chat");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "stdin read error; ending chat");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    persist_final_state(&state).await?;
+    // Give Arti a moment to actually flush any in-flight cells before
+    // tearing down the stream. Without this, the END marker can reach
+    // the peer before the final data cells; we observed this as the
+    // peer's `read_frame` returning EOF on the next iteration even
+    // though we'd just done `write_all` + `flush` successfully. A
+    // proper protocol-level "BYE + ACK" handshake is the right fix
+    // long-term; for now a small fixed delay does the job.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+async fn chat_loop_responder(
+    mut stream: TorStream,
+    mut session: Session,
+    mut group: MlsGroupState,
+    state: Arc<DaemonState>,
+    peer_pub_b32: String,
+) -> anyhow::Result<()> {
+    let peer_short: String = peer_pub_b32.chars().take(8).collect();
+    info!(peer = %peer_short, "chat receive loop active; waiting for peer messages");
+
+    loop {
+        match read_frame(&mut stream, &mut session).await {
+            Ok(frame) => {
+                if frame.frame_type != FRAME_MLS_APP {
+                    warn!(
+                        frame_type = format!("{:#06x}", frame.frame_type),
+                        "ignoring unexpected frame type from peer"
+                    );
+                    continue;
+                }
+                let plaintext = {
+                    let party = state.mls_party.lock().await;
+                    group
+                        .decrypt_application(&party, &frame.payload)
+                        .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
+                };
+                let text = String::from_utf8_lossy(&plaintext).into_owned();
+                // Log structured + print to stdout so operators see it
+                // both ways.
+                info!(peer = %peer_short, message = %text, "chat message");
+                println!("  [{peer_short}] {text}");
+            }
+            Err(e) => {
+                info!(peer = %peer_short, error = %e, "peer side closed; ending receive loop");
+                break;
+            }
+        }
+    }
+
+    persist_final_state(&state).await?;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+async fn persist_final_state(state: &Arc<DaemonState>) -> anyhow::Result<()> {
+    let snapshot = {
+        let party = state.mls_party.lock().await;
+        party
+            .snapshot_state()
+            .map_err(|e| anyhow::anyhow!("final snapshot failed: {e}"))?
+    };
+    persist_mls_snapshot(state, &snapshot).await
 }
 
 // ── Vault helpers ──────────────────────────────────────────────────────────

@@ -6,6 +6,89 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Chat loop: many messages per connection, asymmetric stdin/receive
+
+### What's new
+Both handlers stay open after the initial bootstrap/resume + greeting and exchange application messages in a loop. The dial side reads stdin → encrypts → sends; the accept side decrypts → prints. Either side exits cleanly on peer disconnect or, for the dialer, on stdin EOF.
+
+Verified end-to-end on real Tor: bob piped 3 lines via stdin, alice's responder logged all 3 decrypted plaintexts (with a stdout line per message too).
+
+### Design choice: asymmetric
+For v0, **only the dialer reads stdin**. `tokio::io::stdin()` can't be cleanly split across many concurrent handler tasks, and routing global stdin to a chosen connection is CLI/UX work that belongs in the future `onyx` client. So: bob (dialer) types; alice (acceptor) receives. Bidirectional chat between two daemons would require either a CLI layer or a "second daemon connection in the reverse direction" — both deferred.
+
+### Wire protocol (no change)
+- Bootstrap remains 5 frames (REQUEST_KP, KP, WELCOME, APP-greeting, APP-reply).
+- Resume remains 3 frames (RESUME, APP-greeting, APP-reply).
+- After that initial round-trip, **N additional FRAME_MLS_APP frames** in either direction (only initiator→responder in practice today).
+
+### `onyxd` additions
+- **`chat_loop_initiator(stream, session, group, state)`** — `tokio::select!` between:
+  - `read_frame(peer)` → decrypt → `println!("[peer] {text}")`
+  - `BufReader::new(tokio::io::stdin()).lines().next_line()` → encrypt → `write_frame`
+  Loops until peer disconnect or stdin EOF. Snapshots + persists MLS state on exit.
+- **`chat_loop_responder(stream, session, group, state, peer_pub_b32)`** — read-only loop:
+  - `read_frame(peer)` → decrypt → `info!(chat_message)` + `println!("[peer-short] {text}")`
+  Loops until peer disconnect. Snapshots + persists on exit.
+- Both wired into `handle_inbound` / `run_dial_mode` after the existing bootstrap/resume exchange returns. The exchange's greeting + reply still happens — it stays as a proof-of-liveness round-trip, then chat continues.
+
+### Bug fixed during smoke test: shutdown race
+First smoke run: bob sent 3 chat frames in 3ms, then `stream.shutdown()` immediately. Alice's `read_frame` returned EOF before reading any of the 3 frames. The Arti `DataStream::shutdown` apparently sends an END marker that can outrun in-flight data cells on the same circuit.
+
+**Fix**: add a fixed 500ms drain delay before `shutdown()` on the dial side. Documented inline. The proper fix is a protocol-level BYE+ACK handshake — flagged as a future item.
+
+After the fix, alice's log shows all 3 messages received with their plaintexts and stdout printed `[peer-short] chat-msg-A`, etc.
+
+### Smoke test transcript (real Tor, verified)
+```
+[bob]
+  ─── chat started — type to send, Ctrl-D (or EOF) to exit ───
+INFO onyxd: chat message sent text=chat-msg-A
+INFO onyxd: chat message sent text=chat-msg-B
+INFO onyxd: chat message sent text=chat-msg-C
+INFO onyxd: stdin EOF; ending chat
+
+[alice]
+INFO inbound{…}: chat receive loop active; waiting for peer messages peer=u5lhmxps
+INFO inbound{…}: chat message peer=u5lhmxps chat-msg-A
+INFO inbound{…}: chat message peer=u5lhmxps chat-msg-B
+INFO inbound{…}: chat message peer=u5lhmxps chat-msg-C
+INFO inbound{…}: peer side closed; ending receive loop
+```
+
+Alice's stdout (visible to the operator):
+```
+  [u5lhmxps] chat-msg-A
+  [u5lhmxps] chat-msg-B
+  [u5lhmxps] chat-msg-C
+```
+
+### Stdin reading caveat caught during testing
+`tokio::io::BufReader::new(stdin).lines()` reads available data eagerly. When bob's stdin is piped from `printf 'a\nb\nc\n'`, the bytes are buffered before bob's chat loop even starts; bob sends them all within a few milliseconds. That's *correct* behavior — it just looks weird in the log because there's no human-paced gap.
+
+For interactive use (typing in a terminal), the loop reads line-by-line as you type. The pipe-based test is just convenient for automated smoke testing.
+
+### Dependency change
+- Added `io-std` to `tokio`'s feature list (was missing — `tokio::io::stdin()` is gated behind it).
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ (after replacing one `continue` with an empty branch per `clippy::needless_continue`)
+- `cargo test --workspace` ✓ — **122 passing in `onyx-core`** (no new library tests this phase; library surface unchanged)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Two-daemon Tor smoke test** ✓ — 3-message chat captured above.
+
+### Open security gaps (carry-forward)
+- **Bidirectional chat between two daemons** — currently only the dialer can type. Real client work.
+- **500ms drain hack** — protocol-level BYE+ACK is the right fix; documented in code.
+- **`tokio::io::stdin()` can't be split across handlers** in accept mode — only one connection at a time would effectively get keyboard input, and even that's not implemented because stdin reading is dialer-only.
+- **No CLI / local API socket** — the only way to drive the daemon is `--dial` from a fresh process.
+- **No sealed-sender on daemon path.**
+- **fs-mistrust env-var workaround** still required for custom `--tor-state-dir`.
+- **No schema migration runner.**
+
+---
+
 ## 2026-05-18 — Daemon polish: independent Tor state, peer-verified log, resume fallback
 
 Three small but real items, all demonstrated end-to-end on the dev machine.

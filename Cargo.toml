@@ -65,7 +65,7 @@ tor-cell         = "0.42"
 safelog          = "0.8"
 
 # Async runtime. Used by arti and by the daemon.
-tokio            = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "fs", "time", "sync", "signal"] }
+tokio            = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "net", "fs", "time", "sync", "signal"] }
 # Stream / future utilities (drain the HS rend stream, etc).
 futures          = "0.3"
 # Structured logging for the daemon.
