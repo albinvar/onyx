@@ -6,6 +6,99 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T6.1: KeyPackage directory on the hub
+
+Foundational commit that unblocks two distinct next steps: **T5.2.e** (the `mls/v1` envelope variant with true PCS over the hub) and **T6.3** (multi-party rooms/channels). Both need the same capability: a sender must be able to obtain a recipient's MLS KeyPackage *before* constructing a Welcome message — and recipients aren't necessarily online at send time.
+
+The hub now stores one KeyPackage per routing id and answers fetches. Daemons auto-publish their current KP on every hub connect.
+
+### New wire frame types (`onyx-core::wire`)
+
+```rust
+pub const FRAME_KP_PUBLISH:  u16 = 0x50;  // client → hub  (store-and-forget)
+pub const FRAME_KP_FETCH:    u16 = 0x51;  // client → hub  (lookup request)
+pub const FRAME_KP_RESPONSE: u16 = 0x52;  // hub → client  (lookup answer)
+```
+
+Payload shapes (codified in the doc comments):
+
+  * **`KP_PUBLISH`**: `16-byte routing_id ‖ raw MLS KeyPackage bytes`. Same `target ‖ body` shape as `DELIVER` — keeps the wire decoder simple. Latest-wins; each publish overwrites the prior KP at that routing id. No ACK.
+  * **`KP_FETCH`**: exactly 16 bytes (the routing id to look up). Anything else → hub logs and ignores.
+  * **`KP_RESPONSE`**: 1-byte status (`0` = found, `1` = not found) followed by the KP bytes on `found`. Empty body on not-found.
+
+The wire-format doc on each constant is explicit about the security model and the recipient-side validation obligation. Worth quoting:
+
+> **Hub does not validate publisher ownership of the routing id.** Misuse: a connected client could overwrite another peer's published KP under that peer's routing id. The recipient mitigates this end-to-end: when fetching `target_fingerprint`'s KP, the recipient MUST verify that the KP's embedded Ed25519 signing key hashes to `target_fingerprint`. Hub-side challenge-and-respond ownership proof is a documented future-work item.
+
+This is the cautious cut: the directory is functionally complete today, the ownership-validation gap is recoverable on the recipient side, and the proper fix (sign-challenge requiring the hub to know the publisher's Ed25519) is tracked as `THREAT_MODEL.md` §8.2 #15.
+
+### `onyx-hub::state` — KP directory
+
+`HubState` gains:
+
+```rust
+keypackages: HashMap<RoutingId, Vec<u8>>,
+
+pub fn publish_keypackage(&mut self, routing_id: RoutingId, bytes: Vec<u8>);
+pub fn fetch_keypackage(&self, routing_id: &RoutingId) -> Option<Vec<u8>>;
+pub fn keypackage_count(&self) -> usize;  // diagnostic
+```
+
+Three state-level tokio tests: `fetch_keypackage_missing_returns_none`, `publish_then_fetch_returns_bytes`, `publish_overwrites_latest`. Latest-wins is asserted explicitly (the directory size stays at 1 after a republish — we replace, not append).
+
+### `onyx-hub::handler` — dispatch + integration tests
+
+Two new branches in the per-connection `select!` loop:
+
+  * `FRAME_KP_PUBLISH` → parse 16-byte routing-id prefix, call `state.publish_keypackage(id, kp_bytes)`. Log includes `directory_size` after publish so an operator watching the hub can see the directory growing.
+  * `FRAME_KP_FETCH` → require exactly 16 bytes payload (else log + ignore), call `state.fetch_keypackage(&id)`, write a `FRAME_KP_RESPONSE` with the status byte + optional KP bytes.
+
+Three new duplex integration tests:
+
+  * `keypackage_publish_then_fetch_round_trip` — alice publishes, bob fetches, bob receives `[0, ...kp_bytes]`. Hub-state side-check confirms `keypackage_count() == 1`.
+  * `keypackage_fetch_missing_returns_not_found` — fetch a never-published id, response is `[1]` (status byte only).
+  * `keypackage_republish_overwrites` — alice publishes "v1" then "v2", bob fetches and gets exactly "v2".
+
+(`serve_frames` got a `#[allow(clippy::too_many_lines)]` with a justification — it's one linear dispatcher, splitting per-verb would just rename code into call sites without making the dispatch easier to follow.)
+
+### `onyxd::hub_client` — `SelfPublish` + `write_kp_publish` helper
+
+New public type:
+
+```rust
+pub struct SelfPublish {
+    pub routing_id: RoutingId,
+    pub kp_bytes: Vec<u8>,
+}
+```
+
+`run_hub_session` gains a `self_publish: Option<&SelfPublish>` parameter (now 9 args; `#[allow(clippy::too_many_arguments)]` annotation updated). When `Some`, after the SUBSCRIBE write but before entering the bidirectional loop, the helper writes one `FRAME_KP_PUBLISH` with `routing_id ‖ kp_bytes`. `info!` logs `"hub: our KeyPackage published"` with the byte count.
+
+Split into a `write_kp_publish` helper for the same reason `write_subscribe` is split: smaller pieces are easier to read and the test harness can exercise them without going through the full dial path.
+
+### `onyxd::main` — auto-publish on every hub reconnect
+
+The hub-task reconnect loop now generates a fresh `KeyPackage` per attempt via `state.mls_party.lock().await.key_package_bytes()` and passes it as `self_publish` to `run_hub_session`. Building per-attempt rather than per-process means a hub that loses our entry (its in-memory dir, or a restart) gets us back in the directory on the next reconnect cycle. Generation is cheap (MLS just emits the current signing key + a fresh init key); doing it inside the loop keeps the surface minimal.
+
+Failure to generate a KeyPackage (shouldn't happen but defensive) → `warn!` and skip the publish for this cycle, hub session still proceeds (subscribe + receive still work). We do **not** error out the whole hub session over an inability to publish — the user can still receive hub-relayed messages even if they can't put themselves in the directory.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — added one `#[allow(clippy::too_many_lines)]` to `serve_frames` with justification.
+  * `cargo test --workspace` ✓ — **12 in `onyx-hub`** (+6: 3 state + 3 handler), 156 in `onyx-core`, 26 in `onyxd`, 7 in `onyx`. **201 total** (+6 since T5.2.g).
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **New: `THREAT_MODEL.md` §8.2 #15** — hub does not validate publisher ownership of a routing id when storing a KeyPackage. Recipient-side mitigation in place. Proper fix needs hub to learn the publisher's Ed25519 (Noise XK only surfaces X25519 today).
+  * **Directory is in-memory only** — same as the rest of the hub's state. A hub restart drops every published KP; clients reconnect and republish on their next hub session. Fine for v0.
+  * **No KP rotation policy yet** — a daemon's KP is regenerated each hub reconnect but doesn't expire on its own between reconnects. Real MLS deployments rotate KPs periodically; tracked for future work.
+  * **No `FetchPeerKeyPackage` API verb** in `onyxd` yet — T5.2.e will add it once it has a use for the fetched KP (constructing a Welcome).
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T5.2.g: `onyx send-bootstrap` CLI subcommand
 
 Tiny commit that closes the last UX gap blocking a real end-to-end demo of the hub-relayed first-contact path. Before today, exercising `SendBootstrap` required hand-built NDJSON and `nc -U`. Now it's:

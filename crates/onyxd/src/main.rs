@@ -310,6 +310,24 @@ async fn main() -> anyhow::Result<()> {
             let our_kem_for_cb = our_kem.clone();
             let mut backoff = std::time::Duration::from_millis(500);
             loop {
+                // Build a fresh KeyPackage per reconnect attempt so the
+                // hub's directory reflects our current MLS state. The
+                // generation is cheap (MLS just emits the current
+                // signing key + a fresh init key); doing it inside the
+                // loop keeps the surface minimal.
+                let self_publish = {
+                    let party = state_for_hub_task.mls_party.lock().await;
+                    match party.key_package_bytes() {
+                        Ok(kp_bytes) => Some(hub_client::SelfPublish {
+                            routing_id: our_inbox,
+                            kp_bytes,
+                        }),
+                        Err(e) => {
+                            warn!(error = %e, "hub: KeyPackage generation failed; skipping publish this cycle");
+                            None
+                        }
+                    }
+                };
                 let result = hub_client::run_hub_session(
                     &tor_clone,
                     &host,
@@ -325,6 +343,7 @@ async fn main() -> anyhow::Result<()> {
                             handle_hub_delivery(target, body, &state, &our_kem).await;
                         }
                     },
+                    self_publish.as_ref(),
                 )
                 .await;
                 match result {

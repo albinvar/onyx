@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use onyx_core::crypto::IdentitySecret;
 use onyx_core::transport::{Session, handshake_responder, read_frame, write_frame};
-use onyx_core::wire::{FRAME_DELIVER, FRAME_SUBSCRIBE, InnerFrame};
+use onyx_core::wire::{
+    FRAME_DELIVER, FRAME_KP_FETCH, FRAME_KP_PUBLISH, FRAME_KP_RESPONSE, FRAME_SUBSCRIBE, InnerFrame,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -55,6 +57,11 @@ where
     result
 }
 
+// `serve_frames` is one linear `select!`-loop dispatcher; the body is
+// long because each branch handles a complete protocol verb inline.
+// Splitting per-verb helpers would just rename code into call sites
+// without making the dispatch easier to follow.
+#[allow(clippy::too_many_lines)]
 async fn serve_frames<S>(
     stream: &mut S,
     session: &mut Session,
@@ -113,6 +120,83 @@ where
                             conn = conn_id,
                             live_subscribers = delivered,
                             "hub: deliver routed"
+                        );
+                    }
+                    FRAME_KP_PUBLISH => {
+                        // Store-and-forget. Latest-wins. Hub does NOT
+                        // verify the publisher owns the routing id; the
+                        // recipient must verify the KP's embedded
+                        // signing key against the expected fingerprint
+                        // before trusting (`SECURITY.md` carry-forward).
+                        //
+                        // What routing id to store under? For T6.1 the
+                        // convention is: the publisher's introduction-
+                        // inbox routing id. The hub doesn't know that
+                        // mapping (it'd need the publisher's signing
+                        // key, which Noise XK doesn't surface). So the
+                        // publisher embeds it implicitly: the KP at
+                        // `inbox_id` is the KP for the holder of the
+                        // fingerprint that derives `inbox_id`. To make
+                        // this concrete and testable, the protocol
+                        // requires the publish payload to be prefixed
+                        // with the 16-byte routing id, followed by the
+                        // KP bytes — same shape as DELIVER.
+                        if frame.payload.len() < 16 {
+                            warn!(
+                                conn = conn_id,
+                                payload_len = frame.payload.len(),
+                                "hub: KP_PUBLISH payload missing routing-id prefix; ignoring"
+                            );
+                            continue;
+                        }
+                        let routing_id = parse_target_prefix(&frame.payload)?;
+                        let kp_bytes = frame.payload[16..].to_vec();
+                        let kp_len = kp_bytes.len();
+                        let dir_size = {
+                            let mut s = state.lock().await;
+                            s.publish_keypackage(routing_id, kp_bytes);
+                            s.keypackage_count()
+                        };
+                        info!(
+                            conn = conn_id,
+                            kp_bytes = kp_len,
+                            directory_size = dir_size,
+                            "hub: KeyPackage published"
+                        );
+                    }
+                    FRAME_KP_FETCH => {
+                        // Payload = exactly 16 bytes routing id. Respond
+                        // with FRAME_KP_RESPONSE: status (1 B) + body.
+                        if frame.payload.len() != 16 {
+                            warn!(
+                                conn = conn_id,
+                                payload_len = frame.payload.len(),
+                                "hub: KP_FETCH payload must be exactly 16 bytes; ignoring"
+                            );
+                            continue;
+                        }
+                        let mut routing_id = [0u8; 16];
+                        routing_id.copy_from_slice(&frame.payload);
+                        let kp_opt = state.lock().await.fetch_keypackage(&routing_id);
+                        let found = kp_opt.is_some();
+                        let response_payload = match kp_opt {
+                            Some(kp_bytes) => {
+                                let mut out = Vec::with_capacity(1 + kp_bytes.len());
+                                out.push(0u8); // status: found
+                                out.extend_from_slice(&kp_bytes);
+                                out
+                            }
+                            None => vec![1u8], // status: not-found, no body
+                        };
+                        write_frame(stream, session, &InnerFrame {
+                            frame_type: FRAME_KP_RESPONSE,
+                            payload: response_payload,
+                        }).await
+                            .map_err(|e| anyhow::anyhow!("hub: write KP_RESPONSE: {e}"))?;
+                        info!(
+                            conn = conn_id,
+                            found,
+                            "hub: KP_FETCH answered"
                         );
                     }
                     other => {
@@ -366,5 +450,201 @@ mod tests {
     /// (IdentitySecret deliberately doesn't impl Clone).
     fn hub_sk_clone(sk: &IdentitySecret) -> IdentitySecret {
         IdentitySecret::from_bytes(*sk.to_bytes())
+    }
+
+    /// T6.1: publish + fetch round-trip over the wire.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn keypackage_publish_then_fetch_round_trip() {
+        use onyx_core::transport::handshake_initiator;
+
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let alice_sk = IdentitySecret::generate();
+        let bob_sk = IdentitySecret::generate();
+
+        let state = Arc::new(Mutex::new(HubState::new()));
+
+        let (alice_client, alice_hub) = tokio::io::duplex(65_536);
+        let (bob_client, bob_hub) = tokio::io::duplex(65_536);
+
+        let _alice_hub_task = spawn_hub(alice_hub, hub_sk_clone(&hub_sk), state.clone());
+        let _bob_hub_task = spawn_hub(bob_hub, hub_sk_clone(&hub_sk), state.clone());
+
+        // The directory key alice publishes under.
+        let alice_kp_id: RoutingId = [0xE1; 16];
+        let alice_kp_bytes = b"opaque-mls-keypackage-bytes-from-alice".to_vec();
+
+        // Alice publishes her KP.
+        let hub_pk_for_alice = hub_pk;
+        let alice_kp_bytes_clone = alice_kp_bytes.clone();
+        let alice_task = tokio::spawn(async move {
+            let mut stream = alice_client;
+            let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk_for_alice)
+                .await
+                .expect("alice handshake");
+            // Payload layout per T6.1 wire spec:
+            // 16-byte routing id ‖ KP bytes.
+            let mut payload = Vec::with_capacity(16 + alice_kp_bytes_clone.len());
+            payload.extend_from_slice(&alice_kp_id);
+            payload.extend_from_slice(&alice_kp_bytes_clone);
+            write_frame(
+                &mut stream,
+                &mut session,
+                &InnerFrame {
+                    frame_type: FRAME_KP_PUBLISH,
+                    payload,
+                },
+            )
+            .await
+            .expect("alice KP publish");
+            // Hold the stream open briefly so the hub processes the
+            // publish before bob's fetch races against it. (Without
+            // some ordering signal the two tasks could interleave —
+            // fine for protocol correctness, awkward for the test.)
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        alice_task.await.unwrap();
+
+        // Bob fetches and verifies he gets back exactly what alice published.
+        let hub_pk_for_bob = hub_pk;
+        let bob_task = tokio::spawn(async move {
+            let mut stream = bob_client;
+            let mut session = handshake_initiator(&mut stream, &bob_sk, &hub_pk_for_bob)
+                .await
+                .expect("bob handshake");
+            write_frame(
+                &mut stream,
+                &mut session,
+                &InnerFrame {
+                    frame_type: FRAME_KP_FETCH,
+                    payload: alice_kp_id.to_vec(),
+                },
+            )
+            .await
+            .expect("bob KP fetch");
+
+            let resp = read_frame(&mut stream, &mut session)
+                .await
+                .expect("bob read");
+            assert_eq!(resp.frame_type, FRAME_KP_RESPONSE);
+            // Payload: 1-byte status + KP bytes.
+            assert!(
+                !resp.payload.is_empty(),
+                "response must include status byte"
+            );
+            assert_eq!(resp.payload[0], 0, "status 0 = found");
+            assert_eq!(&resp.payload[1..], alice_kp_bytes.as_slice());
+        });
+        bob_task.await.unwrap();
+
+        // Hub state side-channel: directory has exactly one entry.
+        assert_eq!(state.lock().await.keypackage_count(), 1);
+    }
+
+    /// T6.1: fetch with no prior publish returns status=not-found.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn keypackage_fetch_missing_returns_not_found() {
+        use onyx_core::transport::handshake_initiator;
+
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let alice_sk = IdentitySecret::generate();
+
+        let state = Arc::new(Mutex::new(HubState::new()));
+        let (alice_client, alice_hub) = tokio::io::duplex(65_536);
+        let _alice_hub_task = spawn_hub(alice_hub, hub_sk_clone(&hub_sk), state.clone());
+
+        let missing_id: RoutingId = [0xE2; 16];
+
+        let mut stream = alice_client;
+        let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk)
+            .await
+            .expect("alice handshake");
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: FRAME_KP_FETCH,
+                payload: missing_id.to_vec(),
+            },
+        )
+        .await
+        .expect("write fetch");
+
+        let resp = read_frame(&mut stream, &mut session).await.expect("read");
+        assert_eq!(resp.frame_type, FRAME_KP_RESPONSE);
+        assert_eq!(resp.payload.len(), 1, "not-found has no body");
+        assert_eq!(resp.payload[0], 1, "status 1 = not-found");
+    }
+
+    /// T6.1: latest-wins on republish.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn keypackage_republish_overwrites() {
+        use onyx_core::transport::handshake_initiator;
+
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let alice_sk = IdentitySecret::generate();
+        let bob_sk = IdentitySecret::generate();
+
+        let state = Arc::new(Mutex::new(HubState::new()));
+        let (alice_client, alice_hub) = tokio::io::duplex(65_536);
+        let (bob_client, bob_hub) = tokio::io::duplex(65_536);
+        let _alice_hub_task = spawn_hub(alice_hub, hub_sk_clone(&hub_sk), state.clone());
+        let _bob_hub_task = spawn_hub(bob_hub, hub_sk_clone(&hub_sk), state.clone());
+
+        let id: RoutingId = [0xE3; 16];
+
+        // Alice publishes twice; the second publish must replace, not append.
+        let hub_pk_for_alice = hub_pk;
+        let alice_task = tokio::spawn(async move {
+            let mut stream = alice_client;
+            let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk_for_alice)
+                .await
+                .expect("alice handshake");
+            for (label, body) in [("v1", b"kp-v1".as_slice()), ("v2", b"kp-v2".as_slice())] {
+                let mut payload = Vec::with_capacity(16 + body.len());
+                payload.extend_from_slice(&id);
+                payload.extend_from_slice(body);
+                write_frame(
+                    &mut stream,
+                    &mut session,
+                    &InnerFrame {
+                        frame_type: FRAME_KP_PUBLISH,
+                        payload,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("publish {label}: {e}"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        alice_task.await.unwrap();
+
+        // Bob fetches; must get v2 only.
+        let hub_pk_for_bob = hub_pk;
+        let bob_task = tokio::spawn(async move {
+            let mut stream = bob_client;
+            let mut session = handshake_initiator(&mut stream, &bob_sk, &hub_pk_for_bob)
+                .await
+                .expect("bob handshake");
+            write_frame(
+                &mut stream,
+                &mut session,
+                &InnerFrame {
+                    frame_type: FRAME_KP_FETCH,
+                    payload: id.to_vec(),
+                },
+            )
+            .await
+            .expect("bob fetch");
+            let resp = read_frame(&mut stream, &mut session).await.expect("read");
+            assert_eq!(resp.payload[0], 0, "found");
+            assert_eq!(&resp.payload[1..], b"kp-v2");
+        });
+        bob_task.await.unwrap();
     }
 }

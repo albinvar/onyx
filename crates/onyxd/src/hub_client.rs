@@ -66,11 +66,22 @@ pub struct HubOutbound {
 /// still carry the 16-byte target prefix (the hub preserves it so a
 /// multi-subscribed client can demultiplex) — the callback receives
 /// `(target, body_after_prefix)`.
-// 8-arg signature is intentional: every parameter names a distinct
+/// One self-publication parcel: the routing id under which to file
+/// our KP in the hub's directory + the KP bytes themselves. Built
+/// by `main.rs` from `state.identity.fingerprint()` and a fresh
+/// `MlsParty::key_package_bytes` call.
+#[derive(Debug, Clone)]
+pub struct SelfPublish {
+    pub routing_id: RoutingId,
+    pub kp_bytes: Vec<u8>,
+}
+
+// 9-arg signature is intentional: every parameter names a distinct
 // piece of session context (Tor runtime, host, port, hub static key,
-// our static key, subscriptions, outbound queue, deliver callback).
-// Bundling them into a struct would just trade one readable function
-// for the same arguments rewritten as fields.
+// our static key, subscriptions, outbound queue, deliver callback,
+// optional self-publish). Bundling them into a struct would just
+// trade one readable function for the same arguments rewritten as
+// fields.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_hub_session<F, Fut>(
     tor: &TorRuntime,
@@ -81,6 +92,7 @@ pub async fn run_hub_session<F, Fut>(
     subscribe_to: &[RoutingId],
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     on_deliver: F,
+    self_publish: Option<&SelfPublish>,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
@@ -106,9 +118,46 @@ where
     write_subscribe(&mut stream, &mut session, subscribe_to)
         .await
         .map_err(|e| anyhow::anyhow!("hub SUBSCRIBE write failed: {e}"))?;
-    info!("hub: subscription registered, entering bidirectional loop");
+    info!("hub: subscription registered");
 
+    if let Some(sp) = self_publish {
+        write_kp_publish(&mut stream, &mut session, &sp.routing_id, &sp.kp_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("hub KP_PUBLISH write failed: {e}"))?;
+        info!(
+            kp_bytes = sp.kp_bytes.len(),
+            "hub: our KeyPackage published"
+        );
+    }
+
+    info!("hub: entering bidirectional loop");
     serve_session(&mut stream, &mut session, outbound_rx, on_deliver).await
+}
+
+/// Write one `FRAME_KP_PUBLISH` carrying `routing_id ‖ kp_bytes`.
+/// Split out so the test harness + future re-publish triggers can
+/// call it without dragging in the full dial path.
+async fn write_kp_publish<S>(
+    stream: &mut S,
+    session: &mut Session,
+    routing_id: &RoutingId,
+    kp_bytes: &[u8],
+) -> onyx_core::error::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut payload = Vec::with_capacity(16 + kp_bytes.len());
+    payload.extend_from_slice(routing_id);
+    payload.extend_from_slice(kp_bytes);
+    write_frame(
+        stream,
+        session,
+        &InnerFrame {
+            frame_type: onyx_core::wire::FRAME_KP_PUBLISH,
+            payload,
+        },
+    )
+    .await
 }
 
 /// Write one `FRAME_SUBSCRIBE` carrying the concatenated routing ids.

@@ -41,6 +41,17 @@ pub struct HubState {
     senders: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
     subscribers: HashMap<RoutingId, HashSet<ConnId>>,
     queues: HashMap<RoutingId, Vec<Vec<u8>>>,
+    /// MLS KeyPackage directory. Maps a routing id (typically the
+    /// publisher's introduction-inbox id) to the latest KeyPackage
+    /// bytes they've published. Latest-wins: each `publish_keypackage`
+    /// overwrites the previous entry for that routing id.
+    ///
+    /// **Security note**: the hub does not validate that a publisher
+    /// "owns" the routing id they're publishing under. See the
+    /// `FRAME_KP_PUBLISH` doc in `onyx-core::wire` for the recipient-
+    /// side mitigation (verify KP's embedded signing key against the
+    /// expected fingerprint before trusting).
+    keypackages: HashMap<RoutingId, Vec<u8>>,
 }
 
 impl HubState {
@@ -117,6 +128,29 @@ impl HubState {
         }
         // Reclaim empty-set entries so subscribers doesn't grow without bound.
         self.subscribers.retain(|_, subs| !subs.is_empty());
+    }
+
+    // ── KeyPackage directory (T6.1) ────────────────────────────────────────
+
+    /// Store (or replace) the KeyPackage published at `routing_id`.
+    /// Latest-wins; no validation that the publisher owns the
+    /// routing id (see module-level doc).
+    pub fn publish_keypackage(&mut self, routing_id: RoutingId, bytes: Vec<u8>) {
+        self.keypackages.insert(routing_id, bytes);
+    }
+
+    /// Return the most recent KeyPackage stored at `routing_id`, or
+    /// `None` if nothing has ever been published there.
+    #[must_use]
+    pub fn fetch_keypackage(&self, routing_id: &RoutingId) -> Option<Vec<u8>> {
+        self.keypackages.get(routing_id).cloned()
+    }
+
+    /// Diagnostic: number of routing ids that currently hold a
+    /// published KeyPackage. Used by tests + future status reporting.
+    #[allow(dead_code)]
+    pub fn keypackage_count(&self) -> usize {
+        self.keypackages.len()
     }
 
     // ── Diagnostics (used by tests today; the binary's status
@@ -225,5 +259,42 @@ mod tests {
         // The whole routing-id entry should have been pruned, not
         // left empty in the map.
         assert!(!state.subscribers.contains_key(&id));
+    }
+
+    // ── KeyPackage directory (T6.1) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_keypackage_missing_returns_none() {
+        let state = HubState::new();
+        let id: RoutingId = [0xAA; 16];
+        assert!(state.fetch_keypackage(&id).is_none());
+        assert_eq!(state.keypackage_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_then_fetch_returns_bytes() {
+        let mut state = HubState::new();
+        let id: RoutingId = [0xBB; 16];
+        state.publish_keypackage(id, b"kp-bytes-v1".to_vec());
+        assert_eq!(
+            state.fetch_keypackage(&id).as_deref(),
+            Some(b"kp-bytes-v1".as_slice())
+        );
+        assert_eq!(state.keypackage_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_overwrites_latest() {
+        let mut state = HubState::new();
+        let id: RoutingId = [0xCC; 16];
+        state.publish_keypackage(id, b"kp-v1".to_vec());
+        state.publish_keypackage(id, b"kp-v2".to_vec());
+        // Latest-wins, not concatenation or rejection.
+        assert_eq!(
+            state.fetch_keypackage(&id).as_deref(),
+            Some(b"kp-v2".as_slice())
+        );
+        // And the directory size stays at 1 — we replaced, not appended.
+        assert_eq!(state.keypackage_count(), 1);
     }
 }

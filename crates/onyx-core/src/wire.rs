@@ -54,6 +54,37 @@ pub const FRAME_SUBSCRIBE: u16 = 0x22;
 pub const FRAME_ROOM_OP: u16 = 0x30;
 /// `ROOM_OP_ACK` — hub → client, result of a room op.
 pub const FRAME_ROOM_OP_ACK: u16 = 0x31;
+/// `KP_PUBLISH` — client → hub. Publish (or replace) the client's
+/// current MLS KeyPackage in the hub's keypackage directory under
+/// the publisher's introduction-inbox routing id (DESIGN §5.5).
+///
+/// Payload = raw MLS KeyPackage bytes (the same TLS-serialised form
+/// emitted by [`crate::mls::MlsParty::key_package_bytes`]).
+///
+/// Semantics: latest-wins. Each PUBLISH overwrites any prior KP at
+/// the same routing id. No ACK.
+///
+/// **Hub does not validate publisher ownership of the routing id.**
+/// Misuse: a connected client could overwrite another peer's
+/// published KP under that peer's routing id. The recipient mitigates
+/// this end-to-end: when fetching `target_fingerprint`'s KP, the
+/// recipient MUST verify that the KP's embedded Ed25519 signing key
+/// hashes to `target_fingerprint`. Hub-side challenge-and-respond
+/// ownership proof is a documented future-work item.
+pub const FRAME_KP_PUBLISH: u16 = 0x50;
+/// `KP_FETCH` — client → hub. Request the latest KeyPackage stored
+/// at the given routing id. Payload = exactly 16 bytes (the
+/// routing id). Hub answers with [`FRAME_KP_RESPONSE`].
+pub const FRAME_KP_FETCH: u16 = 0x51;
+/// `KP_RESPONSE` — hub → client. Answer to a `FRAME_KP_FETCH`.
+///
+/// Payload layout:
+///   * 1 byte status: `0` = found (KP bytes follow), `1` = not found
+///     (no further bytes).
+///   * On `found`: the remaining payload bytes are the raw MLS
+///     KeyPackage. Recipient validates the embedded signing key
+///     against the expected fingerprint before trusting.
+pub const FRAME_KP_RESPONSE: u16 = 0x52;
 /// `PING` — either direction, keepalive.
 pub const FRAME_PING: u16 = 0x40;
 /// `PONG` — either direction, keepalive response.
