@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod error;
 pub mod flows;
 pub mod identity;
+pub mod invite;
 pub mod mls;
 pub mod routing;
 pub mod storage;

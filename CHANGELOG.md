@@ -6,6 +6,69 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T7.2: invite URLs (`onyx invite` / `onyx accept`)
+
+Second UX win in the T7.x "make Onyx usable by humans" sequence. T7.1 killed the two-terminal problem; T7.2 kills the **copy three base32 blobs into env vars** problem.
+
+Before today, introducing yourself to a peer over the hub meant:
+
+  1. Run `onyx identity`, copy the 52-char fingerprint *and* the 1948-char KEM pubkey out of the JSON.
+  2. Send both to your peer over Signal / in person.
+  3. Peer runs `onyx send-bootstrap --peer-fingerprint "<52 chars>" --peer-kem-pub-b32 "<1948 chars>" --text "hi"`.
+  4. (Optionally — for MLS — they also fetch your KP and use `send-bootstrap-mls`.)
+
+After today, step 2's payload is **one string**:
+
+```
+onyx://invite/v1?fp=<52chars>&kem=<1948chars>
+```
+
+And the peer's step 3 is just:
+
+```
+onyx accept onyx://invite/v1?fp=…&kem=… --text "hi from bob"
+```
+
+What landed:
+
+**T7.2.a — `onyx_core::invite` module.** New `crates/onyx-core/src/invite.rs` (~120 lines code + ~80 lines tests). Hand-rolled parser/builder for `onyx://invite/v1?fp=…&kem=…` (no `url` crate dependency — the format is intentionally minimal so parsing is one `strip_prefix` + one `split('&')` loop). Public surface:
+
+  * `pub struct Invite { fingerprint: Fingerprint, kem_pub_b32: String }` — both fields are public information by design (same data `onyx identity` prints).
+  * `Invite::new(fp, kem) -> Self` — typed constructor.
+  * `Invite::to_url() -> String` — emits `onyx://invite/v1?fp=<base32_no_spaces>&kem=<base32>`.
+  * `Invite::parse(&str) -> Result<Self>` — rejects wrong scheme, wrong version, missing `fp`/`kem`, empty `kem`, malformed query, invalid base32 fingerprint. Unknown query keys are *ignored* for forward-compat — a future `v1` invite with e.g. `&kp=…` parses cleanly on today's clients, which just fall through to the no-KP code path. A version bump (`invite/v2`) is reserved for breaking changes.
+
+  10 unit tests covering: round-trip, every rejection path, forward-compat key tolerance, grouped-Display round-trip (the URL strips spaces; `Fingerprint::parse` recovers them on the way back).
+
+**Explicitly NOT in the URL (with reasons in the module docstring):**
+
+  * No KeyPackage. MLS-tier first-contact would need a peer KP bundled in. That's `T7.2-mls` (follow-up phase); for now `accept` is msg/v1 only. Operators wanting MLS PCS on first contact still use the existing `fetch-keypackage` + `send-bootstrap-mls` two-step.
+  * No hub onion. The accepting peer is assumed to already have a hub configured. Cross-hub invites are a separate design problem.
+  * No nickname. Identity in Onyx is the fingerprint, full stop. A nickname in the URL would only enable spoofing — labels are the recipient's local concern.
+
+**T7.2.b — `onyx invite` subcommand.** `crates/onyx/src/main.rs`. Calls the daemon's existing `ApiRequest::Identity`, takes the `fingerprint` + `identity_kem_pub_b32` from `IdentityOk`, builds an `Invite`, prints `to_url()` on stdout as plain text (not JSON — meant to be piped into a clipboard / chat client). Daemon errors are forwarded as pretty-printed JSON with exit code 1, matching the convention of `one_shot_print`. **No new API request type was needed**: the daemon already exposes everything required.
+
+**T7.2.c — `onyx accept <url> --text "…"` subcommand.** Parses the URL via `Invite::parse`, then dispatches to the existing `ApiRequest::SendBootstrap { peer_fingerprint, peer_kem_pub_b32, text }`. Invalid URLs surface as anyhow errors with context (`"invalid invite URL: invite: missing onyx:// scheme"`). `--text` is required (clap-enforced) — empty introductions don't exist at the protocol level, so the CLI refuses to invent one.
+
+**T7.2.d — CLI parser tests.** Three new clap tests in `crates/onyx/src/main.rs::tests`:
+
+  * `invite_subcommand_parses_with_no_args` — `onyx invite` with no flags parses to `Some(Command::Invite)`.
+  * `accept_subcommand_parses_url_and_text` — positional URL + `--text` round-trips through clap.
+  * `accept_requires_text_flag` — omitting `--text` must be a parse error (same anti-footgun discipline as `send-bootstrap`).
+
+Security: no protocol change. The invite URL carries only data already published in `onyx status` / `onyx identity` — both the fingerprint and KEM pubkey are designed to be public. The `accept` path sends a msg/v1 sealed-sender envelope, which is the **exact same wire format** as today's `send-bootstrap`: same hybrid X25519 + ML-KEM-768 encapsulation, same per-message PFS, same lack of MLS PCS (documented in `SECURITY.md` §6.1). Recipients should still verify the invite's `fp` segment matches the fingerprint their peer told them out-of-band (Signal, voice, in person) before trusting the channel — the URL itself authenticates nothing about *who* shared it. The module docstring spells this out: "An invite URL is public information by design. Authentication of who the recipient is is the user's responsibility."
+
+What this did NOT do:
+
+  * No hub-side change, no wire-format change, no vault-schema change.
+  * No MLS-tier invite URL yet (the `--with-kp` flag and the `mls://…` path are queued as the next slice — call it `T7.2-mls`).
+  * No QR-code rendering. The URL is short enough (~2 KB on stdout) to paste; a QR helper can live in a follow-up that nobody's asking for yet.
+  * No TUI integration. The TUI doesn't yet present "paste an invite URL" or "show your URL as a QR." That's a separate visual polish pass.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (had to swap one `i as u8` for `u8::try_from(i).expect(...)` in a test fixture once `must_use` candidates were enforced across the new module), `cargo test --workspace` 229 passed / 0 failed (was 216; +10 invite module + +3 CLI parser tests). The actual end-to-end invite handshake reuses the already-tested `SendBootstrap` path — the new code is just a CLI ergonomics layer.
+
+---
+
 ## 2026-05-18 — T7.1: single-binary `onyx` (daemon + TUI in one process) + `~/.onyx/` defaults
 
 Headline UX change. Before today: to chat, a user had to run `onyxd` in one terminal, `onyx tui` in another, point both at the same `--api-socket`, and make sure paths matched. After today: **`onyx` is the one command**. Run it with no subcommand and it launches the daemon in the background and the TUI in the foreground in the same process. The second terminal is gone.

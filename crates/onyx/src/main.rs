@@ -16,6 +16,10 @@
 //! * `onyx send-bootstrap` — first-contact send via hub (msg/v1, PFS only).
 //! * `onyx send-bootstrap-mls` — first-contact send via hub (mls/v1, full MLS PCS).
 //! * `onyx fetch-keypackage` — pull a peer's published KP from the hub directory.
+//! * `onyx invite` — print a shareable `onyx://invite/v1?…` URL bundling
+//!   this identity's fingerprint + KEM pubkey (T7.2+).
+//! * `onyx accept <url> --text "…"` — parse such a URL and send the
+//!   bundled identity a msg/v1 first-contact via the hub (T7.2+).
 //! * `onyx tui` — open the multi-pane Ratatui interface against an
 //!   already-running daemon (won't start one for you — use the
 //!   no-subcommand form for that).
@@ -167,6 +171,31 @@ enum Command {
         #[arg(long)]
         peer_fingerprint: String,
     },
+    /// Print a shareable `onyx://invite/v1?…` URL bundling our
+    /// fingerprint and KEM public key. Hand it to a peer (over Signal,
+    /// in person, whatever channel you trust to authenticate them) and
+    /// they run `onyx accept <url> --text "hi"` to introduce themselves
+    /// via the hub. The URL carries no secrets — it's the same data
+    /// `onyx identity` already prints, just bundled.
+    Invite,
+    /// Accept an `onyx://invite/v1?…` URL by sending the named
+    /// fingerprint a first-contact message via the hub. Equivalent to
+    /// `onyx send-bootstrap --peer-fingerprint … --peer-kem-pub-b32 …
+    /// --text …` but you don't have to copy two long base32 strings.
+    ///
+    /// Tier: msg/v1 (PFS only). MLS-tier bootstrap via invite URL is
+    /// queued for a follow-up phase; for now use `fetch-keypackage` +
+    /// `send-bootstrap-mls` if you need MLS PCS on first contact.
+    Accept {
+        /// The `onyx://invite/v1?…` URL.
+        url: String,
+        /// Plaintext message to deliver alongside the introduction.
+        /// Required — a sealed-sender envelope always carries a
+        /// payload, so an empty "just say hi" introduction doesn't
+        /// exist at the protocol level.
+        #[arg(long)]
+        text: String,
+    },
 }
 
 #[tokio::main]
@@ -301,7 +330,52 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
             )
             .await
         }
+        Some(Command::Invite) => run_invite(&socket).await,
+        Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
     }
+}
+
+/// Build an `onyx://invite/v1?…` URL from the daemon's identity and
+/// print it on stdout. Plain string output (not JSON) — this is meant
+/// to be piped directly into a clipboard / chat client.
+async fn run_invite(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
+    let resp = client::one_shot(socket, &ApiRequest::Identity).await?;
+    match resp {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => {
+            let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
+            let url = onyx_core::invite::Invite::new(fp, identity_kem_pub_b32).to_url();
+            println!("{url}");
+            Ok(ExitCode::SUCCESS)
+        }
+        ApiResponse::Error { .. } => {
+            // Surface the daemon's error verbatim so the operator can
+            // diagnose (vault locked, daemon not ready, etc.).
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(ExitCode::from(1))
+        }
+        other => anyhow::bail!("unexpected daemon response to Identity: {other:?}"),
+    }
+}
+
+/// Parse an invite URL, then ship a msg/v1 sealed-sender bootstrap to
+/// the recipient with `text` as the payload. Same exit-code contract
+/// as `one_shot_print`.
+async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow::Result<ExitCode> {
+    let invite = onyx_core::invite::Invite::parse(url)
+        .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
+    one_shot_print(
+        socket,
+        ApiRequest::SendBootstrap {
+            peer_fingerprint: invite.fingerprint.to_string(),
+            peer_kem_pub_b32: invite.kem_pub_b32,
+            text,
+        },
+    )
+    .await
 }
 
 /// Send `req`, pretty-print the response as JSON on stdout, return
@@ -422,5 +496,38 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn invite_subcommand_parses_with_no_args() {
+        let args = Args::try_parse_from(["onyx", "invite"]).expect("parses");
+        assert!(matches!(args.cmd, Some(Command::Invite)));
+    }
+
+    #[test]
+    fn accept_subcommand_parses_url_and_text() {
+        let args = Args::try_parse_from([
+            "onyx",
+            "accept",
+            "onyx://invite/v1?fp=abcd&kem=efgh",
+            "--text",
+            "hi from accept",
+        ])
+        .expect("parses");
+        match args.cmd {
+            Some(Command::Accept { url, text }) => {
+                assert_eq!(url, "onyx://invite/v1?fp=abcd&kem=efgh");
+                assert_eq!(text, "hi from accept");
+            }
+            other => panic!("expected Accept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_requires_text_flag() {
+        // Empty introduction would silently ship an empty plaintext —
+        // surface it as a clap parse error instead, same discipline
+        // as send-bootstrap.
+        assert!(Args::try_parse_from(["onyx", "accept", "onyx://invite/v1?fp=x&kem=y"]).is_err());
     }
 }
