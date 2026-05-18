@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — Docs: `ANONYMITY.md` — honest inventory of what Onyx hides and what it doesn't
+
+Documentation-only change. No code, no protocol, no behaviour delta. The four recent zero-trust hardenings (T7.3-sec, T7.3-sec.2, T7.3-sec.2-persist) closed real attacks, but the answer to "is Onyx anonymous?" still lived only in this changelog and in scattered module rustdocs. Users wanting to evaluate fit needed to reconstruct the picture from primary sources. `ANONYMITY.md` consolidates it — with the same discipline as `HOW_IT_WORKS.md`: file pointers for every claim, an explicit gap list, no marketing.
+
+Structure (six sections):
+
+  * **§0 honest framing**. Lead paragraph spells out what Onyx aims for (hide who is talking to whom from network, ISP, hubs) and what it does NOT aim for (defend against a global passive adversary watching both endpoints' Tor entry guards). Explicit "no claim of 'perfect anonymity' appears anywhere in this repository" with a "file a bug if you find one" line. Same posture as `SECURITY.md` §1.
+  * **§1 adversary model A1–A4**. Local network / ISP / coffee-shop snooper (defended); compromised or hostile relay hub (defended, with all four T7.3-sec.x mitigations cited); peer turning hostile (MLS PCS + per-message PFS); global passive adversary (NOT defended — Tor's own threat model excludes this, Onyx inherits the posture). Each entry has "what Onyx does" + "caveat" so the user knows exactly where the defence ends.
+  * **§2 what's in place today**. A 12-row table of concrete defences with code pointers — `crates/onyx-core/src/tor.rs` for Tor, `routing.rs::seal_bootstrap` for sealed sender, `routing.rs::introduction_inbox` for the hashed routing id, `wire.rs::max_payload` for size buckets, the T7.3-sec.x commits for hub validation and replay defence, the `unsafe_code = "forbid"` lint setting, the 0700 perm on `~/.onyx/`, etc. Every claim points at a file or test.
+  * **§3 honest gap list**. Nine specific gaps ranked by anonymity impact: timing correlation (biggest — cover traffic, 1–2 sessions), online/offline-linkability (per-session subscription rotation, ~3 hr), per-inbox message count (subsumed by cover traffic), no reproducible builds (supply chain), disk fingerprint, process name leak, partial memory zeroization, group-membership identity leak (out of scope — fundamental MLS property, documented as "use the right tool"), no DPI obfuscation (Tor bridges).
+  * **§4 practical recommendations by threat model**. Five scenarios from "curious coworker" up to "state-level adversary" — what Onyx is right for, what it's wrong for, when to reach for SecureDrop / OnionShare instead. Explicit "for a one-shot anonymous tip, Onyx is the WRONG tool" — Onyx is identity-bound chat, not source protection.
+  * **§5 comparison table**. Onyx / Signal / Briar / SecureDrop / Cwtch on four axes (network anonymity, identity anonymity, cover traffic, audited). Onyx fails the last two ("No" + "No"); both are tracked in `ROADMAP.md`. Comparison is deliberately narrow — not a product ranking, just "where Onyx lands on this one axis." Other tools are good at what they're designed for.
+  * **§6 related docs**. Cross-references SECURITY.md / HOW_IT_WORKS.md / THREAT_MODEL.md / ROADMAP.md / CHANGELOG.md and asks readers to file issues for gaps not listed.
+
+`README.md` §12 doc index updated to feature `ANONYMITY.md` as a bold row, sitting between `HOW_IT_WORKS.md` ("how do I know this is secure?") and `ROADMAP.md` ("what's coming next?") — those are the three answers a new user needs in order to decide whether Onyx fits their threat model.
+
+What this doc does NOT do (intentionally):
+
+  * Does not claim Onyx is anonymous against adversary A4 (it isn't, until cover traffic lands).
+  * Does not promise an audit timeline (there isn't one).
+  * Does not list every possible attack — only the ones with concrete defences or concrete gaps.
+  * Does not recommend Onyx for sources / whistleblowers / anyone whose threat is life-safety. Explicitly redirects to SecureDrop for that.
+
+Verification: documentation-only commit. `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test --workspace` (260 tests) all unchanged from `55fb848`.
+
+---
+
 ## 2026-05-19 — T7.3-sec.2-persist: persist the envelope-replay seen-set across daemon restarts
 
 Closes the restart window left over from T7.3-sec.2. That commit added an in-memory FIFO seen-set of envelope hashes so the recipient daemon would silently drop replays from a hostile hub — *while the daemon was running*. The instant the daemon restarted, the set was empty, and a 5–10-minute window opened in which the hub could replay any stored envelope and bob's daemon would happily surface the duplicate. Today: that window is closed to ≤60 s (the snapshot tick) without changing any wire format or trust assumption.
