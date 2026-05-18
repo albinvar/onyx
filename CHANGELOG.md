@@ -6,6 +6,32 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Docs: HOW_IT_WORKS.md — plain-English security walkthrough with evidence
+
+No code change. New top-level document that answers "how do I know this is secure?" without claiming Onyx is bulletproof — because it isn't. The user asked for "proofs how it's bulletproof"; the cautious response was to write the honest equivalent: a doc that walks through every protection layer and cites the specific test, RFC, or audited library that backs each claim, while loudly preserving the §0 caveat that no external audit has happened.
+
+Eight sections:
+
+  0. **Honest framing**, repeating `SECURITY.md` §1's disclaimer up front. The phrase "bulletproof / unbreakable / military-grade" appears exactly once in the document — explaining why it appears exactly once.
+  1. **A chat message's life, step by step.** ASCII flow diagram tracing the path from "you type 'hi'" → TUI → daemon → MLS encrypt → Noise encrypt → Tor → reverse on the other side. Numbered ten steps so a reader can map any test or source file back to a specific stage.
+  2. **The six layers.** Unix socket, vault encryption, sealed-sender envelope, MLS, Noise XK, Tor — each gets a "what it is / what it protects / what it does NOT protect / evidence" treatment. The evidence sections cite specific test names by full path.
+  3. **Adversary table.** Eleven concrete attacker classes (passive ISP, café Wi-Fi, hub op, hub-rooted attacker, active network MITM, other user on the laptop, laptop thief, global passive observer, quantum-equipped attacker, coerced user, malicious developer) with what protects you and which test/threat-model section verifies it.
+  4. **How to verify yourself.** Three subsections: run the tests (with a table of the dozen most security-relevant test names + what each proves); check the upstream libraries (with links to each crate's repo + audit history); read the protocol references (RFC 9420, 8439, 8032, 7748, 9106, FIPS 203, Noise spec, Tor spec).
+  5. **Comparison to Signal / IRC / Tor Messenger / Briar.** Twelve-row matrix being explicit that Signal is more mature, IRC is less private, Briar covers similar ground with more deployment history. Closing line: "if you want to ship to actual humans today, use Signal. Onyx is interesting because it composes ideas from each in a single explicit codebase, but it has not earned the trust those mature tools have."
+  6. **What Onyx does NOT do (negative claims, explicit).** Nine bullets calling out things a casual reader might assume (audited, malware-proof, deniable, has invite-only hubs, reproducible builds, multi-device, mobile, etc.). Each ends "If any of these is a deal-breaker, Onyx is the wrong tool."
+  7. Pointer to `THREAT_MODEL.md` §8.2 for contributors who want to close one of the gaps.
+  8. Doc index + the line "When this document and the others disagree, the others win. `SECURITY.md` §1 is the authoritative status disclaimer."
+
+**Discipline applied throughout**: every cryptographic claim names the specific crate AND version AND RFC. Where a property holds because of an upstream library, the doc says so explicitly rather than implying Onyx contributes the property. The comparison table places Onyx honestly behind Signal, Briar, and even IRC on dimensions where it is behind, rather than cherry-picking only flattering categories.
+
+The `bulletproof` framing the user asked for was deliberately refused — that adjective doesn't apply and writing it would directly contradict `SECURITY.md` §1 + create a liability if a reader trusts it. The doc's introduction explains this in one sentence and then provides the honest substitute.
+
+`README.md` §12 doc index updated to feature the new document as the entry-point for security questions, with a recommended-bold cell so a reader landing on the repo sees it.
+
+Verification: documentation only — `cargo test --workspace` (216) + `cargo fmt --check` + `cargo clippy -D warnings` + `cargo deny check` all unchanged.
+
+---
+
 ## 2026-05-18 — Docs refresh: README.md rewritten
 
 No code change. The README was four-plus phases out of date — it claimed `onyx` and `onyx-hub` were "scaffold only" (both are functional now), reported "~110 tests" (we have 216), and didn't mention any of T4 (TUI + API socket), T5 (sealed-sender + hub-relayed delivery), T6 (KP directory + fetch verbs), or T7 (local-TCP test modes). New README is a single document covering install, four recipes (no-Tor smoke / local-TCP fast / real Tor / hub-relayed), TUI key reference, CLI subcommand reference, security-tier table, troubleshooting, configuration paths, architecture cheat-sheet, doc index, contributing guidelines, and license.
