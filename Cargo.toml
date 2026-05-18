@@ -48,7 +48,10 @@ openmls_traits   = "0.5"
 # Tor — outbound circuits + hidden service publication.
 # arti is a large dep set; bringing it in significantly bumps build time.
 # `onion-service-service` enables tor-hsservice + keymgr for HS publishing.
-arti-client      = { version = "0.42", features = ["onion-service-service"] }
+arti-client      = { version = "0.42", features = [
+    "onion-service-service", # for publishing our v3 HS
+    "onion-service-client",  # for dialing other peers' .onion addresses
+] }
 tor-rtcompat     = "0.42"
 tor-hsservice    = "0.42"
 tor-hscrypto     = "0.42"

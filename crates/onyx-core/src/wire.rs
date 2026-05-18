@@ -47,6 +47,17 @@ pub const FRAME_PONG: u16 = 0x41;
 pub const FRAME_PAD: u16 = 0xF0;
 /// `ERROR` — either direction, protocol error; receiver closes the connection.
 pub const FRAME_ERROR: u16 = 0xFF;
+/// `MLS_KP` — payload is a TLS-serialised MLS KeyPackage. Sent by a
+/// peer announcing it can be invited to an MLS group. See
+/// [`crate::flows`] for the surrounding protocol.
+pub const FRAME_MLS_KP: u16 = 0x100;
+/// `MLS_WELCOME` — payload is a TLS-serialised MLS Welcome message.
+/// Sent by the inviter so the invitee can join the group.
+pub const FRAME_MLS_WELCOME: u16 = 0x101;
+/// `MLS_APP` — payload is an MLS application-message ciphertext. Both
+/// directions; safe to send any number of times once both sides are in
+/// the same MLS group at the same epoch.
+pub const FRAME_MLS_APP: u16 = 0x102;
 
 // ── Padding buckets (DESIGN.md §5.8) ───────────────────────────────────────
 

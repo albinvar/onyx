@@ -45,11 +45,12 @@ use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
 use onyx_core::crypto::{Argon2Params, IdentityPublic};
+use onyx_core::flows::{initiator_exchange, responder_exchange};
 use onyx_core::identity::Identity;
+use onyx_core::mls::MlsParty;
 use onyx_core::storage::Vault;
 use onyx_core::tor::{TorRuntime, TorStream};
-use onyx_core::transport::{handshake_initiator, handshake_responder, read_frame, write_frame};
-use onyx_core::wire::{FRAME_PING, InnerFrame};
+use onyx_core::transport::{handshake_initiator, handshake_responder};
 use tokio::io::AsyncWriteExt;
 use tracing::{Instrument, error, info, info_span, warn};
 
@@ -204,26 +205,27 @@ async fn handle_inbound(mut stream: TorStream, identity: &Identity) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
     let peer_pub_b32 = encode_b32(&session.peer_static_key());
-    info!(peer_identity_pub_b32 = %peer_pub_b32, "handshake complete");
-
-    let frame = read_frame(&mut stream, &mut session)
-        .await
-        .map_err(|e| anyhow::anyhow!("read frame failed: {e}"))?;
-    let payload = String::from_utf8_lossy(&frame.payload).into_owned();
     info!(
-        frame_type = format!("{:#06x}", frame.frame_type),
-        payload, "received frame"
+        peer_identity_pub_b32 = %peer_pub_b32,
+        "Noise XK complete; starting MLS bootstrap (responder)"
     );
 
-    let reply_text = format!("hello from {} (responder)", identity.fingerprint());
-    let reply = InnerFrame {
-        frame_type: FRAME_PING,
-        payload: reply_text.into_bytes(),
-    };
-    write_frame(&mut stream, &mut session, &reply)
+    // Each inbound connection gets its own MlsParty for now. Sharing
+    // the MLS identity across connections + persisting it into the
+    // vault is the natural next phase.
+    let party = MlsParty::new(identity.fingerprint().as_bytes().to_vec())
+        .map_err(|e| anyhow::anyhow!("mls party create failed: {e}"))?;
+    let reply_text = format!("MLS reply from {} (responder)", identity.fingerprint());
+
+    let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
         .await
-        .map_err(|e| anyhow::anyhow!("write reply failed: {e}"))?;
-    info!("reply written, closing stream");
+        .map_err(|e| anyhow::anyhow!("MLS responder flow failed: {e}"))?;
+    info!(
+        peer_message = %String::from_utf8_lossy(&outcome.peer_message),
+        mls_epoch = outcome.group.epoch(),
+        "MLS round-trip complete (responder); closing stream"
+    );
+
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -263,23 +265,23 @@ async fn run_dial_mode(
         .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
     let learned_peer = encode_b32(&session.peer_static_key());
-    info!(peer_identity_pub_b32 = %learned_peer, "handshake complete");
+    info!(
+        peer_identity_pub_b32 = %learned_peer,
+        "Noise XK complete; starting MLS bootstrap (initiator)"
+    );
 
-    let greeting = format!("hello from {} (initiator)", identity.fingerprint());
-    let frame = InnerFrame {
-        frame_type: FRAME_PING,
-        payload: greeting.into_bytes(),
-    };
-    write_frame(&mut stream, &mut session, &frame)
-        .await
-        .map_err(|e| anyhow::anyhow!("write failed: {e}"))?;
-    info!("greeting sent; awaiting peer reply");
+    let party = MlsParty::new(identity.fingerprint().as_bytes().to_vec())
+        .map_err(|e| anyhow::anyhow!("mls party create failed: {e}"))?;
+    let greeting = format!("MLS hello from {} (initiator)", identity.fingerprint());
 
-    let reply = read_frame(&mut stream, &mut session)
+    let outcome = initiator_exchange(&mut stream, &mut session, &party, greeting.as_bytes())
         .await
-        .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
-    let payload = String::from_utf8_lossy(&reply.payload).into_owned();
-    info!(payload, "received reply — round-trip complete");
+        .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
+    info!(
+        peer_reply = %String::from_utf8_lossy(&outcome.peer_reply),
+        mls_epoch = outcome.group.epoch(),
+        "MLS round-trip complete (initiator); exiting"
+    );
 
     let _ = stream.shutdown().await;
     Ok(())

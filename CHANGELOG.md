@@ -6,6 +6,96 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — MLS over Noise over Tor: real end-to-end encrypted message, verified
+
+### The headline
+Two `onyxd` processes on the dev machine now exchange real **MLS-encrypted application messages** over a Tor circuit, both sides hitting the same MLS group at epoch 1. This was actually run; the captured log output is in this entry. Not a manual runbook claim — actual bytes moved through every layer.
+
+### What's new
+
+#### `onyx_core::wire`
+- Three new frame-type constants: `FRAME_MLS_KP` (0x100), `FRAME_MLS_WELCOME` (0x101), `FRAME_MLS_APP` (0x102). These tag the messages exchanged by the post-Noise MLS bootstrap.
+
+#### `onyx_core::flows` (new module)
+- Owns the choreography of the 4-frame MLS bootstrap that runs over an existing `Session`. Two functions:
+  - `responder_exchange(stream, session, party, reply)` — sends own KeyPackage, reads Welcome + joins group, reads first Application message + decrypts, sends `reply` as encrypted Application.
+  - `initiator_exchange(stream, session, party, greeting)` — reads peer KeyPackage, creates group + invites peer + sends Welcome, sends `greeting` as encrypted Application, reads + decrypts reply.
+- Wire protocol documented in module header — `R → I: KP`, `I → R: Welcome`, `I → R: App`, `R → I: App`. After step 4 both sides are at MLS epoch 1.
+- **Integration test** (`mls_over_noise_round_trip`) runs the entire stack — Noise XK + MLS bootstrap + bidirectional encrypted Application messages — over a `tokio::io::duplex` pair, no Tor required. Both sides assert they decrypted the *other's* plaintext correctly and ended at epoch 1.
+
+#### `onyxd`
+- `handle_inbound` and `run_dial_mode` now call `responder_exchange` / `initiator_exchange` respectively, replacing the previous toy `"hello from <fpr>"` plaintext exchange.
+- Each connection gets a fresh `MlsParty` keyed by the fingerprint. Sharing MlsParty across connections + persisting MLS state into the vault is a planned follow-up.
+- Logs the decrypted peer message + the MLS epoch on completion.
+
+### Hidden gotcha caught while testing
+The first run of the two-daemon smoke test failed at the dial step with a generic `tor: dial failed`. Root cause: `arti-client` ships with `tokio + native-tls + compression` as default features, but **dialing onion addresses requires the `onion-service-client` feature** (which pulls `tor-hsclient` + `tor-hscrypto`). We had `onion-service-service` enabled (for publishing our HS) but not `onion-service-client` (for dialing peers'). One-line feature add fixed it. Documenting here so the next person to add a Tor-backed binary doesn't repeat the bug:
+
+```toml
+arti-client = { version = "0.42", features = [
+    "onion-service-service", # for publishing our v3 HS
+    "onion-service-client",  # for dialing other peers' .onion addresses
+] }
+```
+
+### Actual captured log output
+
+Alice (responder, `2026-05-17T23:58…`):
+```
+INFO onyxd: vault unlocked, identity loaded fingerprint=ak3y 3l5x 6sl5 2hur 2dcv gqfp yhs4 n3ak k6ek sbzp zy5q utgi jbkq identity_pub_b32=bimrt5pbmpwuljk5miinmbl7stnxsj4ktqwxlnf3fa3n6ervdfeq
+INFO onyxd: hidden service published … onion=l2wzed5s5pzr6zzmpkfmhb7avttxbus5v3gajjnfcuvbqlywryext7yd.onion port=1
+INFO inbound{…}: onyxd: accepted inbound stream; starting Noise XK handshake (responder)
+INFO inbound{…}: onyxd: Noise XK complete; starting MLS bootstrap (responder) peer_identity_pub_b32=igz4o7wzgaegf4uexvvyazxy5fwygzpnhupzi5fqtiwqognwfy5a
+INFO inbound{…}: onyxd: MLS round-trip complete (responder); closing stream peer_message=MLS hello from wvhh k7pk sbtg tgi5 lzjo nfsm 65e2 ibji dy37 3dpy eka4 j7ru vanq (initiator) mls_epoch=1
+```
+
+Bob (initiator, `2026-05-17T23:58…`):
+```
+INFO onyxd: vault unlocked, identity loaded fingerprint=wvhh k7pk sbtg tgi5 lzjo nfsm 65e2 ibji dy37 3dpy eka4 j7ru vanq identity_pub_b32=igz4o7wzgaegf4uexvvyazxy5fwygzpnhupzi5fqtiwqognwfy5a
+INFO onyxd: dialing peer onion… host=l2wzed5s5pzr6zzmpkfmhb7avttxbus5v3gajjnfcuvbqlywryext7yd.onion port=1
+INFO onyxd: Tor circuit established; starting Noise XK handshake (initiator)
+INFO onyxd: Noise XK complete; starting MLS bootstrap (initiator) peer_identity_pub_b32=bimrt5pbmpwuljk5miinmbl7stnxsj4ktqwxlnf3fa3n6ervdfeq
+INFO onyxd: MLS round-trip complete (initiator); exiting peer_reply=MLS reply from ak3y 3l5x 6sl5 2hur 2dcv gqfp yhs4 n3ak k6ek sbzp zy5q utgi jbkq (responder) mls_epoch=1
+```
+
+Cross-check that proves every layer worked:
+- Alice's logged `peer_identity_pub_b32` matches Bob's `identity_pub_b32` and vice versa — **Noise XK mutually authenticated** the X25519 statics.
+- Alice's `peer_message` is Bob's fingerprint string, **decrypted via MLS**; Bob's `peer_reply` is Alice's fingerprint string, also **decrypted via MLS**.
+- Both ended at `mls_epoch=1` — same group, same epoch, exchanger and exchangee are both real members.
+- Bob exited 0; clean shutdown.
+
+### What this confirms
+Every layer in the stack is now working end-to-end against itself, on real Tor, between two separate `onyxd` processes:
+
+```
+Tor v3 hidden service publish + descriptor propagation + circuit dial
+  Noise_XK_25519_ChaChaPoly_BLAKE2s   (mutual X25519 auth + per-direction AEAD counter)
+    MLS bootstrap                      (KeyPackage → Welcome → joined group at epoch 1)
+      MLS Application messages         (forward-secret, post-compromise-secure on top of Noise)
+```
+
+### `README.md`
+Added a top-level `README.md` covering build, the verified two-daemon runbook, pointers to `DESIGN.md` / `THREAT_MODEL.md` / `CHANGELOG.md`, and licensing. Includes the placeholder-trap fix: don't `cargo run … --dial-onion <ALICE_ONION>:1` — `<>` are zsh redirection metacharacters. Substitute the actual values.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **111 passing in `onyx-core`** (110 prior + 1 new `mls_over_noise_round_trip`).
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Two-daemon smoke test on the dev machine** ✓ — log output captured verbatim above.
+
+### Open security gaps (carry-forward)
+- **Both daemons share the default Arti state directory.** Bob's daemon starts in read-only mode and reuses Alice's cached Tor consensus. Works for the smoke test; eventually need `--tor-state-dir` so two daemons can be truly independent.
+- **MLS credential is still a fresh ED25519 per `MlsParty`**, not bound to the long-term `Identity`. Noise auth proves who the peer is at the transport layer, but the MLS layer doesn't yet prove "the MLS member I'm exchanging with is the same identity that Noise authenticated." Critical to wire before any release.
+- **MLS state in memory only** — restarting any daemon drops all MLS group state. Persistence into `Vault` is the natural follow-up to the credential binding.
+- **No contact verification on dial** — initiator accepts any peer pubkey the operator typed.
+- **One-shot exchange only** — handlers exit after the first MLS application message round-trip. Long-lived persistent conversations need a loop.
+- **No CLI / local API socket** — `--dial` is the temporary one-shot equivalent.
+- **No sealed-sender bootstrap wiring** — the sealed-sender envelope in `routing::seal_bootstrap` exists in `onyx-core` (with the X25519 ‖ ML-KEM-768 hybrid) but isn't yet on the daemon's data path. With the MLS bootstrap working over Noise, the next step is replacing the in-stream KP exchange with sealed-sender envelopes routed via a hub (or via the initial frame on direct connections).
+
+---
+
 ## 2026-05-18 — Two-daemon end-to-end: dial, Noise XK, frame round-trip
 
 ### What's new
