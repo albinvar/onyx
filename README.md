@@ -419,6 +419,7 @@ For the `onyx` CLI: `ONYX_API_SOCKET` overrides the default socket path. Useful 
 |---|---|
 | `README.md` | (this file) install, run, troubleshoot |
 | **`HOW_IT_WORKS.md`** | **"How do I know this is secure?" — plain-English walkthrough of every protection layer, with the specific tests / RFCs / audited libraries behind each claim. Start here if you want to understand or verify Onyx's security posture.** |
+| **`ROADMAP.md`** | **"What's coming next?" — completed phases, in-flight work, prioritised next queue, long-term direction, explicit "won't do" list. Start here to see where the project is going.** |
 | `DESIGN.md` | Full protocol specification — wire formats, key derivation, frame types, group lifecycle |
 | `THREAT_MODEL.md` | Adversaries (A1-A6) + non-adversaries (N1-N7) + §8 implementation-status table with current carry-forward gaps |
 | `SECURITY.md` | Eight enforcement principles, PR review checklist, vulnerability disclosure policy, primitive table |

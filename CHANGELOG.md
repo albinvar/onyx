@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — Docs: ROADMAP.md — what's done / in-flight / next / later / won't-do
+
+No code change. The project already had `CHANGELOG.md` for what's done (one verbose entry per phase) and `THREAT_MODEL.md` §8.2 for security carry-forwards, but nothing centralised for "what's coming next." Users had to read backwards through the CHANGELOG and infer priorities. New `ROADMAP.md` makes the queue explicit.
+
+Eight sections:
+
+  1. **Status at a glance** — done / in-flight / next / later / won't-do as a single ASCII summary line, plus commit count + test count + the always-on "external review status: none" line.
+  2. **Done** — every shipped phase (T1, T2, T3.1, T4.1–T4.3, T5.1, T5.2.a–g, T6.1, T6.2, T7.0, plus the doc work) summarised in one paragraph each with a pointer to the relevant CHANGELOG entry.
+  3. **In flight** — currently empty. Honest.
+  4. **Next (queued, priority order)** — T7.1 (single-binary `onyx`, recommended next) → T7.2 (invite URLs) → T6.3 (channels). Each has: the change, what the user notices, why it's prioritised where it is, estimated size.
+  5. **Later** — T6.4 async MLS over hub, hub invite-only auth, schema migration runner, hub-side KP ownership validation, reproducible builds + signed releases, cover traffic, **external security audit** (called out as the single most impactful action).
+  6. **Long-term** — multi-device, mobile, voice/video, federation, onion-web tier. Each acknowledged as "real-product territory" needing its own design doc + threat-model update first.
+  7. **Won't do in v0** — six explicit non-goals: centralised identity, phone-number registration, optional cryptographic weakening, `unsafe` in `onyx-core`, telemetry, auto-update.
+  8. **How priorities get set** — two written principles: (1) closing a `THREAT_MODEL.md` §8.2 carry-forward beats adding a new feature; (2) smallest reviewable surface wins. Acknowledges that priorities are one developer's judgment calls and an "override is a deliberate exception" (with T7.0 cited as the recent example).
+
+The doc explicitly does not contain dates, version numbers, or commitments. Estimates are "2–3 hours" type rather than calendar weeks because (a) this is a one-developer project and (b) every prior estimate I've made for myself has been wrong.
+
+`README.md` §12 doc index updated to feature `ROADMAP.md` as the entry point for "what's coming next?" questions, alongside `HOW_IT_WORKS.md` (entry point for "how do I know this is secure?"). Both are now bold rows in the table.
+
+Verification: documentation only — `cargo test --workspace` (216) + `cargo fmt --check` + `cargo clippy -D warnings` + `cargo deny check` all unchanged from prior doc commits.
+
+---
+
 ## 2026-05-18 — Docs: HOW_IT_WORKS.md — plain-English security walkthrough with evidence
 
 No code change. New top-level document that answers "how do I know this is secure?" without claiming Onyx is bulletproof — because it isn't. The user asked for "proofs how it's bulletproof"; the cautious response was to write the honest equivalent: a doc that walks through every protection layer and cites the specific test, RFC, or audited library that backs each claim, while loudly preserving the §0 caveat that no external audit has happened.
