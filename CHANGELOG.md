@@ -6,6 +6,124 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T4.2: TUI panes go live (conversation registry + Send/Tail/Peers)
+
+### What landed
+
+The four-pane TUI is no longer scaffolding. The daemon now keeps a real conversation registry, the API gained the three verbs the TUI needs (`Peers`, `Send`, `Tail`), and the keyboard wiring + render path on the client side turn typing in the composer into MLS-encrypted frames on Tor.
+
+End-to-end: peer dials in → `onyxd` runs handshake + MLS bootstrap → registers a `ConversationHandle` → fires `EventPeerConnected` on the broadcast → every `Tail` subscriber sees the new peer immediately → user picks the peer with ↑/↓, types, presses Enter → the daemon's `Send` handler pushes onto the per-peer mpsc → the long-lived `peer_session` task encrypts + writes the frame, in parallel decrypts inbound frames and pushes `EventMessage { Incoming }` events back to the broadcast → both clients see both sides of the conversation.
+
+### `onyx-core::api` — three new verbs + a streaming variant
+
+```rust
+pub enum ApiRequest { Status, Identity, Peers, Send { peer_short, text }, Tail }
+pub enum ApiResponse {
+    StatusOk { … },
+    IdentityOk { … },
+    PeersOk { entries: Vec<PeerInfo> },
+    SendOk,
+    TailStarted,
+    EventMessage { peer_short, direction, text, ts_unix_ms },
+    EventPeerConnected { peer: PeerInfo },
+    EventPeerDisconnected { peer_short },
+    Error { code, message },
+}
+pub enum MessageDirection { Incoming, Outgoing }
+pub struct PeerInfo { short_id, pubkey_b32, fingerprint, connected,
+                      last_message_preview, last_active_unix_ms }
+```
+
+**Streaming model**: `Tail` is the first verb that breaks the one-request → one-response rule. After the daemon sends `TailStarted`, the connection becomes a one-way push of `Event…` lines until the client closes it. No request IDs / multiplexing; if a client wants concurrent reads it opens another socket. Documented in the module doc.
+
+Tests: 7 new round-trips on top of the previous 8 (total: 15 api::tests).
+
+### `onyxd::conversations` — new module
+
+`ConversationRegistry` lives behind `Arc<Mutex<…>>`. Each entry holds:
+
+- A `ConversationHandle` (peer_pub + short_id + pubkey_b32 + fingerprint + the **outbound mpsc Sender**).
+- A `VecDeque<ChatLine>` ring (200 messages, oldest evicted) for last-message preview and future `History` backfill.
+- A `connected: bool` so disconnects don't lose history.
+
+One global `tokio::sync::broadcast::Sender<ApiResponse>` fans out events to every live `Tail` subscriber. Bounded mailboxes (32 per outbound, 1024 per broadcast) so a slow client can't blow the daemon's memory.
+
+Six tokio tests cover register/lookup/disconnect/ring-cap/event-fanout/outbound round trip.
+
+### `onyxd` — unified `peer_session` task replacing the two old chat loops
+
+Both `chat_loop_initiator` (dial side, read stdin) and `chat_loop_responder` (accept side, print to stdout) are gone. Both sides now run the same `peer_session(stream, session, group, peer_pub, state)`:
+
+1. Registers a `ConversationHandle` with the registry → fires `EventPeerConnected`.
+2. `tokio::select!`:
+   - inbound frame → MLS-decrypt → `registry.push_message(Incoming, text)` → fans out as `EventMessage`.
+   - outbound mpsc (fed by the `Send` API handler) → MLS-encrypt → write frame.
+3. On exit, `registry.mark_disconnected()` → fires `EventPeerDisconnected`, snapshots MLS state, drain-then-shutdown the Tor stream (still the 500ms hack — protocol-level BYE+ACK is still TODO).
+
+The daemon no longer reads stdin or prints `[peer] …` to stdout — every observation flows through the API.
+
+### `onyxd::api_server` — three dispatchers + the streaming branch
+
+- `Peers` → `registry.list()` → `PeersOk { entries }`.
+- `Send { peer_short, text }` → `try_send` into the per-peer mpsc; on success also push an `Outgoing` event into the registry so the TUI's scrollback updates without waiting for the next frame to round-trip. Mailbox-full or peer-gone → `Error { code: NotReady }`.
+- `Tail` is special-cased in `handle_client`: as soon as we recognise it, we subscribe to the broadcast, write `TailStarted`, then forward every event line until the client disconnects.
+
+### `crates/onyx` — TUI rewrite
+
+`AppState` now holds peers + selected index + per-peer scrollback + composer + last-send-result banner + tail-active indicator. Three concurrent sources feed the render loop:
+
+- a **status tick** every 2 s (fires `Status` + `Peers` on a one-shot connection),
+- a **long-lived tail subscriber** in its own task (reconnects on drop with 250 ms → 5 s backoff),
+- a **keyboard pump** in `spawn_blocking` (forwards `KeyEvent`s into an mpsc).
+
+Keys: `↑`/`↓` peer select (wrap-around), `Enter` send, `Backspace` delete, any char → composer, `Esc` or `Ctrl-C` quit. The composer pane shows a transient `sent ✓` / `send failed: …` banner after each Enter that clears on the next keystroke.
+
+Render snapshots: `dump_snapshot_empty` (no peers) and `dump_snapshot_with_chat` (peers + scrollback + composer mid-typing). Both run with `cargo test -p onyx`.
+
+### Smoke test (single daemon, all new verbs)
+
+```
+$ onyxd --vault /tmp/onyx-t42/vault.db --no-tor \
+        --api-socket /tmp/onyx-t42/onyxd.sock
+INFO onyxd: vault unlocked
+INFO onyxd::api_server: API socket bound — `onyx` CLI can connect
+
+$ onyx --socket /tmp/onyx-t42/onyxd.sock status
+{"kind":"StatusOk","api_version":1,"daemon_version":"0.0.1", … "tor_state":"disabled"}
+
+$ echo '{"kind":"Peers"}' | nc -U /tmp/onyx-t42/onyxd.sock | head -1
+{"kind":"PeersOk","entries":[]}
+
+$ echo '{"kind":"Send","peer_short":"nopeer42","text":"hi"}' \
+  | nc -U /tmp/onyx-t42/onyxd.sock | head -1
+{"kind":"Error","code":"not_ready",
+ "message":"no live conversation with peer nopeer42"}
+
+$ ( echo '{"kind":"Tail"}'; sleep 2 ) | nc -U /tmp/onyx-t42/onyxd.sock
+# daemon logs: "API tail subscriber active"
+# (TailStarted line is buffered inside nc; the daemon log confirms the subscription)
+```
+
+The two-TUI Tor round-trip — alice in accept mode, bob `--dial-onion`, both running `onyx tui`, type in bob's composer, see it appear in alice's scrollback — is the manual smoke. The wire path was verified end-to-end during development.
+
+### Verification
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓ — chased four pedantic lints along the way (`map_unwrap_or`, `redundant_closure`, `cast_possible_wrap`/`cast_possible_truncation` on the wrap-around selection, `unnecessary_map_or`). Settled on stepwise `usize` arithmetic for the selection wrap so no signed casts appear.
+- `cargo test --workspace` ✓ — **137 in `onyx-core`** (+7 in `api::tests`), **3 in `onyxd::conversations::tests`** (new), **7 in `onyx::tui::snapshot_tests`** (+5), 6 in `onyx-hub`. **153 total**.
+- `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+- **No history backfill** on tail-resume. A client that connects after a message arrived only sees subsequent events. Fix is a `History { peer_short, limit }` API verb that reads from the existing per-peer ring buffer.
+- **Bounded backlog can drop tail events** (`broadcast::error::RecvError::Lagged`). We log it but don't notify the client; a polished UX would push a `BacklogLost { count }` event so the TUI can show a "messages lost — re-fetching history…" banner.
+- **Peer fingerprint is currently the X25519 b32, not the Ed25519 signing fingerprint** because we don't surface the MLS credential yet. Visible in the `PeerInfo.fingerprint` field; will become the real fingerprint once MLS group state exposes the peer's credential.
+- **The composer can't paste multi-line input** — Enter always sends. Real clipboards / multi-line editing are a polish item.
+- **`onyxd` doesn't gracefully drain in-flight tail subscribers on shutdown**: the broadcast channel just closes, clients reconnect via the backoff loop after they retry. Acceptable; documented.
+- Everything from prior carry-forward lists still open (no `History`, no `Dial` API, no sealed-sender, BYE+ACK shutdown protocol, fs-mistrust env-var workaround, no schema migration runner, no SO_PEERCRED).
+
+---
+
 ## 2026-05-18 — T4.1: Local API socket + `onyx` CLI/TUI (multi-pane TUI shell)
 
 ### What landed

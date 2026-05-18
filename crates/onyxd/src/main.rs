@@ -36,6 +36,7 @@
 //!   * Sealed-sender bootstrap on the daemon path.
 
 mod api_server;
+mod conversations;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
-use onyx_core::api::{DEFAULT_SOCKET_PATH, TorState};
+use onyx_core::api::{DEFAULT_SOCKET_PATH, MessageDirection, TorState};
 use onyx_core::crypto::{Argon2Params, IdentityPublic};
 use onyx_core::flows::{initiator_exchange, responder_exchange};
 use onyx_core::identity::Identity;
@@ -54,9 +55,9 @@ use onyx_core::transport::{
     Session, handshake_initiator, handshake_responder, read_frame, write_frame,
 };
 use onyx_core::wire::{FRAME_MLS_APP, InnerFrame};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
-use tracing::{Instrument, error, info, info_span, warn};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, mpsc};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 const DEFAULT_IDENTITY_NICKNAME: &str = "default";
 const HS_NICKNAME: &str = "onyx";
@@ -116,6 +117,7 @@ pub(crate) struct DaemonState {
     pub(crate) identity_id: i64,
     pub(crate) mls_party: Arc<Mutex<MlsParty>>,
     pub(crate) vault: Arc<Mutex<Vault>>,
+    pub(crate) conversations: conversations::SharedRegistry,
 }
 
 #[tokio::main]
@@ -166,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         identity_id,
         mls_party: Arc::new(Mutex::new(mls_party)),
         vault: Arc::new(Mutex::new(vault)),
+        conversations: conversations::new_shared(),
     });
 
     drop(args.passphrase);
@@ -328,9 +331,11 @@ async fn handle_inbound(mut stream: TorStream, state: Arc<DaemonState>) -> anyho
         record_peer_group(&state, &peer_pub, &group_id).await?;
     }
 
-    // Enter the long-lived receive loop. Decrypts incoming MLS app
-    // messages and prints them. Exits cleanly on peer disconnect.
-    chat_loop_responder(stream, session, group, state, peer_pub_b32).await
+    // Enter the long-lived bidirectional session: peer frames →
+    // registry events, registry outbound queue → peer frames. The TUI
+    // (or any API tail subscriber) is the consumer.
+    let _ = peer_pub_b32; // kept above only for the handshake log line
+    peer_session(stream, session, group, peer_pub, state).await
 }
 
 // ── Dial mode ──────────────────────────────────────────────────────────────
@@ -474,9 +479,10 @@ async fn run_dial_mode(
         record_peer_group(state, &peer_static, &group_id).await?;
     }
 
-    // Enter the interactive chat loop: stdin lines → encrypt → send;
-    // peer frames → decrypt → print. Exits on stdin EOF or peer close.
-    chat_loop_initiator(stream, session, group, state.clone()).await
+    // Same long-lived bidirectional session that the accept side runs.
+    // No stdin reading here any more — the TUI drives sends via the
+    // local API socket.
+    peer_session(stream, session, group, peer_static, state.clone()).await
 }
 
 // ── Persistence helper ────────────────────────────────────────────────────
@@ -506,42 +512,82 @@ async fn record_peer_group(
     Ok(())
 }
 
-// ── Chat loops ────────────────────────────────────────────────────────────
+// ── Long-lived peer session ───────────────────────────────────────────────
 //
-// After bootstrap/resume completes (and the daemons have exchanged a
-// greeting + reply as proof of liveness), both sides enter a chat
-// loop that lets the MLS conversation continue across many messages.
+// After bootstrap/resume completes both dial and accept sides run the
+// same loop: read frames from the peer and feed them into the
+// conversation registry as `Incoming` events; pull lines off the
+// per-peer outbound mpsc (fed by the `Send` API verb) and encrypt
+// them out on the wire.
 //
-// Dial mode = interactive chat: stdin → encrypt → send AND peer →
-// decrypt → print, multiplexed via `tokio::select!`. Exits on stdin
-// EOF (Ctrl-D) or peer disconnect.
+// The TUI (or any API `Tail` subscriber) is the only consumer of the
+// incoming events; the daemon process itself doesn't print messages
+// to stdout any more (no more `println!("[peer] …")`).
 //
-// Accept mode = receive loop: peer → decrypt → print. We deliberately
-// don't read stdin in accept mode because tokio::io::stdin() can't
-// be cleanly multiplexed across many handler tasks; v0 keeps it
-// asymmetric (dialer types, acceptor receives). Bidirectional chat
-// belongs to the future CLI/local-API layer.
-//
-// Both loops snapshot+save MLS state on exit so the ratchet state
-// survives the chat closing.
+// On exit, we deregister the conversation (which fires
+// `EventPeerDisconnected` for any active tail), snapshot+save MLS
+// state, then drain-and-shutdown the Tor stream.
 
-async fn chat_loop_initiator(
+async fn peer_session(
     mut stream: TorStream,
     mut session: Session,
     mut group: MlsGroupState,
+    peer_pub: [u8; 32],
     state: Arc<DaemonState>,
 ) -> anyhow::Result<()> {
-    eprintln!();
-    eprintln!("  ─── chat started — type to send, Ctrl-D (or EOF) to exit ───");
-    eprintln!();
+    let peer_pub_b32 = encode_b32(&peer_pub);
+    // v0: we don't transmit the peer's Ed25519 signing key separately;
+    // use the same b32 as a placeholder fingerprint in the registry.
+    // When the MLS credential gets surfaced we'll swap this for the
+    // real signing-key fingerprint.
+    let fingerprint = peer_pub_b32.clone();
 
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
+    let (handle, mut outbound_rx) = {
+        let mut reg = state.conversations.lock().await;
+        reg.register(peer_pub, &peer_pub_b32, fingerprint)
+    };
+    let short_id = handle.short_id.clone();
+    info!(peer = %short_id, "conversation registered with registry");
 
+    let session_result = drive_peer_session(
+        &mut stream,
+        &mut session,
+        &mut group,
+        &peer_pub,
+        &state,
+        &mut outbound_rx,
+    )
+    .await;
+
+    {
+        let mut reg = state.conversations.lock().await;
+        reg.mark_disconnected(&peer_pub);
+    }
+    info!(peer = %short_id, "conversation marked disconnected");
+
+    persist_final_state(&state).await?;
+
+    // Drain-then-shutdown hack carried over from the old chat loop.
+    // Without this, Arti's END marker can outrace in-flight data
+    // cells and the peer sees EOF before the last frame. Proper fix
+    // is a protocol-level BYE+ACK handshake.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _ = stream.shutdown().await;
+    session_result
+}
+
+async fn drive_peer_session(
+    stream: &mut TorStream,
+    session: &mut Session,
+    group: &mut MlsGroupState,
+    peer_pub: &[u8; 32],
+    state: &Arc<DaemonState>,
+    outbound_rx: &mut mpsc::Receiver<String>,
+) -> anyhow::Result<()> {
     loop {
         tokio::select! {
-            // Peer sent us a frame.
-            res = read_frame(&mut stream, &mut session) => {
+            // Inbound: a frame arrived on the Tor stream.
+            res = read_frame(stream, session) => {
                 match res {
                     Ok(frame) => {
                         if frame.frame_type != FRAME_MLS_APP {
@@ -557,108 +603,44 @@ async fn chat_loop_initiator(
                                 .decrypt_application(&party, &frame.payload)
                                 .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
                         };
-                        println!("  [peer] {}", String::from_utf8_lossy(&plaintext));
+                        let text = String::from_utf8_lossy(&plaintext).into_owned();
+                        let mut reg = state.conversations.lock().await;
+                        reg.push_message(peer_pub, MessageDirection::Incoming, text);
                     }
                     Err(e) => {
-                        info!(error = %e, "peer side closed; ending chat");
-                        break;
+                        info!(error = %e, "peer side closed; ending session");
+                        return Ok(());
                     }
                 }
             }
-            // Stdin produced a line (or EOF).
-            res = lines.next_line() => {
-                match res {
-                    Ok(Some(line)) if line.is_empty() => {
-                        // Skip blank lines without sending an empty
-                        // MLS application message.
-                    }
-                    Ok(Some(line)) => {
-                        let ct = {
-                            let party = state.mls_party.lock().await;
-                            group
-                                .encrypt_application(&party, line.as_bytes())
-                                .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
-                        };
-                        write_frame(
-                            &mut stream,
-                            &mut session,
-                            &InnerFrame {
-                                frame_type: FRAME_MLS_APP,
-                                payload: ct,
-                            },
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
-                        info!(text = %line, "chat message sent");
-                    }
-                    Ok(None) => {
-                        info!("stdin EOF; ending chat");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "stdin read error; ending chat");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    persist_final_state(&state).await?;
-    // Give Arti a moment to actually flush any in-flight cells before
-    // tearing down the stream. Without this, the END marker can reach
-    // the peer before the final data cells; we observed this as the
-    // peer's `read_frame` returning EOF on the next iteration even
-    // though we'd just done `write_all` + `flush` successfully. A
-    // proper protocol-level "BYE + ACK" handshake is the right fix
-    // long-term; for now a small fixed delay does the job.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let _ = stream.shutdown().await;
-    Ok(())
-}
-
-async fn chat_loop_responder(
-    mut stream: TorStream,
-    mut session: Session,
-    mut group: MlsGroupState,
-    state: Arc<DaemonState>,
-    peer_pub_b32: String,
-) -> anyhow::Result<()> {
-    let peer_short: String = peer_pub_b32.chars().take(8).collect();
-    info!(peer = %peer_short, "chat receive loop active; waiting for peer messages");
-
-    loop {
-        match read_frame(&mut stream, &mut session).await {
-            Ok(frame) => {
-                if frame.frame_type != FRAME_MLS_APP {
-                    warn!(
-                        frame_type = format!("{:#06x}", frame.frame_type),
-                        "ignoring unexpected frame type from peer"
-                    );
-                    continue;
-                }
-                let plaintext = {
+            // Outbound: the API server pushed a Send into our mpsc.
+            // (It also already pushed an `Outgoing` event into the
+            // registry's ring buffer + broadcast, so don't double-push.)
+            msg = outbound_rx.recv() => {
+                let Some(text) = msg else {
+                    debug!("outbound channel closed; ending session");
+                    return Ok(());
+                };
+                let ct = {
                     let party = state.mls_party.lock().await;
                     group
-                        .decrypt_application(&party, &frame.payload)
-                        .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
+                        .encrypt_application(&party, text.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
                 };
-                let text = String::from_utf8_lossy(&plaintext).into_owned();
-                // Log structured + print to stdout so operators see it
-                // both ways.
-                info!(peer = %peer_short, message = %text, "chat message");
-                println!("  [{peer_short}] {text}");
-            }
-            Err(e) => {
-                info!(peer = %peer_short, error = %e, "peer side closed; ending receive loop");
-                break;
+                write_frame(
+                    stream,
+                    session,
+                    &InnerFrame {
+                        frame_type: FRAME_MLS_APP,
+                        payload: ct,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+                info!(text = %text, "chat message sent");
             }
         }
     }
-
-    persist_final_state(&state).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
 }
 
 async fn persist_final_state(state: &Arc<DaemonState>) -> anyhow::Result<()> {

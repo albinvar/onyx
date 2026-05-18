@@ -70,13 +70,34 @@ pub enum ApiRequest {
     Status,
     /// Just the local identity (pub key + fingerprint).
     Identity,
+    /// Snapshot of currently-known conversations (live + recently
+    /// disconnected). Returns [`ApiResponse::PeersOk`].
+    Peers,
+    /// Send `text` into the conversation identified by `peer_short`
+    /// (the 8-char id from [`PeerInfo::short_id`]). The daemon will
+    /// MLS-encrypt and frame it on the peer's Noise session.
+    Send { peer_short: String, text: String },
+    /// Subscribe to all conversation events. The server responds with
+    /// [`ApiResponse::TailStarted`] and then keeps pushing
+    /// `Event…` response lines until the client closes the socket.
+    /// After issuing `Tail`, the client **must not** send further
+    /// requests on the same connection — open another one for that.
+    Tail,
 }
 
-/// One response line on the wire (daemon → client). Every request
-/// produces exactly one of these — no streaming variants yet.
+/// One response line on the wire (daemon → client).
+///
+/// For every request kind other than [`ApiRequest::Tail`], the daemon
+/// produces **exactly one** response line and then waits for the
+/// next request. `Tail` is the lone streaming verb: after the
+/// initial [`ApiResponse::TailStarted`] line, the daemon may emit
+/// any number of `Event…` lines until the client closes the socket.
+/// No request IDs / multiplexing — open more sockets if you want
+/// concurrent reads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind")]
 pub enum ApiResponse {
+    // ── one-shot responses ──────────────────────────────────────────
     /// Reply to [`ApiRequest::Status`].
     StatusOk {
         api_version: u16,
@@ -90,9 +111,69 @@ pub enum ApiResponse {
         identity_pub_b32: String,
         fingerprint: String,
     },
+    /// Reply to [`ApiRequest::Peers`].
+    PeersOk { entries: Vec<PeerInfo> },
+    /// Reply to [`ApiRequest::Send`].
+    SendOk,
+
+    // ── streaming-mode ack + events (Tail only) ─────────────────────
+    /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
+    /// daemon will now push events on this connection.
+    TailStarted,
+    /// An application message decrypted from `peer_short`'s
+    /// conversation. `direction` distinguishes incoming from
+    /// echo-of-our-own-send. `ts_unix_ms` is the daemon's wall clock
+    /// at the moment of processing — not the sender's clock.
+    EventMessage {
+        peer_short: String,
+        direction: MessageDirection,
+        text: String,
+        ts_unix_ms: u64,
+    },
+    /// A new conversation was registered with the daemon (a peer
+    /// dialled in, or `onyxd --dial-*` finished its handshake).
+    EventPeerConnected { peer: PeerInfo },
+    /// A conversation was torn down (peer closed the stream, dial
+    /// session ended, etc.). The conversation handle is gone from
+    /// the registry; the client should mark the row stale.
+    EventPeerDisconnected { peer_short: String },
+
+    // ── error ───────────────────────────────────────────────────────
     /// Catch-all error. The client matches on `code` for programmatic
     /// handling and shows `message` to the user.
     Error { code: ApiErrorCode, message: String },
+}
+
+/// One row in `PeersOk`. Mirrors what the daemon's conversation
+/// registry holds for each live or recently-active peer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerInfo {
+    /// 8-char base32 prefix of the peer's X25519 identity public key.
+    /// Used as a stable user-facing handle in `Send { peer_short }`
+    /// and in event lines.
+    pub short_id: String,
+    /// Full base32 of the peer's X25519 identity public key.
+    pub pubkey_b32: String,
+    /// Peer's identity fingerprint (Ed25519 signing key, base32-grouped).
+    pub fingerprint: String,
+    /// Whether the peer's Noise session is still open. `false` means
+    /// the conversation row is just history; new `Send`s will fail.
+    pub connected: bool,
+    /// `Some(text_preview)` for the most recent message, `None` if
+    /// nothing has been exchanged yet.
+    pub last_message_preview: Option<String>,
+    /// Daemon wall clock (ms since UNIX epoch) of the last activity.
+    pub last_active_unix_ms: u64,
+}
+
+/// Direction of an [`ApiResponse::EventMessage`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    /// Decrypted from the peer — show as "them".
+    Incoming,
+    /// Echo of a message the local user just sent — show as "me".
+    Outgoing,
 }
 
 /// Coarse-grained Tor lifecycle states reported via [`ApiResponse::StatusOk`].
@@ -232,6 +313,89 @@ mod tests {
         assert_eq!(s, "\"disabled\"");
         let s = serde_json::to_string(&TorState::Ready).unwrap();
         assert_eq!(s, "\"ready\"");
+    }
+
+    #[test]
+    fn request_round_trip_peers() {
+        let r = ApiRequest::Peers;
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_send() {
+        let r = ApiRequest::Send {
+            peer_short: "u5lhmxps".into(),
+            text: "hello bob".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_tail() {
+        let r = ApiRequest::Tail;
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_peers_ok() {
+        let r = ApiResponse::PeersOk {
+            entries: vec![PeerInfo {
+                short_id: "u5lhmxps".into(),
+                pubkey_b32: "u5lhmxpsxxxx".into(),
+                fingerprint: "fpr".into(),
+                connected: true,
+                last_message_preview: Some("hi".into()),
+                last_active_unix_ms: 1_700_000_000_000,
+            }],
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_send_ok_and_tail_started() {
+        for r in [ApiResponse::SendOk, ApiResponse::TailStarted] {
+            let line = encode_response_line(&r).unwrap();
+            assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn response_round_trip_event_message_both_directions() {
+        for direction in [MessageDirection::Incoming, MessageDirection::Outgoing] {
+            let r = ApiResponse::EventMessage {
+                peer_short: "u5lhmxps".into(),
+                direction,
+                text: "x".into(),
+                ts_unix_ms: 1_700_000_000_001,
+            };
+            let line = encode_response_line(&r).unwrap();
+            assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn response_round_trip_event_peer_connect_and_disconnect() {
+        let connected = ApiResponse::EventPeerConnected {
+            peer: PeerInfo {
+                short_id: "u5lhmxps".into(),
+                pubkey_b32: "u5lhmxpsxxxxxxxxxxxxxxxx".into(),
+                fingerprint: "fpr".into(),
+                connected: true,
+                last_message_preview: None,
+                last_active_unix_ms: 1,
+            },
+        };
+        let disconnected = ApiResponse::EventPeerDisconnected {
+            peer_short: "u5lhmxps".into(),
+        };
+        for r in [connected, disconnected] {
+            let line = encode_response_line(&r).unwrap();
+            assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+        }
     }
 
     #[test]

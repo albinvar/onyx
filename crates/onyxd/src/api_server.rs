@@ -5,6 +5,16 @@
 //! [`onyx_core::api`]. Each accepted connection runs in its own task
 //! and lives until the client closes the socket.
 //!
+//! ## Two operating modes per connection
+//!
+//! 1. **Request/response** (the default). Each client request line
+//!    produces exactly one response line, then the daemon waits for
+//!    the next request on the same connection.
+//! 2. **Streaming** (`ApiRequest::Tail` only). After the initial
+//!    `TailStarted` ack the connection becomes a one-way push of
+//!    `Event…` lines; the client must not send more requests on it.
+//!    Open another connection if you want concurrent reads.
+//!
 //! ## Lifecycle
 //!
 //! The server task runs concurrently with the daemon's main mode
@@ -25,11 +35,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use onyx_core::api::{
-    API_VERSION, ApiErrorCode, ApiRequest, ApiResponse, TorState, decode_request,
+    API_VERSION, ApiErrorCode, ApiRequest, ApiResponse, MessageDirection, TorState, decode_request,
     encode_response_line,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::DaemonState;
@@ -50,8 +61,6 @@ pub async fn serve_api(
 
     let result = accept_loop(listener, state, tor_state).await;
 
-    // Best-effort cleanup. A stale socket file is harmless on next start
-    // (bind_listener removes it), but tidying up here keeps `ls` quiet.
     if let Err(e) = tokio::fs::remove_file(&socket_path).await {
         debug!(path = %socket_path.display(), error = %e, "could not remove API socket on exit (already gone?)");
     }
@@ -67,8 +76,6 @@ async fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
         })?;
     }
 
-    // If a stale socket file is left from a previous crash, remove it
-    // — bind(2) would otherwise refuse with EADDRINUSE.
     if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
         warn!(
             path = %socket_path.display(),
@@ -82,8 +89,6 @@ async fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("binding API socket {}: {e}", socket_path.display()))?;
 
-    // chmod 0600: owner-only RW. Do this *after* bind because the
-    // socket file doesn't exist until then.
     let perms = std::fs::Permissions::from_mode(0o600);
     tokio::fs::set_permissions(socket_path, perms)
         .await
@@ -135,17 +140,29 @@ async fn handle_client(
         if line.trim().is_empty() {
             continue;
         }
-        let response = match decode_request(&line) {
-            Ok(req) => dispatch(&req, &state, tor_state),
-            Err(e) => ApiResponse::Error {
-                code: ApiErrorCode::Malformed,
-                message: format!("could not decode request: {e}"),
-            },
+        let req = match decode_request(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                send_one(
+                    &mut write_half,
+                    &ApiResponse::Error {
+                        code: ApiErrorCode::Malformed,
+                        message: format!("could not decode request: {e}"),
+                    },
+                )
+                .await?;
+                continue;
+            }
         };
-        let out = encode_response_line(&response)
-            .map_err(|e| anyhow::anyhow!("encoding API response: {e}"))?;
-        if let Err(e) = write_half.write_all(out.as_bytes()).await {
-            debug!(error = %e, "API client disconnected mid-write");
+
+        // `Tail` switches the connection into push mode and never returns.
+        if matches!(req, ApiRequest::Tail) {
+            return serve_tail(write_half, &state).await;
+        }
+
+        let response = dispatch_one_shot(&req, &state, tor_state).await;
+        if send_one(&mut write_half, &response).await.is_err() {
+            debug!("API client disconnected mid-write");
             return Ok(());
         }
     }
@@ -153,10 +170,25 @@ async fn handle_client(
     Ok(())
 }
 
-/// Dispatch one decoded request to the right handler. Pure function
-/// over `&DaemonState`; intentionally not async so it can't introduce
-/// reordering surprises in the request/response stream.
-fn dispatch(req: &ApiRequest, state: &DaemonState, tor_state: TorState) -> ApiResponse {
+async fn send_one(
+    write_half: &mut (impl AsyncWriteExt + Unpin),
+    response: &ApiResponse,
+) -> anyhow::Result<()> {
+    let out = encode_response_line(response)
+        .map_err(|e| anyhow::anyhow!("encoding API response: {e}"))?;
+    write_half
+        .write_all(out.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("writing API response: {e}"))?;
+    Ok(())
+}
+
+/// Handle every verb except `Tail`. Returns a single response.
+async fn dispatch_one_shot(
+    req: &ApiRequest,
+    state: &DaemonState,
+    tor_state: TorState,
+) -> ApiResponse {
     match req {
         ApiRequest::Status => ApiResponse::StatusOk {
             api_version: API_VERSION,
@@ -169,6 +201,83 @@ fn dispatch(req: &ApiRequest, state: &DaemonState, tor_state: TorState) -> ApiRe
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
             fingerprint: state.identity.fingerprint().to_string(),
         },
+        ApiRequest::Peers => {
+            let entries = state.conversations.lock().await.list();
+            ApiResponse::PeersOk { entries }
+        }
+        ApiRequest::Send { peer_short, text } => {
+            // Look up the peer's outbound queue, push the text in, and
+            // also echo it into the registry as our own outgoing
+            // message so the TUI's scrollback updates immediately
+            // (the peer session task does NOT push outgoing messages —
+            // it only encrypts + sends them on the wire).
+            let handle_opt = state
+                .conversations
+                .lock()
+                .await
+                .handle_for_short(peer_short);
+            let Some(handle) = handle_opt else {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::NotReady,
+                    message: format!("no live conversation with peer {peer_short}"),
+                };
+            };
+            match handle.outbound_tx.try_send(text.clone()) {
+                Ok(()) => {
+                    state.conversations.lock().await.push_message(
+                        &handle.peer_pub,
+                        MessageDirection::Outgoing,
+                        text.clone(),
+                    );
+                    ApiResponse::SendOk
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ApiResponse::Error {
+                    code: ApiErrorCode::NotReady,
+                    message: format!("outbound queue full for peer {peer_short}"),
+                },
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ApiResponse::Error {
+                    code: ApiErrorCode::NotReady,
+                    message: format!("peer {peer_short} disconnected before send"),
+                },
+            }
+        }
+        ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
+    }
+}
+
+/// Streaming-mode handler: ack with `TailStarted`, subscribe to the
+/// global conversation events, forward each event as a response line
+/// until the client closes the socket or the daemon shuts down.
+async fn serve_tail(
+    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    state: &DaemonState,
+) -> anyhow::Result<()> {
+    // Subscribe BEFORE sending the ack so we don't miss events fired
+    // between the ack and the loop entry.
+    let mut events = state.conversations.lock().await.subscribe_events();
+    send_one(&mut write_half, &ApiResponse::TailStarted).await?;
+    info!("API tail subscriber active");
+
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                if send_one(&mut write_half, &event).await.is_err() {
+                    debug!("API tail client disconnected");
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "API tail subscriber fell behind broadcast; some events dropped"
+                );
+                // Don't terminate — just keep going from the next live event.
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                debug!("API tail event channel closed; ending");
+                return Ok(());
+            }
+        }
     }
 }
 
