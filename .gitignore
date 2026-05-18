@@ -6,3 +6,11 @@
 .vscode/
 state.db
 state.db-*
+# Local-development daemon state — vaults, sockets, demo dirs
+*.db
+*.db-*
+*.sock
+demo/
+onyx-state.db
+onyx-hub.db
+onyxd.sock
