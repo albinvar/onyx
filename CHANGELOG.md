@@ -6,6 +6,44 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T7.2-mls: invite URLs bundle an optional KeyPackage (MLS PCS on first contact)
+
+Follow-on to T7.2. The base T7.2 invite carried only `fp + kem`, so `onyx accept` could only do msg/v1 (PFS only). To get MLS PCS on first contact, the recipient still had to call `fetch-keypackage` and `send-bootstrap-mls` by hand — the very friction T7.2 set out to eliminate. T7.2-mls closes that hole: `onyx invite --with-kp` bundles a fresh MLS KeyPackage into the URL, and `onyx accept` auto-picks the MLS-tier path when it sees one.
+
+What landed:
+
+**T7.2-mls.a — `Invite` struct gains `key_package: Option<Vec<u8>>`.** `crates/onyx-core/src/invite.rs`. New constructor `Invite::with_key_package(fp, kem, kp_bytes)`, query method `is_mls_tier() -> bool`, and adapter `kp_standard_b64() -> Option<String>` that re-encodes the stored raw bytes as standard-base64 for the existing `SendBootstrapMls` / `FetchPeerKeyPackageOk` wire types. The URL format gains an optional `&kp=<base64url>` query parameter — **base64url with no padding** (RFC 4648 §5, alphabet `[A-Za-z0-9_-]`), chosen because standard base64 (`+`, `/`, `=`) needs percent-escaping inside a URL and `+` is the classic form-encoding-decodes-to-space footgun. The module docstring spells out the choice. Six new unit tests:
+
+  * `with_kp_round_trip` — build → to_url → parse → equal, with kp.
+  * `kp_uses_url_safe_base64` — bytes that *would* produce `+`/`/`/`=` in standard base64 produce none of those in the URL's `kp` value.
+  * `kp_standard_b64_converts_from_url_safe` — explicit conversion check (bytes `[0xFB, 0xFF, 0xBF]` → standard base64 `"+/+/"`).
+  * `rejects_invalid_kp_base64` / `rejects_empty_kp` — malformed kp values surface as `InvalidEncoding`, not silently dropped.
+  * `parse_without_kp_back_compat` — T7.2 URLs (no `kp`) parse cleanly on T7.2-mls clients (this is the no-version-bump compatibility check: today's URLs keep working tomorrow).
+
+The module docstring grew a "**KeyPackage is single-use in MLS**" subsection: sharing the same `--with-kp` URL with two peers means only one can actually consume the KP; the second hits a duplicate-init-key MLS rejection. Mint a fresh URL per recipient if you want both to land MLS-tier. (The `fp + kem` portion is fine to reshare arbitrarily — that's the msg/v1 fallback.)
+
+**T7.2-mls.b — new API: `ApiRequest::ExportKeyPackage` + `ApiResponse::ExportKeyPackageOk { kp_b64 }`.** `crates/onyx-core/src/api.rs` + `crates/onyx-daemon/src/api_server.rs`. Purely local — no hub required, unlike `FetchPeerKeyPackage`. The daemon takes the `mls_party` lock, calls the existing `MlsParty::key_package_bytes()` (which mints a *new* KP), snapshots the resulting MLS state via the existing `snapshot_state` path, and persists it via `vault.save_mls_state(...)` before returning. The persist step matters: when the recipient eventually consumes this KP via `SendBootstrapMls` and we resume the group on our side after a restart, the init-key has to be present in our stored state for the MLS welcome decode to succeed. This is the same pattern `handle_send_bootstrap_mls` already uses for the post-invite snapshot.
+
+**T7.2-mls.c — `onyx invite --with-kp` flag + auto-MLS in `accept`.** `crates/onyx/src/main.rs`. `Command::Invite { with_kp: bool }`; when `--with-kp` is set the CLI makes a *second* API call (`ExportKeyPackage`), decodes the standard-base64 response, and constructs `Invite::with_key_package(...)`. The base64 → bytes → base64url shuffle is contained in the CLI — the `Invite` type stays decoupled from the wire encoding. `run_accept` now switches on `invite.kp_standard_b64()`: `Some(kp_b64)` → `SendBootstrapMls { peer_fingerprint, peer_kem_pub_b32, peer_kp_b64 }`, `None` → existing `SendBootstrap`. The tier is fully URL-driven: a recipient who pastes a `--with-kp` URL gets MLS-tier without typing anything different; a recipient who pastes a base T7.2 URL still gets msg/v1.
+
+**Known gap:** the MLS-tier `accept` path *currently silently drops* the `--text` payload, because the existing `SendBootstrapMls` API only ships the MLS Welcome (no inline application message). The introduction completes on the recipient's side (their daemon adds them to the new MLS group) but no chat text arrives in that first round-trip — chat starts from the recipient's first reply. Extending `SendBootstrapMls` to carry an inline first message is a separate slice (call it `T7.2-mls-fu`); it's documented as a doc-comment on `run_accept` so the next reader can find it.
+
+Security: no protocol change. The MLS Welcome wire format, KP TLS encoding, sealed-sender envelope under hybrid X25519 + ML-KEM-768 — all byte-identical to what `send-bootstrap-mls` has been sending since T6.x. The `--with-kp` URL is *larger* (~2.5–3 KB vs ~2 KB for the bare form) because of the embedded KP, but the kp bytes are public information (designed for hub-directory publication anyway), so leaking them in a URL is no worse than leaking them in a hub directory query. The module docstring explicitly notes "the fingerprint, KEM public key, and KeyPackage are all safe to publish" — there is no secret in the URL. Authentication of *who* the recipient is remains the user's job, same as base T7.2.
+
+Vault: no schema change. The new `ExportKeyPackage` handler reuses the existing `save_mls_state` path (schema v4 already accommodates MLS-state-blob writes from `SendBootstrapMls`'s post-invite snapshot).
+
+What this did NOT do:
+
+  * No new wire frame type — `ExportKeyPackage` is local-only over the existing API socket.
+  * No invite-URL version bump — `invite/v1` still validates because today's T7.2 URLs match the v1 spec exactly (kp is optional). T7.2-mls clients accept both forms; T7.2 clients ignore the `kp` query param (forward-compat path is well-tested).
+  * No `--with-kp` UI in the TUI — the CLI is the entry point. TUI invite-helper is a separate visual polish pass.
+  * `--text` is not delivered on the MLS-tier path (see "Known gap" above).
+  * No `THREAT_MODEL.md` update — the threat model already covers `SendBootstrapMls`'s recipient-side KP validation (§8.2 #15); `ExportKeyPackage` is a local write that doesn't change the trust boundary.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (had to hoist `use base64::Engine;` to file scope from inside `run_invite` after `clippy::items_after_statements` flagged it), `cargo test --workspace` 236 passed / 0 failed (was 229; +6 invite module + +1 CLI parser test).
+
+---
+
 ## 2026-05-18 — T7.2: invite URLs (`onyx invite` / `onyx accept`)
 
 Second UX win in the T7.x "make Onyx usable by humans" sequence. T7.1 killed the two-terminal problem; T7.2 kills the **copy three base32 blobs into env vars** problem.

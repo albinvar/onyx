@@ -16,10 +16,13 @@
 //! * `onyx send-bootstrap` — first-contact send via hub (msg/v1, PFS only).
 //! * `onyx send-bootstrap-mls` — first-contact send via hub (mls/v1, full MLS PCS).
 //! * `onyx fetch-keypackage` — pull a peer's published KP from the hub directory.
-//! * `onyx invite` — print a shareable `onyx://invite/v1?…` URL bundling
-//!   this identity's fingerprint + KEM pubkey (T7.2+).
+//! * `onyx invite [--with-kp]` — print a shareable `onyx://invite/v1?…`
+//!   URL bundling this identity's fingerprint + KEM pubkey. With
+//!   `--with-kp`, also bundles a fresh MLS KeyPackage so the accepting
+//!   peer gets full PCS on first contact (T7.2 + T7.2-mls).
 //! * `onyx accept <url> --text "…"` — parse such a URL and send the
-//!   bundled identity a msg/v1 first-contact via the hub (T7.2+).
+//!   bundled identity a first-contact via the hub. Tier auto-picked
+//!   from the URL: MLS if `kp` present, else msg/v1 (T7.2+).
 //! * `onyx tui` — open the multi-pane Ratatui interface against an
 //!   already-running daemon (won't start one for you — use the
 //!   no-subcommand form for that).
@@ -44,6 +47,7 @@ mod tui;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use onyx_core::api::{ApiRequest, ApiResponse};
 
@@ -177,7 +181,19 @@ enum Command {
     /// they run `onyx accept <url> --text "hi"` to introduce themselves
     /// via the hub. The URL carries no secrets — it's the same data
     /// `onyx identity` already prints, just bundled.
-    Invite,
+    ///
+    /// With `--with-kp`, the URL *also* embeds a fresh MLS KeyPackage
+    /// so the accepting peer's `onyx accept` automatically uses
+    /// MLS-tier bootstrap (full PCS on every subsequent message).
+    /// KPs are single-use in MLS — mint a fresh URL per recipient if
+    /// you want both to succeed.
+    Invite {
+        /// Embed a fresh MLS KeyPackage in the URL so the accepting
+        /// peer uses `SendBootstrapMls` (full MLS PCS on first
+        /// contact) instead of msg/v1 (PFS only).
+        #[arg(long)]
+        with_kp: bool,
+    },
     /// Accept an `onyx://invite/v1?…` URL by sending the named
     /// fingerprint a first-contact message via the hub. Equivalent to
     /// `onyx send-bootstrap --peer-fingerprint … --peer-kem-pub-b32 …
@@ -330,52 +346,86 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
             )
             .await
         }
-        Some(Command::Invite) => run_invite(&socket).await,
+        Some(Command::Invite { with_kp }) => run_invite(&socket, with_kp).await,
         Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
     }
 }
 
 /// Build an `onyx://invite/v1?…` URL from the daemon's identity and
 /// print it on stdout. Plain string output (not JSON) — this is meant
-/// to be piped directly into a clipboard / chat client.
-async fn run_invite(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
-    let resp = client::one_shot(socket, &ApiRequest::Identity).await?;
-    match resp {
+/// to be piped directly into a clipboard / chat client. With
+/// `with_kp`, also calls `ExportKeyPackage` and bundles a fresh KP
+/// in the URL so `onyx accept` on the other side will use MLS-tier
+/// bootstrap (full PCS) instead of msg/v1 (PFS only).
+async fn run_invite(socket: &std::path::Path, with_kp: bool) -> anyhow::Result<ExitCode> {
+    let id_resp = client::one_shot(socket, &ApiRequest::Identity).await?;
+    let (fingerprint, kem) = match id_resp {
         ApiResponse::IdentityOk {
             fingerprint,
             identity_kem_pub_b32,
             ..
-        } => {
-            let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
-            let url = onyx_core::invite::Invite::new(fp, identity_kem_pub_b32).to_url();
-            println!("{url}");
-            Ok(ExitCode::SUCCESS)
-        }
+        } => (fingerprint, identity_kem_pub_b32),
         ApiResponse::Error { .. } => {
-            // Surface the daemon's error verbatim so the operator can
-            // diagnose (vault locked, daemon not ready, etc.).
-            println!("{}", serde_json::to_string_pretty(&resp)?);
-            Ok(ExitCode::from(1))
+            println!("{}", serde_json::to_string_pretty(&id_resp)?);
+            return Ok(ExitCode::from(1));
         }
         other => anyhow::bail!("unexpected daemon response to Identity: {other:?}"),
-    }
+    };
+    let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
+
+    let invite = if with_kp {
+        let kp_resp = client::one_shot(socket, &ApiRequest::ExportKeyPackage).await?;
+        let kp_b64_std = match kp_resp {
+            ApiResponse::ExportKeyPackageOk { kp_b64 } => kp_b64,
+            ApiResponse::Error { .. } => {
+                println!("{}", serde_json::to_string_pretty(&kp_resp)?);
+                return Ok(ExitCode::from(1));
+            }
+            other => anyhow::bail!("unexpected daemon response to ExportKeyPackage: {other:?}"),
+        };
+        // API returns standard base64; Invite stores raw bytes and
+        // re-emits as base64url in the URL. Convert once so the Invite
+        // type stays decoupled from the API encoding.
+        let kp_bytes = base64::engine::general_purpose::STANDARD
+            .decode(kp_b64_std)
+            .map_err(|e| anyhow::anyhow!("daemon returned invalid base64 KP: {e}"))?;
+        onyx_core::invite::Invite::with_key_package(fp, kem, kp_bytes)
+    } else {
+        onyx_core::invite::Invite::new(fp, kem)
+    };
+    println!("{}", invite.to_url());
+    Ok(ExitCode::SUCCESS)
 }
 
-/// Parse an invite URL, then ship a msg/v1 sealed-sender bootstrap to
-/// the recipient with `text` as the payload. Same exit-code contract
-/// as `one_shot_print`.
+/// Parse an invite URL, then ship a sealed-sender bootstrap to the
+/// recipient with `text` as the payload. Picks the tier from the URL:
+/// MLS-tier (`SendBootstrapMls`, full PCS) when the URL carries a
+/// `kp`, otherwise msg/v1 (`SendBootstrap`, PFS only).
+///
+/// Note: the existing `SendBootstrapMls` API only ships the MLS
+/// Welcome — it doesn't carry an application message — so the
+/// `--text` payload is *not* delivered on the MLS-tier path. The
+/// introduction completes silently on the recipient's side and chat
+/// starts from their first reply. Extending `SendBootstrapMls` to
+/// carry an inline first message is a separate slice.
 async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow::Result<ExitCode> {
     let invite = onyx_core::invite::Invite::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
-    one_shot_print(
-        socket,
+    let peer_fingerprint = invite.fingerprint.to_string();
+    let req = if let Some(peer_kp_b64) = invite.kp_standard_b64() {
+        ApiRequest::SendBootstrapMls {
+            peer_fingerprint,
+            peer_kem_pub_b32: invite.kem_pub_b32,
+            peer_kp_b64,
+        }
+    } else {
         ApiRequest::SendBootstrap {
-            peer_fingerprint: invite.fingerprint.to_string(),
+            peer_fingerprint,
             peer_kem_pub_b32: invite.kem_pub_b32,
             text,
-        },
-    )
-    .await
+        }
+    };
+    one_shot_print(socket, req).await
 }
 
 /// Send `req`, pretty-print the response as JSON on stdout, return
@@ -501,7 +551,13 @@ mod tests {
     #[test]
     fn invite_subcommand_parses_with_no_args() {
         let args = Args::try_parse_from(["onyx", "invite"]).expect("parses");
-        assert!(matches!(args.cmd, Some(Command::Invite)));
+        assert!(matches!(args.cmd, Some(Command::Invite { with_kp: false })));
+    }
+
+    #[test]
+    fn invite_subcommand_parses_with_kp_flag() {
+        let args = Args::try_parse_from(["onyx", "invite", "--with-kp"]).expect("parses");
+        assert!(matches!(args.cmd, Some(Command::Invite { with_kp: true })));
     }
 
     #[test]

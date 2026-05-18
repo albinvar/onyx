@@ -1,22 +1,24 @@
-//! Invite URLs — `onyx://invite/v1?fp=…&kem=…`.
+//! Invite URLs — `onyx://invite/v1?fp=…&kem=…[&kp=…]`.
 //!
 //! A single shareable string that bundles everything a peer needs to
 //! send a first-contact message to *us*:
 //!
 //!   * `fp`  — our [`Fingerprint`] (base32, no spaces).
 //!   * `kem` — our hybrid (X25519 ‖ ML-KEM-768) KEM public key, base32.
+//!   * `kp`  — *optional* MLS KeyPackage, base64url (no padding). When
+//!     present, [`Invite::is_mls_tier`] is `true` and the accepting
+//!     peer should use the MLS-tier bootstrap (`SendBootstrapMls`)
+//!     instead of the PFS-only msg/v1 path.
 //!
-//! That's the same two pieces of data the user used to copy by hand
-//! out of `onyx identity` before this module existed. Shipping them as
-//! one URL means: copy once, paste once, peer runs `onyx accept <url>
-//! --text "hi"` and the introduction is done.
+//! That's the same two-or-three pieces of data the user used to copy
+//! by hand out of `onyx identity` (+ `onyx fetch-keypackage`) before
+//! this module existed. Shipping them as one URL means: copy once,
+//! paste once, peer runs `onyx accept <url> --text "hi"` and the
+//! introduction is done — *with full MLS PCS on first contact* if the
+//! `kp` segment is present.
 //!
 //! ## What this URL does **not** contain
 //!
-//!   * **No KeyPackage.** MLS-tier bootstraps (`SendBootstrapMls`)
-//!     need a peer KP, which the recipient currently obtains via
-//!     `onyx fetch-keypackage`. A `--with-kp` variant that bundles the
-//!     KP into the URL is queued for a follow-up phase (ROADMAP).
 //!   * **No hub address.** The accepting peer is assumed to already
 //!     know which hub their daemon is configured against. Cross-hub
 //!     invites are a separate design problem.
@@ -24,20 +26,43 @@
 //!     A nickname would be a free-text label the *recipient* assigns
 //!     locally; surfacing it in the URL would only enable spoofing.
 //!
+//! ## Encoding choice: base64url for `kp`
+//!
+//! The KP is a TLS-serialised MLS object — roughly 1.5–2 KB of opaque
+//! bytes. Standard base64 uses `+`, `/`, and `=` which all need
+//! percent-escaping inside a query string (and `+` is a footgun
+//! because form-encoded URLs decode it as space). We use **base64url
+//! with no padding** (RFC 4648 §5) instead — character set is
+//! `[A-Za-z0-9_-]`, all URL-safe, no escaping needed. The conversion
+//! to/from the standard-base64 form used by the existing
+//! [`crate::api::ApiRequest::SendBootstrapMls`] / `FetchPeerKeyPackage`
+//! wire types is done by [`Invite::kp_standard_b64`].
+//!
 //! ## Security
 //!
 //! An invite URL is **public information by design** — it carries no
-//! secrets. The fingerprint and KEM public key are exactly what `onyx
-//! status` prints to stdout. Anyone holding the URL can send the named
-//! identity a sealed-sender envelope; that's the *point*. Authentication
-//! of *who* the recipient is is the user's responsibility — verify the
-//! `fp` segment matches the fingerprint your peer told you out-of-band
-//! (Signal, voice, in person) before trusting the channel.
+//! secrets. The fingerprint, KEM public key, and KeyPackage are all
+//! safe to publish. Anyone holding the URL can send the named
+//! identity a sealed-sender envelope; that's the *point*.
+//! Authentication of *who* the recipient is is the user's
+//! responsibility — verify the `fp` segment matches the fingerprint
+//! your peer told you out-of-band (Signal, voice, in person) before
+//! trusting the channel.
+//!
+//! A KeyPackage is **single-use** in MLS: once the recipient consumes
+//! it to join a group, it cannot be reused. Sharing the same invite
+//! URL with two peers is fine for the `fp+kem` path (which has no
+//! ratchet to consume) but only one of them can actually use the `kp`
+//! to bootstrap an MLS group with the named identity — the second
+//! will get a duplicate-init-key MLS rejection. Mint a fresh URL per
+//! recipient if you care about both getting MLS-tier on first contact.
 //!
 //! Forward-compat note: unknown query keys are ignored on parse so a
-//! future `v1` invite carrying e.g. `&kp=…` still parses on today's
-//! clients — they'll just fall through to the no-KP code path. A
+//! future `v1` invite carrying e.g. `&hub=…` still parses on today's
+//! clients — they'll just fall through to the no-hub code path. A
 //! version bump (`invite/v2`) is reserved for breaking changes.
+
+use base64::Engine;
 
 use crate::crypto::Fingerprint;
 use crate::error::{Error, Result};
@@ -46,8 +71,8 @@ const SCHEME: &str = "onyx://";
 const PATH_V1: &str = "invite/v1";
 
 /// A parsed or freshly-built invite. Construct via [`Invite::new`] for
-/// the typical "bundle our identity" path, or via [`Invite::parse`] to
-/// validate an incoming URL.
+/// the no-KP path, [`Invite::with_key_package`] to add an MLS KP, or
+/// [`Invite::parse`] to validate an incoming URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
     /// The recipient's long-term Ed25519 fingerprint.
@@ -56,35 +81,83 @@ pub struct Invite {
     /// no padding). Kept as a string because callers always pass it
     /// through to the wire format unmodified.
     pub kem_pub_b32: String,
+    /// *Optional* raw MLS KeyPackage bytes (TLS-serialised). When
+    /// present, the URL was produced by `onyx invite --with-kp` and
+    /// the accepting peer should use MLS-tier bootstrap.
+    pub key_package: Option<Vec<u8>>,
 }
 
 impl Invite {
-    /// Build an invite from the two pieces every sealed-sender bootstrap
-    /// needs. Does **not** validate `kem_pub_b32` — that's the daemon's
-    /// job when it tries to decode it as a hybrid KEM pubkey.
+    /// Build an invite with no KeyPackage. Accepting peer will fall
+    /// back to msg/v1 (per-message PFS only) sealed-sender bootstrap.
     #[must_use]
     pub fn new(fingerprint: Fingerprint, kem_pub_b32: String) -> Self {
         Self {
             fingerprint,
             kem_pub_b32,
+            key_package: None,
         }
     }
 
-    /// Serialize to `onyx://invite/v1?fp=…&kem=…`. The fingerprint
-    /// loses its display-only space grouping; the round-trip via
-    /// [`Fingerprint::parse`] recovers it.
+    /// Build an MLS-tier invite carrying a fresh KeyPackage. Accepting
+    /// peer will use `SendBootstrapMls` and the resulting MLS group
+    /// has full post-compromise security on every application message.
+    #[must_use]
+    pub fn with_key_package(
+        fingerprint: Fingerprint,
+        kem_pub_b32: String,
+        key_package: Vec<u8>,
+    ) -> Self {
+        Self {
+            fingerprint,
+            kem_pub_b32,
+            key_package: Some(key_package),
+        }
+    }
+
+    /// Whether this invite carries an MLS KeyPackage (i.e. the
+    /// accepting peer should use `SendBootstrapMls`).
+    #[must_use]
+    pub fn is_mls_tier(&self) -> bool {
+        self.key_package.is_some()
+    }
+
+    /// Re-encode `key_package` as standard base64 — the format the
+    /// daemon API (`SendBootstrapMls.peer_kp_b64`,
+    /// `FetchPeerKeyPackageOk.kp_b64`) consumes. Returns `None` for
+    /// no-KP invites.
+    #[must_use]
+    pub fn kp_standard_b64(&self) -> Option<String> {
+        self.key_package
+            .as_ref()
+            .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+    }
+
+    /// Serialize to `onyx://invite/v1?fp=…&kem=…[&kp=…]`. The
+    /// fingerprint loses its display-only space grouping; the
+    /// round-trip via [`Fingerprint::parse`] recovers it. The KP, if
+    /// present, is base64url-encoded (no padding) so the URL needs no
+    /// percent-escaping anywhere.
     #[must_use]
     pub fn to_url(&self) -> String {
-        format!(
+        let mut url = format!(
             "{SCHEME}{PATH_V1}?fp={fp}&kem={kem}",
             fp = self.fingerprint.to_base32(),
             kem = self.kem_pub_b32,
-        )
+        );
+        if let Some(kp) = &self.key_package {
+            let kp_url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(kp);
+            url.push_str("&kp=");
+            url.push_str(&kp_url);
+        }
+        url
     }
 
     /// Parse an `onyx://invite/v1?…` URL. Unknown query keys are
     /// ignored for forward-compat; the v1 contract only requires
-    /// `fp` and `kem`.
+    /// `fp` and `kem`. `kp` is optional and validated as base64url
+    /// (no padding) bytes — its MLS structure is *not* validated here
+    /// (the daemon does that on `SendBootstrapMls`).
     pub fn parse(s: &str) -> Result<Self> {
         let rest = s
             .strip_prefix(SCHEME)
@@ -98,6 +171,7 @@ impl Invite {
 
         let mut fp: Option<&str> = None;
         let mut kem: Option<&str> = None;
+        let mut kp: Option<&str> = None;
         for pair in query.split('&') {
             let (k, v) = pair
                 .split_once('=')
@@ -105,6 +179,7 @@ impl Invite {
             match k {
                 "fp" => fp = Some(v),
                 "kem" => kem = Some(v),
+                "kp" => kp = Some(v),
                 _ => {} // forward-compat: ignore unknown keys
             }
         }
@@ -114,9 +189,19 @@ impl Invite {
             return Err(Error::InvalidEncoding("invite: empty kem parameter"));
         }
         let fingerprint = Fingerprint::parse(fp)?;
+        let key_package = match kp {
+            Some("") => return Err(Error::InvalidEncoding("invite: empty kp parameter")),
+            Some(kp_b64url) => Some(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(kp_b64url)
+                    .map_err(|_| Error::InvalidEncoding("invite: kp not valid base64url"))?,
+            ),
+            None => None,
+        };
         Ok(Self {
             fingerprint,
             kem_pub_b32: kem.to_string(),
+            key_package,
         })
     }
 }
@@ -202,6 +287,91 @@ mod tests {
         let parsed = Invite::parse(&url).expect("unknown keys must be ignored");
         assert_eq!(parsed.fingerprint, sample_fp());
         assert_eq!(parsed.kem_pub_b32, "abcd");
+        assert!(!parsed.is_mls_tier());
+    }
+
+    #[test]
+    fn with_kp_round_trip() {
+        let kp = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 0xFA, 0xCE];
+        let inv = Invite::with_key_package(sample_fp(), "abcd".to_string(), kp.clone());
+        let url = inv.to_url();
+        assert!(url.contains("&kp="));
+        let parsed = Invite::parse(&url).expect("with-kp round-trip");
+        assert!(parsed.is_mls_tier());
+        assert_eq!(parsed.key_package.as_deref(), Some(kp.as_slice()));
+        assert_eq!(parsed, inv);
+    }
+
+    #[test]
+    fn kp_uses_url_safe_base64() {
+        // Bytes that produce `+` and `/` in standard base64; the `kp`
+        // query value must NOT contain either of those (which would
+        // need percent-escaping) — base64url uses `-` and `_` instead.
+        let kp = vec![0xFBu8, 0xFF, 0xBF, 0xFE, 0xFF, 0xFE];
+        let inv = Invite::with_key_package(sample_fp(), "abcd".to_string(), kp);
+        let url = inv.to_url();
+        let kp_value = url.split("&kp=").nth(1).expect("kp= present in url");
+        assert!(
+            !kp_value.contains('+'),
+            "kp value must not contain + ({kp_value})"
+        );
+        assert!(
+            !kp_value.contains('/'),
+            "kp value must not contain / ({kp_value})"
+        );
+        assert!(
+            !kp_value.contains('='),
+            "kp value must not contain = padding ({kp_value})"
+        );
+        // And it must still round-trip.
+        let parsed = Invite::parse(&url).unwrap();
+        assert_eq!(parsed, inv);
+    }
+
+    #[test]
+    fn rejects_invalid_kp_base64() {
+        let url = format!(
+            "onyx://invite/v1?fp={}&kem=abcd&kp=!!!notbase64!!!",
+            sample_fp().to_base32()
+        );
+        let err = Invite::parse(&url).unwrap_err();
+        assert!(matches!(err, Error::InvalidEncoding(msg) if msg.contains("kp")));
+    }
+
+    #[test]
+    fn rejects_empty_kp() {
+        // `&kp=` (empty value) should be rejected — caller meant to
+        // include a KP but the value is missing, that's not the same
+        // as omitting the field entirely.
+        let url = format!(
+            "onyx://invite/v1?fp={}&kem=abcd&kp=",
+            sample_fp().to_base32()
+        );
+        let err = Invite::parse(&url).unwrap_err();
+        assert!(matches!(err, Error::InvalidEncoding(msg) if msg.contains("kp")));
+    }
+
+    #[test]
+    fn kp_standard_b64_converts_from_url_safe() {
+        // Bytes that diverge between standard and URL-safe base64.
+        let kp = vec![0xFBu8, 0xFF, 0xBF];
+        let inv = Invite::with_key_package(sample_fp(), "abcd".to_string(), kp.clone());
+        let std = inv.kp_standard_b64().expect("kp present");
+        // Standard base64 of [0xFB, 0xFF, 0xBF] is "+/+/".
+        assert_eq!(std, "+/+/");
+        // No-KP invite returns None.
+        let bare = Invite::new(sample_fp(), "abcd".to_string());
+        assert!(bare.kp_standard_b64().is_none());
+    }
+
+    #[test]
+    fn parse_without_kp_back_compat() {
+        // T7.2 URLs (no kp) must still parse cleanly on T7.2-mls
+        // clients. Same v1 path, just no `kp` query param.
+        let url = format!("onyx://invite/v1?fp={}&kem=abcd", sample_fp().to_base32());
+        let parsed = Invite::parse(&url).expect("legacy no-kp URL parses");
+        assert!(!parsed.is_mls_tier());
+        assert!(parsed.key_package.is_none());
     }
 
     #[test]

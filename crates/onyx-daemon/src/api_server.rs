@@ -288,7 +288,52 @@ async fn dispatch_one_shot(
         ApiRequest::FetchPeerKeyPackage { peer_fingerprint } => {
             handle_fetch_peer_keypackage(peer_fingerprint, state).await
         }
+        ApiRequest::ExportKeyPackage => handle_export_key_package(state).await,
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
+    }
+}
+
+/// Mint a fresh KeyPackage from our local MLS party and return it as
+/// standard base64. The CLI uses this to bundle a KP into invite URLs
+/// (`onyx invite --with-kp`) so the recipient can do MLS-tier first
+/// contact without a separate hub fetch. Purely local — no hub
+/// required.
+///
+/// Each call mints a *new* KP and persists the resulting MLS state,
+/// so the recipient's eventual `SendBootstrapMls` (which consumes
+/// this KP's init key on our side when they connect and we resume
+/// the group) can be matched even across a daemon restart.
+async fn handle_export_key_package(state: &DaemonState) -> ApiResponse {
+    let (kp_bytes, snapshot) = {
+        let party = state.mls_party.lock().await;
+        let kp = match party.key_package_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("mls: failed to mint KeyPackage: {e}"),
+                };
+            }
+        };
+        let Ok(snap) = party.snapshot_state() else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "snapshot_state failed".into(),
+            };
+        };
+        (kp, snap)
+    };
+    {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_mls_state(state.identity_id, &snapshot) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_mls_state: {e}"),
+            };
+        }
+    }
+    ApiResponse::ExportKeyPackageOk {
+        kp_b64: base64_encode(&kp_bytes),
     }
 }
 

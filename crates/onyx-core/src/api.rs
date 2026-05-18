@@ -161,6 +161,22 @@ pub enum ApiRequest {
     ///
     /// Requires `--hub-onion` + `--hub-pubkey`.
     FetchPeerKeyPackage { peer_fingerprint: String },
+    /// Export a freshly-minted MLS KeyPackage for *our own* identity,
+    /// so the CLI can bundle it into an invite URL (T7.2-mls).
+    ///
+    /// Each call mints a *new* KP from the persistent `MlsParty`
+    /// (`MlsParty::key_package_bytes()`). KPs are single-use in MLS —
+    /// the recipient consumes it when they call `SendBootstrapMls`
+    /// against it — so don't share the same exported KP with two peers
+    /// expecting both to succeed.
+    ///
+    /// Returns [`ApiResponse::ExportKeyPackageOk`] with the KP bytes
+    /// in standard base64 (same shape as [`Self::FetchPeerKeyPackage`]
+    /// returns). Does **not** require a hub: this is a purely local
+    /// operation against the daemon's own MLS state. Useful when you
+    /// want to share an invite URL out-of-band (Signal, in person)
+    /// without exposing your KP via the hub directory.
+    ExportKeyPackage,
 }
 
 /// One response line on the wire (daemon → client).
@@ -230,6 +246,12 @@ pub enum ApiResponse {
     /// KeyPackage bytes — the same shape `SendBootstrapMls` expects
     /// for its `peer_kp_b64` argument.
     FetchPeerKeyPackageOk { kp_b64: String },
+    /// Reply to [`ApiRequest::ExportKeyPackage`]. `kp_b64` is the
+    /// standard-base64 encoding of a freshly-minted KeyPackage for
+    /// our own MLS party. Re-encode as base64url and put into an
+    /// invite URL's `kp` query parameter to enable MLS-tier first
+    /// contact.
+    ExportKeyPackageOk { kp_b64: String },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the

@@ -3094,6 +3094,7 @@ name = "onyx"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "onyx-core",
@@ -3112,6 +3113,7 @@ dependencies = [
  "argon2",
  "arti-client",
  "base32",
+ "base64",
  "blake2",
  "chacha20poly1305",
  "ciborium",
