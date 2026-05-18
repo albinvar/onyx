@@ -6,6 +6,57 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.2.f: TUI `[hub]` badge for hub-relayed messages
+
+Small commit, security-meaningful. The `via_hub: bool` indicator that's been plumbed through three layers since T5.2.d now actually appears on screen. Users can read the security tier of every message at a glance, which closes the user-comprehension gap that `THREAT_MODEL.md` §8.2 #14 was tracking.
+
+### What landed
+
+`render_messages` in `crates/onyx/src/tui.rs`: for any `ChatLine` with `via_hub == true`, a yellow bold `[hub]` badge is inserted between the sender label and the message text.
+
+```text
+  u5lhmxps: [hub] hi (first contact via hub)
+  u5lhmxps: hi
+        me: hey
+  u5lhmxps: how's the audit?
+```
+
+The `[hub]` styling deliberately stands out (yellow + bold) rather than fading into the background. Reasoning: users are more likely to make a wrong trust decision by assuming a hub-relayed message has full PCS protection than by being mildly annoyed at a noisy badge.
+
+The `#[allow(dead_code)]` on `ChatLine.via_hub` is gone; the field is now genuinely read.
+
+### Snapshot test extended
+
+`dump_snapshot_with_chat` mock now includes one `via_hub: true` line at the top of the scrollback. The test asserts `snap.contains("[hub]")` with a comment explaining the regression-prevention motive: "If this assertion ever regresses, users would silently lose the ability to read which messages have MLS PCS and which don't."
+
+The rendered PNG snapshot was also updated (`target/tui-snapshot-chat.png`) and shared with the user for visual confirmation.
+
+### `THREAT_MODEL.md` §8.2 item #14 closed
+
+Marked closed (struck through) with a note pointing at the implementation + regression test. The tier indicator is now end-to-end:
+  * Wire (`EventMessage.via_hub`, `HistoryEntry.via_hub`) — T5.2.d
+  * Ring buffer (`ChatLine.via_hub`) — T5.2.d
+  * Backfill merge (`merge_history` propagates) — T5.2.d
+  * **Visual rendering (`[hub]` badge)** — this commit
+  * Backfill regression test (`merge_history_dedupes_against_live_entries` asserts `via_hub` survives) — T5.2.d
+  * Render regression test (`dump_snapshot_with_chat` asserts `[hub]` appears) — this commit
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ (clean — no new lints).
+  * `cargo test --workspace` ✓ — 193 total (unchanged count; the existing `dump_snapshot_with_chat` test just gained an assertion).
+  * `cargo deny check` ✓.
+
+### Open security gaps + carry-forward
+
+  * **T5.2.e — `mls/v1` variant for true PCS over hub** is now the only remaining T5.2 step. Requires the recipient to publish a KeyPackage (directory in the hub, or out-of-band exchange).
+  * No CLI affordance for `SendBootstrap` yet (raw NDJSON only).
+  * Hub auth still open.
+  * Peer-list pane still uses `○` for both "disconnected direct peer" and "hub-only contact". A small future enhancement would use a third glyph for hub-only — but the per-message badge already disambiguates in the conversation view, so this is cosmetic.
+
+---
+
 ## 2026-05-18 — T5.2.d: receive-side hub decode — `msg/v1` first-contact end-to-end
 
 The symmetric counterpart to T5.2.c. After this commit, the loop is closed for first-contact hub-relayed delivery: alice's `SendBootstrap` builds a sealed envelope addressed to bob's introduction inbox, the hub forwards on `bob`'s subscription, bob's `handle_hub_delivery` opens the envelope, decodes the inner `BootstrapPayload::PlainMessage`, registers alice as a hub-only peer in the conversation registry, and emits an `EventMessage { via_hub: true }` that the TUI's tail subscription picks up. **As of this commit, "alice sends to offline bob via the hub" actually works end-to-end** — without any direct Noise circuit between them.

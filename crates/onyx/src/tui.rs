@@ -128,10 +128,8 @@ struct ChatLine {
     ts_unix_ms: u64,
     /// `true` when this message arrived via the hub (sealed-sender
     /// envelope, weaker forward-secrecy properties than direct MLS).
-    /// T5.2.f will render the two tiers visually distinct so users
-    /// can read the threat model right — for now it's stored but
-    /// not yet shown.
-    #[allow(dead_code)]
+    /// Rendered as a yellow `[hub]` badge in the conversation pane
+    /// so users can read the security tier at a glance.
     via_hub: bool,
 }
 
@@ -652,10 +650,25 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     MessageDirection::Incoming => (peer.short_id.as_str(), Color::Cyan),
                     MessageDirection::Outgoing => ("me", Color::Green),
                 };
-                Line::from(vec![
-                    Span::styled(format!("{who:>10}: "), Style::default().fg(color)),
-                    Span::raw(line.text.clone()),
-                ])
+                let mut spans: Vec<Span<'_>> = Vec::with_capacity(3);
+                spans.push(Span::styled(
+                    format!("{who:>10}: "),
+                    Style::default().fg(color),
+                ));
+                // `via_hub` messages use the msg/v1 sealed-sender path,
+                // which has per-message PFS but no MLS PCS (see
+                // SECURITY.md §6.1). Render a visible "[hub]" badge so
+                // the user can read the security tier at a glance.
+                if line.via_hub {
+                    spans.push(Span::styled(
+                        "[hub] ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                spans.push(Span::raw(line.text.clone()));
+                Line::from(spans)
             })
             .collect(),
         _ => vec![Line::from(Span::styled(
@@ -839,8 +852,14 @@ mod snapshot_tests {
             vec![
                 ChatLine {
                     direction: MessageDirection::Incoming,
-                    text: "hi".into(),
+                    text: "hi (first contact via hub)".into(),
                     ts_unix_ms: 1_700_000_000_000,
+                    via_hub: true,
+                },
+                ChatLine {
+                    direction: MessageDirection::Incoming,
+                    text: "hi".into(),
+                    ts_unix_ms: 1_700_000_000_005,
                     via_hub: false,
                 },
                 ChatLine {
@@ -908,6 +927,14 @@ mod snapshot_tests {
         assert!(snap.contains("how's the audit?"));
         assert!(snap.contains("looking good"));
         assert!(snap.contains("● live"));
+        // T5.2.f: hub-relayed messages must visibly carry the
+        // weaker-security-tier indicator. If this assertion ever
+        // regresses, users would silently lose the ability to read
+        // which messages have MLS PCS and which don't.
+        assert!(
+            snap.contains("[hub]"),
+            "via_hub messages must render the [hub] badge; snapshot:\n{snap}"
+        );
     }
 
     #[test]
