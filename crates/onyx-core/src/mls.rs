@@ -24,9 +24,18 @@
 //! ## Storage
 //!
 //! Each [`MlsParty`] carries its own [`OpenMlsRustCrypto`] provider with
-//! an in-memory key/state store. Persistence into [`crate::storage::Vault`]
-//! is a follow-up. **Implication for v0**: process restart loses MLS
-//! group state. Acceptable for the daemon process not yet existing.
+//! an in-memory `MemoryStorage` key-value store. We snapshot the entire
+//! store to a single byte blob via [`MlsParty::snapshot_state`] and
+//! restore it via [`MlsParty::from_identity_and_state`]; that blob then
+//! goes through [`crate::storage::Vault::save_mls_state`] /
+//! [`crate::storage::Vault::load_mls_state`] for AEAD-sealed at-rest
+//! storage keyed by identity id. After restore,
+//! [`MlsParty::load_group`] resumes an [`MlsGroup`] by its serialised
+//! group id.
+//!
+//! Daemon-side wiring (sharing one persistent `MlsParty` across all
+//! inbound connections, saving the snapshot after each modification)
+//! is the next phase.
 //!
 //! ## Audit caveat
 //!
@@ -36,7 +45,7 @@
 
 use openmls::credentials::{BasicCredential, CredentialWithKey};
 use openmls::framing::{MlsMessageIn, MlsMessageOut, ProcessedMessageContent, ProtocolMessage};
-use openmls::group::{MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig, StagedWelcome};
+use openmls::group::{GroupId, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig, StagedWelcome};
 use openmls::key_packages::KeyPackage;
 use openmls::prelude::tls_codec::Serialize as TlsSerialize;
 use openmls::prelude::{
@@ -46,6 +55,8 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::types::SignatureScheme;
+use serde_bytes::ByteBuf;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::identity::Identity;
@@ -95,9 +106,10 @@ fn internal<E>(label: &'static str) -> impl FnOnce(E) -> Error {
 ///     byte label as the credential identity.
 ///
 /// Each party owns its own [`OpenMlsRustCrypto`] provider with an
-/// **in-memory** key/state store. Persistence into
-/// [`crate::storage::Vault`] is the next phase. Until then, restart
-/// drops the MLS group state even though the credential is stable.
+/// in-memory `MemoryStorage` key/state store. To survive restart,
+/// snapshot via [`Self::snapshot_state`], persist the bytes through
+/// [`crate::storage::Vault::save_mls_state`], and restore via
+/// [`Self::from_identity_and_state`] + [`Self::load_group`].
 pub struct MlsParty {
     credential_with_key: CredentialWithKey,
     signature_keys: SignatureKeyPair,
@@ -192,6 +204,70 @@ impl MlsParty {
         )
         .map_err(internal("mls: group creation failed"))?;
         Ok(MlsGroupState { group })
+    }
+
+    /// Serialise the entire in-memory storage state (all signature
+    /// keypairs + all group state for every group this party
+    /// participates in) into a single byte blob. Suitable for sealing
+    /// under the vault key and persisting via
+    /// [`crate::storage::Vault::save_mls_state`].
+    ///
+    /// Returns `Zeroizing<Vec<u8>>` — the snapshot contains group
+    /// secrets and the signature private key.
+    ///
+    /// We serialise the underlying `HashMap<Vec<u8>, Vec<u8>>` as a
+    /// CBOR-encoded `Vec<(ByteBuf, ByteBuf)>`. CBOR keeps byte strings
+    /// compact (no base64 inflation like the upstream `MemoryStorage`
+    /// JSON helper does).
+    pub fn snapshot_state(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let map = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| Error::Internal("mls: MemoryStorage RwLock poisoned"))?;
+        let entries: Vec<(ByteBuf, ByteBuf)> = map
+            .iter()
+            .map(|(k, v)| (ByteBuf::from(k.clone()), ByteBuf::from(v.clone())))
+            .collect();
+        drop(map);
+        let mut out = Vec::new();
+        ciborium::into_writer(&entries, &mut out)
+            .map_err(|_| Error::Internal("mls: snapshot CBOR encode failed"))?;
+        Ok(Zeroizing::new(out))
+    }
+
+    /// Rebuild an `MlsParty` for the given long-term [`Identity`]
+    /// **and** restore its provider storage from a snapshot produced
+    /// earlier by [`Self::snapshot_state`].
+    ///
+    /// After this returns, [`Self::load_group`] can be used to resume
+    /// any group the party was previously a member of.
+    pub fn from_identity_and_state(identity: &Identity, snapshot: &[u8]) -> Result<Self> {
+        let party = Self::from_identity(identity)?;
+        let entries: Vec<(ByteBuf, ByteBuf)> = ciborium::from_reader(snapshot)
+            .map_err(|_| Error::InvalidEncoding("mls: snapshot is not valid CBOR"))?;
+        {
+            let mut map = party
+                .provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| Error::Internal("mls: MemoryStorage RwLock poisoned"))?;
+            for (k, v) in entries {
+                map.insert(k.into_vec(), v.into_vec());
+            }
+        }
+        Ok(party)
+    }
+
+    /// Resume a previously-existing group by its serialised id.
+    /// Returns `Ok(None)` if no state for that group is present.
+    pub fn load_group(&self, group_id_bytes: &[u8]) -> Result<Option<MlsGroupState>> {
+        let group_id = GroupId::from_slice(group_id_bytes);
+        let group = MlsGroup::load(self.provider.storage(), &group_id)
+            .map_err(internal("mls: load group failed"))?;
+        Ok(group.map(|g| MlsGroupState { group: g }))
     }
 
     /// Join an existing group from a serialised Welcome (the bytes that
@@ -315,6 +391,13 @@ impl MlsGroupState {
     pub fn epoch(&self) -> u64 {
         self.group.epoch().as_u64()
     }
+
+    /// Group identifier bytes. Pass to [`MlsParty::load_group`] after
+    /// restoring an [`MlsParty`] from a persisted snapshot.
+    #[must_use]
+    pub fn group_id_bytes(&self) -> Vec<u8> {
+        self.group.group_id().as_slice().to_vec()
+    }
 }
 
 impl std::fmt::Debug for MlsGroupState {
@@ -393,6 +476,101 @@ mod tests {
             a.signature_keys.to_public_vec(),
             b.signature_keys.to_public_vec()
         );
+    }
+
+    #[test]
+    fn snapshot_restore_round_trip_preserves_group() {
+        // The killer test: two parties form a group + exchange a
+        // message; both snapshot; both restored into fresh `MlsParty`s
+        // from the snapshot bytes; both can load the *same* group by
+        // id; a NEW application message after restore decrypts
+        // correctly. This is the persistence invariant the daemon
+        // needs to survive restart.
+        let id_a = identity_from_seed([100u8; 32], [101u8; 32]);
+        let id_b = identity_from_seed([110u8; 32], [111u8; 32]);
+
+        // Phase 1: set up the group.
+        let alice = MlsParty::from_identity(&id_a).unwrap();
+        let bob = MlsParty::from_identity(&id_b).unwrap();
+        let bob_kp = bob.key_package_bytes().unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let group_id = alice_group.group_id_bytes();
+        let welcome = alice_group.invite(&alice, &bob_kp).unwrap();
+        let mut bob_group = bob.join_from_welcome(&welcome).unwrap();
+        assert_eq!(group_id, bob_group.group_id_bytes());
+
+        // Exchange one message so both ratchets advance.
+        let ct = alice_group
+            .encrypt_application(&alice, b"before restore")
+            .unwrap();
+        let pt = bob_group.decrypt_application(&bob, &ct).unwrap();
+        assert_eq!(pt, b"before restore");
+
+        // Phase 2: snapshot both.
+        let alice_state = alice.snapshot_state().unwrap();
+        let bob_state = bob.snapshot_state().unwrap();
+        assert!(!alice_state.is_empty(), "snapshot must contain bytes");
+        assert!(!bob_state.is_empty());
+
+        // Phase 3: drop the originals (simulates daemon restart).
+        drop(alice_group);
+        drop(bob_group);
+        drop(alice);
+        drop(bob);
+
+        // Phase 4: restore both from the snapshots into fresh parties.
+        let alice2 = MlsParty::from_identity_and_state(&id_a, &alice_state).unwrap();
+        let bob2 = MlsParty::from_identity_and_state(&id_b, &bob_state).unwrap();
+
+        // Phase 5: load the group state on both sides.
+        let mut alice_group2 = alice2
+            .load_group(&group_id)
+            .unwrap()
+            .expect("alice group missing after restore");
+        let mut bob_group2 = bob2
+            .load_group(&group_id)
+            .unwrap()
+            .expect("bob group missing after restore");
+
+        // Same epoch on both sides — the restore preserved the ratchet
+        // state exactly.
+        assert_eq!(alice_group2.epoch(), bob_group2.epoch());
+
+        // Phase 6: send a NEW application message after restore.
+        let ct2 = alice_group2
+            .encrypt_application(&alice2, b"after restore")
+            .unwrap();
+        let pt2 = bob_group2.decrypt_application(&bob2, &ct2).unwrap();
+        assert_eq!(pt2, b"after restore");
+
+        // And bob can reply.
+        let ct3 = bob_group2
+            .encrypt_application(&bob2, b"bob's reply post-restore")
+            .unwrap();
+        let pt3 = alice_group2.decrypt_application(&alice2, &ct3).unwrap();
+        assert_eq!(pt3, b"bob's reply post-restore");
+    }
+
+    #[test]
+    fn load_group_returns_none_for_unknown_id() {
+        let id = identity_from_seed([200u8; 32], [201u8; 32]);
+        let party = MlsParty::from_identity(&id).unwrap();
+        assert!(
+            party
+                .load_group(b"this-group-doesnt-exist")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn from_identity_and_state_rejects_garbage() {
+        let id = identity_from_seed([7u8; 32], [8u8; 32]);
+        assert!(matches!(
+            MlsParty::from_identity_and_state(&id, b"not cbor"),
+            Err(Error::InvalidEncoding(_))
+        ));
     }
 
     #[test]

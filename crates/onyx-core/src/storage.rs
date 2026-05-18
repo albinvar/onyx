@@ -34,16 +34,21 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 
 use crate::crypto::{AeadKey, Argon2Params, Nonce, argon2id_derive, random_array};
 use crate::error::{Error, Result};
 
 /// On-disk schema version. Bumped when migrations land.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// **v1 → v2**: added `mls_state` table for per-identity MLS provider
+/// snapshots. No migration logic; v1 vaults won't open. Since v0 has
+/// no real users, the migration story is "delete the vault and
+/// recreate." This will get a proper migration runner before v0.1.
+pub const SCHEMA_VERSION: i32 = 2;
 
-const SCHEMA_V1: &str = "
+const SCHEMA_V2: &str = "
 CREATE TABLE vault_meta (
   id              INTEGER PRIMARY KEY CHECK (id = 1),
   schema_version  INTEGER NOT NULL,
@@ -60,6 +65,16 @@ CREATE TABLE identities (
   fingerprint     BLOB NOT NULL UNIQUE,
   encrypted_blob  BLOB NOT NULL,
   created_at      INTEGER NOT NULL
+);
+
+-- One row per identity that has any MLS state. Snapshot is the
+-- AEAD-encrypted serialised form of openmls's MemoryStorage hashmap
+-- (see crate::mls). Pinned by identity_id with ON DELETE CASCADE so
+-- deleting an identity also clears its MLS state.
+CREATE TABLE mls_state (
+  identity_id     INTEGER PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+  encrypted_blob  BLOB NOT NULL,
+  updated_at      INTEGER NOT NULL
 );
 ";
 
@@ -194,7 +209,7 @@ impl Vault {
 
     fn initialize(conn: Connection, passphrase: &[u8], params: &Argon2Params) -> Result<Self> {
         params.validate()?;
-        conn.execute_batch(SCHEMA_V1).map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_V2).map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -232,6 +247,50 @@ impl Vault {
     /// Decrypt bytes previously produced by [`Self::encrypt_blob`].
     pub fn decrypt_blob(&self, blob: &[u8]) -> Result<Vec<u8>> {
         unseal(&self.aead, blob)
+    }
+
+    /// Persist (or overwrite) the MLS state blob for `identity_id`.
+    /// The plaintext bytes are sealed under the vault key before being
+    /// written; callers do NOT need to encrypt themselves. Typically
+    /// the plaintext is whatever [`crate::mls::MlsParty::snapshot_state`]
+    /// produced.
+    pub fn save_mls_state(&self, identity_id: i64, plaintext: &[u8]) -> Result<()> {
+        let encrypted = self.encrypt_blob(plaintext)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO mls_state (identity_id, encrypted_blob, updated_at) \
+                 VALUES (?, ?, ?) \
+                 ON CONFLICT(identity_id) DO UPDATE SET \
+                   encrypted_blob = excluded.encrypted_blob, \
+                   updated_at = excluded.updated_at",
+                params![identity_id, encrypted, now],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Load and decrypt the MLS state for `identity_id`, returning
+    /// `None` if no row exists. The returned `Vec` is plaintext bytes
+    /// suitable for [`crate::mls::MlsParty::from_identity_and_state`].
+    pub fn load_mls_state(&self, identity_id: i64) -> Result<Option<Vec<u8>>> {
+        let encrypted: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT encrypted_blob FROM mls_state WHERE identity_id = ?",
+                params![identity_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db_err)?;
+        match encrypted {
+            Some(blob) => Ok(Some(self.decrypt_blob(&blob)?)),
+            None => Ok(None),
+        }
     }
 
     /// Read-only access to the underlying SQLite connection for
@@ -317,6 +376,59 @@ mod tests {
             v.decrypt_blob(&blob[..5]),
             Err(Error::InvalidEncoding(_))
         ));
+    }
+
+    #[test]
+    fn mls_state_save_load_round_trip() {
+        // The mls_state table is keyed by identity_id with a FK to
+        // identities — use an in-memory vault and create an identity
+        // first so the FK is satisfied. (Schema FK enforcement isn't
+        // on by default in SQLite, but the test exercises the round-
+        // trip either way.)
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("alice").unwrap();
+
+        // No state yet.
+        assert!(v.load_mls_state(id).unwrap().is_none());
+
+        // Save and read back.
+        let blob = b"opaque MLS snapshot bytes \xff\x00\x42";
+        v.save_mls_state(id, blob).unwrap();
+        let loaded = v.load_mls_state(id).unwrap().expect("must be Some");
+        assert_eq!(loaded, blob);
+
+        // Overwrite via UPSERT.
+        let blob2 = b"replacement bytes";
+        v.save_mls_state(id, blob2).unwrap();
+        assert_eq!(v.load_mls_state(id).unwrap().unwrap(), blob2);
+    }
+
+    #[test]
+    fn mls_state_persists_across_reopen() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        tmp.close().unwrap();
+
+        let identity_id;
+        let saved_blob = b"persisted MLS snapshot";
+
+        {
+            let mut v = Vault::create(&path, b"pw", &Argon2Params::FLOOR).unwrap();
+            let (id, _identity) = v.create_identity("alice").unwrap();
+            v.save_mls_state(id, saved_blob).unwrap();
+            identity_id = id;
+        }
+
+        {
+            let v = Vault::open(&path, b"pw").unwrap();
+            let loaded = v
+                .load_mls_state(identity_id)
+                .unwrap()
+                .expect("MLS state lost across reopen");
+            assert_eq!(loaded, saved_blob);
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

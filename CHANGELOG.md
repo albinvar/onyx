@@ -6,6 +6,84 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — MLS state persistence into Vault
+
+### What's new
+MLS group state — the ratchet tree, all queued proposals, the per-epoch secrets — now persists to disk via the encrypted vault. Two parties can form a group, snapshot, drop their `MlsParty`s entirely (simulating daemon restart), reload from the snapshot, and **continue exchanging encrypted Application messages in the same group**. The killer test (`snapshot_restore_round_trip_preserves_group`) exercises this end-to-end.
+
+### Approach
+Rather than reimplementing openmls's ~50-method `StorageProvider` trait against SQLite, we took a smaller and more correct path. `openmls_memory_storage::MemoryStorage` (what `OpenMlsRustCrypto` uses by default) is just a `RwLock<HashMap<Vec<u8>, Vec<u8>>>` with the `values` field publicly accessible. We:
+
+1. Snapshot the entire HashMap to a CBOR-encoded `Vec<(ByteBuf, ByteBuf)>` blob.
+2. AEAD-seal the blob under the vault key (existing `Vault::encrypt_blob`).
+3. Store one row per identity in a new `mls_state` table keyed by `identity_id`.
+4. On restore: AEAD-unseal, CBOR-decode, write the entries back into a fresh `MemoryStorage` via the same public `values` field.
+5. Call `MlsGroup::load(storage, &group_id)` to resume any group.
+
+Trade-off: every snapshot rewrites the whole blob. For 1-on-1 DMs the blob is tiny (~few KB); for 200-member rooms it'll be heftier but still manageable. A future optimization is per-group blobs keyed by `(identity_id, group_id)`.
+
+### `onyx_core::storage`
+- **Schema bump**: `SCHEMA_VERSION = 2`. New `mls_state` table with `identity_id INTEGER PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE`, `encrypted_blob BLOB`, `updated_at INTEGER`. **v1 vaults will not open.** No migration runner yet — documented in code; v0 has no real users so the migration story is "delete and recreate."
+- **`Vault::save_mls_state(identity_id, plaintext)`** — UPSERT-style; caller passes raw plaintext, the method AEAD-seals before insert. `ON CONFLICT(identity_id) DO UPDATE` so repeat calls overwrite.
+- **`Vault::load_mls_state(identity_id) -> Option<Vec<u8>>`** — returns `None` if no row, else decrypts and returns plaintext.
+- 2 new tests: round-trip in memory + persistence across reopen.
+
+### `onyx_core::mls`
+- **`MlsParty::snapshot_state(&self) -> Result<Zeroizing<Vec<u8>>>`** — serialise the entire MemoryStorage to CBOR. `Zeroizing<Vec<u8>>` because the snapshot contains the signature private key seed and group secrets.
+- **`MlsParty::from_identity_and_state(&Identity, &[u8]) -> Result<Self>`** — fresh party with the deterministic Identity-bound credential, plus the storage pre-populated from a snapshot.
+- **`MlsParty::load_group(&[u8]) -> Result<Option<MlsGroupState>>`** — wraps `MlsGroup::load`; returns `None` if no state for that group is present.
+- **`MlsGroupState::group_id_bytes(&self) -> Vec<u8>`** — accessor so callers can persist + later retrieve a specific group.
+- 3 new tests (5 total new in this phase): the killer round-trip; `load_group` returns `None` on unknown id; `from_identity_and_state` rejects garbage CBOR.
+
+### What the killer test proves
+```
+Phase 1: alice + bob form group, exchange one message, both at epoch 1
+Phase 2: both snapshot their state
+Phase 3: drop everything (simulates daemon restart)
+Phase 4: rebuild MlsParty from Identity + snapshot bytes
+Phase 5: load_group() on both sides yields the same group
+Phase 6: alice encrypts a NEW message after restore; bob decrypts it
+Phase 7: bob encrypts a reply; alice decrypts it
+```
+
+If Phase 7 succeeds, the ratchet state was preserved exactly through the snapshot/restore cycle. It does.
+
+### Module docs updated
+- `mls.rs` header rewritten — no longer says persistence is a follow-up; now points at the snapshot/restore + `Vault::save_mls_state` flow.
+- `MlsParty` doc updated to mention the snapshot pattern.
+
+### Daemon integration NOT in this phase
+The library primitive works. The daemon-side change — sharing a single persistent `MlsParty` across all inbound connections + saving after every modification — is the next phase. It needs:
+- An architecture change (currently each connection creates its own `MlsParty`).
+- A wrapper around `MlsParty` with `Arc<Mutex<>>` or similar so concurrent connections can mutate consistently.
+- A save-after-mutation policy (every encrypt? every commit? batch?).
+- Group lifecycle on the daemon: when a connection bootstraps a group, the group id needs to be remembered so subsequent connections can route to the right state.
+
+Worth a phase of its own.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **119 passing in `onyx-core`** (114 prior + 5 new):
+  - `mls::tests::snapshot_restore_round_trip_preserves_group`
+  - `mls::tests::load_group_returns_none_for_unknown_id`
+  - `mls::tests::from_identity_and_state_rejects_garbage`
+  - `storage::tests::mls_state_save_load_round_trip`
+  - `storage::tests::mls_state_persists_across_reopen`
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+
+### Open security gaps (carry-forward, updated)
+- **Daemon doesn't yet use persistence** — primitive is ready; the integration is the next phase.
+- **No contact verification on dial path.**
+- **One-shot exchange only** (handler-side; library now supports persistent groups).
+- **No CLI / local API socket.**
+- **No sealed-sender wiring on daemon path.**
+- **Shared Arti state dir.**
+- **Schema migration runner is still TODO** — v0 has no real users, so v1→v2 is "delete the vault." Before any release, an actual migration runner is needed.
+
+---
+
 ## 2026-05-18 — MLS credential bound to long-term Identity
 
 ### What's new
