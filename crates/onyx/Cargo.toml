@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 onyx-core = { workspace = true }
+onyx-daemon = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

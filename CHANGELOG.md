@@ -6,6 +6,51 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T7.1: single-binary `onyx` (daemon + TUI in one process) + `~/.onyx/` defaults
+
+Headline UX change. Before today: to chat, a user had to run `onyxd` in one terminal, `onyx tui` in another, point both at the same `--api-socket`, and make sure paths matched. After today: **`onyx` is the one command**. Run it with no subcommand and it launches the daemon in the background and the TUI in the foreground in the same process. The second terminal is gone.
+
+Why this matters (user feedback): "Why this much hard to test something… Why cant we simplify things…" — `ROADMAP.md` called T7.1 the next priority for exactly this reason. The chat works, the security model is documented, but the bring-up friction was scaring off the very people who could give the project useful feedback. Without an external audit yet, the next-best signal is real users actually trying it. Two-terminal UX was the blocker.
+
+What landed:
+
+**T7.1.a — daemon as a library.** All daemon logic — vault open, identity load, MLS state restore, Tor bootstrap, API server, hub client, accept/dial loops, all the helpers — moved out of `crates/onyxd/src/main.rs` (which was ~1180 lines) into a new library crate `crates/onyx-daemon/` with the same code in `lib.rs`. The library exposes three things: `pub struct Config` (mirrors the old clap Args struct, but without the clap conflicts/requires — those stay in the binary), `pub struct DaemonState`, and `pub async fn run(args: Config) -> anyhow::Result<()>`. The submodules `api_server`, `conversations`, and `hub_client` moved with it; `use crate::DaemonState` still resolves because `lib.rs` re-exports it. `crates/onyxd/src/main.rs` is now ~100 lines: clap-parse, `impl From<Args> for Config`, `tracing_subscriber::fmt().init()`, `onyx_daemon::run(args.into()).await`. The `onyxd` binary continues to exist for headless/systemd use; it's just a thin wrapper now.
+
+**T7.1.b — `onyx` (no subcommand) = daemon + TUI in one process.** `crates/onyx/src/main.rs` gains:
+
+  * `onyx-daemon` as a dependency.
+  * Global flags hoisted to the top-level `Args`: `--vault`, `--passphrase` (env `ONYX_PASSPHRASE`), `--listen-tcp`, `--dial-tcp`, `--dial-pubkey`. All `global = true` so subcommands inherit them.
+  * `cmd: Option<Command>` (was non-optional).
+  * New `Command::Daemon` subcommand for running daemon-only inside `onyx` (parity with standalone `onyxd`).
+  * New `fn build_daemon_config(args, socket)` that constructs `onyx_daemon::Config` from the global args, bailing with a clear message if `--passphrase` was omitted.
+  * `dispatch` gains a `None` arm: spawn `onyx_daemon::run(config)` as a `tokio::spawn` background task, sleep 500ms so the API socket has time to bind before the TUI's first connect, then run `tui::run(socket)` in the foreground. When the TUI exits the daemon task is `.abort()`ed.
+
+**T7.1.c — sensible defaults under `~/.onyx/`.** New helpers in `onyx-daemon`: `default_data_dir()` (returns `$HOME/.onyx`, falling back to `./.onyx` if `HOME` is unset for CI sandboxes), `default_vault_path()` (= `~/.onyx/vault.db`), `default_api_socket_path()` (= `~/.onyx/onyx.sock`), and `ensure_data_dir(&Path)` which `mkdir -p`s the directory and `chmod 0700`s it on Unix (idempotent — runs every start in case the dir was created earlier with a wider umask). `onyx_daemon::run` now ensures the parent dir of both `vault` and `api_socket` exists; if the parent is the default `~/.onyx`, it also tightens permissions to 0700. Custom paths under user-chosen parents (e.g. `/tmp/...`) get `mkdir -p` but no chmod — that's the operator's territory. Both `onyxd` and `onyx` changed their clap defaults for `--vault` and `--api-socket` from the old `./onyx-state.db` / `./onyxd.sock` to `Option<...>` with `unwrap_or_else(onyx_daemon::default_*)` in `From<Args>`/`build_daemon_config`. So passing nothing now means "use `~/.onyx/`", and existing `--vault ./foo.db` invocations keep working unchanged.
+
+Smoke-test evidence (two `onyx daemon` instances chatting via local TCP, no Tor):
+
+```
+INFO inbound-tcp{peer=127.0.0.1:58673}: onyx_daemon: Noise XK complete
+INFO inbound-tcp{peer=127.0.0.1:58673}: onyx_daemon: MLS round-trip complete (responder); was_bootstrap=true
+INFO inbound-tcp{peer=127.0.0.1:58673}: onyx_daemon: conversation registered with registry peer=ri4ioet7
+```
+
+That `onyx_daemon:` (not `onyxd:`) on every log line confirms the daemon code is running inside the unified `onyx` binary via the shared library — it's not just a renamed shim around `onyxd`. Bob then sent "hi alice — from the unified onyx binary!" via the Send API → `SendOk` → Alice received the plaintext in her registry.
+
+Security: identical to T7.0. No protocol-visible change. The library extraction is purely organisational — the wire bytes, the MLS group, the Noise transport, the vault format are all byte-identical. The `~/.onyx/` directory is 0700, so the vault + socket are not world-readable by default (was previously `./onyxd.sock` in the CWD which inherited umask, so this is a small *improvement* not a regression). `--passphrase` continues to be hide_env_values + recommended-via-env-not-CLI so it doesn't show up in `ps`. Test-only `--listen-tcp` / `--dial-tcp` flags still loudly warn "no anonymity" via the existing T7.0 warning paths.
+
+What this did NOT do:
+
+  * No change to the hub protocol, the wire format, or the vault schema.
+  * No change to MLS bootstrap or MLS PCS.
+  * The `onyxd` binary is still built and shipped; this is purely additive at the binary level. Anyone running `onyxd` under systemd today doesn't have to change anything.
+  * Invite URLs (`onyx invite` / `onyx accept`) are T7.2, still queued.
+  * Channels / multi-party rooms are T6.3, still queued.
+
+Verification: full gate green — `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (had to add `#[must_use]` to two now-public methods in `conversations.rs`, swap a `map().unwrap_or_else()` to `map_or_else()`, and nest an or-pattern in `main.rs` once they crossed visibility/version boundaries), `cargo test --workspace` 216 passed / 0 failed (same count as before; no test added but none lost either — the smoke-test above is the real end-to-end check the library extraction is correct).
+
+---
+
 ## 2026-05-18 — Docs: ROADMAP.md — what's done / in-flight / next / later / won't-do
 
 No code change. The project already had `CHANGELOG.md` for what's done (one verbose entry per phase) and `THREAT_MODEL.md` §8.2 for security carry-forwards, but nothing centralised for "what's coming next." Users had to read backwards through the CHANGELOG and infer priorities. New `ROADMAP.md` makes the queue explicit.

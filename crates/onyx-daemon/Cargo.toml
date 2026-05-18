@@ -1,0 +1,25 @@
+[package]
+name = "onyx-daemon"
+description = "Onyx daemon as a library — shared between the standalone `onyxd` binary and the all-in-one `onyx` binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+name = "onyx_daemon"
+
+[dependencies]
+onyx-core = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+base32 = { workspace = true }
+base64 = { workspace = true }
+serde_bytes = { workspace = true }
+
+[lints]
+workspace = true

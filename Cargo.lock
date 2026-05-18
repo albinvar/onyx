@@ -3097,6 +3097,7 @@ dependencies = [
  "clap",
  "crossterm",
  "onyx-core",
+ "onyx-daemon",
  "ratatui",
  "serde_json",
  "tokio",
@@ -3145,6 +3146,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "onyx-daemon"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base32",
+ "base64",
+ "futures",
+ "onyx-core",
+ "serde_bytes",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "onyx-hub"
 version = "0.0.1"
 dependencies = [
@@ -3163,14 +3178,10 @@ name = "onyxd"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "base32",
- "base64",
  "clap",
- "futures",
  "onyx-core",
- "serde_bytes",
+ "onyx-daemon",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 

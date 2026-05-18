@@ -103,6 +103,7 @@ impl ConversationRegistry {
     /// Subscribe to the global event stream. New subscribers see
     /// events emitted **after** the subscribe call; backfill is the
     /// caller's job (typically a `Peers` request to learn current state).
+    #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<ApiResponse> {
         self.events_tx.subscribe()
     }
@@ -289,6 +290,7 @@ impl ConversationRegistry {
     /// Look up a handle by the user-facing short_id (e.g. typed into
     /// `onyx send <short> <text>`). Returns `None` if no live peer
     /// matches or the peer's session has ended.
+    #[must_use]
     pub fn handle_for_short(&self, short_id: &str) -> Option<ConversationHandle> {
         let peer_pub = self.by_short.get(short_id)?;
         let state = self.by_peer.get(peer_pub)?;

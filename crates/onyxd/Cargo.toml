@@ -1,6 +1,6 @@
 [package]
 name = "onyxd"
-description = "Onyx daemon — long-running per-user process that owns identity, MLS state, and Tor."
+description = "Onyx daemon — headless long-running per-user process that owns identity, MLS state, and Tor."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,15 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 onyx-core = { workspace = true }
+onyx-daemon = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-base32 = { workspace = true }
-base64 = { workspace = true }
-serde_bytes = { workspace = true }
 
 [lints]
 workspace = true
