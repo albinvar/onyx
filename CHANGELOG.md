@@ -6,6 +6,100 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.2.g: `onyx send-bootstrap` CLI subcommand
+
+Tiny commit that closes the last UX gap blocking a real end-to-end demo of the hub-relayed first-contact path. Before today, exercising `SendBootstrap` required hand-built NDJSON and `nc -U`. Now it's:
+
+```
+onyx --socket ./bob.sock send-bootstrap \
+  --peer-fingerprint "$ALICE_FP" \
+  --peer-kem-pub-b32 "$ALICE_KEM" \
+  --text "hello"
+```
+
+Same exit-code semantics as the other `onyx` verbs: `0` on `SendBootstrapOk`, `1` on `Error { code, message }`, `2` on connect failure.
+
+### `crates/onyx/src/main.rs` change
+
+Added `Command::SendBootstrap { peer_fingerprint, peer_kem_pub_b32, text }` with three `--flag VALUE` arguments. Long-form `--` flags rather than positional args so a long, alarming KEM b32 string (~1948 chars) is unambiguously associated with its parameter even on terminals that wrap mid-token.
+
+The subcommand's `--help` doc carries the **security tier warning** explicitly:
+
+> Security tier note: `msg/v1` envelopes have per-message PFS only — no MLS PCS. See `SECURITY.md` §6.1 for the full tradeoff. The recipient TUI will render the message with a yellow `[hub]` badge so they can tell which tier it is.
+
+A user who reads `onyx send-bootstrap --help` cannot miss the fact that this path is weaker than direct MLS.
+
+### Two CLI-shape tests
+
+`send_bootstrap_parses_with_three_flags` — locks in the literal flag names (`--peer-fingerprint`, `--peer-kem-pub-b32`, `--text`) so a future rename can't silently break shell scripts users have written against this command.
+
+`send_bootstrap_requires_all_three_flags` — omitting `--text` must be a clap parse error, not silently default to empty. Sending an empty message would be a real footgun (the user thinks "did it send?" without any signal); failing loudly forces them to be explicit.
+
+### End-to-end recipe (manual smoke; works against the existing binaries)
+
+Genuinely demonstrable in three terminals + one hub:
+
+```
+# Terminal 1: hub
+ONYX_HUB_PASSPHRASE=hub-pass ./target/debug/onyx-hub \
+  --vault ./hub.db --tor-state-dir ./hub-tor
+# Logs:
+#   hub_pub_b32=<HUB_PUB_B32>
+#   hidden service published — onion=<HUB_ONION>:1
+
+# Terminal 2: alice (sender)
+FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
+ONYX_PASSPHRASE=alice-pass ./target/debug/onyxd \
+  --vault ./alice.db --tor-state-dir ./alice-tor \
+  --api-socket ./alice.sock \
+  --hub-onion <HUB_ONION>:1 --hub-pubkey <HUB_PUB_B32>
+
+# Terminal 3: bob (recipient)
+FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
+ONYX_PASSPHRASE=bob-pass ./target/debug/onyxd \
+  --vault ./bob.db --tor-state-dir ./bob-tor \
+  --api-socket ./bob.sock \
+  --hub-onion <HUB_ONION>:1 --hub-pubkey <HUB_PUB_B32>
+
+# Terminal 4: alice shares bob's identity, then sends
+./target/debug/onyx --socket ./bob.sock identity | tee /tmp/bob-id.json
+BOB_FP=$(jq -r .fingerprint /tmp/bob-id.json)
+BOB_KEM=$(jq -r .identity_kem_pub_b32 /tmp/bob-id.json)
+
+./target/debug/onyx --socket ./alice.sock send-bootstrap \
+  --peer-fingerprint "$BOB_FP" \
+  --peer-kem-pub-b32 "$BOB_KEM" \
+  --text "hi bob — sent via hub before you came online"
+
+# {"kind":"SendBootstrapOk"} ← exit code 0
+
+# Terminal 5: bob's TUI
+./target/debug/onyx --socket ./bob.sock tui
+# Live tail picks up the EventMessage { via_hub: true }
+# Conversation pane shows:
+#     alice_sho: [hub] hi bob — sent via hub before you came online
+```
+
+Tested locally on a `--no-tor` daemon for the CLI path (`{"kind":"Error","code":"not_ready","message":"hub client is not enabled..."}` returned with exit code 1 — correct behaviour, no hub configured). The full real-Tor recipe above hasn't been run inline in this commit (would take 60+ seconds of Tor bootstrap × 3 daemons) but the building blocks all have unit + integration test coverage.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — clean.
+  * `cargo test --workspace` ✓ — **7 in `onyx`** (was 5; +2 CLI shape tests), 156 in `onyx-core`, 26 in `onyxd`, 6 in `onyx-hub`. **195 total** (+2 since T5.2.f).
+  * `cargo deny check` ✓.
+  * `onyx send-bootstrap --help` surfaces the security tier warning verbatim.
+  * Live smoke against `onyxd --no-tor`: `onyx identity` → pipe FP + KEM into `onyx send-bootstrap` → `{"kind":"Error","code":"not_ready", ...}` exit 1.
+
+### Open security gaps + carry-forward
+
+  * **T5.2.e — `mls/v1` variant for true PCS over hub** is now genuinely the only T5.2 step left. Requires a KeyPackage exchange protocol (directory in the hub, or out-of-band).
+  * Hub auth still open.
+  * No `onyx contact card` / `onyx contact import` yet; shells using `jq` to splice fingerprint + KEM around are the v0 ergonomic.
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — T5.2.f: TUI `[hub]` badge for hub-relayed messages
 
 Small commit, security-meaningful. The `via_hub: bool` indicator that's been plumbed through three layers since T5.2.d now actually appears on screen. Users can read the security tier of every message at a glance, which closes the user-comprehension gap that `THREAT_MODEL.md` §8.2 #14 was tracking.
