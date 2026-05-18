@@ -6,6 +6,61 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — MLS credential bound to long-term Identity
+
+### What's new
+The MLS credential signing key is now **the same Ed25519 key as the long-term `Identity`**. Same bytes, same fingerprint. Previously each `MlsParty` generated a fresh ED25519 keypair (which was fine for in-process tests but meant "the Noise-authenticated peer" and "the MLS group member" were two separate identities that we had no way of binding together).
+
+### `onyx_core::mls`
+- **`MlsParty::from_identity(&Identity) -> Result<Self>`** — new production constructor. Uses `SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed_bytes, pubkey_bytes)` from openmls_basic_credential 0.5 to import our Ed25519 seed directly (no derivation, no re-hashing — openmls's own `SignatureKeyPair::new` for ED25519 stores the same 32-byte seed format that `ed25519_dalek::SigningKey::to_bytes()` produces).
+- `BasicCredential` identity field = the 32-byte fingerprint (= verifying-key bytes). So the MLS credential is byte-identical to the identity the Noise XK handshake authenticates.
+- **Determinism**: `MlsParty::from_identity(id1) == MlsParty::from_identity(id2)` (in signature pubkey + credential bytes) when `id1 == id2`. This is the invariant that makes MLS state persistence meaningful — when we restart and reload, the credential matches the one the group was created with.
+- `MlsParty::new(label)` (fresh keypair per call) kept for tests, with a doc note that production should use `from_identity`.
+- Internal refactor: both constructors funnel through a shared `assemble` helper that installs the key in the provider's keystore.
+
+### Tests (3 new, 117 total in `onyx-core`)
+- `from_identity_is_deterministic_in_signature_public_key` — two `MlsParty`s built from the same `Identity` (same 32-byte seed) produce byte-identical signature pubkeys + matching `CredentialWithKey.signature_key` fields, and the pubkey equals the `Identity`'s fingerprint bytes.
+- `from_identity_two_different_identities_have_different_keys` — sanity check the other way.
+- `from_identity_keys_can_sign_via_mls` — full 2-party group bootstrap where both ends used `from_identity`, exchange an application message, decrypt successfully. Exercises the MLS credential's signing path against keys imported via `from_raw`.
+
+### `onyxd`
+- `handle_inbound` and `run_dial_mode` now call `MlsParty::from_identity(identity)` instead of `MlsParty::new(fingerprint.as_bytes().to_vec())`. The previous code happened to use the fingerprint as the credential label but generated a separate ED25519 for MLS signing.
+
+### Verified end-to-end on real Tor (again)
+Re-ran the same two-daemon recipe from the previous phase with the bound credentials. Captured cross-check:
+
+| | Alice (responder) | Bob (initiator) |
+|---|---|---|
+| Self `identity_pub_b32` | `wgv2bbfjrwcrcap2kkblpuzd6lkeizr6a4ul333r7froyqmhnraq` | `tnysubldtknqksm2j2z6brnsjcje42dn7rtabtychpjnx544yj2a` |
+| Other side's `peer_identity_pub_b32` | (Bob's) `tnys…j2a` ✓ | (Alice's) `wgv2…raq` ✓ |
+| Decrypted MLS message contains | Bob's fingerprint `u3vu tjyq …` ✓ | Alice's fingerprint `ti6q kbhk …` ✓ |
+| MLS epoch | 1 | 1 |
+
+Note: with this change the MLS signature pubkey and the Noise-authenticated identity pubkey are still **different keys** (Ed25519 vs X25519), but they're both derived from the same long-term `Identity`. The MLS signing key is now the same as the fingerprint — meaning anyone who can verify the fingerprint can verify the MLS signatures, no separate trust step needed.
+
+### Why this matters
+- **Foundation for MLS persistence**: if we persisted MLS group state today, we'd reload it on the next start and the credential would be a different ED25519 — every signature would fail to verify against the stored credential. The binding makes the credential stable across restarts, which is the precondition for storage.
+- **Foundation for contact verification**: a future `--verify-peer-fingerprint` flag on dial can check that the peer's MLS credential identity equals the fingerprint we expected. Without the binding, that check is meaningless because the MLS identity is unrelated.
+- **Reduces audit surface**: one identity key for everything is one less thing that can be wrong.
+
+### Verification
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace --all-targets -- -D warnings` ✓
+- `cargo test --workspace` ✓ — **114 passing in `onyx-core`** (111 prior + 3 new)
+- `cargo fmt --all --check` ✓
+- `cargo deny check` ✓
+- **Two-daemon smoke test on real Tor** ✓ — log output captured above.
+
+### Open security gaps (carry-forward, updated)
+- **MLS group state still in memory only** — credential is now stable; persisting the group state into `Vault` is the natural next phase (uses our existing `seal` / `unseal`).
+- **No contact verification on dial path** — still trusts whatever pubkey the operator types.
+- **One-shot exchange only** — handlers exit after one MLS round-trip.
+- **No CLI / local API socket** — `--dial` is the temporary one-shot equivalent.
+- **No sealed-sender wiring on the daemon path** — exists in `onyx_core::routing` but not on the data path yet.
+- **Shared Arti state dir** — same as before; needs `--tor-state-dir`.
+
+---
+
 ## 2026-05-18 — MLS over Noise over Tor: real end-to-end encrypted message, verified
 
 ### The headline

@@ -213,8 +213,10 @@ async fn handle_inbound(mut stream: TorStream, identity: &Identity) -> anyhow::R
     // Each inbound connection gets its own MlsParty for now. Sharing
     // the MLS identity across connections + persisting it into the
     // vault is the natural next phase.
-    let party = MlsParty::new(identity.fingerprint().as_bytes().to_vec())
-        .map_err(|e| anyhow::anyhow!("mls party create failed: {e}"))?;
+    // Bind the MLS credential to the long-term Identity (same Ed25519
+    // key as Noise authenticated). MLS signature pubkey == fingerprint.
+    let party = MlsParty::from_identity(identity)
+        .map_err(|e| anyhow::anyhow!("mls party from_identity failed: {e}"))?;
     let reply_text = format!("MLS reply from {} (responder)", identity.fingerprint());
 
     let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
@@ -270,8 +272,10 @@ async fn run_dial_mode(
         "Noise XK complete; starting MLS bootstrap (initiator)"
     );
 
-    let party = MlsParty::new(identity.fingerprint().as_bytes().to_vec())
-        .map_err(|e| anyhow::anyhow!("mls party create failed: {e}"))?;
+    // Bind the MLS credential to the long-term Identity (same Ed25519
+    // key as Noise authenticated). MLS signature pubkey == fingerprint.
+    let party = MlsParty::from_identity(identity)
+        .map_err(|e| anyhow::anyhow!("mls party from_identity failed: {e}"))?;
     let greeting = format!("MLS hello from {} (initiator)", identity.fingerprint());
 
     let outcome = initiator_exchange(&mut stream, &mut session, &party, greeting.as_bytes())

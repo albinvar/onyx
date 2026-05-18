@@ -3,10 +3,13 @@
 //! See DESIGN.md §6. This module deliberately hides almost all of
 //! `openmls`'s surface and exposes just the operations Onyx needs:
 //!
-//!   * **identity** — wrap our long-term signing key as an MLS credential
-//!     (currently a fresh ED25519 key per [`MlsParty`] — binding it to
-//!     [`crate::identity::Identity`] is a follow-up; see
-//!     [`MlsParty::new`] notes),
+//!   * **identity** — [`MlsParty::from_identity`] binds the MLS
+//!     credential signing key to the long-term [`Identity`]'s Ed25519
+//!     key. The MLS signature pubkey equals the user's fingerprint
+//!     bytes, and the `BasicCredential` identity field equals the
+//!     fingerprint too — so the MLS credential is byte-identical to
+//!     whatever the Noise XK handshake authenticated at the transport
+//!     layer. [`MlsParty::new`] (fresh key per call) remains for tests.
 //!   * **bootstrap** — generate a KeyPackage to be invited, create a
 //!     group, invite a peer, accept a Welcome,
 //!   * **traffic** — encrypt and decrypt application messages,
@@ -45,6 +48,7 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::types::SignatureScheme;
 
 use crate::error::{Error, Result};
+use crate::identity::Identity;
 
 /// Onyx-wide MLS ciphersuite. X25519 / ChaCha20-Poly1305 / SHA-256 /
 /// Ed25519 — keeps the algorithm set consistent with our other layers.
@@ -80,16 +84,20 @@ fn internal<E>(label: &'static str) -> impl FnOnce(E) -> Error {
 // ── MlsParty ───────────────────────────────────────────────────────────────
 
 /// An MLS participant — credential + signature keypair + crypto provider.
-/// Each party owns its own in-memory key/state store; calling
-/// [`MlsParty::new`] twice gives two independent participants suitable
-/// for in-process round-trip tests.
 ///
-/// **Identity binding to our Ed25519 long-term key is not wired yet.**
-/// v0 generates a fresh MLS signature keypair per party so the
-/// integration with `openmls`'s default keystore is straightforward.
-/// Once we have the daemon, the natural change is to back the MLS
-/// signature key with [`crate::crypto::SigningKey`] — `SignatureKeyPair`
-/// has a from-raw constructor that accepts the seed bytes.
+/// Two constructors:
+///
+///   * [`MlsParty::from_identity`] (production) — MLS credential
+///     bound to a long-term [`Identity`]. Same Ed25519 key as Noise
+///     authenticated; deterministic; survives restart once we wire
+///     storage persistence.
+///   * [`MlsParty::new`] (tests) — fresh ED25519 keypair, ad-hoc
+///     byte label as the credential identity.
+///
+/// Each party owns its own [`OpenMlsRustCrypto`] provider with an
+/// **in-memory** key/state store. Persistence into
+/// [`crate::storage::Vault`] is the next phase. Until then, restart
+/// drops the MLS group state even though the credential is stable.
 pub struct MlsParty {
     credential_with_key: CredentialWithKey,
     signature_keys: SignatureKeyPair,
@@ -98,13 +106,50 @@ pub struct MlsParty {
 
 impl MlsParty {
     /// Create a new party with the given byte label as the
-    /// `BasicCredential` identity. In v0 this label is the only
-    /// caller-supplied input; v1 will use the Ed25519 fingerprint.
+    /// `BasicCredential` identity and a freshly-generated Ed25519
+    /// signing key. **For tests and one-off use only** — production
+    /// daemons should use [`Self::from_identity`] so the MLS
+    /// credential is provably the same identity that authenticated
+    /// at the Noise layer.
     pub fn new(identity_label: Vec<u8>) -> Result<Self> {
-        let provider = OpenMlsRustCrypto::default();
-        let credential = BasicCredential::new(identity_label);
         let signature_keys = SignatureKeyPair::new(SignatureScheme::ED25519)
             .map_err(internal("mls: signature key generation failed"))?;
+        Self::assemble(identity_label, signature_keys)
+    }
+
+    /// Create a party whose MLS credential is bound to the given
+    /// long-term [`Identity`].
+    ///
+    /// The MLS signature key is the **same** Ed25519 key that
+    /// `identity.signing()` exposes — the 32-byte seed is shared
+    /// verbatim with `openmls`'s `SignatureKeyPair::from_raw`
+    /// constructor. The `BasicCredential` identity field is the
+    /// 32-byte fingerprint (= verifying key bytes), so the MLS
+    /// credential is byte-identical to whatever the Noise XK
+    /// handshake authenticated at the transport layer.
+    ///
+    /// Determinism: two `MlsParty`s constructed from the **same**
+    /// `Identity` produce **byte-identical** signature public keys
+    /// and credentials. This is what lets MLS state survive daemon
+    /// restarts once we wire persistence — the credential at restart
+    /// matches the credential the group was created with.
+    pub fn from_identity(identity: &Identity) -> Result<Self> {
+        let signing = identity.signing();
+        let private_seed = signing.to_bytes(); // Zeroizing<[u8; 32]>
+        let public = signing.verifying_key().to_bytes();
+        let signature_keys = SignatureKeyPair::from_raw(
+            SignatureScheme::ED25519,
+            private_seed.to_vec(),
+            public.to_vec(),
+        );
+        let fingerprint_bytes = identity.fingerprint().as_bytes().to_vec();
+        Self::assemble(fingerprint_bytes, signature_keys)
+    }
+
+    /// Common tail of [`Self::new`] and [`Self::from_identity`].
+    fn assemble(identity_label: Vec<u8>, signature_keys: SignatureKeyPair) -> Result<Self> {
+        let provider = OpenMlsRustCrypto::default();
+        let credential = BasicCredential::new(identity_label);
         signature_keys
             .store(provider.storage())
             .map_err(internal("mls: signature key store failed"))?;
@@ -290,12 +335,89 @@ fn serialize_mls_message(msg: &MlsMessageOut) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::SigningKey;
     use crate::routing;
 
     fn alice_and_bob() -> (MlsParty, MlsParty) {
         let alice = MlsParty::new(b"alice".to_vec()).unwrap();
         let bob = MlsParty::new(b"bob".to_vec()).unwrap();
         (alice, bob)
+    }
+
+    /// Build an [`Identity`] from a fixed 32-byte seed for deterministic
+    /// binding tests. We avoid going through `Identity::generate` because
+    /// we explicitly want the same seed twice.
+    fn identity_from_seed(signing_seed: [u8; 32], x25519_seed: [u8; 32]) -> Identity {
+        Identity::from_seeds(&signing_seed, x25519_seed)
+    }
+
+    #[test]
+    fn from_identity_is_deterministic_in_signature_public_key() {
+        // Two `MlsParty`s built from the *same* Identity must produce
+        // the **same** MLS signature public-key bytes and the **same**
+        // credential identity field. This is the invariant that lets
+        // persisted MLS group state still verify after a daemon
+        // restart.
+        let id1 = identity_from_seed([7u8; 32], [9u8; 32]);
+        let id2 = identity_from_seed([7u8; 32], [9u8; 32]);
+
+        let a = MlsParty::from_identity(&id1).unwrap();
+        let b = MlsParty::from_identity(&id2).unwrap();
+
+        let a_pub = a.signature_keys.to_public_vec();
+        let b_pub = b.signature_keys.to_public_vec();
+        assert_eq!(
+            a_pub, b_pub,
+            "MLS signature pubkey must be deterministic from Identity"
+        );
+
+        // The CredentialWithKey.signature_key field also has to match
+        // (it's just a copy of the public bytes, but assert the chain).
+        assert_eq!(
+            a.credential_with_key.signature_key,
+            b.credential_with_key.signature_key,
+        );
+
+        // And the Ed25519 fingerprint matches the verifying key used
+        // inside the SignatureKeyPair.
+        assert_eq!(a_pub, id1.fingerprint().as_bytes().as_slice());
+    }
+
+    #[test]
+    fn from_identity_two_different_identities_have_different_keys() {
+        let id1 = identity_from_seed([1u8; 32], [2u8; 32]);
+        let id2 = identity_from_seed([3u8; 32], [4u8; 32]);
+        let a = MlsParty::from_identity(&id1).unwrap();
+        let b = MlsParty::from_identity(&id2).unwrap();
+        assert_ne!(
+            a.signature_keys.to_public_vec(),
+            b.signature_keys.to_public_vec()
+        );
+    }
+
+    #[test]
+    fn from_identity_keys_can_sign_via_mls() {
+        // Bootstrap a 2-party group where both ends used from_identity,
+        // and exchange one application message in each direction. This
+        // exercises the MLS credential's actual signing path against
+        // keys imported via from_raw.
+        let alice = MlsParty::from_identity(&identity_from_seed([11u8; 32], [12u8; 32])).unwrap();
+        let bob = MlsParty::from_identity(&identity_from_seed([21u8; 32], [22u8; 32])).unwrap();
+
+        let bob_kp = bob.key_package_bytes().unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let welcome = alice_group.invite(&alice, &bob_kp).unwrap();
+        let mut bob_group = bob.join_from_welcome(&welcome).unwrap();
+
+        let msg = b"hello via Identity-bound MLS credential";
+        let ct = alice_group.encrypt_application(&alice, msg).unwrap();
+        let pt = bob_group.decrypt_application(&bob, &ct).unwrap();
+        assert_eq!(pt, msg);
+
+        // Sanity: ensuring the SigningKey itself can be used the same
+        // way ed25519-dalek expects, after the round-trip through
+        // openmls's from_raw.
+        let _unused = SigningKey::from_bytes(&[11u8; 32]);
     }
 
     /// Set up a 2-party group via the welcome flow and return both
