@@ -45,6 +45,7 @@
 pub mod api_server;
 pub mod conversations;
 pub mod hub_client;
+pub mod replay_guard;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -165,6 +166,13 @@ pub struct DaemonState {
     /// Future T6.x can add request-id multiplexing to remove the
     /// serialisation.
     pub hub_fetch_lock: Arc<Mutex<()>>,
+    /// Bounded FIFO seen-set of envelope-body hashes (T7.3-sec.2).
+    /// `handle_hub_delivery` consults this before any decryption work
+    /// and drops a delivery silently if the hub is replaying an
+    /// envelope we have already accepted. In-memory only; resets on
+    /// daemon restart (documented restart window, see
+    /// `replay_guard::EnvelopeReplayGuard` module rustdoc).
+    pub seen_envelopes: Arc<Mutex<replay_guard::EnvelopeReplayGuard>>,
 }
 
 /// Run the Onyx daemon to completion. Returns when the daemon exits
@@ -262,6 +270,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         conversations: conversations::new_shared(),
         hub_outbound: hub_tx,
         hub_fetch_lock: Arc::new(Mutex::new(())),
+        seen_envelopes: Arc::new(Mutex::new(replay_guard::EnvelopeReplayGuard::new())),
     });
 
     drop(args.passphrase);
@@ -1029,6 +1038,23 @@ async fn handle_hub_delivery(
     state: &Arc<DaemonState>,
     our_kem: &onyx_core::crypto::HybridKemSecret,
 ) {
+    // 0. Replay defence (T7.3-sec.2): if we've already accepted an
+    //    envelope with identical bytes, the hub is replaying it.
+    //    Drop without spending CPU on the AEAD decapsulation. The
+    //    seen-set is in-memory only — a daemon restart resets it,
+    //    documented as a known window in `replay_guard` rustdoc.
+    {
+        let mut seen = state.seen_envelopes.lock().await;
+        if !seen.check_and_record(&body) {
+            debug!(
+                target_b32 = %encode_b32(&target),
+                body_bytes = body.len(),
+                "hub: dropping replayed envelope (already accepted)"
+            );
+            return;
+        }
+    }
+
     // 1. Decapsulate + verify the envelope. Failures are expected
     //    (wrong recipient, tampering, garbage from an attacker
     //    probing our inbox) — drop silently at debug level so an

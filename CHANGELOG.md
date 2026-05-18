@@ -6,6 +6,46 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T7.3-sec.2: recipient-side replay defence for hub-delivered envelopes (closes THREAT_MODEL §8.2 #16)
+
+Second zero-trust hardening slice in 24 hours. T7.3-sec stopped the hub from accepting *malicious publishes* into the directory; T7.3-sec.2 stops the hub from *replaying anything alice ever sent bob*. Both deepen the "hub is untrusted infrastructure" posture — neither asks the user to do anything different.
+
+The attack, before today: alice sends bob a sealed-sender envelope. The hub stores it briefly (queue), delivers it to bob's daemon when bob comes online (DELIVER frame), bob's daemon decodes it, surfaces an `EventMessage`, message appears in bob's TUI. The hub *retains the body bytes* (it has to, to deliver them in the first place). Some time later — minutes, hours, weeks — the hub re-sends the *exact same DELIVER frame* to bob. The envelope's ephemeral hybrid KEM keys are still valid (they don't expire), the Ed25519 sender signature still checks, the inner BootstrapPayload still decodes. Bob's daemon happily surfaces a *second* `EventMessage` carrying the same text. From bob's user-facing perspective: alice sent the same message twice. From the hostile hub's perspective: a free disinformation primitive at zero protocol cost.
+
+What landed:
+
+**T7.3-sec.2.a — `onyx_daemon::replay_guard::EnvelopeReplayGuard`.** New module, ~140 lines, no external deps beyond what was already in the workspace. Bounded FIFO seen-set keyed on BLAKE2b-128 of the raw body bytes (same hash function `onyx_core::crypto` already exposes for routing-id derivation, so no new primitive enters the threat surface). Capacity default 4096 entries (~64 KB at full occupancy including HashMap overhead). True FIFO eviction, *not* LRU — critically, `check_and_record` does NOT re-rank on a replay hit. That property is load-bearing: if we re-ranked on hit, an attacker could keep a stale entry alive forever by replaying it, denying it cache eviction even as real new entries arrive. The unit test `replay_does_not_refresh_position` proves the FIFO semantics with a 10-replay-attempt scenario. Seven unit tests in total: first-sight-vs-replay, distinct-bodies-independent, FIFO eviction at capacity, the non-refresh property, zero-capacity clamps to one, hash collision-resistance sanity (one-bit flip ≠ collision), empty-body handled without panic.
+
+**T7.3-sec.2.b — wiring into `handle_hub_delivery`.** `DaemonState` gains `seen_envelopes: Arc<Mutex<EnvelopeReplayGuard>>`, initialised with `EnvelopeReplayGuard::new()` (default capacity). The very first thing `handle_hub_delivery` does — *before* `open_bootstrap`, *before* even computing the sender's fingerprint — is consult the guard. On a hit, log at debug level (`"hub: dropping replayed envelope (already accepted)"`) and return early. This ordering matters: the replay check is **strictly cheaper** than the AEAD decapsulation, so even under sustained replay spam an attacker pays more (network bandwidth) than we do (16-byte hash + HashSet probe).
+
+No new wire format. No new API. No new dep. Only a `Mutex<EnvelopeReplayGuard>` holding ~64 KB of bytes in process memory.
+
+**T7.3-sec.2.c — THREAT_MODEL §8.2 #16 added and immediately struck-through.** Documents the attack as the original carry-forward gap so the audit trail is honest, then marks it closed in the same revision with a pointer to the guard and the known restart window.
+
+Known limitations (documented in module rustdoc + THREAT_MODEL):
+
+  * **Restart window.** The seen-set is in-memory only. If the daemon restarts (Ctrl-C + relaunch, crash recovery, system reboot), the set is empty; the first 5–10 minutes are replay-vulnerable again. Closing this means persisting the seen-set to the vault — a separate slice (call it `T7.3-sec.2-persist`) because vault writes per-envelope hurt throughput unless we batch.
+  * **Sender retransmits look like replays.** If alice's daemon explicitly re-sends the *same* envelope (her hub-outbound queue stalled, she retried), bob's guard collapses both into one. This is the right call: sealed-sender envelopes carry no sequence number, so bob has no protocol-level way to distinguish "alice retried" from "hub replayed." Alice's daemon already constructs a fresh envelope per `seal_bootstrap` call (the ephemeral hybrid keys differ), so honest retries produce *different* bytes and pass the guard correctly. Documented in the module rustdoc so a future reader doesn't trip.
+  * **Cross-recipient replays.** A hub that delivers alice→bob's envelope to *charlie* instead is a different problem (the KEM decryption will fail at charlie because the envelope wasn't sealed to charlie's KEM public). The recipient-side guard wouldn't help; the hybrid KEM does. Worth a separate audit pass but out of scope here.
+
+Security impact:
+
+  * **Closes** the disinformation-replay primitive a hostile or curious hub previously had against every recipient.
+  * **Does not introduce a new trust assumption** — the guard runs purely in the recipient daemon's process memory, requires no cooperation from the hub or the sender, and uses a primitive (BLAKE2b-128) the threat model already trusts elsewhere.
+  * **Does not add a DoS vector** — the guard's worst-case work per delivery is a 16-byte hash and a HashSet probe (microseconds). An attacker spamming 4096+ *unique* valid envelopes to flush the FIFO would have to *first* construct each one (sealed-sender requires a real ephemeral KEM keypair per envelope), and even then would only push our window forward — the attacker can't selectively evict.
+  * **Strictly cheaper than `open_bootstrap`** so the replay check ordering means a replay storm costs the hub more bandwidth than it costs us CPU.
+
+What this did NOT do:
+
+  * Did not persist the seen-set across daemon restarts (restart window documented; tracked as `T7.3-sec.2-persist` follow-up).
+  * Did not add cover traffic — still the biggest remaining anonymity gap.
+  * Did not add rate-limiting on hub deliveries (orthogonal; a hostile hub already controls delivery cadence so rate-limiting would only hurt honest hubs).
+  * Did not change the wire format or the recipient's API contract — `EventMessage` events still surface identically; the user only notices the *absence* of duplicate messages they shouldn't have seen.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` **252 passed / 0 failed** (was 245; +7 replay_guard unit tests). No integration test for the wired-in guard inside `handle_hub_delivery` because constructing a sealed envelope round-trip needs the full Identity/KEM/MLS setup — the unit tests verify the dedup semantic at the right granularity and the wiring is a seven-line read-then-skip block whose correctness is direct on inspection. If a regression test for the wiring becomes valuable, the place to add it is alongside the existing `handle_send_bootstrap_mls` integration test in `api_server.rs`.
+
+---
+
 ## 2026-05-18 — T7.3-sec: hub validates publisher ownership of KeyPackage directory entries (closes THREAT_MODEL §8.2 #15)
 
 First *security-only* slice in the T7.x line. No new feature, no UX surface — just a real known attack vector, closed at the hub layer instead of papered over with a "the recipient catches it later" note.
