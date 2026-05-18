@@ -6,6 +6,71 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T7.3-sec: hub validates publisher ownership of KeyPackage directory entries (closes THREAT_MODEL §8.2 #15)
+
+First *security-only* slice in the T7.x line. No new feature, no UX surface — just a real known attack vector, closed at the hub layer instead of papered over with a "the recipient catches it later" note.
+
+The attack, before today:
+
+  1. Alice publishes her MLS KeyPackage to the hub directory under her introduction-inbox routing id (`introduction_inbox(alice_fingerprint)`).
+  2. Mallory connects to the same hub and sends `FRAME_KP_PUBLISH` claiming alice's routing id, with mallory's own KeyPackage as the body.
+  3. The hub previously stored blindly (latest-wins), so mallory's KP now sits under alice's routing id.
+  4. Bob fetches the KP under alice's routing id, gets mallory's KP, *might* invite mallory into a group thinking it's alice.
+
+The defence before today was recipient-side: `handle_fetch_peer_keypackage` in the daemon extracts the KP's embedded Ed25519 signing key and refuses if it doesn't hash to `target_fingerprint`. That works — the end-to-end channel is recoverable — but the hub was still a willing accomplice. A passive observer of the directory couldn't tell whose KP was real, and the attack consumed alice's directory slot (denial of service even when authentication catches it).
+
+What landed:
+
+**T7.3-sec.a — `onyx_core::mls::signing_key_from_kp_bytes` free function.** New module-level helper next to `MlsParty::peer_signing_pk_from_kp_bytes`. Same parsing path (`KeyPackageIn::tls_deserialize_exact_bytes` → `validate(provider.crypto(), ProtocolVersion::Mls10)` → extract `leaf_node().signature_key()`) but instantiates an ephemeral `OpenMlsRustCrypto::default()` per call instead of borrowing a party's. The hub doesn't run MLS — it doesn't hold an `MlsParty` — but it needs the same byte-level validation, and the open-mls-rust-crypto provider is cheap to construct because we're only using its crypto trait impls (no storage, no state).
+
+Three new unit tests in `crates/onyx-core/src/mls.rs::free_standing_helper_tests`:
+  * `signing_key_from_kp_bytes_round_trips` — mint a KP from a fresh identity, extract the signing key, assert it equals `identity.fingerprint().as_bytes()` (the fingerprint *is* the Ed25519 verifying-key bytes by design).
+  * `signing_key_from_kp_bytes_rejects_garbage` — empty bytes + non-KeyPackage payload → `InvalidEncoding` / `VerificationFailed`.
+  * `signing_key_from_kp_bytes_matches_party_method` — the free function and `MlsParty::peer_signing_pk_from_kp_bytes` agree byte-for-byte on the same input (so daemon and hub apply identical checks).
+
+The existing `MlsParty::peer_signing_pk_from_kp_bytes` is now a one-line forwarder to the new free function (was previously an open-coded copy of the same logic). Single source of truth; if the validation rules change, they change in one place.
+
+**T7.3-sec.b — `onyx-hub::handler.rs` validates `FRAME_KP_PUBLISH` ownership.** In the publish-frame branch (between the existing routing-id-prefix length check and the `state.publish_keypackage` write):
+
+  1. Extract the publisher's signing key via `signing_key_from_kp_bytes(&kp_bytes)`.
+  2. Construct the publisher's fingerprint (`Fingerprint::from_bytes(signing_pk_bytes)`).
+  3. Derive the expected routing id (`introduction_inbox(&fingerprint)`).
+  4. Compare to the routing id the publisher *claimed* in the 16-byte prefix.
+
+If extraction fails (un-parseable KP, failed MLS validation) **or** the derived routing id doesn't match the claim, the publish is rejected: `continue` the connection loop, no error to the publisher (silent drop — same posture as other malformed-frame handling, so attackers can't probe by counting error responses). A `warn!` lands in the hub's tracing log with the rejection reason so the operator can see attack attempts. On the accept path, the success log now reads `"hub: KeyPackage published (ownership verified)"` so operators can grep for the post-T7.3-sec posture.
+
+Wire format **unchanged**: still 16-byte routing-id prefix followed by TLS-serialised KP. Old (pre-T7.3-sec) publishers stay compatible because they were already sending well-formed self-owned KPs under their own routing id (that was the protocol; the hub just wasn't enforcing it). New (post-T7.3-sec) publishers don't have to do anything different — the daemon's own publish path was already correct.
+
+**T7.3-sec.c — attack test.** New `crates/onyx-hub/src/handler.rs::tests::keypackage_publish_rejects_routing_id_mismatch`. Spins up the hub with `tokio::io::duplex` (no real Tor) and runs the full attack:
+  1. Alice (real Identity, real MlsParty, real KP) publishes legitimately under her routing id.
+  2. Attacker (different Identity, different MlsParty, different KP) connects and tries to publish their KP claiming **alice's** routing id.
+  3. Direct state assertion: `state.fetch_keypackage(&alice_routing_id)` still returns alice's KP bytes byte-for-byte. Attacker's overwrite was rejected.
+
+The pre-existing `keypackage_publish_then_fetch_round_trip` and `keypackage_republish_overwrites` tests are updated to use real KP bytes (they previously used fake `b"opaque-kp"` payloads which now fail the validation as expected — they only worked before because there was no validation). The republish-overwrites test mints two distinct KPs from the **same** alice identity (successive `key_package_bytes()` calls produce different bundles because the init key is fresh per call, but both have the same signing key → same derived routing id → both are accepted). Latest-wins semantics preserved.
+
+**T7.3-sec.d — THREAT_MODEL.md updated.** §8.2 #15 is now ~~struck through~~ and marked **closed in T7.3-sec** with a one-paragraph summary of the fix and a pointer to the attack test. The old note hand-waved that "a sign-challenge requires the hub to learn the publisher's Ed25519 key, which Noise XK doesn't surface" — that turned out to be wrong: the KP already *carries* the Ed25519 signing key, self-signed via the MLS leaf-node signature, so no out-of-band challenge protocol is needed. Closed properly, not papered over.
+
+Security impact:
+
+  * **Closes** a directory-tampering vector that previously consumed alice's directory slot even when end-to-end authentication caught the impersonation. Mallory can no longer trash the directory.
+  * **Closes** a partition vector where alice's hub session momentarily lapses (reconnect, KP-rotation), mallory races in to claim the slot, alice's subsequent re-publish succeeds (alice's KP derives alice's id), but during the gap any bob fetching the slot gets garbage. Both attack and defence used to depend on alice's hub-side timing; now mallory simply cannot enter the gap.
+  * **No DoS vector introduced**: the hub already drops malformed frames silently. The new check adds an MLS KeyPackage parse + ed25519-key extraction per publish — a few hundred microseconds, dominated by the existing Noise transport AEAD work.
+  * **Defence-in-depth retained**: recipient-side `handle_fetch_peer_keypackage` check is unchanged. If a future bug breaks the hub's check, the recipient still catches.
+  * **No new trust assumption on the hub**: the hub does the same validation the recipient already does. The hub *learns* the publisher's fingerprint as a side-effect of the check, but that fingerprint was already visible to the hub via the very routing-id the publisher claimed (the routing id is a 128-bit BLAKE2b of the fingerprint, so the hub already had a one-way fingerprint commitment; it now just verifies the publisher provided the matching pre-image).
+
+What this did NOT do:
+
+  * Did not change the wire format.
+  * Did not add a new `THREAT_MODEL.md` carry-forward.
+  * Did not change MLS protocol behaviour, ciphersuite, or vault schema.
+  * Did not touch the recipient-side validation in the daemon — that stays as defence-in-depth.
+  * Did not address timing correlation (still wide open; cover-traffic is the separate, bigger slice).
+  * Did not address the `~/.onyx/` on-disk fingerprint, process-name leak, reproducible builds, or signed releases — all separate items, all still on the list.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` **245 passed / 0 failed** (was 241; +3 mls helper tests + +1 hub attack-rejection test). Hub tests: 13 passed including the new attack scenario.
+
+---
+
 ## 2026-05-18 — T7.2-mls-fu: MLS-tier invite delivers the `--text` payload as the first message
 
 Closes the known gap left over from T7.2-mls. Before today, `onyx accept <url> --text "hi"` against an MLS-tier (`--with-kp`) invite silently *dropped* the `--text` payload — the recipient saw a synthetic placeholder `"(joined MLS group <id> via hub Welcome)"` instead of the actual introduction. The CLI rustdoc even apologised for it. Today the gap is closed: the text rides inside the same sealed-sender envelope as the Welcome and surfaces as the first message of the new conversation.

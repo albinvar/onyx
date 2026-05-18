@@ -123,24 +123,27 @@ where
                         );
                     }
                     FRAME_KP_PUBLISH => {
-                        // Store-and-forget. Latest-wins. Hub does NOT
-                        // verify the publisher owns the routing id; the
-                        // recipient must verify the KP's embedded
-                        // signing key against the expected fingerprint
-                        // before trusting (`SECURITY.md` carry-forward).
+                        // Latest-wins on accept. The publisher must
+                        // prove ownership of the routing id by shipping
+                        // a KP whose embedded Ed25519 signing key
+                        // derives the claimed routing id via the same
+                        // path the recipient uses (fingerprint =
+                        // signing-key bytes, routing id =
+                        // introduction_inbox(fingerprint)).
                         //
-                        // What routing id to store under? For T6.1 the
-                        // convention is: the publisher's introduction-
-                        // inbox routing id. The hub doesn't know that
-                        // mapping (it'd need the publisher's signing
-                        // key, which Noise XK doesn't surface). So the
-                        // publisher embeds it implicitly: the KP at
-                        // `inbox_id` is the KP for the holder of the
-                        // fingerprint that derives `inbox_id`. To make
-                        // this concrete and testable, the protocol
-                        // requires the publish payload to be prefixed
-                        // with the 16-byte routing id, followed by the
-                        // KP bytes — same shape as DELIVER.
+                        // Before T7.3-sec the hub stored blindly and
+                        // relied on recipient-side verification
+                        // (THREAT_MODEL §8.2 #15: a hostile publisher
+                        // could overwrite anyone's directory entry,
+                        // and recipients caught it on fetch). The
+                        // hub-side check below makes the overwrite
+                        // impossible in the first place — the malicious
+                        // client's KP doesn't derive the target routing
+                        // id, so the publish is rejected.
+                        //
+                        // Wire format unchanged: 16-byte routing id
+                        // prefix, then the TLS-serialised KP. Same
+                        // shape as DELIVER; same parse_target_prefix.
                         if frame.payload.len() < 16 {
                             warn!(
                                 conn = conn_id,
@@ -152,6 +155,41 @@ where
                         let routing_id = parse_target_prefix(&frame.payload)?;
                         let kp_bytes = frame.payload[16..].to_vec();
                         let kp_len = kp_bytes.len();
+
+                        // Ownership check: extract the KP's signing
+                        // key, hash to a fingerprint, derive the
+                        // expected inbox id, compare to the claimed
+                        // routing id. Any failure (un-parseable KP,
+                        // failed MLS validation, mismatch) → reject.
+                        match onyx_core::mls::signing_key_from_kp_bytes(&kp_bytes) {
+                            Ok(signing_pk_bytes) => {
+                                let fingerprint = onyx_core::crypto::Fingerprint::from_bytes(
+                                    signing_pk_bytes,
+                                );
+                                let expected =
+                                    onyx_core::routing::introduction_inbox(&fingerprint);
+                                if expected != routing_id {
+                                    warn!(
+                                        conn = conn_id,
+                                        kp_bytes = kp_len,
+                                        "hub: KP_PUBLISH rejected — KP signing key does not \
+                                         derive the claimed routing id (ownership check failed)"
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    conn = conn_id,
+                                    kp_bytes = kp_len,
+                                    error = %e,
+                                    "hub: KP_PUBLISH rejected — KP did not validate as a \
+                                     well-formed MLS KeyPackage"
+                                );
+                                continue;
+                            }
+                        }
+
                         let dir_size = {
                             let mut s = state.lock().await;
                             s.publish_keypackage(routing_id, kp_bytes);
@@ -161,7 +199,7 @@ where
                             conn = conn_id,
                             kp_bytes = kp_len,
                             directory_size = dir_size,
-                            "hub: KeyPackage published"
+                            "hub: KeyPackage published (ownership verified)"
                         );
                     }
                     FRAME_KP_FETCH => {
@@ -452,10 +490,15 @@ mod tests {
         IdentitySecret::from_bytes(*sk.to_bytes())
     }
 
-    /// T6.1: publish + fetch round-trip over the wire.
+    /// T6.1 + T7.3-sec: publish + fetch round-trip over the wire,
+    /// with real MLS KeyPackage bytes whose embedded signing key
+    /// derives the claimed routing id (the hub's ownership check
+    /// rejects anything else — see T7.3-sec).
     #[allow(clippy::similar_names)]
     #[tokio::test]
     async fn keypackage_publish_then_fetch_round_trip() {
+        use onyx_core::identity::Identity;
+        use onyx_core::mls::MlsParty;
         use onyx_core::transport::handshake_initiator;
 
         let hub_sk = IdentitySecret::generate();
@@ -471,9 +514,14 @@ mod tests {
         let _alice_hub_task = spawn_hub(alice_hub, hub_sk_clone(&hub_sk), state.clone());
         let _bob_hub_task = spawn_hub(bob_hub, hub_sk_clone(&hub_sk), state.clone());
 
-        // The directory key alice publishes under.
-        let alice_kp_id: RoutingId = [0xE1; 16];
-        let alice_kp_bytes = b"opaque-mls-keypackage-bytes-from-alice".to_vec();
+        // Real KP from alice's MLS party, plus the routing id that
+        // its embedded signing key derives — must match for the hub's
+        // ownership check to accept the publish.
+        let alice_identity = Identity::generate();
+        let alice_party = MlsParty::from_identity(&alice_identity).unwrap();
+        let alice_kp_bytes = alice_party.key_package_bytes().unwrap();
+        let alice_fp = alice_identity.fingerprint();
+        let alice_kp_id: RoutingId = onyx_core::routing::introduction_inbox(&alice_fp);
 
         // Alice publishes her KP.
         let hub_pk_for_alice = hub_pk;
@@ -579,10 +627,15 @@ mod tests {
         assert_eq!(resp.payload[0], 1, "status 1 = not-found");
     }
 
-    /// T6.1: latest-wins on republish.
+    /// T6.1 + T7.3-sec: latest-wins on republish, with two real KPs
+    /// minted from the same alice identity (both pass the ownership
+    /// check because they share alice's Ed25519 signing key → same
+    /// derived routing id).
     #[allow(clippy::similar_names)]
     #[tokio::test]
     async fn keypackage_republish_overwrites() {
+        use onyx_core::identity::Identity;
+        use onyx_core::mls::MlsParty;
         use onyx_core::transport::handshake_initiator;
 
         let hub_sk = IdentitySecret::generate();
@@ -596,16 +649,29 @@ mod tests {
         let _alice_hub_task = spawn_hub(alice_hub, hub_sk_clone(&hub_sk), state.clone());
         let _bob_hub_task = spawn_hub(bob_hub, hub_sk_clone(&hub_sk), state.clone());
 
-        let id: RoutingId = [0xE3; 16];
+        let alice_identity = Identity::generate();
+        let alice_party = MlsParty::from_identity(&alice_identity).unwrap();
+        let alice_kp_v1 = alice_party.key_package_bytes().unwrap();
+        let alice_kp_v2 = alice_party.key_package_bytes().unwrap();
+        assert_ne!(
+            alice_kp_v1, alice_kp_v2,
+            "successive key_package_bytes() calls must mint distinct bundles \
+             (their init keys differ); republish-overwrites is only meaningful then"
+        );
+        let id: RoutingId = onyx_core::routing::introduction_inbox(&alice_identity.fingerprint());
 
         // Alice publishes twice; the second publish must replace, not append.
         let hub_pk_for_alice = hub_pk;
+        let alice_kp_v2_for_check = alice_kp_v2.clone();
         let alice_task = tokio::spawn(async move {
             let mut stream = alice_client;
             let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk_for_alice)
                 .await
                 .expect("alice handshake");
-            for (label, body) in [("v1", b"kp-v1".as_slice()), ("v2", b"kp-v2".as_slice())] {
+            for (label, body) in [
+                ("v1", alice_kp_v1.as_slice()),
+                ("v2", alice_kp_v2.as_slice()),
+            ] {
                 let mut payload = Vec::with_capacity(16 + body.len());
                 payload.extend_from_slice(&id);
                 payload.extend_from_slice(body);
@@ -643,8 +709,109 @@ mod tests {
             .expect("bob fetch");
             let resp = read_frame(&mut stream, &mut session).await.expect("read");
             assert_eq!(resp.payload[0], 0, "found");
-            assert_eq!(&resp.payload[1..], b"kp-v2");
+            assert_eq!(&resp.payload[1..], alice_kp_v2_for_check.as_slice());
         });
         bob_task.await.unwrap();
+    }
+
+    /// T7.3-sec: a hostile publisher cannot overwrite another peer's
+    /// directory entry. The attacker's KP signing key derives the
+    /// attacker's own routing id, not alice's — the hub rejects the
+    /// publish at the ownership check, alice's entry stays put.
+    ///
+    /// This closes THREAT_MODEL.md §8.2 #15 at the hub layer (the
+    /// recipient-side validation in `handle_fetch_peer_keypackage`
+    /// continues to defend defence-in-depth).
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn keypackage_publish_rejects_routing_id_mismatch() {
+        use onyx_core::identity::Identity;
+        use onyx_core::mls::MlsParty;
+        use onyx_core::transport::handshake_initiator;
+
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+
+        // Alice owns a routing id; attacker tries to overwrite it.
+        let alice_identity = Identity::generate();
+        let alice_party = MlsParty::from_identity(&alice_identity).unwrap();
+        let alice_kp = alice_party.key_package_bytes().unwrap();
+        let alice_routing_id: RoutingId =
+            onyx_core::routing::introduction_inbox(&alice_identity.fingerprint());
+
+        let attacker_identity = Identity::generate();
+        let attacker_party = MlsParty::from_identity(&attacker_identity).unwrap();
+        let attacker_kp = attacker_party.key_package_bytes().unwrap();
+
+        let state = Arc::new(Mutex::new(HubState::new()));
+
+        // 1. Alice legitimately publishes her KP under her own
+        //    routing id.
+        let (alice_client, alice_hub) = tokio::io::duplex(65_536);
+        let _alice_hub_task = spawn_hub(alice_hub, hub_sk_clone(&hub_sk), state.clone());
+        let alice_sk = IdentitySecret::generate();
+        let alice_routing_for_publish = alice_routing_id;
+        let alice_kp_for_publish = alice_kp.clone();
+        let alice_task = tokio::spawn(async move {
+            let mut stream = alice_client;
+            let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk)
+                .await
+                .expect("alice handshake");
+            let mut payload = Vec::with_capacity(16 + alice_kp_for_publish.len());
+            payload.extend_from_slice(&alice_routing_for_publish);
+            payload.extend_from_slice(&alice_kp_for_publish);
+            write_frame(
+                &mut stream,
+                &mut session,
+                &InnerFrame {
+                    frame_type: FRAME_KP_PUBLISH,
+                    payload,
+                },
+            )
+            .await
+            .expect("alice publish");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        alice_task.await.unwrap();
+
+        // 2. Attacker connects and tries to overwrite alice's entry
+        //    by claiming alice's routing id with the attacker's KP.
+        //    The hub MUST reject — KP signing key does not derive
+        //    alice's routing id.
+        let (attacker_client, attacker_hub) = tokio::io::duplex(65_536);
+        let _attacker_hub_task = spawn_hub(attacker_hub, hub_sk_clone(&hub_sk), state.clone());
+        let attacker_sk = IdentitySecret::generate();
+        let attacker_kp_for_publish = attacker_kp.clone();
+        let attacker_task = tokio::spawn(async move {
+            let mut stream = attacker_client;
+            let mut session = handshake_initiator(&mut stream, &attacker_sk, &hub_pk)
+                .await
+                .expect("attacker handshake");
+            let mut payload = Vec::with_capacity(16 + attacker_kp_for_publish.len());
+            payload.extend_from_slice(&alice_routing_id); // attacker claims alice's id
+            payload.extend_from_slice(&attacker_kp_for_publish);
+            write_frame(
+                &mut stream,
+                &mut session,
+                &InnerFrame {
+                    frame_type: FRAME_KP_PUBLISH,
+                    payload,
+                },
+            )
+            .await
+            .expect("attacker publish (hub will reject silently)");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        attacker_task.await.unwrap();
+
+        // 3. Direct state-check side-channel: the directory entry
+        //    under alice_routing_id is still alice's KP, not the
+        //    attacker's.
+        let stored = state.lock().await.fetch_keypackage(&alice_routing_id);
+        assert_eq!(
+            stored.as_deref(),
+            Some(alice_kp.as_slice()),
+            "alice's entry must be intact; attacker's overwrite must have been rejected"
+        );
     }
 }

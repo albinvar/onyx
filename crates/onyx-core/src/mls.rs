@@ -217,16 +217,79 @@ impl MlsParty {
     /// (signature, lifetime, ciphersuite, etc.). The successful
     /// path returns exactly 32 bytes (Ed25519 pubkey).
     pub fn peer_signing_pk_from_kp_bytes(&self, kp_bytes: &[u8]) -> Result<[u8; 32]> {
-        let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(kp_bytes)
-            .map_err(|_| Error::InvalidEncoding("mls: peer KeyPackage not TLS-encoded"))?;
-        let kp = kp_in
-            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(|_| Error::VerificationFailed)?;
-        let sig_bytes = kp.leaf_node().signature_key().as_slice();
-        <[u8; 32]>::try_from(sig_bytes)
-            .map_err(|_| Error::InvalidEncoding("mls: KeyPackage signing key not 32 bytes"))
+        signing_key_from_kp_bytes(kp_bytes)
+    }
+}
+
+/// Free-standing variant of [`MlsParty::peer_signing_pk_from_kp_bytes`]
+/// — extract and validate the Ed25519 signing key embedded in a
+/// TLS-serialised MLS KeyPackage without needing to hold an `MlsParty`
+/// instance.
+///
+/// Same return contract: 32-byte Ed25519 public key on success,
+/// [`Error::InvalidEncoding`] for non-KeyPackage bytes,
+/// [`Error::VerificationFailed`] if the KP's own signature / lifetime
+/// / ciphersuite checks fail.
+///
+/// **Use case**: `onyx-hub` validates `FRAME_KP_PUBLISH` payloads
+/// (THREAT_MODEL §8.2 #15) — the hub doesn't run MLS itself but it
+/// needs to verify the publisher's claimed routing id matches the
+/// fingerprint derivable from the KP's signing key, to defend against
+/// a hostile client overwriting another peer's directory entry. The
+/// hub creates an ephemeral [`OpenMlsRustCrypto`] provider per call;
+/// it carries no persistent state because we're only using its
+/// crypto trait impls for the [`KeyPackageIn::validate`] step.
+pub fn signing_key_from_kp_bytes(kp_bytes: &[u8]) -> Result<[u8; 32]> {
+    let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(kp_bytes)
+        .map_err(|_| Error::InvalidEncoding("mls: peer KeyPackage not TLS-encoded"))?;
+    let provider = OpenMlsRustCrypto::default();
+    let kp = kp_in
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .map_err(|_| Error::VerificationFailed)?;
+    let sig_bytes = kp.leaf_node().signature_key().as_slice();
+    <[u8; 32]>::try_from(sig_bytes)
+        .map_err(|_| Error::InvalidEncoding("mls: KeyPackage signing key not 32 bytes"))
+}
+
+#[cfg(test)]
+mod free_standing_helper_tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    #[test]
+    fn signing_key_from_kp_bytes_round_trips() {
+        let id = Identity::generate();
+        let party = MlsParty::from_identity(&id).unwrap();
+        let kp_bytes = party.key_package_bytes().unwrap();
+        let recovered = signing_key_from_kp_bytes(&kp_bytes).expect("extract");
+        assert_eq!(
+            &recovered,
+            id.fingerprint().as_bytes(),
+            "extracted signing key bytes must equal the identity's fingerprint \
+             (which is the Ed25519 verifying-key bytes by design)"
+        );
     }
 
+    #[test]
+    fn signing_key_from_kp_bytes_rejects_garbage() {
+        assert!(signing_key_from_kp_bytes(&[]).is_err());
+        assert!(signing_key_from_kp_bytes(b"definitely not a TLS KeyPackage").is_err());
+    }
+
+    #[test]
+    fn signing_key_from_kp_bytes_matches_party_method() {
+        // The two paths must agree byte-for-byte.
+        let id = Identity::generate();
+        let party = MlsParty::from_identity(&id).unwrap();
+        let kp_bytes = party.key_package_bytes().unwrap();
+        let via_free = signing_key_from_kp_bytes(&kp_bytes).unwrap();
+        let via_method = party.peer_signing_pk_from_kp_bytes(&kp_bytes).unwrap();
+        assert_eq!(via_free, via_method);
+    }
+}
+
+// Re-open the impl block so subsequent methods stay grouped.
+impl MlsParty {
     /// Create a new MLS group containing only this party.
     pub fn create_group(&self) -> Result<MlsGroupState> {
         let group = MlsGroup::new(
