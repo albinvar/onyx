@@ -50,9 +50,16 @@ use crate::error::{Error, Result};
 /// existing group instead of bootstrapping a fresh one on every
 /// reconnect.
 ///
+/// v4 (T5.2.a): the AEAD plaintext inside `identities.encrypted_blob`
+/// grew from 64 bytes (signing seed ‖ x25519 secret) to
+/// 64 + HYBRID_SECRET_LEN = 2496 bytes — the hybrid KEM secret
+/// (X25519 + ML-KEM-768) was appended. No SQL change; the blob
+/// column is opaque to SQLite. Old v3 vaults fail the schema-version
+/// check at open and must be recreated.
+///
 /// No migration runner yet; old vaults won't open. v0 has no real
 /// users so the migration story is "delete the vault and recreate."
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 const SCHEMA_V3: &str = "
 CREATE TABLE vault_meta (

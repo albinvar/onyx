@@ -196,10 +196,12 @@ async fn dispatch_one_shot(
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
             fingerprint: state.identity.fingerprint().to_string(),
             tor_state,
+            identity_kem_pub_b32: encode_b32(&state.identity.kem_public().to_bytes()),
         },
         ApiRequest::Identity => ApiResponse::IdentityOk {
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
             fingerprint: state.identity.fingerprint().to_string(),
+            identity_kem_pub_b32: encode_b32(&state.identity.kem_public().to_bytes()),
         },
         ApiRequest::Peers => {
             let entries = state.conversations.lock().await.list();

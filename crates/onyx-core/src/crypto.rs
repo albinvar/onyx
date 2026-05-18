@@ -527,10 +527,21 @@ pub const HYBRID_CLASSICAL_LEN: usize = 32;
 pub const HYBRID_PQ_PUBLIC_LEN: usize = 1184;
 /// ML-KEM-768 ciphertext size (FIPS 203, K=3): 32 (Du K + Dv) = 1088 bytes.
 pub const HYBRID_PQ_CIPHERTEXT_LEN: usize = 1088;
+/// ML-KEM-768 decapsulation-key size (FIPS 203, K=3): 768 K + 96 = 2400 bytes.
+///
+/// The test `hybrid_pq_secret_len_matches_runtime` in this module
+/// asserts this constant matches the live `<PqDecapKey as
+/// EncodedSizeUser>::EncodedSize` so a future ml-kem release that
+/// changes the layout fails loudly here rather than at runtime in
+/// the field.
+pub const HYBRID_PQ_SECRET_LEN: usize = 2400;
 /// Combined hybrid public-key size on the wire: X25519 pk ‖ ML-KEM EK.
 pub const HYBRID_PUBLIC_LEN: usize = HYBRID_CLASSICAL_LEN + HYBRID_PQ_PUBLIC_LEN;
 /// Combined hybrid ciphertext size on the wire: ephemeral X25519 pk ‖ ML-KEM CT.
 pub const HYBRID_CIPHERTEXT_LEN: usize = HYBRID_CLASSICAL_LEN + HYBRID_PQ_CIPHERTEXT_LEN;
+/// Serialised size of a [`HybridKemSecret`]: X25519 sk ‖ ML-KEM-768 dk.
+/// Used as the chunk size when persisting hybrid KEM keys to the vault.
+pub const HYBRID_SECRET_LEN: usize = HYBRID_CLASSICAL_LEN + HYBRID_PQ_SECRET_LEN;
 
 /// HKDF salt for combining the classical and post-quantum shared secrets.
 /// Bumping this string invalidates every prior hybrid derivation, so it only
@@ -569,6 +580,57 @@ impl HybridKemSecret {
             classical: x25519_dalek::PublicKey::from(&self.classical).to_bytes(),
             post_quantum: self.post_quantum.encapsulation_key().clone(),
         }
+    }
+
+    /// Serialise both halves into a [`HYBRID_SECRET_LEN`]-byte buffer
+    /// for vault persistence. Returns a [`Zeroizing`] buffer so the
+    /// caller can't accidentally leak the secret on the stack.
+    ///
+    /// Layout: `X25519 secret (32 B) ‖ ML-KEM-768 decapsulation key (2400 B)`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(HYBRID_SECRET_LEN));
+        out.extend_from_slice(&self.classical.to_bytes());
+        let pq_encoded = self.post_quantum.as_bytes();
+        out.extend_from_slice(pq_encoded.as_slice());
+        debug_assert_eq!(out.len(), HYBRID_SECRET_LEN);
+        out
+    }
+
+    /// Reconstruct from a buffer produced by [`Self::to_bytes`].
+    ///
+    /// Errors:
+    ///   * [`Error::InvalidEncoding`] if the buffer is the wrong length
+    ///     (the only validation we can do — ML-KEM-768's decapsulation key
+    ///     itself accepts any 2400-byte input; correctness only surfaces
+    ///     when an actual decapsulation runs).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != HYBRID_SECRET_LEN {
+            return Err(Error::BufferSize {
+                expected: HYBRID_SECRET_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let mut classical_bytes = [0u8; HYBRID_CLASSICAL_LEN];
+        classical_bytes.copy_from_slice(&bytes[..HYBRID_CLASSICAL_LEN]);
+        let classical = x25519_dalek::StaticSecret::from(classical_bytes);
+        classical_bytes.zeroize();
+
+        let pq_slice = &bytes[HYBRID_CLASSICAL_LEN..];
+        // `Encoded<PqDecapKey>` is `Array<u8, N>`. Construct it from the
+        // slice; ml-kem's `from_bytes` then maps the byte array into the
+        // internal key representation.
+        let pq_encoded =
+            Encoded::<PqDecapKey>::try_from(pq_slice).map_err(|_| Error::BufferSize {
+                expected: HYBRID_PQ_SECRET_LEN,
+                actual: pq_slice.len(),
+            })?;
+        let post_quantum = PqDecapKey::from_bytes(&pq_encoded);
+
+        Ok(Self {
+            classical,
+            post_quantum,
+        })
     }
 
     /// Decapsulate a hybrid ciphertext to the combined shared secret.
@@ -1136,8 +1198,64 @@ mod tests {
         assert_eq!(HYBRID_CLASSICAL_LEN, 32);
         assert_eq!(HYBRID_PQ_PUBLIC_LEN, 1184);
         assert_eq!(HYBRID_PQ_CIPHERTEXT_LEN, 1088);
+        assert_eq!(HYBRID_PQ_SECRET_LEN, 2400);
         assert_eq!(HYBRID_PUBLIC_LEN, 1216);
         assert_eq!(HYBRID_CIPHERTEXT_LEN, 1120);
+        assert_eq!(HYBRID_SECRET_LEN, 2432);
+    }
+
+    #[test]
+    fn hybrid_pq_secret_len_matches_runtime() {
+        // Catches a future ml-kem release that changes the encoded
+        // size — the test asserts that our compile-time constant
+        // matches what the crate actually produces.
+        let sk = HybridKemSecret::generate();
+        let bytes = sk.to_bytes();
+        let pq_bytes = &bytes[HYBRID_CLASSICAL_LEN..];
+        assert_eq!(pq_bytes.len(), HYBRID_PQ_SECRET_LEN);
+    }
+
+    #[test]
+    fn hybrid_kem_secret_byte_round_trip() {
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+
+        // Establish a baseline shared secret with the original.
+        let (ct, ss_send) = pk.encapsulate().unwrap();
+        let ss_orig = sk.decapsulate(&ct).unwrap();
+        assert_eq!(ss_send.as_bytes(), ss_orig.as_bytes());
+
+        // Round-trip the secret through bytes and re-decapsulate the
+        // same ciphertext; we must recover the identical shared secret.
+        let bytes = sk.to_bytes();
+        assert_eq!(bytes.len(), HYBRID_SECRET_LEN);
+        let sk2 = HybridKemSecret::from_bytes(&bytes).expect("round-trip");
+        let ss_after = sk2.decapsulate(&ct).unwrap();
+        assert_eq!(
+            ss_after.as_bytes(),
+            ss_orig.as_bytes(),
+            "round-tripped secret must decapsulate to the same shared secret"
+        );
+        // The round-tripped secret should also produce an identical
+        // public key (since both halves are derived deterministically).
+        let pk2 = sk2.public();
+        assert_eq!(pk.to_bytes(), pk2.to_bytes());
+    }
+
+    #[test]
+    fn hybrid_kem_secret_rejects_wrong_size() {
+        assert!(matches!(
+            HybridKemSecret::from_bytes(&[0u8; 10]),
+            Err(Error::BufferSize { .. })
+        ));
+        assert!(matches!(
+            HybridKemSecret::from_bytes(&[0u8; HYBRID_SECRET_LEN - 1]),
+            Err(Error::BufferSize { .. })
+        ));
+        assert!(matches!(
+            HybridKemSecret::from_bytes(&[0u8; HYBRID_SECRET_LEN + 1]),
+            Err(Error::BufferSize { .. })
+        ));
     }
 
     #[test]

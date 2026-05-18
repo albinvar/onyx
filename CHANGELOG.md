@@ -6,6 +6,102 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-18 — T5.2.a + T5.2.b: per-identity hybrid KEM + bidirectional hub client
+
+Two foundational pieces toward hub-relayed sealed-sender delivery (the full chain is T5.2.a → T5.2.f). Neither one ships a new user-visible feature on its own; together they remove every prerequisite blocking T5.2.c (the `SendBootstrap` API verb + on-the-wire envelope). Split deliberately: each piece has small, reviewable security implications, and the project never ends up with a half-wired crypto surface that someone might trust by mistake.
+
+### Scope honesty up front
+
+Full T5.2 ("Alice sends to offline Bob via the hub, Bob comes online and reads") needs at least four more steps after this commit:
+
+  * **T5.2.c** — `SendBootstrap { peer_pubkey_b32, peer_kem_pub_b32, text }` API verb that constructs an MLS Welcome + seals it with `routing::seal_bootstrap` + pushes via `hub_outbound`.
+  * **T5.2.d** — hub_client's `on_deliver` callback wired into `open_bootstrap` + `MlsParty::join_from_welcome` + `ConversationRegistry::register` on the recipient side.
+  * **T5.2.e** — ongoing-message wire format (MLS application messages over hub via per-epoch session-token routing ids) so post-bootstrap traffic doesn't have to revert to direct dial.
+  * **T5.2.f** — TUI integration: a "send to fingerprint…" affordance, visual distinction between direct-MLS and hub-relayed messages (the latter has weaker properties — see open security gaps below).
+
+What lands today is the **foundation** only: every identity now holds a persistent post-quantum KEM keypair so senders have something to encapsulate to, and the hub-client can write outbound frames as well as read them. The API even surfaces the new KEM public so a future `onyx contact export` knows what to put on the card.
+
+### T5.2.a — Identity gains a `HybridKemSecret`; vault schema v4 persists it
+
+The cryptographic helper `routing::seal_bootstrap` has existed in the library since the PQ phase, but no identity had a `HybridKemSecret` to be sealed against. T5.2.a closes that gap.
+
+**`crates/onyx-core/src/crypto.rs`** gains:
+
+  * `HYBRID_PQ_SECRET_LEN = 2400` — the ML-KEM-768 decapsulation key size per FIPS 203 Table 3 (K=3, 768 × K + 96).
+  * `HYBRID_SECRET_LEN = HYBRID_CLASSICAL_LEN + HYBRID_PQ_SECRET_LEN = 2432` — full serialised secret.
+  * `HybridKemSecret::to_bytes() -> Zeroizing<Vec<u8>>` — concatenates X25519 secret (32 B) ‖ ML-KEM-768 decap key (2400 B). `Zeroizing` so the buffer wipes on drop.
+  * `HybridKemSecret::from_bytes(&[u8]) -> Result<Self>` — reconstructs from the same layout, rejecting wrong lengths with `Error::BufferSize`. Uses `Encoded<PqDecapKey>::try_from` to wrap the ML-KEM half.
+
+Three new unit tests, all passing:
+
+  * `hybrid_pq_secret_len_matches_runtime` — asserts the compile-time constant matches the runtime `<PqDecapKey as EncodedSizeUser>::EncodedSize`. A future `ml-kem` release that quietly changes the layout fails here, in CI, instead of in the field.
+  * `hybrid_kem_secret_byte_round_trip` — the security-relevant invariant: a ciphertext encapsulated to the original public key decapsulates **identically** with the byte-round-tripped secret. Also verifies the round-tripped secret's derived public key matches the original.
+  * `hybrid_kem_secret_rejects_wrong_size` — fuzz-style smoke on three wrong sizes (too short, too short by one, too long by one).
+
+**`crates/onyx-core/src/identity.rs`** restructured:
+
+  * `Identity` struct now owns three secrets: `signing: SigningKey`, `identity: IdentitySecret` (Noise X25519), and `kem: HybridKemSecret` (sealed-sender X25519 + ML-KEM-768). The Noise X25519 and the KEM's classical half are **separate keys** — different protocol roles, no cross-protocol reuse. The extra 32 bytes are a conservative choice grounded in `SECURITY.md` P6 ("no optional weakening").
+  * New accessors `kem_secret() -> &HybridKemSecret` and `kem_public() -> HybridKemPublic`. The public is freshly derived from the secret on demand; cheap, and avoids caching a derived form in the struct.
+  * New constructor `from_parts(signing_seed, identity_secret, kem_bytes) -> Result<Identity>` for vault reload and import flows; validates the KEM bytes.
+  * Kept `from_seeds(signing_seed, identity_secret) -> Identity` as a test convenience whose **fingerprint** is deterministic in the seeds but whose KEM keypair is freshly generated each call. Doc on the method names the determinism boundary explicitly so a future reader can't be surprised.
+  * Serialised layout inside the AEAD blob grew from 64 bytes to 64 + 2432 = **2496 bytes**. Captured in a fresh ASCII layout diagram in the module doc. The `delete_identity` scrub buffer was sized accordingly (`IDENTITY_SECRET_BLOB_LEN + 256` random bytes) so the best-effort forensic-recovery overwrite still comfortably exceeds the encrypted blob's on-disk footprint.
+  * Two new tests: `from_parts_is_deterministic_for_classical_fields` (same seeds → same fingerprint even with different KEM halves), `from_parts_rejects_wrong_kem_length`, **and** `kem_keypair_round_trips_across_reopen` — the latter is the security-relevant invariant for this entire phase: encapsulate to alice's public before vault close, reopen, decapsulate with the restored secret, assert identical shared secret. If this test ever regresses, sealed-sender bootstrap envelopes encrypted before a daemon restart become un-decryptable after the restart — a real outage, not just a UX nit.
+
+**`crates/onyx-core/src/storage.rs`** bumps `SCHEMA_VERSION` from 3 → 4 with an explanatory comment about the blob-layout change. No SQL change: the `identities.encrypted_blob` column is opaque to SQLite, only the AEAD plaintext length changed. Old v3 vaults fail the schema-version check at open and must be recreated.
+
+### T5.2.b — Hub client becomes bidirectional
+
+Until this phase, `hub_client::run_hub_session` only read. T5.2.b makes it also write — the prerequisite for any `Send`-via-hub verb.
+
+  * New public type `HubOutbound { target: RoutingId, body: Vec<u8> }`. Body is opaque; `hub_client` doesn't care whether it's a sealed envelope or anything else.
+  * New public const `OUTBOUND_QUEUE_CAPACITY = 64`. Bounded mailbox: a hung hub can't make the daemon buffer unbounded data on the user's behalf.
+  * `run_hub_session` signature gains `outbound_rx: &mut mpsc::Receiver<HubOutbound>`. After SUBSCRIBE, the loop is a `tokio::select!` between `read_frame` (existing inbound path) and `outbound_rx.recv()` (new): each `HubOutbound` is written as a `FRAME_DELIVER` with payload `target (16 B) ‖ body`. Channel-closed → clean `Ok(())` return (caller dropped the sender, daemon shutdown). Write-error mid-session → `Err(...)` so the reconnect loop in `main.rs` backs off and retries.
+  * The post-handshake body was factored into `serve_session<S>` generic over the stream type so the new bidirectional logic is testable without spinning up a real Tor circuit. The dial + handshake + subscribe entry point still does the real network setup in production.
+
+New test `bidirectional_session_round_trip_over_duplex` uses `tokio::io::duplex(65_536)` to stand up a fake hub-side responder, exercises both directions end-to-end (push inbound DELIVER → callback fires; queue outbound HubOutbound → frame appears on the wire with the right `target ‖ body`), and verifies clean shutdown when the sender side of the outbound channel is dropped. This is exactly the kind of test that catches "what if the read future and the write future are both pending and one of them panics inside `select!`" classes of bug before they ship.
+
+### `onyxd::DaemonState` carries the sender, ungated for now
+
+`DaemonState` gains `hub_outbound: Option<mpsc::Sender<HubOutbound>>`. `Some` only when `--hub-onion` + `--hub-pubkey` were both set (in `--no-tor` mode it stays `None`, since the hub task never runs). The field is marked `#[allow(dead_code)]` with an inline note pointing at T5.2.c, which adds the `SendBootstrap` API verb that finally drains it. **No code path today reads this field** — the foundation is in place, but nothing actually sends via the hub yet.
+
+### API surface: the KEM public goes through
+
+`ApiResponse::StatusOk` and `ApiResponse::IdentityOk` both gain `identity_kem_pub_b32: String`. The doc on the field warns explicitly about the length:
+
+  > The underlying bytes are HYBRID_PUBLIC_LEN = 1216 bytes (32 + 1184); base32 with no padding encodes that to ~1948 characters. It looks alarming on stdout but it isn't a typo — that's the real on-the-wire size of an ML-KEM-768 encapsulation key.
+
+Two existing api round-trip tests were extended to include the new field. The TUI's `StatusSnapshot` consumer uses `..` to ignore unrecognised fields, so it picks up the change transparently without code changes.
+
+### Verification
+
+  * `cargo fmt --all --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓ — chased three lints along the way: a `struct_field_names` on `Identity.identity` (kept the field name, allowed the lint with a justification comment because `identity` is the right English noun for an X25519 identity secret), a `too_many_arguments` on `run_hub_session` (allowed; every parameter names a distinct piece of session context and bundling them into a struct would just rename the arguments to fields), and a stray `mut` on the `on_deliver: F` parameter (removed — `FnMut` calls inside `select!` don't need an outer `mut`).
+  * `cargo test --workspace` ✓ — **147 in `onyx-core`** (+5 since T5.1: 3 hybrid KEM secret tests + 2 identity persistence/length tests), **15 in `onyxd`** (+1: the bidirectional duplex round-trip), 6 in `onyx-hub`, 5 in `onyx`. **173 total**.
+  * `cargo deny check` ✓.
+
+### `THREAT_MODEL.md` updated in the same commit
+
+§8.1 gains two new rows:
+
+  * "Per-identity hybrid KEM keypair (sealed-sender prerequisite)" — designed + implemented + verified by the reopen round-trip test.
+  * "Hub-client bidirectional outbound queue" — designed + implemented + verified by the duplex round-trip test.
+
+§8.2 carry-forward items updated:
+
+  * **#1** ("Sealed-sender wrap on the daemon's hub path") gains a note that the building blocks are now in place: KEM keypair persists, hub-client can write outbound. What remains is the API verb, the MLS-Welcome construction, and the recipient-side join.
+  * **#2** ("PQ hybrid X25519 + ML-KEM-768 wired into the daemon path") moves from "not implemented" to **partial**: each identity owns and persists a hybrid KEM keypair, but no live wire path uses it yet. Store-now-decrypt-later attackers archiving today's traffic still get plaintext until the sealed envelope ships.
+  * **#13** added: "Vault schema v4 has no migration runner" — this is the **fifth** schema bump without a migration story (v1 → v2 → v3 → v4). The cost of writing the runner grows each time; flagged with bumped priority.
+
+### Open security gaps + carry-forward
+
+  * **T5.2.c–T5.2.f still ahead** to actually deliver "Alice → offline Bob → comes online → reads". Each will be its own commit.
+  * **Hub-relayed messages will have weaker properties than direct MLS** even once T5.2.c+ land. The sealed-sender envelope gives per-message forward secrecy via the ephemeral X25519 + ML-KEM-768 encapsulation, **but** an MLS Welcome that crosses the hub only kicks off a new group — it has no post-compromise security against an attacker who later compromises the recipient. The TUI must visually distinguish direct-MLS and hub-relayed messages so users can read the threat model right. Tracked for T5.2.f.
+  * **Vault schema v4 — recreate to upgrade.** Same pattern as prior bumps; documented in `THREAT_MODEL.md` §8.2#13.
+  * **Daemon `from_seeds` non-determinism on KEM half** is intentional but worth knowing about. Two `from_seeds` calls with the same seeds produce identical fingerprints but **different** KEM publics. For tests that don't care this is fine; for any future reproducibility-sensitive flow, use `from_parts`.
+  * Everything from prior carry-forward lists still open.
+
+---
+
 ## 2026-05-18 — Docs: SECURITY.md + THREAT_MODEL.md §8 implementation status
 
 No code change this entry. Two documents written / updated so future contributors and reviewers can tell at a glance which security claims are *designed*, *implemented*, and *verified*, and what the rules of engagement are for adding features without eroding the guarantees we already make.

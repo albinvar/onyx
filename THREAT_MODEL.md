@@ -178,8 +178,8 @@ Statuses:
 
 This is the same list that accumulated across CHANGELOG entries, surfaced in one place and mapped to the adversary classes affected. Order is rough priority for closing.
 
-1. **Sealed-sender wrap on the daemon's hub path** (affects A2). When T5.2 wires hub-relayed delivery, the hub would observe sender identity in the envelope header unless the sealed-sender envelope ships first. The `routing::seal_bootstrap` helper is the building block.
-2. **PQ hybrid X25519 + ML-KEM-768 wired into the daemon handshake** (affects N5). Helper exists in `routing.rs`; not used by the live `peer_session` task. Store-now-decrypt-later attackers currently get plaintext eventually.
+1. **Sealed-sender wrap on the daemon's hub path** (affects A2). When the full hub-relayed delivery path is wired (T5.2.c+), the hub would observe sender identity in the envelope header unless the sealed-sender envelope ships first. **As of T5.2.a + T5.2.b the building blocks are in place**: each identity now owns a persistent hybrid KEM keypair the sender can address with `routing::seal_bootstrap`, and the hub-client's bidirectional loop can already write outbound `FRAME_DELIVER` frames. What remains: a `SendBootstrap` API verb, an MLS-Welcome construction at the sender, the hub-side fan-out (already present), and the receive-side `open_bootstrap` + `join_from_welcome` integration.
+2. **PQ hybrid X25519 + ML-KEM-768 wired into the daemon path** (affects N5). **Partially closed in T5.2.a**: each identity now owns and persists a hybrid KEM keypair (`Identity::kem_public` / `Identity::kem_secret`). Not yet used in the Noise handshake or in any live envelope. Store-now-decrypt-later attackers who archive Noise + MLS traffic today still get plaintext eventually; the new KEM keypair starts protecting them only once the sealed-sender hub path goes live.
 3. **Cover traffic on idle Tor circuits** (affects A2's "coarse activity" caveat and §5#1, #5). Frame buckets shape *transmitted* frames; idle circuits leak presence.
 4. **Hub auth — invite-only or signed-token registration** (affects A2/A3). Anyone holding the hub's static key can connect, subscribe, and DELIVER. DoS risk; no rate limits; no quotas.
 5. **`derive_peer_fingerprint` silent fallback** (affects P7 / user-facing trust). If MLS member extraction fails for any reason, the TUI shows the X25519 b32 as if it were the Ed25519 fingerprint, with no visual distinction. Should log a `warn!` and render differently.
@@ -190,6 +190,14 @@ This is the same list that accumulated across CHANGELOG entries, surfaced in one
 10. **Onion-web tier** (N6) — not implemented at all yet. Listed because once it lands the explicit tradeoff documented in N6 becomes a real surface to defend.
 11. **Macos `fs-mistrust` bypass workaround** (affects A5 marginally on macOS). The env var `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1` skips Arti's state-file integrity checks. Acceptable in dev; should not appear in operator-facing release instructions without a documented mitigation.
 12. **Protocol-level BYE+ACK** (affects A4's reordering guarantee at session-end). The 500 ms drain hack before `stream.shutdown()` (`peer_session` in `onyxd`) is a band-aid; the real fix is a final acknowledged frame.
+13. **Vault schema v4 has no migration runner** (affects A5 indirectly — vault accessibility on upgrade). T5.2.a bumped the on-disk schema from v3 to v4 (identity blob grew from 64 bytes to 2496 bytes to fit the hybrid KEM secret). Existing v3 vaults fail the schema check at open and must be recreated. This is now the **fifth** schema bump without a migration story — the cost of writing the runner grows each time. Priority bumped accordingly.
+
+Also row in 8.1 updated this turn:
+
+| §2 / §5 claim                                         | D | I | V | Notes                                                                                                                                |
+|------------------------------------------------------|---|---|---|--------------------------------------------------------------------------------------------------------------------------------------|
+| Per-identity hybrid KEM keypair (sealed-sender prerequisite) | ✓ | ✓ | unit + reopen-round-trip tests | New in T5.2.a. `Identity::kem_secret` / `kem_public`; persisted in vault schema v4. KEM keypair survives daemon restart (verified by test). Not yet exercised by any sealed envelope on the daemon path. |
+| Hub-client bidirectional outbound queue              | ✓ | ✓ | duplex round-trip test | New in T5.2.b. `hub_client::run_hub_session` now accepts a `mpsc::Receiver<HubOutbound>` and writes `FRAME_DELIVER` frames from it via `tokio::select!`. No API verb yet drains the sender side. |
 
 Each item is also enumerated in the relevant CHANGELOG entry. This list and the CHANGELOG must stay in sync.
 

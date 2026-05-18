@@ -133,6 +133,13 @@ pub(crate) struct DaemonState {
     pub(crate) mls_party: Arc<Mutex<MlsParty>>,
     pub(crate) vault: Arc<Mutex<Vault>>,
     pub(crate) conversations: conversations::SharedRegistry,
+    /// `Some` only when the daemon was launched with `--hub-onion`.
+    /// Push [`hub_client::HubOutbound`] here to relay a delivery via
+    /// the hub. Bounded; full-mailbox surfaces as `NotReady`. Not
+    /// yet read by anything — T5.2.c will add a `SendBootstrap` API
+    /// verb that uses it.
+    #[allow(dead_code)]
+    pub(crate) hub_outbound: Option<mpsc::Sender<hub_client::HubOutbound>>,
 }
 
 #[tokio::main]
@@ -183,12 +190,28 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("MLS party create failed: {e}"))?
     };
 
+    // Construct the hub outbound channel up front so the API server
+    // can hold the Sender alongside the rest of DaemonState. The
+    // Receiver is parked here and handed to the hub task below if
+    // --hub-onion is set; in --no-tor mode it's dropped immediately,
+    // leaving `hub_outbound: None` so any Send-via-hub attempt fails
+    // cleanly with NotReady rather than queueing into a void.
+    let want_hub = args.hub_onion.is_some() && args.hub_pubkey.is_some() && !args.no_tor;
+    let (hub_tx, mut hub_rx_holder) = if want_hub {
+        let (tx, rx) =
+            mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let state = Arc::new(DaemonState {
         identity,
         identity_id,
         mls_party: Arc::new(Mutex::new(mls_party)),
         vault: Arc::new(Mutex::new(vault)),
         conversations: conversations::new_shared(),
+        hub_outbound: hub_tx,
     });
 
     drop(args.passphrase);
@@ -261,6 +284,13 @@ async fn main() -> anyhow::Result<()> {
         // exposing the StaticSecret type.
         let our_sk_bytes: [u8; 32] = *state.identity.identity_key().to_bytes();
         let tor_clone = tor.clone();
+        // Take the parked receiver. `want_hub == true` implies
+        // hub_rx_holder is Some, so this unwrap is sound — but we
+        // express it defensively to avoid a panic if the invariant
+        // ever drifts.
+        let mut outbound_rx = hub_rx_holder
+            .take()
+            .expect("hub_rx_holder is Some when hub_onion+hub_pubkey are both set");
         Some(tokio::spawn(async move {
             let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(our_sk_bytes);
             let mut backoff = std::time::Duration::from_millis(500);
@@ -272,9 +302,10 @@ async fn main() -> anyhow::Result<()> {
                     &hub_pubkey,
                     &our_sk,
                     &[our_inbox],
+                    &mut outbound_rx,
                     |target, body| {
-                        // T5.1 stops at "we got a delivery". T5.2 will
-                        // wire this into the sealed-sender unwrap +
+                        // T5.2.a/b stops at "we got a delivery". T5.2.c+
+                        // will wire this into the sealed-sender unwrap +
                         // conversation registry.
                         info!(
                             target_b32 = %encode_b32(&target),

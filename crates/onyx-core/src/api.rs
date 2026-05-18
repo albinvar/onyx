@@ -110,11 +110,25 @@ pub enum ApiResponse {
         identity_pub_b32: String,
         fingerprint: String,
         tor_state: TorState,
+        /// Hybrid (X25519 ‖ ML-KEM-768) KEM public key, base32.
+        ///
+        /// **Length note**: the underlying bytes are
+        /// `HYBRID_PUBLIC_LEN = 1216` bytes (32 + 1184); base32 with
+        /// no padding encodes that to ~1948 characters. It looks
+        /// alarming on stdout but it isn't a typo — that's the
+        /// real on-the-wire size of an ML-KEM-768 encapsulation key.
+        ///
+        /// Used by senders to address sealed-sender envelopes to
+        /// this identity. Safe to publish.
+        identity_kem_pub_b32: String,
     },
     /// Reply to [`ApiRequest::Identity`].
     IdentityOk {
         identity_pub_b32: String,
         fingerprint: String,
+        /// See [`Self::StatusOk::identity_kem_pub_b32`] for the
+        /// length-and-encoding caveat.
+        identity_kem_pub_b32: String,
     },
     /// Reply to [`ApiRequest::Peers`].
     PeersOk { entries: Vec<PeerInfo> },
@@ -285,6 +299,7 @@ mod tests {
             identity_pub_b32: "abcdef".into(),
             fingerprint: "deadbeef".into(),
             tor_state: TorState::Ready,
+            identity_kem_pub_b32: "long-b32-string-stand-in".into(),
         };
         let line = encode_response_line(&r).unwrap();
         let parsed = decode_response(line.trim_end_matches('\n')).unwrap();
@@ -296,6 +311,7 @@ mod tests {
         let r = ApiResponse::IdentityOk {
             identity_pub_b32: "abc".into(),
             fingerprint: "def".into(),
+            identity_kem_pub_b32: "long-b32-stand-in".into(),
         };
         let line = encode_response_line(&r).unwrap();
         let parsed = decode_response(line.trim_end_matches('\n')).unwrap();
