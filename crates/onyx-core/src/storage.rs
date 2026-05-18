@@ -104,6 +104,26 @@ CREATE TABLE mls_peer_groups (
 );
 ";
 
+/// Additive extension applied via `CREATE TABLE IF NOT EXISTS` on
+/// every `open`/`initialize` rather than being part of the
+/// version-pinned `SCHEMA_V3`. Stores the recipient-side hub-envelope
+/// replay-defence snapshot (T7.3-sec.2-persist).
+///
+/// We deliberately do **not** bump [`SCHEMA_VERSION`] for this — it
+/// is a pure additive change to vaults that already passed the schema
+/// check, no rows in any other table are touched. Existing v4 vaults
+/// pick up the table on next open with no migration runner required.
+/// (`THREAT_MODEL` §8.2 #13 already tracks the absence of a real
+/// migration runner; this additive pattern is what we do when a bump
+/// would not be worth the upgrade-friction cost.)
+const SCHEMA_REPLAY_STATE_ADD: &str = "
+CREATE TABLE IF NOT EXISTS replay_state (
+  identity_id     INTEGER PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+  encrypted_blob  BLOB NOT NULL,
+  updated_at      INTEGER NOT NULL
+);
+";
+
 /// Known plaintext used to detect a wrong passphrase. Encrypted under
 /// the vault key at creation; failure to decrypt at open means the
 /// passphrase doesn't match (or the file is corrupted — we don't
@@ -230,12 +250,20 @@ impl Vault {
             return Err(Error::VerificationFailed);
         }
 
+        // Apply additive table extensions. Idempotent — safe on every
+        // open. Does NOT bump the schema-version pin (see
+        // SCHEMA_REPLAY_STATE_ADD rustdoc).
+        conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
+            .map_err(map_db_err)?;
+
         Ok(Self { conn, aead })
     }
 
     fn initialize(conn: Connection, passphrase: &[u8], params: &Argon2Params) -> Result<Self> {
         params.validate()?;
         conn.execute_batch(SCHEMA_V3).map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
+            .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -387,6 +415,52 @@ impl Vault {
         }
     }
 
+    /// Persist (or overwrite) the recipient-side hub-envelope replay
+    /// seen-set snapshot for `identity_id` (T7.3-sec.2-persist). The
+    /// plaintext shape is whatever
+    /// [`crate::routing`]-adjacent client code produced via its
+    /// `EnvelopeReplayGuard::snapshot` — opaque to the vault.
+    pub fn save_replay_state(&self, identity_id: i64, plaintext: &[u8]) -> Result<()> {
+        let encrypted = self.encrypt_blob(plaintext)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO replay_state (identity_id, encrypted_blob, updated_at) \
+                 VALUES (?, ?, ?) \
+                 ON CONFLICT(identity_id) DO UPDATE SET \
+                   encrypted_blob = excluded.encrypted_blob, \
+                   updated_at = excluded.updated_at",
+                params![identity_id, encrypted, now],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Load and decrypt the replay-state snapshot for `identity_id`.
+    /// Returns `None` if no row exists (first run, or vault never
+    /// snapshotted the guard). Caller decides what to do with a
+    /// decode failure of the plaintext — typically: start with an
+    /// empty guard rather than refuse to launch.
+    pub fn load_replay_state(&self, identity_id: i64) -> Result<Option<Vec<u8>>> {
+        let encrypted: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT encrypted_blob FROM replay_state WHERE identity_id = ?",
+                params![identity_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_db_err)?;
+        match encrypted {
+            Some(blob) => Ok(Some(self.decrypt_blob(&blob)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Read-only access to the underlying SQLite connection for
     /// implementing per-entity repos (identity, contacts, …). Repos
     /// MUST NOT bypass [`Self::encrypt_blob`]/[`Self::decrypt_blob`]
@@ -495,6 +569,27 @@ mod tests {
         let blob2 = b"replacement bytes";
         v.save_mls_state(id, blob2).unwrap();
         assert_eq!(v.load_mls_state(id).unwrap().unwrap(), blob2);
+    }
+
+    #[test]
+    fn replay_state_save_load_round_trip() {
+        // Mirror mls_state_save_load_round_trip for the additive
+        // replay_state table. UPSERT semantics on (identity_id) PK,
+        // AEAD-sealed at rest, in-memory vault sufficient.
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("alice").unwrap();
+
+        assert!(v.load_replay_state(id).unwrap().is_none());
+
+        let snap = b"opaque replay-guard snapshot \x00\xde\xad\xbe\xef";
+        v.save_replay_state(id, snap).unwrap();
+        let loaded = v.load_replay_state(id).unwrap().expect("must be Some");
+        assert_eq!(loaded, snap);
+
+        // UPSERT overwrites.
+        let snap2 = b"replacement snapshot";
+        v.save_replay_state(id, snap2).unwrap();
+        assert_eq!(v.load_replay_state(id).unwrap().unwrap(), snap2);
     }
 
     #[test]

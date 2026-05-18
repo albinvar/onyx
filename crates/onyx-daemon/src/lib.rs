@@ -262,6 +262,36 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         (None, None)
     };
 
+    // Restore the envelope-replay seen-set from the vault if a
+    // previous run persisted one (T7.3-sec.2-persist). Corrupt
+    // snapshot → start with an empty guard rather than refuse to
+    // launch (losing the seen-set re-opens the replay window for one
+    // snapshot cycle, which is strictly better than the daemon
+    // failing to boot).
+    let initial_guard = if let Some(bytes) = vault
+        .load_replay_state(identity_id)
+        .context("loading replay state")?
+    {
+        if let Ok(g) = replay_guard::EnvelopeReplayGuard::restore(&bytes) {
+            info!(
+                entries = g.len(),
+                capacity = g.capacity(),
+                "loaded persisted envelope-replay seen-set"
+            );
+            g
+        } else {
+            warn!(
+                snapshot_bytes = bytes.len(),
+                "persisted replay snapshot did not parse; starting with \
+                 empty guard (one snapshot cycle of replay vulnerability)"
+            );
+            replay_guard::EnvelopeReplayGuard::new()
+        }
+    } else {
+        info!("no persisted replay seen-set; starting fresh");
+        replay_guard::EnvelopeReplayGuard::new()
+    };
+
     let state = Arc::new(DaemonState {
         identity,
         identity_id,
@@ -270,10 +300,18 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         conversations: conversations::new_shared(),
         hub_outbound: hub_tx,
         hub_fetch_lock: Arc::new(Mutex::new(())),
-        seen_envelopes: Arc::new(Mutex::new(replay_guard::EnvelopeReplayGuard::new())),
+        seen_envelopes: Arc::new(Mutex::new(initial_guard)),
     });
 
     drop(args.passphrase);
+
+    // T7.3-sec.2-persist: spawn the periodic snapshot task BEFORE
+    // any mode-specific branch so it runs in every mode (TCP-test,
+    // no-tor, Tor accept, Tor dial). Tick interval is 60s; the
+    // snapshot is skipped when nothing changed since last save
+    // (snapshot bytes are deterministic — see the
+    // `snapshot_is_deterministic_when_state_unchanged` test).
+    spawn_replay_snapshot_task(state.clone());
 
     let api_socket_path = PathBuf::from(&args.api_socket);
 
@@ -308,6 +346,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             }
             () = wait_for_ctrl_c() => info!("shutting down on Ctrl-C"),
         }
+        final_replay_snapshot(&state).await;
         return Ok(());
     }
 
@@ -443,6 +482,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         run_accept_mode(&tor, state.clone()).await
     };
 
+    // Final replay-guard snapshot before we abort the API task — the
+    // periodic snapshot task may have died mid-tick. T7.3-sec.2-persist.
+    final_replay_snapshot(&state).await;
+
     // Stop the API server so its socket file gets unlinked promptly.
     api_task.abort();
     if let Some(h) = hub_task {
@@ -500,6 +543,8 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
         () = wait_for_ctrl_c() => info!("shutting down on Ctrl-C"),
     }
 
+    // No final_replay_snapshot here — the run() wrapper calls it
+    // after mode_result returns. Keeps the snapshot exactly once.
     drop(hs);
     Ok(())
 }
@@ -629,6 +674,7 @@ async fn run_tcp_listen_mode(
         () = accept_loop => {},
         () = wait_for_ctrl_c() => info!("shutting down on Ctrl-C"),
     }
+    final_replay_snapshot(&state).await;
     api_task.abort();
     Ok(())
 }
@@ -1240,5 +1286,92 @@ async fn wait_for_ctrl_c() {
     match tokio::signal::ctrl_c().await {
         Ok(()) => {}
         Err(e) => error!("failed to listen for Ctrl-C: {e}"),
+    }
+}
+
+/// Tick interval for the envelope-replay seen-set snapshot task
+/// (T7.3-sec.2-persist). At 60 s the maximum replay-vulnerability
+/// window after an unclean daemon exit is 60 s, which is a defensible
+/// trade-off against the cost of an AEAD-sealed SQLite write per
+/// tick when the guard hasn't changed.
+const REPLAY_SNAPSHOT_INTERVAL_SECS: u64 = 60;
+
+/// Spawn a background task that periodically snapshots the recipient-
+/// side envelope-replay seen-set to the vault. T7.3-sec.2-persist.
+///
+/// The task runs forever (until the parent task aborts it on
+/// shutdown). Each tick:
+///   1. Lock the guard, take a deterministic snapshot.
+///   2. Compare to the last-written bytes; skip the vault round-trip
+///      if nothing changed (a quiet daemon costs zero disk I/O).
+///   3. Otherwise, lock the vault and persist via
+///      [`Vault::save_replay_state`].
+///
+/// Errors are logged at `warn!` level and the loop continues. A
+/// failed snapshot doesn't break the in-memory replay defence —
+/// only narrows the restart-window persistence guarantee.
+///
+/// We deliberately do *not* trigger snapshots on every guard insert
+/// because the per-envelope vault write would dominate the cost of
+/// receiving a message. The 60 s tick is a coarse but correct
+/// amortisation: even a busy daemon snapshots a bounded number of
+/// times per minute.
+fn spawn_replay_snapshot_task(state: Arc<DaemonState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            REPLAY_SNAPSHOT_INTERVAL_SECS,
+        ));
+        // Skip the immediate first tick — the guard was just loaded
+        // (or freshly created), there is nothing new to persist.
+        interval.tick().await;
+        let mut last_snapshot: Option<Vec<u8>> = None;
+        loop {
+            interval.tick().await;
+            let snapshot = {
+                let guard = state.seen_envelopes.lock().await;
+                guard.snapshot()
+            };
+            if last_snapshot.as_ref() == Some(&snapshot) {
+                continue; // unchanged since last write
+            }
+            let save_result = {
+                let vault = state.vault.lock().await;
+                vault.save_replay_state(state.identity_id, &snapshot)
+            };
+            match save_result {
+                Ok(()) => {
+                    debug!(
+                        bytes = snapshot.len(),
+                        "replay seen-set snapshot persisted to vault"
+                    );
+                    last_snapshot = Some(snapshot);
+                }
+                Err(e) => {
+                    warn!(error = %e, "replay seen-set snapshot save failed; will retry next tick");
+                }
+            }
+        }
+    });
+}
+
+/// Synchronous version of the per-tick snapshot logic. Called once
+/// from the Ctrl-C shutdown handler so we narrow the restart window
+/// to "what happened since the last successful tick" rather than
+/// "everything since the last periodic save".
+async fn final_replay_snapshot(state: &DaemonState) {
+    let snapshot = {
+        let guard = state.seen_envelopes.lock().await;
+        guard.snapshot()
+    };
+    let save_result = {
+        let vault = state.vault.lock().await;
+        vault.save_replay_state(state.identity_id, &snapshot)
+    };
+    match save_result {
+        Ok(()) => info!(
+            bytes = snapshot.len(),
+            "final replay snapshot persisted on shutdown"
+        ),
+        Err(e) => warn!(error = %e, "final replay snapshot save failed on shutdown"),
     }
 }

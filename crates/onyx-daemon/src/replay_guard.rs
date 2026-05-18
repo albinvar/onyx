@@ -137,6 +137,87 @@ impl EnvelopeReplayGuard {
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
+
+    /// Serialise the current guard state to a flat byte buffer for
+    /// vault persistence (T7.3-sec.2-persist). Format is intentionally
+    /// minimal — fixed-size header + raw hashes in FIFO order — so it
+    /// stays trivially audit-able:
+    ///
+    /// ```text
+    ///   magic(4) = "ORG1"   // Onyx Replay Guard v1
+    ///   capacity(u32 BE)
+    ///   count(u32 BE)
+    ///   hashes[count][16]   // oldest first
+    /// ```
+    ///
+    /// The buffer is plaintext; the vault layer AEAD-seals it before
+    /// writing to disk. Snapshots are idempotent (no entropy) so
+    /// successive snapshots of an unchanged guard produce identical
+    /// bytes — useful for "did anything change?" detection.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + self.order.len() * 16);
+        out.extend_from_slice(b"ORG1");
+        out.extend_from_slice(
+            &u32::try_from(self.capacity)
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(
+            &u32::try_from(self.order.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        for hash in &self.order {
+            out.extend_from_slice(hash);
+        }
+        out
+    }
+
+    /// Restore a guard from a [`Self::snapshot`] buffer. Returns
+    /// `Ok(guard)` on a well-formed buffer; returns `Err(())` on any
+    /// parse failure (wrong magic, truncated, count exceeds capacity,
+    /// trailing bytes). Callers should fall back to a fresh guard on
+    /// `Err` rather than refusing to launch — losing the seen-set is
+    /// a worse outcome than re-opening the restart window for one
+    /// snapshot cycle.
+    ///
+    /// The `()` error type is deliberate: there is nothing a caller
+    /// can do with the failure beyond "use the default guard" — we
+    /// don't want to encourage retry loops or partial-recovery code.
+    /// Diagnostic detail goes through `tracing` at the call site.
+    #[allow(clippy::result_unit_err)]
+    pub fn restore(bytes: &[u8]) -> std::result::Result<Self, ()> {
+        if bytes.len() < 12 || &bytes[..4] != b"ORG1" {
+            return Err(());
+        }
+        let capacity = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let expected = 12usize
+            .checked_add(count.checked_mul(16).ok_or(())?)
+            .ok_or(())?;
+        if bytes.len() != expected {
+            return Err(());
+        }
+        if count > capacity {
+            return Err(());
+        }
+        let mut g = Self::with_capacity(capacity.max(1));
+        for i in 0..count {
+            let start = 12 + i * 16;
+            let mut h = [0u8; 16];
+            h.copy_from_slice(&bytes[start..start + 16]);
+            // Bypass check_and_record's BLAKE2b step — we're restoring
+            // already-hashed entries. Insert directly; if the on-disk
+            // snapshot contained a duplicate (shouldn't happen but
+            // belt-and-braces), the HashSet collapses it and the
+            // VecDeque ordering reflects whatever was on disk.
+            if g.seen.insert(h) {
+                g.order.push_back(h);
+            }
+        }
+        Ok(g)
+    }
 }
 
 impl Default for EnvelopeReplayGuard {
@@ -252,5 +333,115 @@ mod tests {
         let mut g = EnvelopeReplayGuard::with_capacity(4);
         assert!(g.check_and_record(b""));
         assert!(!g.check_and_record(b""), "even empty bodies dedup");
+    }
+
+    #[test]
+    fn snapshot_then_restore_preserves_seen_set() {
+        let mut original = EnvelopeReplayGuard::with_capacity(8);
+        original.check_and_record(b"alpha");
+        original.check_and_record(b"beta");
+        original.check_and_record(b"gamma");
+        let snap = original.snapshot();
+
+        let restored = EnvelopeReplayGuard::restore(&snap).expect("snapshot must round-trip");
+        assert_eq!(restored.capacity(), 8);
+        assert_eq!(restored.len(), 3);
+
+        // Hashes that *were* in the original are still rejected:
+        let mut restored = restored;
+        assert!(!restored.check_and_record(b"alpha"));
+        assert!(!restored.check_and_record(b"beta"));
+        assert!(!restored.check_and_record(b"gamma"));
+        // A new hash is accepted:
+        assert!(restored.check_and_record(b"delta"));
+    }
+
+    #[test]
+    fn snapshot_empty_guard_round_trips() {
+        let g = EnvelopeReplayGuard::with_capacity(4);
+        let snap = g.snapshot();
+        let restored = EnvelopeReplayGuard::restore(&snap).unwrap();
+        assert_eq!(restored.capacity(), 4);
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn snapshot_preserves_fifo_order_for_eviction() {
+        // Order matters: restoring must put the oldest hashes at the
+        // FIFO front so they evict first when new entries arrive.
+        let mut g = EnvelopeReplayGuard::with_capacity(3);
+        g.check_and_record(b"oldest");
+        g.check_and_record(b"middle");
+        g.check_and_record(b"newest");
+        let snap = g.snapshot();
+
+        let mut restored = EnvelopeReplayGuard::restore(&snap).unwrap();
+        // Insert one new entry. The oldest should evict first, not
+        // the newest — same as if we'd never snapshotted.
+        // State before: [oldest, middle, newest]
+        // After "fourth": [middle, newest, fourth] (oldest evicted)
+        restored.check_and_record(b"fourth");
+        assert!(
+            !restored.check_and_record(b"middle"),
+            "middle survived (one slot back)"
+        );
+        assert!(
+            !restored.check_and_record(b"newest"),
+            "newest survived (two slots back)"
+        );
+        assert!(
+            !restored.check_and_record(b"fourth"),
+            "fourth survived (just added)"
+        );
+        assert!(
+            restored.check_and_record(b"oldest"),
+            "oldest must have been evicted — first-sight again"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_wrong_magic() {
+        // Different magic word → not our snapshot.
+        let bad = b"XXXX\x00\x00\x00\x08\x00\x00\x00\x00".to_vec();
+        assert!(EnvelopeReplayGuard::restore(&bad).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_truncated() {
+        let g = {
+            let mut g = EnvelopeReplayGuard::with_capacity(8);
+            g.check_and_record(b"a");
+            g.check_and_record(b"b");
+            g
+        };
+        let snap = g.snapshot();
+        // Lop off the last 5 bytes — count claims 2 entries but body
+        // only has space for ~1.7.
+        let truncated = &snap[..snap.len() - 5];
+        assert!(EnvelopeReplayGuard::restore(truncated).is_err());
+    }
+
+    #[test]
+    fn restore_rejects_count_exceeding_capacity() {
+        // Hand-craft a snapshot claiming count > capacity.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(b"ORG1");
+        bad.extend_from_slice(&4u32.to_be_bytes()); // capacity = 4
+        bad.extend_from_slice(&10u32.to_be_bytes()); // count = 10 (impossible)
+        bad.extend_from_slice(&[0u8; 16 * 10]);
+        assert!(EnvelopeReplayGuard::restore(&bad).is_err());
+    }
+
+    #[test]
+    fn snapshot_is_deterministic_when_state_unchanged() {
+        // Two snapshots of the same guard state produce identical
+        // bytes. Lets the daemon skip a vault write if nothing has
+        // changed since the last snapshot (efficiency, not security).
+        let mut g = EnvelopeReplayGuard::with_capacity(4);
+        g.check_and_record(b"a");
+        g.check_and_record(b"b");
+        let s1 = g.snapshot();
+        let s2 = g.snapshot();
+        assert_eq!(s1, s2);
     }
 }

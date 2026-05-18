@@ -6,6 +6,51 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T7.3-sec.2-persist: persist the envelope-replay seen-set across daemon restarts
+
+Closes the restart window left over from T7.3-sec.2. That commit added an in-memory FIFO seen-set of envelope hashes so the recipient daemon would silently drop replays from a hostile hub — *while the daemon was running*. The instant the daemon restarted, the set was empty, and a 5–10-minute window opened in which the hub could replay any stored envelope and bob's daemon would happily surface the duplicate. Today: that window is closed to ≤60 s (the snapshot tick) without changing any wire format or trust assumption.
+
+What landed:
+
+**T7.3-sec.2-persist.a — `EnvelopeReplayGuard::snapshot` + `restore`.** New methods on the guard type:
+
+  * `snapshot() -> Vec<u8>` serialises the guard state to a flat byte buffer with a fixed `ORG1` magic, capacity (u32 BE), count (u32 BE), and the FIFO hashes in oldest-first order. No CBOR — the format is intentionally minimal so it stays trivially auditable. Deterministic: two snapshots of an unchanged guard produce byte-identical buffers, enabling a "did anything change?" check that skips disk writes when the guard is quiet.
+  * `restore(&[u8]) -> Result<Self, ()>` rejects on wrong magic, truncated buffer, count exceeding capacity, or trailing bytes. The `()` error type is deliberate — a snapshot parse failure is unrecoverable in any useful sense, so the caller's only sensible response is "start with a fresh guard." `#[allow(clippy::result_unit_err)]` is on the method with the reasoning written inline.
+
+  Seven new tests added on top of the seven T7.3-sec.2 tests: snapshot/restore round-trip, empty-guard round-trip, FIFO order preservation across snapshot (critical — the daemon needs eviction to behave the same after restore as before snapshot), `restore` rejects wrong magic / truncated / impossibly-large counts, deterministic snapshot bytes for unchanged state.
+
+**T7.3-sec.2-persist.b — additive `replay_state` vault table.** New table in `onyx-core::storage` keyed by `identity_id` (FK to `identities` with `ON DELETE CASCADE`), single `encrypted_blob BLOB` column, `updated_at` timestamp. Same shape as `mls_state`. Two new methods on `Vault`: `save_replay_state(identity_id, plaintext)` and `load_replay_state(identity_id) -> Option<Vec<u8>>` — mirror `save_mls_state` / `load_mls_state` byte-for-byte (AEAD-seal under the vault key on save, AEAD-open on load).
+
+  **Crucially: no schema-version bump.** The new table is created via a separate `SCHEMA_REPLAY_STATE_ADD` constant applied with `CREATE TABLE IF NOT EXISTS` in *both* `initialize` (new vault) and `open` (existing vault). Idempotent, additive. Existing v4 vaults pick up the table on next open with no migration runner — this is the documented pattern for avoiding further worsening of `THREAT_MODEL` §8.2 #13 (which already tracks the absence of a real migration runner). The rustdoc on `SCHEMA_REPLAY_STATE_ADD` spells out the rationale for the next reader.
+
+**T7.3-sec.2-persist.c — daemon load/save/shutdown cycle.** Three pieces in `crates/onyx-daemon/src/lib.rs`:
+
+  * **Startup load**: before constructing `DaemonState`, the daemon calls `vault.load_replay_state(identity_id)` and feeds the bytes to `EnvelopeReplayGuard::restore`. On `Err(())` (corrupt snapshot), logs a `warn!` and falls back to an empty guard rather than refusing to launch — losing the seen-set re-opens the replay window for one snapshot cycle, which is strictly better than the daemon failing to boot. On success, logs `entries` and `capacity` at `info!` so operators can see persistence is working.
+  * **Periodic snapshot task**: a `tokio::spawn`'d task that ticks every 60 s. Each tick locks the guard, takes a deterministic snapshot, compares to the last-written bytes, and skips the vault write if nothing changed (a quiet daemon costs zero disk I/O). The 60 s interval is a coarse but defensible trade-off — at this cadence, an unclean exit (kill -9, crash, power loss) opens at most a 60 s replay window.
+  * **Final snapshot on shutdown**: `final_replay_snapshot(&state)` is called on every clean exit path — `--no-tor` early return, post-`mode_result?` in `run`, the TCP-test modes, and the embedded-`onyx` flow — so a Ctrl-C clean exit persists *everything* the periodic task may have just missed. Removes the wasted-duplicate inline call from `run_accept_mode` that used to happen redundantly with the wrapper.
+
+Snapshot task spawn happens *before* any mode-specific branching, so it runs in every mode (TCP-test, no-tor, Tor accept, Tor dial). The single task survives across all modes — there is no per-mode plumbing.
+
+Security and threat-model impact:
+
+  * **Closes** the daemon-restart replay window. New worst case: 60 s after an unclean exit. Old worst case: indefinite (until the BLAKE2b-128 hash space happened to collide on an honest delivery, statistically never).
+  * **No new trust assumption.** The snapshot is AEAD-sealed by the existing vault key (Argon2id-derived from the passphrase) before any byte hits disk. A future adversary with the disk image and the vault file but not the passphrase learns nothing — they get an opaque blob the same as for `mls_state`.
+  * **No new attack surface.** The snapshot file format is a 12-byte header + raw hash bytes. No CBOR parser, no serde, no chance of a parser-confusion bug. The only operation on the bytes between disk read and `restore()` is `Vault::decrypt_blob`, which is the same primitive used for every other vault field.
+  * **No wire format change.** The defence remains purely recipient-side.
+  * **No schema bump.** Existing vaults pick up the new table on next open via `CREATE TABLE IF NOT EXISTS`. The carry-forward #13 ("vault has no migration runner") is *not* worsened by this commit — quite the opposite, this commit documents and demonstrates the additive-extension pattern for future incremental schema work.
+
+`THREAT_MODEL §8.2 #16` now reflects the closed state (was: ~~struck through~~ with a "restart window remains" caveat; now: ~~struck through~~ with both T7.3-sec.2 and T7.3-sec.2-persist cited, and the "restart window closed" statement explicit).
+
+Known caveats that remain:
+
+  * **Hard crash within 60 s of a fresh insert** still loses that insert. Acceptable trade-off — write-per-envelope would dominate the cost of receiving a message, and the worst-case impact is "the daemon's seen-set is up to 60 s behind reality."
+  * **An attacker who can write to the on-disk vault** can rewrite the `replay_state` row to be `{}` (or any older snapshot) and re-open the replay window arbitrarily. This is *not* a new attack surface — the same attacker already controls the vault's `mls_state` row and could blow away every MLS group; we don't have a stronger story for on-disk integrity than "the disk is trusted." Documented in the module rustdoc.
+  * **Cover traffic is still the biggest remaining anonymity gap.** Replay-defence is integrity-of-history, not unlinkability.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (one `#[allow(clippy::result_unit_err)]` on `restore` with the justification inline; two `match` → `if let` rewrites in the daemon load path), `cargo test --workspace` **260 passed / 0 failed** (was 252; +7 replay_guard snapshot/restore tests + +1 vault `replay_state_save_load_round_trip` test).
+
+---
+
 ## 2026-05-19 — T7.3-sec.2: recipient-side replay defence for hub-delivered envelopes (closes THREAT_MODEL §8.2 #16)
 
 Second zero-trust hardening slice in 24 hours. T7.3-sec stopped the hub from accepting *malicious publishes* into the directory; T7.3-sec.2 stops the hub from *replaying anything alice ever sent bob*. Both deepen the "hub is untrusted infrastructure" posture — neither asks the user to do anything different.
