@@ -47,7 +47,9 @@
 //!   * `End`                — snap back to live (T-polish.4).
 //!   * `Ctrl-N`             — open the Create Room modal (T-polish.6).
 //!   * `Ctrl-I`             — open the Invite Peer modal (requires a room selected; T-polish.6).
+//!   * `Ctrl-F`             — open the Send File modal (requires a room selected; T-files.e).
 //!   * `Tab` (in modal)     — cycle between input fields.
+//!   * `Space` (in modal)   — toggle the focused checkbox (Send File only).
 //!   * `Enter`              — send composer text / submit active modal.
 //!   * `Backspace`          — delete one char (in composer or modal).
 //!   * any other char       — append to composer (snaps back to live) or modal field.
@@ -165,6 +167,14 @@ struct AppState {
     /// otherwise key events route to the modal handler and the
     /// main UI is dimmed behind it.
     modal: Option<ModalState>,
+    /// T-files.e: file-ids (b32) we've already rendered as inline
+    /// `📎 received …` lines in some scrollback. Used to dedupe
+    /// the periodic `ListReceivedFiles` poll: a file appears
+    /// exactly once in a room's history, no matter how many
+    /// refresh ticks fire after it arrives. Globally unique
+    /// (BLAKE2b-256 content hash truncated to 32 bytes / 52 b32
+    /// chars), so no per-conversation namespacing needed.
+    seen_files: HashSet<String>,
 }
 
 /// T-polish.6: TUI modals for room operations that can't easily
@@ -190,6 +200,22 @@ enum ModalState {
         kem_pub_b32: String,
         kp_b64: String,
         /// Which of the three input fields has focus (0..3).
+        focus: usize,
+    },
+    /// T-files.e: file-picker modal. Opened with Ctrl-F when a
+    /// room is selected. Path is a single line; two toggles
+    /// (Tab to cycle, Space to flip). Submit dispatches
+    /// `ApiRequest::SendFileToRoom`. Strip defaults (keep_metadata
+    /// = false, keep_filename = false) match the daemon defaults
+    /// from FILES.md §3 — privacy-by-default, with opt-out flags
+    /// for the operator who knows what they're doing.
+    SendFile {
+        group_id_b32: String,
+        path: String,
+        keep_filename: bool,
+        keep_metadata: bool,
+        /// 0 = path field, 1 = keep_filename toggle,
+        /// 2 = keep_metadata toggle.
         focus: usize,
     },
 }
@@ -254,6 +280,7 @@ impl AppState {
             unread: HashMap::new(),
             last_activity_ms: HashMap::new(),
             modal: None,
+            seen_files: HashSet::new(),
         }
     }
 
@@ -559,6 +586,26 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             }
             return false;
         }
+        // T-files.e: Ctrl-F opens the send-file modal. Same
+        // selection gate as Ctrl-I — files only flow into rooms
+        // today (DM file sending is documented out of scope in
+        // FILES.md §7). Defaults match daemon defaults: strip
+        // metadata + replace filename. The operator can flip
+        // both toggles in the modal.
+        (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => {
+            if let Some(SelectedEntry::Room(r)) = app.selected_entry() {
+                app.modal = Some(ModalState::SendFile {
+                    group_id_b32: r.group_id_b32.clone(),
+                    path: String::new(),
+                    keep_filename: false,
+                    keep_metadata: false,
+                    focus: 0,
+                });
+            } else {
+                app.last_send_result = Some(Err("send-file needs a room selected".to_string()));
+            }
+            return false;
+        }
         (KeyCode::Esc, _) => return true,
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return true,
         (KeyCode::Up, _) => app.move_selection(-1),
@@ -697,6 +744,49 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
         (ModalState::InvitePeer { .. }, KeyCode::Enter) => {
             submit_intent = Some(modal.clone());
         }
+        // T-files.e SendFile arms: Tab cycles (path → keep_filename
+        // → keep_metadata → path), Space toggles the focused
+        // checkbox, Char appends to path, Backspace pops from
+        // path, Enter submits.
+        (ModalState::SendFile { focus, .. }, KeyCode::Tab) => {
+            *focus = (*focus + 1) % 3;
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::SendFile {
+                keep_filename,
+                keep_metadata,
+                focus,
+                ..
+            },
+            KeyCode::Char(' '),
+        ) if *focus != 0 => {
+            if *focus == 1 {
+                *keep_filename = !*keep_filename;
+            } else {
+                *keep_metadata = !*keep_metadata;
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::SendFile { path, focus, .. }, KeyCode::Backspace) if *focus == 0 => {
+            path.pop();
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::SendFile { path, focus, .. }, KeyCode::Char(c)) if *focus == 0 => {
+            path.push(c);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::SendFile { path, .. }, KeyCode::Enter) => {
+            if path.trim().is_empty() {
+                app.modal = Some(modal);
+                return;
+            }
+            submit_intent = Some(modal.clone());
+        }
         _ => {
             app.modal = Some(modal);
             return;
@@ -718,6 +808,22 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 peer_kem_pub_b32: kem_pub_b32,
                 peer_kp_b64: kp_b64,
             }),
+            // T-files.e: SendFile dispatches to the same daemon
+            // handler the CLI calls (`onyx room send-file`). The
+            // modal trims the path so trailing whitespace from
+            // paste-into-terminal doesn't blow up open().
+            ModalState::SendFile {
+                group_id_b32,
+                path,
+                keep_filename,
+                keep_metadata,
+                ..
+            } => Some(ApiRequest::SendFileToRoom {
+                group_id_b32,
+                path: path.trim().to_string(),
+                keep_filename,
+                keep_metadata,
+            }),
         };
         if let Some(req) = req {
             match client::one_shot(&app.socket_path, &req).await {
@@ -728,6 +834,53 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 Ok(ApiResponse::InviteToRoomOk { members, .. }) => {
                     app.last_send_result = Some(Ok(()));
                     tracing::info!(roster = members.len(), "invited via TUI modal");
+                }
+                Ok(ApiResponse::SendFileToRoomOk {
+                    group_id_b32,
+                    file_id_b32,
+                    size,
+                    mime,
+                    stripped_metadata,
+                    chunks,
+                    delivered_to_direct,
+                    delivered_to_hub,
+                    skipped_no_kem,
+                    total_members,
+                }) => {
+                    // T-files.e: surface delivery counts the same
+                    // way SendRoomOk does. Also append a local
+                    // "you sent <file>" line so the operator sees
+                    // their own upload in the scrollback (the
+                    // daemon does NOT echo outgoing files back as
+                    // events — same rationale as SendRoomOk).
+                    let key = format!("room/{}", short_id(&group_id_b32));
+                    let now = now_unix_ms();
+                    let label = format!(
+                        "📎 sent {} ({} bytes, {}, {} chunks{})",
+                        short_id(&file_id_b32),
+                        size,
+                        mime,
+                        chunks,
+                        if stripped_metadata { ", stripped" } else { "" }
+                    );
+                    app.scrollback
+                        .entry(key.clone())
+                        .or_default()
+                        .push(ChatLine {
+                            direction: MessageDirection::Outgoing,
+                            text: label,
+                            ts_unix_ms: now,
+                            via_hub: false,
+                        });
+                    app.last_activity_ms.insert(key, now);
+                    app.last_send_result = Some(Ok(()));
+                    tracing::info!(
+                        delivered_to_direct,
+                        delivered_to_hub,
+                        skipped_no_kem,
+                        total_members,
+                        "file send delivery counts"
+                    );
                 }
                 Ok(ApiResponse::Error { message, .. }) => {
                     app.last_send_result = Some(Err(message));
@@ -927,6 +1080,91 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
         }
         // Any non-Ok or non-HistoryOk: leave unbackfilled, retry next tick.
     }
+
+    // T-files.e: poll for received files on every room we know
+    // about. Cheap (one round-trip per room) and bounded by room
+    // count, which is small. `seen_files` dedupes across ticks
+    // so an already-rendered attachment doesn't get re-added on
+    // every refresh.
+    //
+    // Why per-room and not a single global list: scrollback is
+    // per-conversation; we need to know which key to push the
+    // line into. The daemon's `ListReceivedFiles` is already
+    // scoped that way (`conversation` is the request key).
+    let room_keys: Vec<(String, String)> = app
+        .rooms
+        .iter()
+        .map(|r| {
+            (
+                r.group_id_b32.clone(),
+                format!("room/{}", short_id(&r.group_id_b32)),
+            )
+        })
+        .collect();
+    for (_gid_b32, conv_key) in room_keys {
+        let req = ApiRequest::ListReceivedFiles {
+            conversation: conv_key.clone(),
+            limit: 200,
+        };
+        if let Ok(ApiResponse::ListReceivedFilesOk { files, .. }) =
+            client::one_shot(socket, &req).await
+        {
+            apply_received_files(app, &conv_key, files);
+        }
+    }
+}
+
+/// T-files.e: merge the daemon's per-room file list into the
+/// scrollback as `📎 received NAME (size, mime) → PATH` lines.
+/// Dedupes against `app.seen_files` (the file-id b32, BLAKE2b-256
+/// content hash) so the periodic poll only adds each file once.
+/// Lines are inserted in ts order; existing live lines retain
+/// their position — `received_at_ms` from the manifest is the
+/// timestamp.
+fn apply_received_files(
+    app: &mut AppState,
+    conv_key: &str,
+    files: Vec<onyx_core::api::ReceivedFileInfo>,
+) {
+    if files.is_empty() {
+        return;
+    }
+    let mut additions: Vec<ChatLine> = Vec::new();
+    for f in files {
+        if !app.seen_files.insert(f.content_hash_b32.clone()) {
+            continue;
+        }
+        let label = format!(
+            "📎 received {} ({} bytes, {}) → {}",
+            f.name, f.size, f.mime, f.path
+        );
+        additions.push(ChatLine {
+            direction: MessageDirection::Incoming,
+            text: label,
+            ts_unix_ms: f.received_at_ms,
+            via_hub: false,
+        });
+        // T-polish.5: count new files toward unread when they're
+        // not in the active selection.
+        let active_key = app
+            .selected_entry()
+            .map(|e| e.scrollback_key())
+            .unwrap_or_default();
+        if active_key != conv_key {
+            *app.unread.entry(conv_key.to_string()).or_insert(0) += 1;
+        }
+        let prev = app.last_activity_ms.get(conv_key).copied().unwrap_or(0);
+        if f.received_at_ms > prev {
+            app.last_activity_ms
+                .insert(conv_key.to_string(), f.received_at_ms);
+        }
+    }
+    if additions.is_empty() {
+        return;
+    }
+    let entry = app.scrollback.entry(conv_key.to_string()).or_default();
+    entry.extend(additions);
+    entry.sort_by_key(|l| l.ts_unix_ms);
 }
 
 /// Merge `messages` (oldest → newest) into the front of the scrollback
@@ -1063,12 +1301,18 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 }
 
 /// T-polish.6: render the active modal as a centered overlay.
+// Three variants × ~40 lines each puts the total over the 100-line
+// clippy default. Each variant block is self-contained (different
+// fields, different layouts) so splitting into helpers would just
+// chase the line count around without improving readability.
+#[allow(clippy::too_many_lines)]
 fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) {
     // Compute a centered region. Width = min(76, area.width - 4).
     let width = area.width.saturating_sub(4).min(76);
     let height = match modal {
         ModalState::CreateRoom { .. } => 7,
         ModalState::InvitePeer { .. } => 17,
+        ModalState::SendFile { .. } => 13,
     };
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -1150,6 +1394,87 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
                 )),
                 Line::from(Span::styled(
                     " Get KP via `onyx fetch-keypackage --peer-fingerprint X`.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+        ModalState::SendFile {
+            group_id_b32,
+            path,
+            keep_filename,
+            keep_metadata,
+            focus,
+        } => {
+            // T-files.e: send-file modal. Three rows. Path is a
+            // free-form line; the two toggles are rendered as
+            // [x]/[ ] checkboxes. Hint at the bottom reminds the
+            // operator what defaults-off means (FILES.md §3).
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Send File  (Tab=cycle, Space=toggle, Esc=cancel, Enter=send) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let sending_to = format!(" → room/{} ", short_id(group_id_b32));
+            let path_focused = *focus == 0;
+            let path_line = Line::from(vec![
+                Span::styled(
+                    if path_focused {
+                        "▶ Path: "
+                    } else {
+                        "  Path: "
+                    },
+                    Style::default().fg(if path_focused {
+                        Color::Yellow
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+                Span::styled(
+                    truncate_for_display(path, 60),
+                    Style::default().fg(Color::White),
+                ),
+                if path_focused {
+                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK))
+                } else {
+                    Span::raw("")
+                },
+            ]);
+            let mk_toggle = |label: &str, val: bool, idx: usize| -> Line<'_> {
+                let focused = *focus == idx;
+                let box_glyph = if val { "[x]" } else { "[ ]" };
+                Line::from(vec![
+                    Span::styled(
+                        if focused { "▶ " } else { "  " },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{box_glyph} {label}"),
+                        Style::default().fg(if focused { Color::Yellow } else { Color::White }),
+                    ),
+                ])
+            };
+            let body = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    sending_to,
+                    Style::default().fg(Color::Magenta),
+                )),
+                Line::from(""),
+                path_line,
+                Line::from(""),
+                mk_toggle(
+                    "Keep original filename (otherwise random)",
+                    *keep_filename,
+                    1,
+                ),
+                mk_toggle("Keep metadata (no EXIF/etc. strip)", *keep_metadata, 2),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Default: strip metadata + random filename (privacy first).",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    " Sender-side size cap applies — see FILES.md §4.",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -1725,6 +2050,57 @@ mod snapshot_tests {
         // Entry exists (so we won't keep retrying) but is empty.
         let s = app.scrollback.get("fresh").unwrap();
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn apply_received_files_dedupes_across_polls_and_orders_by_ts() {
+        // T-files.e: the periodic ListReceivedFiles poll must add
+        // each file exactly once even when it appears in every
+        // tick's response. Also: additions sort into the existing
+        // scrollback by ts_unix_ms so a later-discovered older
+        // file doesn't jump to the bottom.
+        let mut app = mock_app_with_status(TorState::Ready);
+        // Pretend there's already a live text message in the room
+        // at ts=2000.
+        let conv = "room/abcdefgh";
+        app.scrollback.insert(
+            conv.into(),
+            vec![ChatLine {
+                direction: MessageDirection::Outgoing,
+                text: "hi".into(),
+                ts_unix_ms: 2_000,
+                via_hub: false,
+            }],
+        );
+        let f1 = onyx_core::api::ReceivedFileInfo {
+            sender_fp: "(peer)".into(),
+            name: "early.txt".into(),
+            mime: "text/plain".into(),
+            size: 4,
+            content_hash_b32: "HASH-A".into(),
+            path: "/tmp/a".into(),
+            received_at_ms: 1_000,
+        };
+        let f2 = onyx_core::api::ReceivedFileInfo {
+            sender_fp: "(peer)".into(),
+            name: "late.txt".into(),
+            mime: "text/plain".into(),
+            size: 4,
+            content_hash_b32: "HASH-B".into(),
+            path: "/tmp/b".into(),
+            received_at_ms: 3_000,
+        };
+        apply_received_files(&mut app, conv, vec![f1.clone(), f2.clone()]);
+        let entries = app.scrollback.get(conv).unwrap();
+        // Order: early.txt (1000), hi (2000), late.txt (3000).
+        let texts: Vec<&str> = entries.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts.len(), 3);
+        assert!(texts[0].starts_with("📎 received early.txt"));
+        assert_eq!(texts[1], "hi");
+        assert!(texts[2].starts_with("📎 received late.txt"));
+        // Second tick with same files: must not double-add.
+        apply_received_files(&mut app, conv, vec![f1, f2]);
+        assert_eq!(app.scrollback.get(conv).unwrap().len(), 3);
     }
 
     #[test]

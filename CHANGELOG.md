@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-files.e: TUI file-picker modal + inline attachment rendering (last T-files slice)
+
+Final T-files slice. The operator no longer needs to drop to a shell to share a file in a room — `Ctrl-F` from the TUI opens a modal that wraps the same `ApiRequest::SendFileToRoom` path the CLI uses. Incoming files render inline in the room's scrollback as `📎 received <name> (<size> bytes, <mime>) → <path>`, sorted by timestamp.
+
+What landed:
+
+  * **`Ctrl-F`** key binding opens **`ModalState::SendFile`**. Same selection gate as `Ctrl-I` — refuses when the selected entry isn't a room ("send-file needs a room selected"). Defaults to strip-metadata-on, random-filename-on; the operator can flip either with `Tab` + `Space` in the modal.
+  * **Modal layout** (3 rows): path input, `[ ] Keep original filename`, `[ ] Keep metadata`. `Tab` cycles focus; `Space` toggles the focused checkbox when not on the path field; `Enter` submits; `Esc` cancels. Same widget pattern as the existing CreateRoom / InvitePeer modals.
+  * **`SendFileToRoomOk` response handler** in the TUI: pushes a local `📎 sent <id> (<size> bytes, <mime>, N chunks, stripped)` ChatLine into the room's scrollback so the operator sees their own upload land. Same rationale as `SendRoomOk` — the daemon does not echo room sends as outgoing events.
+  * **Periodic `ListReceivedFiles` poll** on every room, fired from the 2-second status tick. Cheap (O(rooms) round-trips per tick); dedupes via the new **`AppState::seen_files`** set keyed on the BLAKE2b-256 content hash, so an already-rendered file doesn't re-appear on the next tick.
+  * **`apply_received_files`** helper merges the daemon's per-room file list into the scrollback as ChatLines, sorts by `ts_unix_ms` so a later-discovered older file slots into the correct chronological position, and bumps `unread` + `last_activity_ms` so unseen-room attachments surface in the badge/sort the same way unseen messages do (T-polish.5 surface, reused).
+  * **Help banner** updated: `Ctrl-F` and the in-modal `Space` toggle are now documented.
+  * **Unit test** `apply_received_files_dedupes_across_polls_and_orders_by_ts` — proves (a) ordering across a pre-existing live message, (b) deduplication across repeated polls. 447 passing (+1).
+
+What's intentionally NOT in this slice:
+
+  * **Progress reporting for in-flight transfers**. Today multi-MB files block the modal-submit path until all chunks have been fanned out. A streamed "X of N chunks delivered" indicator needs a different API shape (event stream vs. one-shot reply) and is deferred. Acceptable for now: a typical 200 KB file fans out in ~100ms; a 4 MB file in ~3s; the operator sees the "📎 sent …" line when it completes.
+  * **File-picker file-system browser**. The modal accepts a raw path. A `fzf`-style directory walker is nicer UX but expands scope significantly; deferred.
+  * **DM file sending from the TUI**. The modal refuses when a peer (not a room) is selected, mirroring the daemon's room-only file scope (FILES.md §7).
+
+This closes T-files. Operators can now:
+  * Send files via CLI: `onyx room send-file --group-id X --path Y`
+  * Send files via TUI: `Ctrl-F`
+  * Receive files automatically via either the CLI (`onyx files list`) or the TUI (inline 📎 lines)
+  * Trust that EXIF / metadata is stripped by default
+  * Trust that the BLAKE2b-256 content hash is verified end-to-end (T-files.b)
+
+Gate: fmt ✓, clippy `-D warnings` ✓, `cargo test --workspace` → **447 passed** (+1 from 446).
+
+Status of T-files slices: ✅ a, ✅ b, ✅ c, ✅ d, ✅ e. T-files **complete**.
+
+---
+
 ## 2026-05-19 — T-files.d: CLI verbs (`onyx room send-file`, `onyx files list`) + end-to-end smoke
 
 Fourth of five T-files slices. The wire + persistence layer (T-files.b) and the metadata-strip layer (T-files.c) are now reachable from the CLI: `onyx room send-file --group-id X --path photo.jpg` sanitizes + chunks + fans out; `onyx files list --conversation room/<short>` enumerates received files.
