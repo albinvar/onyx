@@ -134,6 +134,17 @@ pub fn session_token(group_secret: &[u8; 32], index: u64) -> RoutingId {
 /// does not arrange that; `MlsWelcome` does. The TUI renders the
 /// `[hub]` badge on every `via_hub` message; future polish (T6.x)
 /// may differentiate `msg/v1` vs `mls/v1` more loudly.
+/// One entry of [`BootstrapPayload::MlsWelcome::member_kems`]
+/// (T6.3.h). Plain struct — both fields are public protocol values.
+/// `fingerprint` is the same base32-grouped form printed by `onyx
+/// identity`; `kem_pub` is the raw bytes of a hybrid X25519 +
+/// ML-KEM-768 public key (1216 bytes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomMemberKem {
+    pub fingerprint: String,
+    pub kem_pub: ByteBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "v")]
 pub enum BootstrapPayload {
@@ -185,6 +196,32 @@ pub enum BootstrapPayload {
         /// joined `MlsGroupState`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room_name: Option<String>,
+        /// Optional roster of current room members' (fingerprint,
+        /// hybrid KEM pub) pairs (T6.3.h). When present, the
+        /// recipient persists each pair to
+        /// `Vault::save_room_member_kem` on join so they can
+        /// hub-fallback to any current member, not just the inviter
+        /// — closes the structural gap noted in T6.3.e's CHANGELOG.
+        ///
+        /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]`
+        /// for back-compat: pre-T6.3.h Welcomes (which lack the
+        /// field) decode cleanly, and an empty roster (e.g. self-
+        /// invite, never expected to actually happen) round-trips
+        /// byte-identically to the pre-T6.3.h form. Sender includes
+        /// every current member — including themselves — so a fresh
+        /// joiner has the full hub-fallback graph.
+        ///
+        /// **Security note.** The roster is covered by the outer
+        /// sealed-sender Ed25519 signature alongside `welcome` and
+        /// `room_name`, so a hostile hub cannot tamper. The inviter
+        /// is trusted to be honest about the roster — a malicious
+        /// inviter could omit a member's KEM or substitute an
+        /// attacker's KEM under a member's fingerprint, but the
+        /// worst-case outcome is "hub-fallback messages to that
+        /// member don't decrypt." Same trust scope as any room
+        /// member: see [`crate::room::RoomAppMessage::KemAdvertisement`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        member_kems: Vec<RoomMemberKem>,
     },
     /// "mlsapp/v1" (T6.3.e) — already-encrypted MLS application
     /// message routed via the hub. Wraps a single ciphertext
@@ -574,6 +611,7 @@ mod tests {
             welcome: ByteBuf::from(b"opaque-mls-welcome-bytes-from-rfc9420".to_vec()),
             first_message: None,
             room_name: None,
+            member_kems: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -586,6 +624,7 @@ mod tests {
             welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
             first_message: Some("hi from the invite URL".to_string()),
             room_name: None,
+            member_kems: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -599,10 +638,53 @@ mod tests {
             welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
             first_message: None,
             room_name: Some("#general".to_string()),
+            member_kems: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
         assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_round_trip_mls_welcome_with_member_kems() {
+        // T6.3.h: member_kems must round-trip alongside the Welcome.
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
+            first_message: None,
+            room_name: Some("#general".to_string()),
+            member_kems: vec![
+                RoomMemberKem {
+                    fingerprint: "fp_alice".into(),
+                    kem_pub: ByteBuf::from(vec![0xA1u8; 1216]),
+                },
+                RoomMemberKem {
+                    fingerprint: "fp_bob".into(),
+                    kem_pub: ByteBuf::from(vec![0xB2u8; 1216]),
+                },
+            ],
+        };
+        let bytes = p.to_cbor().expect("encode");
+        let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_mls_welcome_omits_member_kems_field_when_empty() {
+        // Wire back-compat (T6.3.h): an empty member_kems must NOT
+        // be emitted so pre-T6.3.h daemons that lack the field
+        // entirely round-trip byte-identically to what they'd emit.
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"w".to_vec()),
+            first_message: None,
+            room_name: None,
+            member_kems: vec![],
+        };
+        let bytes = p.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("member_kems"),
+            "member_kems must be skipped from the wire when empty; got {bytes:?}"
+        );
     }
 
     #[test]
@@ -616,6 +698,7 @@ mod tests {
             welcome: ByteBuf::from(b"w".to_vec()),
             first_message: None,
             room_name: None,
+            member_kems: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -635,6 +718,7 @@ mod tests {
             welcome: ByteBuf::from(b"w".to_vec()),
             first_message: None,
             room_name: None,
+            member_kems: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -650,6 +734,7 @@ mod tests {
             welcome: ByteBuf::from(b"w".to_vec()),
             first_message: None,
             room_name: None,
+            member_kems: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -713,6 +798,7 @@ mod tests {
             welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
             first_message: None,
             room_name: None,
+            member_kems: vec![],
         };
         let payload_bytes = payload.to_cbor().unwrap();
 

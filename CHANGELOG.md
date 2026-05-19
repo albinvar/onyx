@@ -6,6 +6,51 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.h: KEM-pub exchange + structured room plaintext + 3-party commit-distribution bugfix
+
+Sixth — and largest — T6.3 slice. Closes three issues left open by T6.3.b–e:
+
+  1. **Bugfix**: `MlsGroupState::invite` was discarding the commit it produced. For 2-party rooms this works (the second member learns everything from the Welcome alone) but for 3+-party rooms the existing members silently never advance past the inviter's first add — their MLS ratchet stays at epoch N while the inviter advances to N+1, and every subsequent room message fails to decrypt on the existing-member side. Pre-T6.3.h, no test exercised the 3-party path. This slice fixes the cause, distributes the commit to existing members on the wire, and adds a regression test.
+  2. **KEM-pub exchange**: pre-T6.3.h, only the *inviter* had cached KEM pubs for room members. Bob (joined via alice's Welcome) could hub-fallback to alice but not to carol. Now alice ships every current member's KEM in the Welcome roster, and the post-invite KEM-advertisement broadcast tells existing members about new joiners — closes the structural gap.
+  3. **Structured room plaintext**: T6.3.d shipped raw UTF-8 as the room app-message plaintext. T6.3.h's KEM advertisement needs a structured plaintext to carry both chat text AND non-chat metadata. Introduces `RoomAppMessage::{Text, KemAdvertisement}` as a CBOR-tagged enum — forward-compatible with future variants (typing, presence, room metadata) without coordinated upgrades.
+
+What landed:
+
+  * **`onyx-core::room` module** — new. `RoomAppMessage::{Text, KemAdvertisement}` with CBOR tagged-enum encoding (`#[serde(tag = "kind")]`). 6 unit tests covering round-trip, kind-tag, garbage-rejection, unknown-tag-rejection.
+  * **`MlsGroupState::invite`** signature change: `fn invite(...) -> Result<Vec<u8>>` → `fn invite(...) -> Result<(Vec<u8>, Vec<u8>)>` (commit_bytes, welcome_bytes). All 6 callers updated (1 production in `flows.rs`, 1 production in `api_server.rs::handle_invite_to_room`, 1 production in `api_server.rs::handle_send_bootstrap_mls`, 4 test sites in `mls.rs`). The 2-party DM bootstrap path discards the commit explicitly with `_commit_unused` and an inline comment explaining why. The room-invite path distributes it.
+  * **`MlsGroupState::process_incoming`** — new. Replaces the `decrypt_application` call on the room recipient path. Returns `IncomingRoomMessage::{Application(Vec<u8>), Commit}` so callers see both cases. `Commit` is auto-merged into the group state internally (no separate `merge_commit` step required from the caller). `decrypt_application` retained for the DM path (which never carries commits).
+  * **`BootstrapPayload::MlsWelcome::member_kems`** — new `Vec<RoomMemberKem>` field with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` for wire back-compat. Sender includes every known room-member (fingerprint, kem_pub) pair; recipient persists each to `room_member_kems` on join. New `RoomMemberKem` struct alongside. 2 new round-trip tests (with-roster + empty-omits).
+  * **Daemon — sender side** (`handle_invite_to_room`):
+    1. Captures the pre-invite roster (`members_before`) so we know who needs the commit.
+    2. After `invite()` succeeds, runs the existing Welcome fan-out (unchanged).
+    3. Fans out the commit to every pre-existing member (excluding ourselves + the new joiner) via the new `fanout_room_mls_bytes` helper — direct-or-hub fallback identical to room-message fan-out.
+    4. Encrypts a `RoomAppMessage::KemAdvertisement { fingerprint: new_invitee_fp, kem_pub: their_kem }` at the new epoch and fans it out the same way. Existing members process commit → advance epoch → process KEM-ad → persist new member's KEM.
+    5. Builds the Welcome's `member_kems` roster from our cached KEMs (we have ourselves always; existing members from `room_member_kems`; the new invitee from the API args).
+  * **Daemon — sender** (`handle_send_room`): wraps the plaintext text in `RoomAppMessage::Text` before MLS encryption — uses the structured plaintext path everywhere.
+  * **Daemon — recipient side** (`handle_room_app_frame` rewritten):
+    1. Calls `process_incoming` instead of `decrypt_application`.
+    2. Snapshots MLS state regardless of whether the message was an Application or a Commit (both mutate the ratchet).
+    3. On Commit: calls `refresh_room_roster_after_commit` helper to rebuild the `rooms.members_b32` cache from the post-merge group; logs `mls_epoch = ...` so an operator can see the advance.
+    4. On Application: decodes the plaintext as `RoomAppMessage`. `Text` → existing `push_room_message` path (unchanged). `KemAdvertisement` → persist via `vault.save_room_member_kem`.
+  * **Daemon — Welcome receive** (`process_hub_mls_welcome` extended): when `member_kems` is non-empty, persist each entry to `room_member_kems` *before* the existing `process_room_welcome` path so the new joiner has the full hub-fallback graph on first contact.
+  * **Refactor**: `fanout_room_mls_bytes` helper extracted from `handle_send_room`'s body so the post-invite commit + KEM-ad broadcasts can reuse the direct-or-hub fan-out logic without copy-paste. `refresh_room_roster_after_commit` extracted from `handle_room_app_frame` for clippy `too_many_lines`.
+
+Design notes:
+
+  * **Why the commit-discard wasn't caught earlier**. No existing test exercised a 3-party room. T6.3.b–e all built on top of `invite()`'s 2-party semantics, and the 2-party tests pass cleanly because the new member bootstraps from the Welcome at the new epoch. The test added in this slice (`three_party_room_commit_distribution`) pins the post-fix behaviour: alice invites bob (solo→2), then alice invites carol (2→3); bob processes the commit and advances to epoch 2; alice then sends an app message that both bob AND carol decrypt successfully. Pre-fix, bob would fail at decrypt.
+  * **Ordering**: existing members receive (commit, KEM-ad) in that order via the same per-member FIFO channel — they process commit (advances epoch N→N+1), then KEM-ad (encrypted at N+1, which they're now at). For the hub path, commits + KEM-ads go through `BootstrapPayload::MlsApp` (the same envelope T6.3.e introduced for room app messages); recipient `process_incoming` discriminates internally. Per-hub TCP FIFO + EnvelopeReplayGuard dedup preserves order.
+  * **KEM advertisement authenticity**. The ad is MLS-encrypted in the room group's epoch, so only a current member could have produced it. A malicious member *could* announce a wrong KEM under another member's fingerprint, but the worst-case outcome is "hub-fallback messages to that victim don't decrypt on the victim's side" — the victim's MLS state stays intact, and a malicious member could already silently drop messages or commit a malicious epoch. Not a trust-boundary expansion.
+  * **Why `process_incoming` over an `is_commit: bool` discriminator on `decrypt_application`**. The Commit branch needs to *merge* the staged commit internally before returning — that's a side effect of decryption-as-processing, not something the caller can do separately. Returning an enum makes the side effect explicit at the type level.
+  * **`fanout_room_mls_bytes` deliberately doesn't return delivery stats**. The commit/KEM-ad broadcasts are best-effort by design — if any individual member can't be reached (no direct session AND no cached KEM), the operator will see that as a missed-message symptom later, not as a per-call error. Stats matter for `handle_send_room`'s user-facing response, not for behind-the-scenes broadcasts.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **352 passed** (+9 new from 343: 6 `RoomAppMessage` + 2 `MlsWelcome.member_kems` + 1 `three_party_room_commit_distribution`).
+
+End-to-end smoke (still deferred to operator-on-real-Tor): now that the 3-party path is correct, the operator smoke described in T6.3.f.1's CHANGELOG should work for N≥3 too — alice can invite bob, then invite carol; both should be able to receive alice's `room send`. Carol can `room send` and both alice + bob should decrypt; same for bob.
+
+Next: T6.3.g (per-epoch session tokens) or T6.3.f.2 (TUI room pane). Operator preference dictates next pick.
+
+---
+
 ## 2026-05-19 — T6.3.f.1: `onyx room` CLI verbs (create / list / invite / send)
 
 Fifth code slice of T6.3 — adds the user-facing CLI surface so the wired-up multi-party-room plumbing is actually callable from the terminal. Pure dispatcher code; no new daemon behaviour.

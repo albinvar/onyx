@@ -611,9 +611,12 @@ async fn handle_invite_to_room(
         };
     };
 
-    // 4. Load the group, invite the peer, extract the Welcome bytes,
-    //    snapshot updated MLS state.
-    let (welcome_bytes, snapshot, refreshed_members_b32) = {
+    // 4. Load the group, invite the peer, extract BOTH the commit
+    //    (for existing members) and Welcome (for the new member)
+    //    bytes (T6.3.h: pre-T6.3.h discarded the commit and silently
+    //    broke 3+-party rooms). Existing-member commit distribution
+    //    happens in step 9 below.
+    let (commit_bytes, welcome_bytes, snapshot, refreshed_members_b32, members_before) = {
         let party = state.mls_party.lock().await;
         let mut group = match party.load_group(&group_id_bytes) {
             Ok(Some(g)) => g,
@@ -630,7 +633,12 @@ async fn handle_invite_to_room(
                 };
             }
         };
-        let Ok(welcome) = group.invite(&party, &kp_bytes) else {
+        // Capture the pre-invite roster — these are the members who
+        // need the commit (the new joiner doesn't, they bootstrap
+        // from the Welcome). We pull this BEFORE invite() so the
+        // list doesn't include the new member.
+        let members_before = crate::members_b32_from_group(&group);
+        let Ok((commit, welcome)) = group.invite(&party, &kp_bytes) else {
             return ApiResponse::Error {
                 code: ApiErrorCode::Internal,
                 message: "invite failed".into(),
@@ -646,7 +654,7 @@ async fn handle_invite_to_room(
         // the recipient uses on join — keeps the cache shape
         // symmetric.
         let members = crate::members_b32_from_group(&group);
-        (welcome, snap, members)
+        (commit, welcome, snap, members, members_before)
     };
 
     // 5. Persist post-invite MLS state and refresh the cached
@@ -691,12 +699,52 @@ async fn handle_invite_to_room(
         }
     }
 
-    // 6. Seal the Welcome with room_name = Some(room.name) so the
+    // 6. Build the current-roster KEM list (T6.3.h). Includes
+    //    ourselves (always known), every existing member whose KEM
+    //    we have cached, and the new invitee (we just decoded
+    //    their KEM from the API args). The new joiner persists each
+    //    entry on receive so they can hub-fallback to any member
+    //    — closes the structural gap noted in T6.3.e's CHANGELOG.
+    let our_fp = state.identity.fingerprint().to_string();
+    let member_kems = {
+        let mut out = Vec::new();
+        out.push(onyx_core::routing::RoomMemberKem {
+            fingerprint: our_fp.clone(),
+            kem_pub: serde_bytes::ByteBuf::from(state.identity.kem_public().to_bytes()),
+        });
+        let vault = state.vault.lock().await;
+        for fp in refreshed_members_b32
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter(|s| *s != our_fp && *s != peer_fingerprint)
+        {
+            if let Ok(Some(kem)) =
+                vault.lookup_room_member_kem(state.identity_id, &group_id_bytes, fp)
+            {
+                out.push(onyx_core::routing::RoomMemberKem {
+                    fingerprint: fp.to_string(),
+                    kem_pub: serde_bytes::ByteBuf::from(kem),
+                });
+            }
+        }
+        // Always include the new invitee — we have their KEM
+        // from the API args, so refusing to include it would just
+        // make the joiner unable to fallback to themselves
+        // (harmless but messy).
+        out.push(onyx_core::routing::RoomMemberKem {
+            fingerprint: peer_fingerprint.to_string(),
+            kem_pub: serde_bytes::ByteBuf::from(kem_pub_bytes.clone()),
+        });
+        out
+    };
+
+    // 7. Seal the Welcome with room_name = Some(room.name) so the
     //    recipient knows this is a room invite, not a DM bootstrap.
     let payload = onyx_core::routing::BootstrapPayload::MlsWelcome {
         welcome: serde_bytes::ByteBuf::from(welcome_bytes),
         first_message: None,
         room_name: Some(room.name.clone()),
+        member_kems,
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {
@@ -736,28 +784,196 @@ async fn handle_invite_to_room(
             }
         }
     }
-    if accepted > 0 {
-        tracing::info!(
-            op = "invite_to_room",
-            accepted,
-            total = state.hub_outbounds.len(),
-            "hub fan-out"
-        );
-        let members = refreshed_members_b32
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        ApiResponse::InviteToRoomOk {
-            group_id_b32: encode_b32(&group_id_bytes),
-            members,
-        }
-    } else {
-        ApiResponse::Error {
+    if accepted == 0 {
+        return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
             message: last_err.unwrap_or_else(|| "no hub accepted the Welcome envelope".into()),
+        };
+    }
+    tracing::info!(
+        op = "invite_to_room",
+        accepted,
+        total = state.hub_outbounds.len(),
+        "Welcome hub fan-out"
+    );
+
+    // 9. T6.3.h: distribute the commit to every existing member (the
+    //    members that were in the group BEFORE this invite). Without
+    //    this, their MLS state stays at the old epoch and they
+    //    silently stop being able to decrypt room messages. The new
+    //    invitee does NOT need the commit — they bootstrap from the
+    //    Welcome at the new epoch.
+    let pre_existing_members: Vec<String> = members_before
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != our_fp && *s != peer_fingerprint)
+        .map(str::to_owned)
+        .collect();
+    if !pre_existing_members.is_empty() {
+        fanout_room_mls_bytes(
+            &group_id_bytes,
+            &commit_bytes,
+            &pre_existing_members,
+            state,
+            "commit",
+        )
+        .await;
+    }
+
+    // 10. T6.3.h: broadcast a KEM advertisement for the new member to
+    //     existing members so they can hub-fallback to the new member
+    //     when they're offline. Wraps in RoomAppMessage::KemAdvertisement,
+    //     encrypts at the new epoch (which existing members will be at
+    //     once they process the commit above), fans out via the same
+    //     direct-or-hub path. Both messages travel via the same per-
+    //     member channel (FIFO), so existing members process commit
+    //     first → KEM-ad second; epoch ordering is preserved.
+    if !pre_existing_members.is_empty() {
+        let ad = onyx_core::room::RoomAppMessage::KemAdvertisement {
+            fingerprint: peer_fingerprint.to_string(),
+            kem_pub: serde_bytes::ByteBuf::from(kem_pub_bytes.clone()),
+        };
+        if let Ok(ad_plaintext) = ad.to_cbor() {
+            let ad_ciphertext_opt = {
+                let party = state.mls_party.lock().await;
+                match party.load_group(&group_id_bytes) {
+                    Ok(Some(mut g)) => g.encrypt_application(&party, &ad_plaintext).ok(),
+                    _ => None,
+                }
+            };
+            if let Some(ad_ciphertext) = ad_ciphertext_opt {
+                // Snapshot the freshly-advanced MLS state.
+                let snap_opt = {
+                    let party = state.mls_party.lock().await;
+                    party.snapshot_state().ok()
+                };
+                if let Some(snap) = snap_opt {
+                    let vault = state.vault.lock().await;
+                    let _ = vault.save_mls_state(state.identity_id, &snap);
+                }
+                fanout_room_mls_bytes(
+                    &group_id_bytes,
+                    &ad_ciphertext,
+                    &pre_existing_members,
+                    state,
+                    "kem-ad",
+                )
+                .await;
+            }
         }
     }
+
+    let members = refreshed_members_b32
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ApiResponse::InviteToRoomOk {
+        group_id_b32: encode_b32(&group_id_bytes),
+        members,
+    }
+}
+
+/// T6.3.h fan-out helper. Pushes a pre-built MLS message
+/// (commit or application-tier ciphertext) to every named member
+/// over their direct Noise session if one is live, otherwise seals
+/// it as a `BootstrapPayload::MlsApp` envelope and ships via the
+/// hub. Same direct-or-hub fan-out logic as `handle_send_room`,
+/// extracted so the post-invite commit + KEM-ad broadcasts can
+/// reuse it without copy-paste.
+///
+/// `op_label` shows up in the tracing log line for observability —
+/// e.g. "commit" vs "kem-ad" vs (in send_room) "app".
+async fn fanout_room_mls_bytes(
+    group_id_bytes: &[u8],
+    mls_bytes: &[u8],
+    members: &[String],
+    state: &DaemonState,
+    op_label: &'static str,
+) {
+    let mut delivered_direct: u32 = 0;
+    let mut delivered_hub: u32 = 0;
+    let mut skipped_no_kem: u32 = 0;
+    let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
+        let reg = state.conversations.lock().await;
+        members
+            .iter()
+            .map(|fp| (fp.clone(), reg.handle_for_fingerprint(fp)))
+            .collect()
+    };
+    for (fp, maybe_handle) in direct_targets {
+        if let Some(handle) = maybe_handle {
+            if handle
+                .outbound_tx
+                .try_send(crate::conversations::PeerOutbound::RoomFrame(
+                    mls_bytes.to_vec(),
+                ))
+                .is_ok()
+            {
+                delivered_direct += 1;
+                continue;
+            }
+        }
+        // Hub fallback.
+        let kem_bytes_opt = {
+            let vault = state.vault.lock().await;
+            vault
+                .lookup_room_member_kem(state.identity_id, group_id_bytes, &fp)
+                .unwrap_or(None)
+        };
+        let Some(kem_bytes) = kem_bytes_opt else {
+            skipped_no_kem += 1;
+            continue;
+        };
+        let Ok(kem_pub) = onyx_core::crypto::HybridKemPublic::from_bytes(&kem_bytes) else {
+            skipped_no_kem += 1;
+            continue;
+        };
+        let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
+            skipped_no_kem += 1;
+            continue;
+        };
+        let payload = onyx_core::routing::BootstrapPayload::MlsApp {
+            group_id: serde_bytes::ByteBuf::from(group_id_bytes.to_vec()),
+            ciphertext: serde_bytes::ByteBuf::from(mls_bytes.to_vec()),
+        };
+        let Ok(payload_bytes) = payload.to_cbor() else {
+            continue;
+        };
+        let Ok(sealed) = onyx_core::routing::seal_bootstrap(
+            state.identity.signing(),
+            state.identity.identity_key(),
+            &payload_bytes,
+            &kem_pub,
+        ) else {
+            continue;
+        };
+        let target = onyx_core::routing::introduction_inbox(&target_fp_parsed);
+        let mut any_accepted = false;
+        for hub_outbound in &state.hub_outbounds {
+            if hub_outbound
+                .try_send(crate::hub_client::HubOutbound::deliver(
+                    target,
+                    sealed.clone(),
+                ))
+                .is_ok()
+            {
+                any_accepted = true;
+            }
+        }
+        if any_accepted {
+            delivered_hub += 1;
+        }
+    }
+    tracing::info!(
+        op = "room_fanout",
+        op_label,
+        delivered_to_direct = delivered_direct,
+        delivered_to_hub = delivered_hub,
+        skipped_no_kem,
+        total = members.len(),
+        "room: per-member fan-out done"
+    );
 }
 
 /// Send a plaintext message to every member of a room over their
@@ -816,7 +1032,19 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    // 2. Encrypt once in the room's MLS group, snapshot.
+    // 2. Wrap the user-typed text in a structured RoomAppMessage
+    //    (T6.3.h) so the plaintext format is forward-compatible
+    //    with the KEM-advertisement variant. Then encrypt once in
+    //    the room's MLS group, snapshot.
+    let app_msg = onyx_core::room::RoomAppMessage::Text {
+        text: text.to_string(),
+    };
+    let Ok(plaintext_bytes) = app_msg.to_cbor() else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: "RoomAppMessage CBOR encode failed".into(),
+        };
+    };
     let (ciphertext, snapshot) = {
         let party = state.mls_party.lock().await;
         let mut group = match party.load_group(&group_id_bytes) {
@@ -834,7 +1062,7 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
                 };
             }
         };
-        let Ok(ct) = group.encrypt_application(&party, text.as_bytes()) else {
+        let Ok(ct) = group.encrypt_application(&party, &plaintext_bytes) else {
             return ApiResponse::Error {
                 code: ApiErrorCode::Internal,
                 message: "encrypt_application failed".into(),
@@ -1336,7 +1564,11 @@ async fn handle_send_bootstrap_mls(
                 message: "create_group failed".into(),
             };
         };
-        let Ok(welcome) = group.invite(&party, &kp_bytes) else {
+        // T6.3.h: invite now returns (commit, welcome). The DM
+        // bootstrap path (solo → 2-person) has no existing members
+        // to ship the commit to, so we discard it — the recipient
+        // bootstraps from the Welcome at the new epoch.
+        let Ok((_commit_unused, welcome)) = group.invite(&party, &kp_bytes) else {
             return ApiResponse::Error {
                 code: ApiErrorCode::Internal,
                 message: "invite failed".into(),
@@ -1367,6 +1599,8 @@ async fn handle_send_bootstrap_mls(
         // (T6.3.c) and set room_name = Some(name) so the recipient
         // surfaces a `rooms` entry instead of a DM conversation.
         room_name: None,
+        // T6.3.h: not a room, so no member-roster KEM list.
+        member_kems: vec![],
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {

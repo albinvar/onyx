@@ -26,6 +26,7 @@ pub mod flows;
 pub mod identity;
 pub mod invite;
 pub mod mls;
+pub mod room;
 pub mod routing;
 pub mod storage;
 pub mod tor;

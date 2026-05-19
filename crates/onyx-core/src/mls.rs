@@ -436,34 +436,67 @@ impl std::fmt::Debug for MlsParty {
 /// Live MLS group state for one party. Pass the same [`MlsParty`] back
 /// in for every operation — operations use that party's provider /
 /// keystore, which is where the group state actually lives.
+/// Discriminator returned by [`MlsGroupState::process_incoming`].
+/// Distinguishes "decrypted plaintext you should surface" from
+/// "this was a member-change commit that I've already merged
+/// into the group state for you."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomingRoomMessage {
+    /// MLS application message; bytes are the plaintext.
+    Application(Vec<u8>),
+    /// MLS commit (add/remove/update). Already processed and merged
+    /// into the group; the group's epoch has advanced.
+    Commit,
+}
+
 pub struct MlsGroupState {
     group: MlsGroup,
 }
 
 impl MlsGroupState {
     /// Add a member by their serialised KeyPackage. Returns the
-    /// serialised Welcome to forward to the new member. Internally
-    /// commits the change and updates this group's epoch.
-    pub fn invite(&mut self, party: &MlsParty, peer_kp_bytes: &[u8]) -> Result<Vec<u8>> {
+    /// pair of serialised MLS messages produced by the commit:
+    ///
+    ///   * **`commit_bytes`** — the Commit message that every
+    ///     *existing* member of the group must process so their
+    ///     own copy of the group state advances to the new epoch.
+    ///     For a solo-group → 2-party invite there are no existing
+    ///     members and this can be discarded (the new member learns
+    ///     the new epoch from the Welcome alone). For an N≥3 invite
+    ///     the caller MUST fan it out to every existing member or
+    ///     they'll silently stop being able to decrypt room messages
+    ///     (their MLS ratchet stays at the old epoch while ours
+    ///     advances).
+    ///   * **`welcome_bytes`** — the Welcome message for the new
+    ///     member.
+    ///
+    /// Internally merges the pending commit so our own group state
+    /// moves to the new epoch atomically.
+    ///
+    /// **T6.3.h bugfix note**: pre-T6.3.h, this function only
+    /// returned the Welcome and discarded the commit. That was
+    /// correct for solo→2-party (the only case T6.1–T6.2 cared
+    /// about) but silently broke 3+-party rooms — existing
+    /// members never advanced past the inviter's first add.
+    pub fn invite(&mut self, party: &MlsParty, peer_kp_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(peer_kp_bytes)
             .map_err(|_| Error::InvalidEncoding("mls: peer KeyPackage not TLS-encoded"))?;
         let kp = kp_in
             .validate(party.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(internal("mls: peer KeyPackage validation failed"))?;
 
-        let (_commit, welcome_out, _group_info) = self
+        let (commit, welcome_out, _group_info) = self
             .group
             .add_members(&party.provider, &party.signature_keys, &[kp])
             .map_err(internal("mls: add_members failed"))?;
 
-        // Solo group becoming 2-person: the commit has no other existing
-        // members to distribute to; we just merge it locally so our
-        // group state moves to the new epoch.
         self.group
             .merge_pending_commit(&party.provider)
             .map_err(internal("mls: merge_pending_commit failed"))?;
 
-        serialize_mls_message(&welcome_out)
+        let commit_bytes = serialize_mls_message(&commit)?;
+        let welcome_bytes = serialize_mls_message(&welcome_out)?;
+        Ok((commit_bytes, welcome_bytes))
     }
 
     /// Encrypt an application message for the group.
@@ -473,6 +506,62 @@ impl MlsGroupState {
             .create_message(&party.provider, &party.signature_keys, plaintext)
             .map_err(internal("mls: create_message failed"))?;
         serialize_mls_message(&out)
+    }
+
+    /// Process any incoming MLS message for this group (T6.3.h).
+    /// Used by the room recipient path, which sees both application
+    /// messages AND commits (new member added by another room
+    /// member). Returns [`IncomingRoomMessage`] discriminated on
+    /// what came in:
+    ///
+    ///   * `Application(bytes)` — plaintext ready to feed to
+    ///     `RoomAppMessage::from_cbor`.
+    ///   * `Commit` — a member-change commit was processed and
+    ///     merged into the group state; the group's epoch has
+    ///     advanced. The caller doesn't need to do anything
+    ///     further (other than persist the post-merge MLS
+    ///     snapshot so the new epoch survives a restart).
+    ///
+    /// Tampered ciphertext / wrong-key sender / commits we can't
+    /// staged-merge all surface as [`Error::VerificationFailed`].
+    /// Non-Private/Public framings (Welcome, KeyPackage, GroupInfo
+    /// at this layer) surface as [`Error::InvalidEncoding`] — the
+    /// dispatcher above this is responsible for routing those to
+    /// the right path.
+    pub fn process_incoming(
+        &mut self,
+        party: &MlsParty,
+        ciphertext: &[u8],
+    ) -> Result<IncomingRoomMessage> {
+        let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
+            .map_err(|_| Error::InvalidEncoding("mls: incoming message not TLS-encoded"))?;
+        let protocol_msg: ProtocolMessage = match mls_in.extract() {
+            MlsMessageBodyIn::PrivateMessage(pm) => pm.into(),
+            MlsMessageBodyIn::PublicMessage(pm) => pm.into(),
+            _ => {
+                return Err(Error::InvalidEncoding(
+                    "mls: incoming message is not a PrivateMessage / PublicMessage",
+                ));
+            }
+        };
+        let processed = self
+            .group
+            .process_message(&party.provider, protocol_msg)
+            .map_err(|_| Error::VerificationFailed)?;
+        match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(am) => {
+                Ok(IncomingRoomMessage::Application(am.into_bytes()))
+            }
+            ProcessedMessageContent::StagedCommitMessage(staged) => {
+                self.group
+                    .merge_staged_commit(&party.provider, *staged)
+                    .map_err(internal("mls: merge_staged_commit failed"))?;
+                Ok(IncomingRoomMessage::Commit)
+            }
+            _ => Err(Error::InvalidEncoding(
+                "mls: processed message is not Application or StagedCommit",
+            )),
+        }
     }
 
     /// Decrypt an incoming application message. Tampered ciphertext or
@@ -672,7 +761,7 @@ mod tests {
 
         let mut alice_group = alice.create_group().unwrap();
         let group_id = alice_group.group_id_bytes();
-        let welcome = alice_group.invite(&alice, &bob_kp).unwrap();
+        let (_, welcome) = alice_group.invite(&alice, &bob_kp).unwrap();
         let mut bob_group = bob.join_from_welcome(&welcome).unwrap();
         assert_eq!(group_id, bob_group.group_id_bytes());
 
@@ -760,7 +849,7 @@ mod tests {
 
         let bob_kp = bob.key_package_bytes().unwrap();
         let mut alice_group = alice.create_group().unwrap();
-        let welcome = alice_group.invite(&alice, &bob_kp).unwrap();
+        let (_, welcome) = alice_group.invite(&alice, &bob_kp).unwrap();
         let mut bob_group = bob.join_from_welcome(&welcome).unwrap();
 
         let msg = b"hello via Identity-bound MLS credential";
@@ -781,7 +870,7 @@ mod tests {
         let bob_kp = bob.key_package_bytes().unwrap();
 
         let mut alice_group = alice.create_group().unwrap();
-        let welcome = alice_group.invite(&alice, &bob_kp).unwrap();
+        let (_, welcome) = alice_group.invite(&alice, &bob_kp).unwrap();
         let bob_group = bob.join_from_welcome(&welcome).unwrap();
 
         // Sanity: epochs match (both at epoch 1 after the add).
@@ -817,7 +906,7 @@ mod tests {
         let bob_kp = bob.key_package_bytes().unwrap();
         let mut alice_group = alice.create_group().unwrap();
         assert_eq!(alice_group.epoch(), 0);
-        let welcome = alice_group.invite(&alice, &bob_kp).unwrap();
+        let (_, welcome) = alice_group.invite(&alice, &bob_kp).unwrap();
         assert!(!welcome.is_empty());
         assert_eq!(alice_group.epoch(), 1, "add+merge should advance the epoch");
     }
@@ -900,6 +989,65 @@ mod tests {
     fn peek_group_id_rejects_garbage() {
         assert!(peek_group_id(&[]).is_err());
         assert!(peek_group_id(b"not MLS-encoded bytes").is_err());
+    }
+
+    // ── T6.3.h bugfix: 3-party room commit distribution ───────────
+
+    /// Pre-T6.3.h, `invite()` discarded the commit it produced; the
+    /// inviter advanced to epoch N+1 while every existing member
+    /// stayed at epoch N and silently lost the ability to decrypt
+    /// subsequent room messages. This test pins the post-T6.3.h
+    /// behaviour: alice invites bob (epoch 0 → 1), then alice
+    /// invites carol (epoch 1 → 2). Bob processes the commit alice
+    /// produced for the carol-invite via `process_incoming` and
+    /// advances to epoch 2 — now bob+alice+carol can all exchange
+    /// application messages decryptable by everyone.
+    #[test]
+    fn three_party_room_commit_distribution() {
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let bob = MlsParty::new(b"bob".to_vec()).unwrap();
+        let carol = MlsParty::new(b"carol".to_vec()).unwrap();
+
+        // Round 1: alice creates a group, invites bob.
+        let bob_kp = bob.key_package_bytes().unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let (_commit_solo_to_2, welcome_to_bob) =
+            alice_group.invite(&alice, &bob_kp).unwrap();
+        let mut bob_group = bob.join_from_welcome(&welcome_to_bob).unwrap();
+        assert_eq!(alice_group.epoch(), 1);
+        assert_eq!(bob_group.epoch(), 1);
+
+        // Round 2: alice invites carol. Now alice has 3 members
+        // pending; bob is the lone existing member who needs the
+        // commit.
+        let carol_kp = carol.key_package_bytes().unwrap();
+        let (commit_to_bob, welcome_to_carol) =
+            alice_group.invite(&alice, &carol_kp).unwrap();
+        let mut carol_group = carol.join_from_welcome(&welcome_to_carol).unwrap();
+        assert_eq!(alice_group.epoch(), 2);
+        assert_eq!(carol_group.epoch(), 2);
+        // BUGFIX CORE: bob processes the commit and advances.
+        let processed = bob_group
+            .process_incoming(&bob, &commit_to_bob)
+            .expect("bob processes the commit");
+        assert!(matches!(processed, IncomingRoomMessage::Commit));
+        assert_eq!(
+            bob_group.epoch(),
+            2,
+            "bob must advance to epoch 2 after processing the commit"
+        );
+
+        // Round 3: cross-decrypt sanity. alice sends an app msg;
+        // both bob AND carol can decrypt it. Pre-T6.3.h, bob would
+        // fail to decrypt at this point because his epoch was still
+        // 1 while alice was at 2.
+        let ct = alice_group
+            .encrypt_application(&alice, b"hello room")
+            .unwrap();
+        let pt_bob = bob_group.process_incoming(&bob, &ct).unwrap();
+        let pt_carol = carol_group.process_incoming(&carol, &ct).unwrap();
+        assert_eq!(pt_bob, IncomingRoomMessage::Application(b"hello room".to_vec()));
+        assert_eq!(pt_carol, IncomingRoomMessage::Application(b"hello room".to_vec()));
     }
 
     #[test]

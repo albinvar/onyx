@@ -1174,12 +1174,17 @@ async fn handle_room_app_frame(
     sender_peer_pub: &[u8; 32],
     state: &Arc<DaemonState>,
 ) {
-    let plaintext_result = {
+    // T6.3.h: an incoming MLS frame for a room can be either an
+    // application message (chat text or KEM advertisement) OR a
+    // commit (an existing member added/removed someone — we must
+    // merge it so our group state advances to the new epoch).
+    // `process_incoming` discriminates internally.
+    let processed_result = {
         let party = state.mls_party.lock().await;
         match party.load_group(group_id) {
             Ok(Some(mut room_group)) => room_group
-                .decrypt_application(&party, payload)
-                .map(|pt| (pt, room_group.epoch())),
+                .process_incoming(&party, payload)
+                .map(|im| (im, room_group.epoch())),
             Ok(None) => {
                 debug!(
                     group_id_b32 = %encode_b32(group_id),
@@ -1193,17 +1198,15 @@ async fn handle_room_app_frame(
             }
         }
     };
-    let Ok((plaintext, epoch)) = plaintext_result else {
+    let Ok((incoming, epoch)) = processed_result else {
         debug!(
             group_id_b32 = %encode_b32(group_id),
-            "MLS room frame: decrypt failed; dropping"
+            "MLS room frame: process_incoming failed; dropping"
         );
         return;
     };
-    let text = String::from_utf8_lossy(&plaintext).into_owned();
-    // Persist the new MLS state — a successful decrypt mutates the
-    // group's ratchet, and losing it on restart would desync us from
-    // the room. Best-effort; warn but keep going on failure.
+    // Persist updated MLS state regardless of message kind — both
+    // app messages and commits mutate the ratchet.
     let snap_result = {
         let party = state.mls_party.lock().await;
         party.snapshot_state()
@@ -1214,18 +1217,112 @@ async fn handle_room_app_frame(
             warn!(error = %e, "room frame: snapshot save failed");
         }
     }
+    let plaintext = match incoming {
+        onyx_core::mls::IncomingRoomMessage::Application(pt) => pt,
+        onyx_core::mls::IncomingRoomMessage::Commit => {
+            refresh_room_roster_after_commit(group_id, sender_peer_pub, epoch, state).await;
+            return;
+        }
+    };
+    // T6.3.h: every room app message is a CBOR-tagged RoomAppMessage.
+    // Drop at debug (no warn) on decode failure — could be a pre-
+    // T6.3.h sender (no such installed base today) or future variant.
+    let Ok(msg) = onyx_core::room::RoomAppMessage::from_cbor(&plaintext) else {
+        debug!(
+            group_id_b32 = %encode_b32(group_id),
+            plaintext_bytes = plaintext.len(),
+            "room: decrypted but RoomAppMessage CBOR decode failed; dropping"
+        );
+        return;
+    };
+    match msg {
+        onyx_core::room::RoomAppMessage::Text { text } => {
+            info!(
+                group_id_b32 = %encode_b32(group_id),
+                from_peer_short = %short_id_of_peer_pub(sender_peer_pub),
+                mls_epoch = epoch,
+                text_bytes = text.len(),
+                "room: incoming text message"
+            );
+            let _ = state.conversations.lock().await.push_room_message(
+                group_id,
+                *sender_peer_pub,
+                text,
+            );
+        }
+        onyx_core::room::RoomAppMessage::KemAdvertisement {
+            fingerprint,
+            kem_pub,
+        } => {
+            // T6.3.h: in-room KEM-pub advertisement from another
+            // member. Persist into room_member_kems so we can hub-
+            // fallback to that member later. Authenticity comes from
+            // the MLS ratchet (only a current member could encrypt
+            // this); the sealed-envelope outer Ed25519 layer adds
+            // the sender identity binding for the hub path.
+            let vault = state.vault.lock().await;
+            match vault.save_room_member_kem(
+                state.identity_id,
+                group_id,
+                &fingerprint,
+                kem_pub.as_ref(),
+            ) {
+                Ok(()) => info!(
+                    group_id_b32 = %encode_b32(group_id),
+                    member_fp = %fingerprint,
+                    kem_bytes = kem_pub.len(),
+                    "room: KEM advertisement persisted"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    member_fp = %fingerprint,
+                    "room: KEM advertisement save failed"
+                ),
+            }
+        }
+    }
+}
+
+/// Post-commit roster refresh (T6.3.h). Called when
+/// [`handle_room_app_frame`] processes an MLS commit on a room —
+/// rebuilds `rooms.members_b32` from the post-merge group so
+/// subsequent local `list_rooms` / `send_room` queries see the
+/// new roster. Pure side-effect helper; failures warn but never
+/// propagate.
+async fn refresh_room_roster_after_commit(
+    group_id: &[u8],
+    sender_peer_pub: &[u8; 32],
+    epoch: u64,
+    state: &Arc<DaemonState>,
+) {
+    let new_members_b32 = {
+        let party = state.mls_party.lock().await;
+        match party.load_group(group_id) {
+            Ok(Some(g)) => members_b32_from_group(&g),
+            _ => String::new(),
+        }
+    };
+    if !new_members_b32.is_empty() {
+        let vault = state.vault.lock().await;
+        if let Ok(rows) = vault.list_rooms(state.identity_id)
+            && let Some(row) = rows.into_iter().find(|r| r.group_id == group_id)
+            && let Err(e) = vault.save_room(
+                state.identity_id,
+                group_id,
+                &row.name,
+                &new_members_b32,
+                row.created_at_ms,
+            )
+        {
+            warn!(error = %e, "room frame: roster refresh failed");
+        }
+    }
     info!(
         group_id_b32 = %encode_b32(group_id),
         from_peer_short = %short_id_of_peer_pub(sender_peer_pub),
         mls_epoch = epoch,
-        text_bytes = text.len(),
-        "room: incoming app message decrypted"
+        "room: commit merged; group epoch advanced"
     );
-    let _ = state
-        .conversations
-        .lock()
-        .await
-        .push_room_message(group_id, *sender_peer_pub, text);
 }
 
 /// 8-char base32 prefix of a peer's X25519 pubkey — matches what the
@@ -1321,11 +1418,13 @@ async fn handle_hub_delivery(
             welcome,
             first_message,
             room_name,
+            member_kems,
         } => {
             process_hub_mls_welcome(
                 welcome.as_ref(),
                 first_message,
                 room_name,
+                member_kems,
                 sender_x25519,
                 &sender_pub_b32,
                 sender_fingerprint,
@@ -1426,6 +1525,7 @@ async fn process_hub_mls_welcome(
     welcome_bytes: &[u8],
     first_message: Option<String>,
     room_name: Option<String>,
+    member_kems: Vec<onyx_core::routing::RoomMemberKem>,
     sender_x25519: [u8; 32],
     sender_pub_b32: &str,
     sender_fingerprint: String,
@@ -1462,6 +1562,33 @@ async fn process_hub_mls_welcome(
     // T6.3.c: if the Welcome carried a `room_name`, this is a multi-
     // party room invite rather than a 2-party DM bootstrap.
     if let Some(name) = room_name.clone() {
+        // T6.3.h: persist every (fingerprint, kem_pub) pair the
+        // inviter bundled so this new joiner can hub-fallback to
+        // any current member (not just the inviter). Save BEFORE
+        // process_room_welcome so even if a member-row save fails
+        // partway through, the room row's own save still happens.
+        if !member_kems.is_empty() {
+            let group_id_bytes = group.group_id_bytes();
+            let vault = state.vault.lock().await;
+            for entry in &member_kems {
+                if let Err(e) = vault.save_room_member_kem(
+                    state.identity_id,
+                    &group_id_bytes,
+                    &entry.fingerprint,
+                    entry.kem_pub.as_ref(),
+                ) {
+                    warn!(
+                        error = %e,
+                        member = %entry.fingerprint,
+                        "hub: mls/v1 Welcome: save_room_member_kem failed"
+                    );
+                }
+            }
+            info!(
+                count = member_kems.len(),
+                "hub: mls/v1 Welcome carried roster KEMs; persisted"
+            );
+        }
         process_room_welcome(&group, &name, &sender_fingerprint, state).await;
         return;
     }

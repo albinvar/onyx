@@ -117,9 +117,14 @@ where
         ));
     }
 
-    // 3. Build group, invite, send Welcome.
+    // 3. Build group, invite, send Welcome. This is the 2-party DM
+    //    bootstrap path — solo → 2-person, so the commit has no
+    //    existing members to distribute to and we discard it
+    //    (the new member learns the new epoch from the Welcome).
+    //    Room invites take a different path; see
+    //    `handle_invite_to_room` in `onyx-daemon`.
     let mut group = party.create_group()?;
-    let welcome_bytes = group.invite(party, &kp_frame.payload)?;
+    let (_commit_unused, welcome_bytes) = group.invite(party, &kp_frame.payload)?;
     write_frame(
         stream,
         session,
