@@ -1070,4 +1070,327 @@ mod tests {
             "alice's entry must be intact; attacker's overwrite must have been rejected"
         );
     }
+
+    // ── T8.3.d: gossip loop / forward semantics ──────────────────────
+
+    /// Helper for T8.3.d tests: build a `HubState` with `peer_count`
+    /// peer outbounds (all backed by `Receiver`s the caller can
+    /// observe), our own hub hash set, and federation enabled.
+    /// Returns the state plus a `Vec<(pubkey, rx)>` so tests can
+    /// poke at each peer's channel.
+    #[allow(clippy::type_complexity)] // test helper; tuple shape IS the contract
+    fn fed_state(
+        self_hash: [u8; 16],
+        peer_count: usize,
+    ) -> (
+        HubState,
+        Vec<(
+            [u8; 32],
+            tokio::sync::mpsc::Receiver<onyx_core::wire::InnerFrame>,
+        )>,
+    ) {
+        let mut state = HubState::new();
+        state.set_self_hub_hash(self_hash);
+        let mut peers = std::collections::HashMap::new();
+        let mut rxs = Vec::with_capacity(peer_count);
+        for i in 0..peer_count {
+            // Distinct pubkey per peer (low byte = index).
+            let mut pk = [0u8; 32];
+            pk[0] = u8::try_from(i + 1).expect("peer index fits in u8");
+            let (tx, rx) = tokio::sync::mpsc::channel::<onyx_core::wire::InnerFrame>(16);
+            peers.insert(pk, tx);
+            rxs.push((pk, rx));
+        }
+        state.set_peer_outbounds(peers);
+        (state, rxs)
+    }
+
+    /// Helper: build a valid MLS KeyPackage + its routing-id from a
+    /// fresh Identity. Used wherever T7.3-sec ownership check needs
+    /// to pass.
+    fn fresh_kp_and_routing_id() -> (Vec<u8>, RoutingId) {
+        use onyx_core::identity::Identity;
+        use onyx_core::mls::MlsParty;
+        let id = Identity::generate();
+        let party = MlsParty::from_identity(&id).unwrap();
+        let kp = party.key_package_bytes().unwrap();
+        let rid = onyx_core::routing::introduction_inbox(&id.fingerprint());
+        (kp, rid)
+    }
+
+    /// T8.3.d: a gossip frame whose `seen_by` equals our own hub
+    /// hash is dropped silently — no local store, no re-fanout.
+    /// Defends against an immediate-loop attack.
+    #[tokio::test]
+    async fn gossip_publish_self_seen_by_drops() {
+        use onyx_core::wire::{GOSSIP_TTL_DEFAULT, GossipFrame};
+        let our_hash = [0xAA; 16];
+        let (state, mut peer_rxs) = fed_state(our_hash, 2);
+        let state = Arc::new(Mutex::new(state));
+
+        let (kp_bytes, rid) = fresh_kp_and_routing_id();
+        // Forge a frame as if WE had already sent it (seen_by = us).
+        let frame = GossipFrame {
+            ttl: GOSSIP_TTL_DEFAULT,
+            seen_by: our_hash,
+            routing_id: rid,
+            body: kp_bytes,
+        };
+        let payload = frame.encode();
+
+        // Source pubkey can be anything; we won't reach the re-fanout.
+        let source_pk = [0x99; 32];
+        handle_gossip_publish(&payload, &state, &source_pk).await;
+
+        // Nothing should have been stored locally.
+        {
+            let s = state.lock().await;
+            assert_eq!(s.keypackage_count(), 0, "loop drop must skip local store");
+        }
+        // No peer channel received a re-fanout.
+        for (_pk, rx) in &mut peer_rxs {
+            assert!(
+                rx.try_recv().is_err(),
+                "loop drop must NOT trigger re-fanout"
+            );
+        }
+    }
+
+    /// T8.3.d: TTL=1 receives correctly store locally BUT do not
+    /// re-fanout — `saturating_sub(1) == 0`, the TTL guard skips the
+    /// forward. Bounds the propagation depth in any topology.
+    #[tokio::test]
+    async fn gossip_publish_ttl_one_stores_but_does_not_forward() {
+        use onyx_core::wire::GossipFrame;
+        let our_hash = [0xBB; 16];
+        let (state, mut peer_rxs) = fed_state(our_hash, 2);
+        let state = Arc::new(Mutex::new(state));
+
+        let (kp_bytes, rid) = fresh_kp_and_routing_id();
+        let frame = GossipFrame {
+            ttl: 1,
+            seen_by: [0xCC; 16], // from some other hub
+            routing_id: rid,
+            body: kp_bytes,
+        };
+        let payload = frame.encode();
+
+        let source_pk = [0x77; 32];
+        handle_gossip_publish(&payload, &state, &source_pk).await;
+
+        // Local store HAPPENED (TTL only governs forwarding, not local accept).
+        {
+            let s = state.lock().await;
+            assert_eq!(s.keypackage_count(), 1, "TTL=1 must still accept locally");
+        }
+        // No peer channel got the forward — TTL would have gone to 0.
+        for (_pk, rx) in &mut peer_rxs {
+            assert!(
+                rx.try_recv().is_err(),
+                "TTL=1 must NOT forward (saturating_sub would underflow)"
+            );
+        }
+    }
+
+    /// T8.3.d: source-pubkey skip on re-fanout. The peer who sent
+    /// us the gossip never receives our forwarded copy — prevents
+    /// trivial A→B→A ping-pong.
+    #[tokio::test]
+    async fn gossip_publish_source_pubkey_skipped_on_forward() {
+        use onyx_core::wire::GossipFrame;
+        let our_hash = [0xDD; 16];
+        let (state, mut peer_rxs) = fed_state(our_hash, 3);
+        // Pick peer #0 as the source.
+        let source_pk = peer_rxs[0].0;
+        let state = Arc::new(Mutex::new(state));
+
+        let (kp_bytes, rid) = fresh_kp_and_routing_id();
+        let frame = GossipFrame {
+            ttl: 3,
+            seen_by: [0xEE; 16],
+            routing_id: rid,
+            body: kp_bytes,
+        };
+        let payload = frame.encode();
+
+        handle_gossip_publish(&payload, &state, &source_pk).await;
+
+        // Source peer (#0) must have received NOTHING.
+        assert!(
+            peer_rxs[0].1.try_recv().is_err(),
+            "source pubkey must be skipped on re-fanout"
+        );
+        // The other two peers each got the re-fanout.
+        for (idx, (_pk, rx)) in peer_rxs.iter_mut().enumerate().skip(1) {
+            let inner = rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("peer #{idx} should have received re-fanout"));
+            assert_eq!(inner.frame_type, onyx_core::wire::FRAME_GOSSIP_PUBLISH);
+            let fwd = onyx_core::wire::GossipFrame::decode(&inner.payload).unwrap();
+            assert_eq!(fwd.ttl, 2, "TTL decremented from 3 to 2");
+            assert_eq!(fwd.seen_by, our_hash, "seen_by rewritten to OUR hash");
+        }
+    }
+
+    /// T8.3.d: GOSSIP_DELIVER source-skip + TTL semantics — mirrors
+    /// the GOSSIP_PUBLISH test above for the queue path.
+    #[tokio::test]
+    async fn gossip_deliver_source_pubkey_skipped_on_forward_eager() {
+        use onyx_core::wire::GossipFrame;
+        let our_hash = [0x11; 16];
+        let (mut state, mut peer_rxs) = fed_state(our_hash, 3);
+        state.set_gossip_mode(crate::state::GossipMode::Eager);
+        let source_pk = peer_rxs[0].0;
+        let state = Arc::new(Mutex::new(state));
+
+        // Envelope body is opaque AEAD ciphertext from the hub's
+        // perspective — we don't need a valid MLS object here.
+        let frame = GossipFrame {
+            ttl: 3,
+            seen_by: [0x22; 16],
+            routing_id: [0x33; 16],
+            body: b"opaque sealed envelope bytes".to_vec(),
+        };
+        let payload = frame.encode();
+
+        handle_gossip_deliver(&payload, &state, &source_pk).await;
+
+        // Source peer skipped; other two peers received under eager.
+        assert!(
+            peer_rxs[0].1.try_recv().is_err(),
+            "source pubkey must be skipped on re-fanout"
+        );
+        for (_pk, rx) in peer_rxs.iter_mut().skip(1) {
+            let inner = rx.recv().await.expect("non-source peer received");
+            assert_eq!(inner.frame_type, onyx_core::wire::FRAME_GOSSIP_DELIVER);
+            let fwd = onyx_core::wire::GossipFrame::decode(&inner.payload).unwrap();
+            assert_eq!(fwd.ttl, 2);
+            assert_eq!(fwd.seen_by, our_hash);
+        }
+    }
+
+    /// T8.3.d: lazy mode + gossip-receive with NO local subscriber
+    /// → re-fanout happens (envelope would otherwise die at us).
+    #[tokio::test]
+    async fn gossip_deliver_lazy_forwards_when_no_local_sub() {
+        use onyx_core::wire::GossipFrame;
+        let our_hash = [0x44; 16];
+        let (state, mut peer_rxs) = fed_state(our_hash, 2);
+        // Default mode is Lazy.
+        let source_pk = peer_rxs[0].0;
+        let state = Arc::new(Mutex::new(state));
+
+        let frame = GossipFrame {
+            ttl: 3,
+            seen_by: [0x55; 16],
+            routing_id: [0x66; 16],
+            body: b"opaque bytes".to_vec(),
+        };
+        let payload = frame.encode();
+
+        handle_gossip_deliver(&payload, &state, &source_pk).await;
+
+        // No local subscriber for routing_id 0x66 → lazy mode
+        // forwards. Source skipped; peer #1 receives.
+        assert!(peer_rxs[0].1.try_recv().is_err(), "source skipped");
+        let inner = peer_rxs[1]
+            .1
+            .recv()
+            .await
+            .expect("non-source peer received under lazy when no local sub");
+        assert_eq!(inner.frame_type, onyx_core::wire::FRAME_GOSSIP_DELIVER);
+    }
+
+    /// T8.3.d: lazy mode + gossip-receive WITH local subscriber
+    /// → no re-fanout. The envelope reached its destination here,
+    /// no need to keep gossiping.
+    #[tokio::test]
+    async fn gossip_deliver_lazy_does_not_forward_when_local_sub_accepted() {
+        use onyx_core::wire::GossipFrame;
+        let our_hash = [0x77; 16];
+        let (mut state, mut peer_rxs) = fed_state(our_hash, 2);
+        // Register a local subscriber for the routing id we'll
+        // gossip to.
+        let target_rid: RoutingId = [0x88; 16];
+        let (sub_tx, _sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let conn = state.register_conn(sub_tx);
+        state.subscribe(conn, &[target_rid]);
+        let source_pk = peer_rxs[0].0;
+        let state = Arc::new(Mutex::new(state));
+
+        let frame = GossipFrame {
+            ttl: 3,
+            seen_by: [0x99; 16],
+            routing_id: target_rid,
+            body: b"will-be-delivered-locally".to_vec(),
+        };
+        let payload = frame.encode();
+
+        handle_gossip_deliver(&payload, &state, &source_pk).await;
+
+        // Neither peer channel sees the gossip — lazy mode swallowed
+        // it because the local subscriber accepted.
+        for (_pk, rx) in &mut peer_rxs {
+            assert!(
+                rx.try_recv().is_err(),
+                "lazy mode must NOT forward when local subscriber accepted"
+            );
+        }
+    }
+
+    /// T8.3.d: gossip with garbage body (un-decodable as GossipFrame)
+    /// is silently dropped — same posture as other malformed-frame
+    /// handling. No panic.
+    #[tokio::test]
+    async fn gossip_publish_malformed_payload_drops_cleanly() {
+        let our_hash = [0xAB; 16];
+        let (state, mut peer_rxs) = fed_state(our_hash, 1);
+        let state = Arc::new(Mutex::new(state));
+
+        // Payload shorter than the gossip header.
+        let too_short = vec![0u8; 5];
+        handle_gossip_publish(&too_short, &state, &[0u8; 32]).await;
+        handle_gossip_deliver(&too_short, &state, &[0u8; 32]).await;
+
+        // No store, no fan-out.
+        assert_eq!(state.lock().await.keypackage_count(), 0);
+        for (_pk, rx) in &mut peer_rxs {
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    /// T8.3.d: gossip KP whose signing key does NOT derive the
+    /// claimed routing id is rejected (T7.3-sec ownership check
+    /// propagated to gossip path). A hostile peer hub gossiping
+    /// somebody else's routing id with their own KP gets silently
+    /// dropped.
+    #[tokio::test]
+    async fn gossip_publish_ownership_check_propagates_to_gossip() {
+        use onyx_core::wire::GossipFrame;
+        let our_hash = [0xCD; 16];
+        let (state, _rxs) = fed_state(our_hash, 1);
+        let state = Arc::new(Mutex::new(state));
+
+        // Real KP, but with a WRONG routing id (claimed by the
+        // hostile gossiper).
+        let (kp_bytes, _real_rid) = fresh_kp_and_routing_id();
+        let wrong_rid: RoutingId = [0xFF; 16]; // not derivable from this KP
+        let frame = GossipFrame {
+            ttl: 3,
+            seen_by: [0x55; 16],
+            routing_id: wrong_rid,
+            body: kp_bytes,
+        };
+        let payload = frame.encode();
+
+        handle_gossip_publish(&payload, &state, &[0u8; 32]).await;
+
+        // Rejected — nothing stored.
+        assert_eq!(
+            state.lock().await.keypackage_count(),
+            0,
+            "ownership-check failure must skip local store"
+        );
+    }
 }

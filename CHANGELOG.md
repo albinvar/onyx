@@ -6,6 +6,57 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.d: gossip loop-termination + forward-semantics test suite
+
+Fifth T8.3 implementation slice. Tests targeting `handle_gossip_publish` and `handle_gossip_deliver` directly to verify the loop-prevention properties and forward semantics that the previous slices documented but didn't actively exercise. These are the unit-level proofs that the design works as written; an end-to-end 3-hub-via-real-Noise integration test is still deferred (would require lifting `hub_handle_connection`'s Noise XK assumption to support a test-mode handshake — out of scope here).
+
+What landed:
+
+**T8.3.d.a — `fed_state` test helper.** New helper in `handler.rs::tests` that builds a `HubState` with N peer outbound channels (backed by `Receiver`s the test can observe), our own hub hash set, and federation enabled. Each peer gets a distinct pubkey (`[i+1, 0, 0, …]`) so source-skip tests can pick "which peer is the source." Returns `(HubState, Vec<(pubkey, rx)>)`. Annotated `#[allow(clippy::type_complexity)]` — the tuple shape IS the contract; renaming it into a named type would just shift the readability problem.
+
+**T8.3.d.b — `fresh_kp_and_routing_id` test helper.** Mints a real MLS KeyPackage from a fresh Identity and computes its derived routing id. Used by gossip tests where the T7.3-sec ownership check needs to pass; bypasses the boilerplate the existing `keypackage_publish_*` tests had inline.
+
+**T8.3.d.c — Eight new tests covering the gossip-frame semantics:**
+
+  1. **`gossip_publish_self_seen_by_drops`** — frame with `seen_by == our_hash` is silently dropped. No local store, no re-fanout. Defends against the immediate-loop case (A→B→A).
+  2. **`gossip_publish_ttl_one_stores_but_does_not_forward`** — TTL=1 receives correctly store the KP locally BUT do not re-fanout (saturating_sub semantics). Bounds the propagation depth.
+  3. **`gossip_publish_source_pubkey_skipped_on_forward`** — three-peer setup; gossip arrives from peer #0. After re-fanout, peers #1 and #2 receive the forwarded frame; peer #0 receives NOTHING. Verifies TTL=3→2, seen_by=ours.
+  4. **`gossip_deliver_source_pubkey_skipped_on_forward_eager`** — same as #3 but for envelope gossip in eager mode. Confirms both gossip variants apply the source-skip identically.
+  5. **`gossip_deliver_lazy_forwards_when_no_local_sub`** — lazy mode + no local subscriber → re-fanout happens (otherwise envelope dies). Mirrors origin-side `deliver_from_client_lazy_only_gossips_when_no_local_sub` for the receive path.
+  6. **`gossip_deliver_lazy_does_not_forward_when_local_sub_accepted`** — lazy mode + live local subscriber → no re-fanout. Local delivery counts as "we got it home"; no point gossiping further.
+  7. **`gossip_publish_malformed_payload_drops_cleanly`** — under-length payloads (`Vec<u8>` shorter than `GOSSIP_HEADER_LEN`) silently drop. No panic, no partial state.
+  8. **`gossip_publish_ownership_check_propagates_to_gossip`** — real KP but with a WRONG `routing_id` claim → T7.3-sec ownership check rejects, nothing stored. Confirms gossip is authenticated to the same standard as direct client publish, defending the F1 (hostile peer hub) threat.
+
+**3-hub triangle termination property (proven inductively by the tests above):**
+
+  * **Hop 0**: A receives from a client. Origin TTL=3, seen_by=hash(A). Fans out to B + C.
+  * **Hop 1**: B receives from A with TTL=3, seen_by=hash(A). B≠hash(A) → process. forward(TTL=2, seen_by=hash(B)) to C (B's only other peer; source A skipped). Symmetrically C→B.
+  * **Hop 2**: C receives second copy from B with TTL=2, seen_by=hash(B). C≠hash(B) → process (UPSERT — same KP, same routing id, no-op-ish). forward(TTL=1) to A (skip B). A receives.
+  * **Hop 3 (terminates)**: A receives TTL=1 from C. A's `gossip_publish_ttl_one_stores_but_does_not_forward` shows: store locally (UPSERT, no-op), do NOT forward — `saturating_sub(1) == 0`.
+
+The triangle ring closes within 3 hops in worst case. Stronger ring topologies (4+ hubs) hit the same `ttl == 0` floor; default `GOSSIP_TTL_DEFAULT = 3` caps the max hops regardless of ring size.
+
+What this did NOT do:
+
+  * Did not write an end-to-end "two real hubs over duplex, KP gossips A→B" integration test. That requires hub-handle-connection to support a test-mode Noise handshake (or to extract `serve_peer_frames`/`serve_frames` so tests can call them without going through Noise). Defer to T8.3.e or beyond.
+  * Did not add a four-hub-square topology test. The triangle test above + the unit tests cover the relevant property; a four-hub test would be N+1 boilerplate without new coverage.
+  * Did not extract or move the `handle_gossip_*` functions out of `pub(crate)` visibility — they're already accessible from the `tests` module via `super::*`.
+  * Did not update `FEDERATION.md` to mark T8.3.d done — that goes in T8.3.e final-docs slice.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (added `#[allow(clippy::type_complexity)]` on the `fed_state` test helper — the tuple return shape is intentional), `cargo test --workspace` **317 passed / 0 failed** (was 309; +8 new gossip-semantics tests).
+
+**Federation status after T8.3.d:**
+  * KP gossip: ✅ end-to-end (T8.3.b.x)
+  * Envelope gossip: ✅ end-to-end (T8.3.c)
+  * Loop prevention: ✅ tested at unit level (T8.3.d); seen_by + TTL=3 bounds proven
+  * Source-skip on re-fanout: ✅ tested both directions
+  * Eager + lazy mode semantics: ✅ tested both directions
+  * Ownership check on gossip path: ✅ tested
+  * Operator opt-in: ✅ `--peer-hub` + `--gossip-mode`
+  * THREAT_MODEL update: ⏳ T8.3.e
+
+---
+
 ## 2026-05-19 — T8.3.c: queue gossip via `FRAME_GOSSIP_DELIVER` + `--gossip-mode lazy|eager`
 
 Fourth T8.3 implementation slice. T8.3.b.x landed KP gossip end-to-end; T8.3.c does the same for queued envelopes — when a client sends a DELIVER frame and either has no local subscriber or the operator opts into eager mode, the envelope rides the existing peer-hub Noise XK sessions to other hubs. The recipient daemon's existing T7.3-sec.2 replay guard handles cross-hub duplicates with zero new dedup logic. **Federation is now functionally complete for both KP-directory and offline-queue paths**; the remaining T8.3.d/e slices are loop-test hardening + docs.
