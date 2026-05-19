@@ -6,6 +6,34 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.c: invite-to-room via existing T7.2-mls hub path
+
+Second code slice of T6.3 (multi-party rooms). Adds the only verb that has to traverse the wire: invite an existing peer (whose KeyPackage we have) into a room we've already created. The recipient sees the room appear in their vault on next decode of the Welcome. Send-to-room (T6.3.d–e) and TUI surfacing (T6.3.f) still pending.
+
+What landed:
+
+  * **Wire format**: `BootstrapPayload::MlsWelcome` gains optional `room_name: Option<String>` field with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Pre-T6.3.c senders that omit the field are still parsed (CBOR maps are unordered + extensible); pre-T6.3.c daemons that don't know about the field ignore it. The bytes the field carries are covered by the outer sealed-sender Ed25519 signature, so a hostile hub can't rename a recipient's room. New round-trip test `bootstrap_payload_round_trip_mls_welcome_with_room_name` + back-compat sentinel `bootstrap_payload_mls_welcome_omits_room_name_field_when_none`.
+  * **API**: `ApiRequest::InviteToRoom { group_id_b32, peer_fingerprint, peer_kem_pub_b32, peer_kp_b64 }` and `ApiResponse::InviteToRoomOk { group_id_b32, members: Vec<String> }`. 3 new round-trip + wire-shape tests.
+  * **Daemon — sender side** (`handle_invite_to_room` in `api_server.rs`):
+    * Parses `group_id_b32` → bytes, runs the same fingerprint↔KP-signing-key validation as `handle_send_bootstrap_mls` (THREAT_MODEL §8.2 #15: refuses to add a member whose KP signing key does not hash to the supplied fingerprint).
+    * Looks up the existing `rooms` row by `group_id` (refuses if missing — fail-loud rather than send a nameless Welcome).
+    * `MlsParty::load_group(&group_id_bytes)` → `MlsGroupState::invite` → fresh Welcome.
+    * Snapshots MLS state and refreshes the cached `members_b32` from the post-commit group (new helper `MlsGroupState::member_signing_keys()` walks all leaves; `members_b32_from_group` lifts each to a `Fingerprint`).
+    * Wraps Welcome in `BootstrapPayload::MlsWelcome { welcome, first_message: None, room_name: Some(room.name) }`, seals via `seal_bootstrap`, fans out across all configured hubs (same shape as `handle_send_bootstrap_mls`).
+  * **Daemon — recipient side** (`process_room_welcome` in `lib.rs`): when an opened `MlsWelcome` carries `room_name = Some(name)`, the recipient persists a `rooms` row instead of going through the DM `register_hub_only` path. Members list is computed identically via `members_b32_from_group` on the joined `MlsGroupState`, so both sides see the same comma-separated fingerprint cache. Extraction was forced by clippy's `too_many_lines` budget — keeps `handle_hub_delivery`'s room arm a single one-liner branch.
+  * **No CLI / TUI surface yet**. `onyx invite <room>` and a room pane land in T6.3.f. T6.3.c is daemon-only; exercise via raw JSON over the socket.
+
+Design notes:
+
+  * **Why fail-loud when the room row is missing**. A daemon process can lose its in-memory MLS state in principle (panic + restart before a snapshot lands), but the post-T7-zeroize-audit snapshot happens immediately after every mutation, so a vault-row-missing-but-MLS-state-present case implies operator tampering (e.g. they deleted the row with `sqlite3`). The right response is "refuse and surface a Malformed error so the operator sees it" rather than "silently re-create the row with whatever name the caller passed."
+  * **`#[allow(clippy::too_many_lines)]` on `handle_invite_to_room`**. Pattern carried forward from `handle_send_bootstrap_mls` — the function is one linear parse→validate→build→seal→persist→push sequence with several short-circuit error branches; splitting per-step would yield helpers that are each a few lines of glue plus a typed error response, with no net readability win.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **331 passed** (+5 new from 326). Manual smoke deferred to T6.3.d when there's a working send-to-room.
+
+Next: T6.3.d — send-to-room direct path (MLS encrypt + route over existing per-peer Noise sessions).
+
+---
+
 ## 2026-05-19 — T6.3.b: vault `rooms` table + `CreateRoom` / `ListRooms` API
 
 First code slice of T6.3 (multi-party rooms). Establishes the data model and the daemon plumbing to create + enumerate rooms. **No invite, no send, no receive yet** — those are T6.3.c–e. Sized deliberately small so the foundations can be reviewed and exercised before the routing surface lands on top.

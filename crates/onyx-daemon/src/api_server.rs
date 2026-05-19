@@ -309,6 +309,21 @@ async fn dispatch_one_shot(
         ApiRequest::ExportKeyPackage => handle_export_key_package(state).await,
         ApiRequest::CreateRoom { name } => handle_create_room(name, state).await,
         ApiRequest::ListRooms => handle_list_rooms(state).await,
+        ApiRequest::InviteToRoom {
+            group_id_b32,
+            peer_fingerprint,
+            peer_kem_pub_b32,
+            peer_kp_b64,
+        } => {
+            handle_invite_to_room(
+                group_id_b32,
+                peer_fingerprint,
+                peer_kem_pub_b32,
+                peer_kp_b64,
+                state,
+            )
+            .await
+        }
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
     }
 }
@@ -466,6 +481,261 @@ async fn handle_list_rooms(state: &DaemonState) -> ApiResponse {
         })
         .collect();
     ApiResponse::ListRoomsOk { rooms }
+}
+
+/// Invite a peer into an existing room (T6.3.c). Parallels
+/// [`handle_send_bootstrap_mls`] structurally — same KP-fingerprint
+/// validation (`THREAT_MODEL.md` §8.2 #15), same `BootstrapPayload::
+/// MlsWelcome` (`mls/v1`) envelope, same hub fan-out — but loads the
+/// existing `MlsGroupState` by `group_id` instead of creating a fresh
+/// 2-party group, and stamps `room_name = Some(room.name)` so the
+/// recipient surfaces a room on their side instead of treating the
+/// Welcome as a DM bootstrap.
+///
+/// After a successful invite commit, refreshes the local `rooms` row's
+/// cached `members_b32` to include the new member's fingerprint.
+//
+// Function is one linear sequence with several short-circuit error
+// branches; splitting per-step would yield helpers that are each a
+// few lines of glue plus a typed error response, with no net
+// readability win.
+#[allow(clippy::too_many_lines)]
+async fn handle_invite_to_room(
+    group_id_b32: &str,
+    peer_fingerprint: &str,
+    peer_kem_pub_b32: &str,
+    peer_kp_b64: &str,
+    state: &DaemonState,
+) -> ApiResponse {
+    if state.hub_outbounds.is_empty() {
+        return ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+        };
+    }
+
+    // 1. Parse inputs.
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer_fingerprint did not parse".into(),
+        };
+    };
+    let Some(kem_pub_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        peer_kem_pub_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer_kem_pub_b32 is not valid base32".into(),
+        };
+    };
+    let Ok(kem_pub) = onyx_core::crypto::HybridKemPublic::from_bytes(&kem_pub_bytes) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer_kem_pub_b32 did not decode as HybridKemPublic".into(),
+        };
+    };
+    let Ok(kp_bytes) = base64_decode(peer_kp_b64) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer_kp_b64 is not valid base64".into(),
+        };
+    };
+
+    // 2. SECURITY: validate the KP's embedded Ed25519 signing key
+    //    hashes to peer_fingerprint BEFORE inviting (THREAT_MODEL §8.2
+    //    #15). Same mitigation as handle_send_bootstrap_mls.
+    let extracted_signing_pk = {
+        let party = state.mls_party.lock().await;
+        match party.peer_signing_pk_from_kp_bytes(&kp_bytes) {
+            Ok(pk) => pk,
+            Err(_) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "peer_kp_b64 did not validate as a KeyPackage".into(),
+                };
+            }
+        }
+    };
+    let Ok(vk) = onyx_core::crypto::VerifyingKey::from_bytes(extracted_signing_pk) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "KP signing key is not a valid Ed25519 point".into(),
+        };
+    };
+    if vk.fingerprint() != fp {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "KP signing key does not match peer_fingerprint \
+                      — refusing to invite (potential hub-directory tampering)"
+                .into(),
+        };
+    }
+
+    // 3. Look up the existing room row so we know what name to stamp
+    //    on the recipient's Welcome. Refusing if the row is missing
+    //    is the safer default — we'd rather fail loud than send a
+    //    Welcome that the recipient renders nameless.
+    let room_row = {
+        let vault = state.vault.lock().await;
+        match vault.list_rooms(state.identity_id) {
+            Ok(rows) => rows.into_iter().find(|r| r.group_id == group_id_bytes),
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list_rooms: {e}"),
+                };
+            }
+        }
+    };
+    let Some(room) = room_row else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "no room with that group_id (create one first with CreateRoom)".into(),
+        };
+    };
+
+    // 4. Load the group, invite the peer, extract the Welcome bytes,
+    //    snapshot updated MLS state.
+    let (welcome_bytes, snapshot, refreshed_members_b32) = {
+        let party = state.mls_party.lock().await;
+        let mut group = match party.load_group(&group_id_bytes) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "MLS state has no group with that group_id (vault drift?)".into(),
+                };
+            }
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("load_group: {e}"),
+                };
+            }
+        };
+        let Ok(welcome) = group.invite(&party, &kp_bytes) else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "invite failed".into(),
+            };
+        };
+        let Ok(snap) = party.snapshot_state() else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "snapshot_state failed".into(),
+            };
+        };
+        // Re-derive members from the post-commit group. Same helper
+        // the recipient uses on join — keeps the cache shape
+        // symmetric.
+        let members = crate::members_b32_from_group(&group);
+        (welcome, snap, members)
+    };
+
+    // 5. Persist post-invite MLS state and refresh the cached
+    //    members_b32 on our side. Updates the row's name to itself
+    //    (effectively just refreshes members) — save_room is an
+    //    upsert by (identity_id, group_id).
+    {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_mls_state(state.identity_id, &snapshot) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_mls_state: {e}"),
+            };
+        }
+        if let Err(e) = vault.save_room(
+            state.identity_id,
+            &group_id_bytes,
+            &room.name,
+            &refreshed_members_b32,
+            room.created_at_ms,
+        ) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_room: {e}"),
+            };
+        }
+    }
+
+    // 6. Seal the Welcome with room_name = Some(room.name) so the
+    //    recipient knows this is a room invite, not a DM bootstrap.
+    let payload = onyx_core::routing::BootstrapPayload::MlsWelcome {
+        welcome: serde_bytes::ByteBuf::from(welcome_bytes),
+        first_message: None,
+        room_name: Some(room.name.clone()),
+    };
+    let Ok(payload_bytes) = payload.to_cbor() else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: "encoding mls/v1 BootstrapPayload failed".into(),
+        };
+    };
+    let Ok(sealed) = onyx_core::routing::seal_bootstrap(
+        state.identity.signing(),
+        state.identity.identity_key(),
+        &payload_bytes,
+        &kem_pub,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: "seal_bootstrap failed".into(),
+        };
+    };
+
+    // 7. Fan-out across all configured hubs. Same shape as
+    //    handle_send_bootstrap_mls; recipient's EnvelopeReplayGuard
+    //    de-dupes if multiple hubs deliver.
+    let target = onyx_core::routing::introduction_inbox(&fp);
+    let mut accepted = 0;
+    let mut last_err: Option<String> = None;
+    for (idx, hub_outbound) in state.hub_outbounds.iter().enumerate() {
+        match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(
+            target,
+            sealed.clone(),
+        )) {
+            Ok(()) => accepted += 1,
+            Err(TrySendError::Full(_)) => {
+                last_err = Some(format!("hub #{idx} outbound queue is full"));
+            }
+            Err(TrySendError::Closed(_)) => {
+                last_err = Some(format!("hub #{idx} client task has ended"));
+            }
+        }
+    }
+    if accepted > 0 {
+        tracing::info!(
+            op = "invite_to_room",
+            accepted,
+            total = state.hub_outbounds.len(),
+            "hub fan-out"
+        );
+        let members = refreshed_members_b32
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        ApiResponse::InviteToRoomOk {
+            group_id_b32: encode_b32(&group_id_bytes),
+            members,
+        }
+    } else {
+        ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: last_err.unwrap_or_else(|| "no hub accepted the Welcome envelope".into()),
+        }
+    }
 }
 
 /// Fetch a peer's MLS KeyPackage from the hub's T6.1 directory.
@@ -848,6 +1118,11 @@ async fn handle_send_bootstrap_mls(
     let payload = onyx_core::routing::BootstrapPayload::MlsWelcome {
         welcome: serde_bytes::ByteBuf::from(welcome_bytes),
         first_message: initial_text.map(str::to_owned),
+        // SendBootstrapMls always creates a fresh 2-party DM group —
+        // never a room. Rooms go through handle_invite_to_room
+        // (T6.3.c) and set room_name = Some(name) so the recipient
+        // surfaces a `rooms` entry instead of a DM conversation.
+        room_name: None,
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {

@@ -165,6 +165,26 @@ pub enum BootstrapPayload {
         welcome: ByteBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_message: Option<String>,
+        /// Optional local display name of the multi-party room the
+        /// Welcome is for (T6.3.c). When `Some`, the recipient saves
+        /// a `rooms` row with this name on join so the new member
+        /// sees the same name the inviter sees. When `None` (current
+        /// 2-party DM bootstrap, and any pre-T6.3.c sender), the
+        /// recipient treats the Welcome as a 2-party DM and does not
+        /// surface a room. `#[serde(default, skip_serializing_if)]`
+        /// so old wire payloads round-trip byte-identically — pre-
+        /// T6.3.c daemons that don't know about the field still parse
+        /// the envelope and ignore the unknown key (CBOR maps).
+        ///
+        /// **Security note.** This field is covered by the outer
+        /// sealed-sender Ed25519 signature alongside the Welcome and
+        /// `first_message`, so a hostile hub cannot rename the room
+        /// the recipient sees without invalidating the envelope. It
+        /// is *not* a cryptographic identifier — the binding
+        /// identifier is the MLS `group_id` recovered from the
+        /// joined `MlsGroupState`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        room_name: Option<String>,
     },
 }
 
@@ -516,6 +536,7 @@ mod tests {
         let p = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"opaque-mls-welcome-bytes-from-rfc9420".to_vec()),
             first_message: None,
+            room_name: None,
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -527,6 +548,20 @@ mod tests {
         let p = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
             first_message: Some("hi from the invite URL".to_string()),
+            room_name: None,
+        };
+        let bytes = p.to_cbor().expect("encode");
+        let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_round_trip_mls_welcome_with_room_name() {
+        // T6.3.c: room_name must round-trip alongside the Welcome.
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
+            first_message: None,
+            room_name: Some("#general".to_string()),
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -543,6 +578,7 @@ mod tests {
         let p = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"w".to_vec()),
             first_message: None,
+            room_name: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -553,10 +589,30 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_payload_mls_welcome_omits_room_name_field_when_none() {
+        // Wire back-compat (T6.3.c): None room_name must NOT be
+        // emitted, so pre-T6.3.c daemons (which lack the field
+        // entirely) round-trip the bytes byte-identically to what
+        // they would emit themselves.
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"w".to_vec()),
+            first_message: None,
+            room_name: None,
+        };
+        let bytes = p.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            !s.contains("room_name"),
+            "room_name must be skipped from the wire when None; got {bytes:?}"
+        );
+    }
+
+    #[test]
     fn bootstrap_payload_mls_welcome_carries_version_tag() {
         let p = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"w".to_vec()),
             first_message: None,
+            room_name: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -578,6 +634,7 @@ mod tests {
         let payload = BootstrapPayload::MlsWelcome {
             welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
             first_message: None,
+            room_name: None,
         };
         let payload_bytes = payload.to_cbor().unwrap();
 

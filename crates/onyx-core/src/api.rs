@@ -202,6 +202,31 @@ pub enum ApiRequest {
     /// [`ApiResponse::ListRoomsOk`] with one [`RoomInfo`] per room,
     /// ordered by `created_at_ms` ascending (older first).
     ListRooms,
+    /// Invite `peer` into the existing room identified by
+    /// `group_id_b32` (T6.3.c). The daemon loads the persisted MLS
+    /// group, calls `MlsGroupState::invite` against the peer's
+    /// validated KeyPackage, wraps the resulting Welcome in a
+    /// `BootstrapPayload::MlsWelcome` (`v: mls/v1`) sealed-sender
+    /// envelope **with `room_name = Some(name)` set so the recipient
+    /// surfaces a room and not a DM**, and fans out across all
+    /// configured hubs.
+    ///
+    /// SECURITY: same fingerprint↔KP-signing-key validation as
+    /// [`Self::SendBootstrapMls`] applies — refuses to add a member
+    /// whose KP signing key does not hash to the supplied
+    /// `peer_fingerprint` (defends `THREAT_MODEL.md` §8.2 #15: a
+    /// hostile hub directory could otherwise swap an attacker's KP
+    /// under the target's routing id).
+    ///
+    /// Requires `--hub onion:port,b32pubkey`. After a successful
+    /// commit, the room's cached `members_b32` is refreshed in the
+    /// vault with the new member's fingerprint included.
+    InviteToRoom {
+        group_id_b32: String,
+        peer_fingerprint: String,
+        peer_kem_pub_b32: String,
+        peer_kp_b64: String,
+    },
 }
 
 /// One response line on the wire (daemon → client).
@@ -292,6 +317,16 @@ pub enum ApiResponse {
     /// Reply to [`ApiRequest::ListRooms`]. `rooms` is ordered by
     /// `created_at_ms` ascending (older first).
     ListRoomsOk { rooms: Vec<RoomInfo> },
+    /// Reply to [`ApiRequest::InviteToRoom`] on success. `group_id_b32`
+    /// echoes the room's stable identifier; `members` is the room's
+    /// refreshed member-fingerprint list AFTER the invite commit
+    /// (one entry per current member, fingerprint in the same
+    /// `onyx identity`-printed form). Delivery to the recipient is
+    /// asynchronous — they join the moment they decode the Welcome.
+    InviteToRoomOk {
+        group_id_b32: String,
+        members: Vec<String>,
+    },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
@@ -581,6 +616,45 @@ mod tests {
         assert!(
             line.contains("\"kind\":\"CreateRoom\""),
             "wire must carry kind=CreateRoom; got {line:?}"
+        );
+    }
+
+    // ── T6.3.c: invite-to-room ────────────────────────────────────
+
+    #[test]
+    fn request_round_trip_invite_to_room() {
+        let r = ApiRequest::InviteToRoom {
+            group_id_b32: "groupabc".into(),
+            peer_fingerprint: "AAAA-BBBB-CCCC-DDDD-EEEE".into(),
+            peer_kem_pub_b32: "kemkemkem".into(),
+            peer_kp_b64: "a2V5LXBhY2thZ2U=".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_invite_to_room_ok() {
+        let r = ApiResponse::InviteToRoomOk {
+            group_id_b32: "groupabc".into(),
+            members: vec!["fp_alice".into(), "fp_bob".into(), "fp_carol".into()],
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn invite_to_room_wire_shape() {
+        let r = ApiRequest::InviteToRoom {
+            group_id_b32: "g".into(),
+            peer_fingerprint: "fp".into(),
+            peer_kem_pub_b32: "k".into(),
+            peer_kp_b64: "p".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert!(
+            line.contains("\"kind\":\"InviteToRoom\""),
+            "wire must carry kind=InviteToRoom; got {line:?}"
         );
     }
 

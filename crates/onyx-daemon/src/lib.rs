@@ -1195,6 +1195,7 @@ async fn handle_hub_delivery(
         onyx_core::routing::BootstrapPayload::MlsWelcome {
             welcome,
             first_message,
+            room_name,
         } => {
             // 3'. mls/v1: the sender invited us into a fresh MLS group.
             //     Join the group (creates persistent MLS state on our
@@ -1230,6 +1231,18 @@ async fn handle_hub_delivery(
                 if let Err(e) = vault.save_mls_state(state.identity_id, &snap) {
                     warn!(error = %e, "hub: mls/v1 snapshot save failed");
                 }
+            }
+
+            // T6.3.c: if the Welcome carried a `room_name`, this is a
+            // multi-party room invite rather than a 2-party DM
+            // bootstrap. Persist the room row and skip the DM
+            // register path (the conversation registry is DM-only;
+            // room surfacing in the TUI lands in T6.3.f). For DM
+            // bootstraps (room_name = None) we fall through to the
+            // existing T7.2-mls path.
+            if let Some(name) = room_name.clone() {
+                process_room_welcome(&group, &name, &sender_fingerprint, state).await;
+                return;
             }
 
             // Register the peer. They surface as a hub-only
@@ -1318,6 +1331,68 @@ fn ensure_default_identity(vault: &mut Vault) -> anyhow::Result<(i64, Identity)>
 
 fn encode_b32(bytes: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, bytes)
+}
+
+/// Persist a freshly-joined room on the recipient side (T6.3.c).
+/// Extracted from [`handle_hub_delivery`] so its room-arm stays
+/// short. Logs success at info, failures at warn.
+async fn process_room_welcome(
+    group: &onyx_core::mls::MlsGroupState,
+    name: &str,
+    sender_fingerprint: &str,
+    state: &Arc<DaemonState>,
+) {
+    let members_b32 = members_b32_from_group(group);
+    let group_id_bytes = group.group_id_bytes();
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(0);
+    let vault = state.vault.lock().await;
+    match vault.save_room(
+        state.identity_id,
+        &group_id_bytes,
+        name,
+        &members_b32,
+        now_ms,
+    ) {
+        Ok(()) => {
+            info!(
+                room_name = %name,
+                group_id_b32 = %encode_b32(&group_id_bytes),
+                mls_epoch = group.epoch(),
+                from_fingerprint = %sender_fingerprint,
+                "hub: mls/v1 Welcome processed, joined room"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "hub: mls/v1 room save failed");
+        }
+    }
+}
+
+/// Derive the comma-separated fingerprint list cached in
+/// `rooms.members_b32` from a joined MLS group (T6.3.c). One entry
+/// per current member (leaf-index order from MLS), formatted via
+/// `Fingerprint::to_string` — the same form printed by `onyx
+/// identity` and accepted everywhere else in the wire/UI surface.
+/// Members whose embedded signing key is not a valid Ed25519 point
+/// are skipped silently (defensive: should never happen for groups
+/// we've actually joined, since openmls would have rejected the
+/// Welcome).
+pub(crate) fn members_b32_from_group(group: &onyx_core::mls::MlsGroupState) -> String {
+    let mut out = Vec::new();
+    for raw in group.member_signing_keys() {
+        let Ok(arr) = <[u8; 32]>::try_from(raw.as_slice()) else {
+            continue;
+        };
+        if let Ok(vk) = onyx_core::crypto::VerifyingKey::from_bytes(arr) {
+            out.push(vk.fingerprint().to_string());
+        }
+    }
+    out.join(",")
 }
 
 fn decode_b32_32(s: &str) -> anyhow::Result<[u8; 32]> {

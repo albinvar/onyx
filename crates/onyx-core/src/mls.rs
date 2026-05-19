@@ -494,6 +494,21 @@ impl MlsGroupState {
         }
     }
 
+    /// Raw signing public keys of every current member of this group,
+    /// in the order MLS lists them (leaf-index order). Used by the
+    /// room layer (T6.3.c) to derive the members fingerprint cache
+    /// from the post-join / post-invite group state. Unlike
+    /// [`Self::peer_signing_key_bytes`] this works for groups of any
+    /// size, including the inviter's own row (callers filter as
+    /// needed).
+    #[must_use]
+    pub fn member_signing_keys(&self) -> Vec<Vec<u8>> {
+        self.group
+            .members()
+            .map(|m| m.signature_key.as_slice().to_vec())
+            .collect()
+    }
+
     /// Per-epoch 32-byte routing-token base secret. Identical across
     /// all members of the group at the same epoch — that's what makes
     /// the token namespace consistent for routing.
