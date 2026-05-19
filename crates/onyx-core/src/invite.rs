@@ -85,6 +85,17 @@ pub struct Invite {
     /// present, the URL was produced by `onyx invite --with-kp` and
     /// the accepting peer should use MLS-tier bootstrap.
     pub key_package: Option<Vec<u8>>,
+    /// *Optional* list of hubs the recipient publishes to (T8.2+).
+    /// Each entry is `onion:port,b32pubkey` — the same shape as the
+    /// daemon's `--hub` flag. Empty list == legacy form (URL was
+    /// produced before T8.2, or sender chose not to disclose).
+    ///
+    /// Used for transparency on the sender side: `onyx accept` shows
+    /// the recipient's hubs so the user knows where their first-
+    /// contact message will land. A future slice will let the sender
+    /// auto-configure their daemon to fan out via the recipient's
+    /// hubs; v1 just surfaces the list to stderr.
+    pub hubs: Vec<String>,
 }
 
 impl Invite {
@@ -96,6 +107,7 @@ impl Invite {
             fingerprint,
             kem_pub_b32,
             key_package: None,
+            hubs: Vec::new(),
         }
     }
 
@@ -112,7 +124,18 @@ impl Invite {
             fingerprint,
             kem_pub_b32,
             key_package: Some(key_package),
+            hubs: Vec::new(),
         }
+    }
+
+    /// Builder: attach the recipient's hub list (T8.2+). Each entry
+    /// must be `onion:port,b32pubkey` shape (same as the daemon's
+    /// `--hub` flag). Empty entries / missing commas are rejected
+    /// at parse time, not here — callers are trusted.
+    #[must_use]
+    pub fn with_hubs(mut self, hubs: Vec<String>) -> Self {
+        self.hubs = hubs;
+        self
     }
 
     /// Whether this invite carries an MLS KeyPackage (i.e. the
@@ -133,11 +156,16 @@ impl Invite {
             .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
     }
 
-    /// Serialize to `onyx://invite/v1?fp=…&kem=…[&kp=…]`. The
-    /// fingerprint loses its display-only space grouping; the
+    /// Serialize to `onyx://invite/v1?fp=…&kem=…[&kp=…][&hub=…]…`.
+    /// The fingerprint loses its display-only space grouping; the
     /// round-trip via [`Fingerprint::parse`] recovers it. The KP, if
     /// present, is base64url-encoded (no padding) so the URL needs no
-    /// percent-escaping anywhere.
+    /// percent-escaping anywhere. The hub list (T8.2+) is emitted as
+    /// one `&hub=<onion:port,b32pubkey>` per entry — repeating the
+    /// query key rather than packing all hubs into a single value
+    /// keeps the format trivially extensible and avoids inventing a
+    /// new in-value delimiter (the `,` inside `onion:port,pubkey`
+    /// already has meaning).
     #[must_use]
     pub fn to_url(&self) -> String {
         let mut url = format!(
@@ -149,6 +177,10 @@ impl Invite {
             let kp_url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(kp);
             url.push_str("&kp=");
             url.push_str(&kp_url);
+        }
+        for hub in &self.hubs {
+            url.push_str("&hub=");
+            url.push_str(hub);
         }
         url
     }
@@ -172,6 +204,7 @@ impl Invite {
         let mut fp: Option<&str> = None;
         let mut kem: Option<&str> = None;
         let mut kp: Option<&str> = None;
+        let mut hubs: Vec<String> = Vec::new();
         for pair in query.split('&') {
             let (k, v) = pair
                 .split_once('=')
@@ -180,6 +213,23 @@ impl Invite {
                 "fp" => fp = Some(v),
                 "kem" => kem = Some(v),
                 "kp" => kp = Some(v),
+                "hub" => {
+                    // Validate shape here so a malformed entry fails
+                    // parse instead of surfacing at "send to this
+                    // hub" time. Format: `onion:port,b32pubkey`.
+                    if v.is_empty() {
+                        return Err(Error::InvalidEncoding("invite: empty hub parameter"));
+                    }
+                    let (onion, pubkey) = v.split_once(',').ok_or(Error::InvalidEncoding(
+                        "invite: hub must be `onion:port,b32pubkey`",
+                    ))?;
+                    if onion.is_empty() || pubkey.is_empty() {
+                        return Err(Error::InvalidEncoding(
+                            "invite: hub onion or pubkey field is empty",
+                        ));
+                    }
+                    hubs.push(v.to_string());
+                }
                 _ => {} // forward-compat: ignore unknown keys
             }
         }
@@ -202,6 +252,7 @@ impl Invite {
             fingerprint,
             kem_pub_b32: kem.to_string(),
             key_package,
+            hubs,
         })
     }
 }
@@ -372,6 +423,92 @@ mod tests {
         let parsed = Invite::parse(&url).expect("legacy no-kp URL parses");
         assert!(!parsed.is_mls_tier());
         assert!(parsed.key_package.is_none());
+        assert!(parsed.hubs.is_empty(), "no hub keys → empty hubs Vec");
+    }
+
+    // ── T8.2: hubs in invite URL ──────────────────────────────────────
+
+    #[test]
+    fn with_hubs_round_trip_single() {
+        let inv = Invite::new(sample_fp(), "abcd".to_string())
+            .with_hubs(vec!["alice.onion:1,ALICEKEY".to_string()]);
+        let url = inv.to_url();
+        assert!(url.contains("&hub=alice.onion:1,ALICEKEY"));
+        let parsed = Invite::parse(&url).expect("single-hub round-trip");
+        assert_eq!(parsed.hubs, vec!["alice.onion:1,ALICEKEY".to_string()]);
+        assert_eq!(parsed, inv);
+    }
+
+    #[test]
+    fn with_hubs_round_trip_multiple() {
+        let inv = Invite::new(sample_fp(), "abcd".to_string()).with_hubs(vec![
+            "hub1.onion:1,KEY1".to_string(),
+            "hub2.onion:1,KEY2".to_string(),
+            "hub3.onion:1,KEY3".to_string(),
+        ]);
+        let url = inv.to_url();
+        let parsed = Invite::parse(&url).expect("multi-hub round-trip");
+        assert_eq!(parsed.hubs.len(), 3);
+        assert_eq!(parsed.hubs, inv.hubs);
+        // FIFO order preserved (matters for sender's fan-out priority).
+        assert_eq!(parsed.hubs[0], "hub1.onion:1,KEY1");
+        assert_eq!(parsed.hubs[2], "hub3.onion:1,KEY3");
+    }
+
+    #[test]
+    fn parse_rejects_empty_hub_value() {
+        let url = format!(
+            "onyx://invite/v1?fp={}&kem=abcd&hub=",
+            sample_fp().to_base32()
+        );
+        let err = Invite::parse(&url).unwrap_err();
+        assert!(matches!(err, Error::InvalidEncoding(msg) if msg.contains("hub")));
+    }
+
+    #[test]
+    fn parse_rejects_hub_without_comma() {
+        let url = format!(
+            "onyx://invite/v1?fp={}&kem=abcd&hub=onion-only-no-pubkey",
+            sample_fp().to_base32()
+        );
+        let err = Invite::parse(&url).unwrap_err();
+        assert!(matches!(err, Error::InvalidEncoding(msg) if msg.contains("hub")));
+    }
+
+    #[test]
+    fn parse_rejects_hub_with_empty_field() {
+        // Comma present but one side is empty.
+        let url = format!(
+            "onyx://invite/v1?fp={}&kem=abcd&hub=,JUSTPUBKEY",
+            sample_fp().to_base32()
+        );
+        let err = Invite::parse(&url).unwrap_err();
+        assert!(matches!(err, Error::InvalidEncoding(msg) if msg.contains("hub")));
+    }
+
+    #[test]
+    fn hubs_combine_with_kp() {
+        // Both query keys present; both round-trip.
+        let inv = Invite::with_key_package(
+            sample_fp(),
+            "abcd".to_string(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+        )
+        .with_hubs(vec!["h.onion:1,K".to_string()]);
+        let url = inv.to_url();
+        let parsed = Invite::parse(&url).expect("kp+hubs round-trip");
+        assert!(parsed.is_mls_tier());
+        assert_eq!(parsed.hubs, vec!["h.onion:1,K".to_string()]);
+        assert_eq!(parsed, inv);
+    }
+
+    #[test]
+    fn legacy_no_hub_url_parses_on_new_client() {
+        // Pre-T8.2 URLs (no &hub=) still parse cleanly. Back-compat
+        // sanity — the new field defaults to empty Vec.
+        let url = format!("onyx://invite/v1?fp={}&kem=abcd", sample_fp().to_base32());
+        let parsed = Invite::parse(&url).expect("legacy URL parses");
+        assert!(parsed.hubs.is_empty());
     }
 
     #[test]

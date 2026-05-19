@@ -199,6 +199,13 @@ pub struct DaemonState {
     /// daemon restart (documented restart window, see
     /// `replay_guard::EnvelopeReplayGuard` module rustdoc).
     pub seen_envelopes: Arc<Mutex<replay_guard::EnvelopeReplayGuard>>,
+    /// Snapshot of the hubs the daemon was configured with at
+    /// startup (T8.2+). Exposed via `IdentityOk.hubs` so the CLI can
+    /// embed them in invite URLs (`onyx invite --with-hubs`). Order
+    /// matches the order they were passed on the command line. Read
+    /// only — the daemon does not currently support runtime hub
+    /// reconfiguration.
+    pub configured_hubs: Vec<HubConfig>,
 }
 
 /// Run the Onyx daemon to completion. Returns when the daemon exits
@@ -336,6 +343,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         hub_outbounds,
         hub_fetch_lock: Arc::new(Mutex::new(())),
         seen_envelopes: Arc::new(Mutex::new(initial_guard)),
+        configured_hubs: args.hubs.clone(),
     });
 
     drop(args.passphrase);

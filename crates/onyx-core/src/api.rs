@@ -228,6 +228,13 @@ pub enum ApiResponse {
         /// See [`Self::StatusOk::identity_kem_pub_b32`] for the
         /// length-and-encoding caveat.
         identity_kem_pub_b32: String,
+        /// Hubs the daemon currently publishes to and subscribes
+        /// on (T8.2+). Each entry is `onion:port,b32pubkey` — the
+        /// same shape as the daemon's `--hub` flag. Empty when the
+        /// daemon has no hubs configured. `#[serde(default)]` for
+        /// wire back-compat with pre-T8.2 daemons.
+        #[serde(default)]
+        hubs: Vec<String>,
     },
     /// Reply to [`ApiRequest::Peers`].
     PeersOk { entries: Vec<PeerInfo> },
@@ -450,10 +457,27 @@ mod tests {
             identity_pub_b32: "abc".into(),
             fingerprint: "def".into(),
             identity_kem_pub_b32: "long-b32-stand-in".into(),
+            hubs: vec!["h1.onion:1,K1".into(), "h2.onion:1,K2".into()],
         };
         let line = encode_response_line(&r).unwrap();
         let parsed = decode_response(line.trim_end_matches('\n')).unwrap();
         assert_eq!(parsed, r);
+    }
+
+    #[test]
+    fn identity_ok_hubs_back_compat() {
+        // A pre-T8.2 daemon would not include the `hubs` field in
+        // its IdentityOk JSON. New clients must decode that legacy
+        // payload as `hubs: vec![]` via `#[serde(default)]`.
+        let legacy_wire = "{\"kind\":\"IdentityOk\",\"identity_pub_b32\":\"abc\",\
+                           \"fingerprint\":\"def\",\"identity_kem_pub_b32\":\"k\"}";
+        let parsed = decode_response(legacy_wire).expect("legacy wire decodes");
+        match parsed {
+            ApiResponse::IdentityOk { hubs, .. } => {
+                assert!(hubs.is_empty(), "missing field must default to empty Vec");
+            }
+            other => panic!("expected IdentityOk, got {other:?}"),
+        }
     }
 
     #[test]

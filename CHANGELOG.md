@@ -6,6 +6,60 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.2: multi-hub invite URLs — recipients disclose their hub list, senders see where messages will land
+
+Third step in the relay-setup arc. T8.0 made one hub durable; T8.1 made the daemon talk to N hubs in parallel; T8.2 extends invite URLs to carry the recipient's hub list, plus surfaces it on the sender's `onyx accept` for transparency. No auto-config in this slice — that's a future T8.2.b. v1 of T8.2 is: **the URL becomes a complete hub manifest**, and the user *sees* where their message is going before they send it.
+
+What landed:
+
+**T8.2.a — `Invite` struct gains `hubs: Vec<String>`.** `crates/onyx-core/src/invite.rs`. Each entry is `onion:port,b32pubkey` — same shape as the daemon's `--hub` flag. Empty Vec == legacy form (pre-T8.2 URL, or sender chose not to disclose). New `Invite::with_hubs(Vec<String>)` builder.
+
+URL encoding: each hub adds `&hub=<onion:port,b32pubkey>` to the URL. **Repeated query keys** rather than packing all hubs into a single value — keeps the format trivially extensible and avoids inventing a new in-value delimiter (the `,` inside `onion:port,pubkey` already has meaning). Parser switched from "overwrite on duplicate key" to "accumulate into Vec" for the `hub` key. Validation at parse time: each `hub` value must contain a comma and have non-empty onion + pubkey fields — surfaced as `InvalidEncoding`, not deferred to send time.
+
+Seven new tests covering: single-hub round-trip, multi-hub round-trip with FIFO order preservation, rejection of empty hub values, rejection of comma-less values, rejection of comma-present-but-empty-field values, `kp + hubs` combination round-trip, and the back-compat sanity ("legacy URLs without `&hub=` still parse, hubs Vec defaults empty").
+
+**T8.2.b — `ApiResponse::IdentityOk` gains `hubs: Vec<String>`.** `crates/onyx-core/src/api.rs`. `#[serde(default)]` for wire back-compat — a pre-T8.2 daemon's JSON (no `hubs` field) decodes cleanly as empty Vec. Hand-rolled back-compat test `identity_ok_hubs_back_compat` literally constructs a pre-T8.2 wire payload and asserts it decodes as `hubs: vec![]`.
+
+**T8.2.c — daemon populates `IdentityOk.hubs` from `Config.hubs`.** `crates/onyx-daemon/src/api_server.rs` + `lib.rs`. `DaemonState` gains `configured_hubs: Vec<HubConfig>` — a snapshot of what `run` was launched with. The `Identity` API handler reads it and formats each as `format!("{onion},{pubkey}")`. The daemon does not currently support runtime hub reconfiguration, so the snapshot is set once at startup and read-only thereafter.
+
+**T8.2.d — `onyx invite --with-hubs` flag.** `crates/onyx/src/main.rs`. Independent of `--with-kp` — they compose freely (you can have both, either, or neither). When set, `run_invite` reads `daemon_hubs` from `IdentityOk`, attaches via `Invite::with_hubs`, and emits the augmented URL. If the daemon has no hubs configured (empty Vec), surfaces a `warn!` to stderr but still prints a usable URL (without the hub list).
+
+**T8.2.e — `onyx accept` surfaces the recipient's hub list.** Stderr (so stdout stays pipe-friendly for the JSON response). Format:
+
+```
+onyx: recipient publishes to 3 hub(s):
+  • alice-hub-1.onion:1,KEY1
+  • alice-hub-2.onion:1,KEY2
+  • alice-hub-3.onion:1,KEY3
+onyx: your daemon will use ITS OWN configured --hub list for the
+fan-out. For maximum delivery reliability, ensure your daemon
+connects to at least one of the above hubs.
+```
+
+**Transparency, not auto-config.** v1 explicitly does *not* mutate the sender's daemon configuration based on the URL — that's a separate slice with bigger implications (transient hub sessions, runtime hub add/remove, etc.). v1 just tells the user "here's where you're sending" so they can sanity-check their own `--hub` config against it.
+
+**T8.2.f — three new CLI parser tests.** `invite_subcommand_parses_with_hubs_flag`, `invite_subcommand_parses_with_kp_and_hubs` (compose both flags), and the existing `invite_subcommand_parses_with_no_args` + `with_kp_flag` tests were updated to assert the new struct shape (`Command::Invite { with_kp, with_hubs }`).
+
+Security and anonymity:
+
+  * **The hub list is public information.** Same posture as the rest of the URL — fingerprint, KEM pubkey, KP, hub list are all data the recipient *intends* to be publicly known about themselves. An attacker learning "alice publishes to hubs X, Y, Z" learns nothing they couldn't learn by watching alice's hubs themselves. No new disclosure.
+  * **No new authentication surface.** The hub list is carried inside the same `onyx://invite/v1?…` URL that the user already trusts out-of-band; if the URL itself was tampered with, the recipient also tampered with the fingerprint, which is a more impactful tamper. The user's job is verify the fingerprint matches their peer; the hub list ride-along inherits the same trust.
+  * **No wire-format change to the hub protocol.** The invite URL is purely client-side; hubs are unaware T8.2 exists. Identical posture to T8.1 in this regard.
+  * **Forward-compat preserved.** Legacy URLs parse cleanly (empty hubs Vec); legacy daemons' `IdentityOk` (no `hubs` field) decodes cleanly on new clients. No version bump needed.
+
+`ANONYMITY.md` will be updated in a follow-up doc-only commit if the multi-hub-invite workflow turns up new user-facing anonymity caveats. None observed in this slice.
+
+What this did NOT do:
+
+  * Did not auto-configure the sender's daemon to fan out via the recipient's hubs. Sender still uses *their own* `--hub` config. Auto-config is the natural follow-up (call it `T8.2.b-autoconfig`) — needs design work on transient hub sessions + a security review of "URL can tell my daemon to dial arbitrary onions."
+  * Did not add hub-to-hub gossip (still T8.3+, real federation).
+  * Did not change the daemon protocol or wire format. Pure additive shape on the invite URL + the `IdentityOk` API response.
+  * Did not warn the sender if their hub config doesn't intersect the recipient's. That requires the sender's CLI to know its *own* daemon's hub list (already available via `Identity` API), do the intersection, surface the warning. Trivial follow-up; left out of v1 to keep the slice tight.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (zero new warnings — the additive pattern stayed inside existing constraints), `cargo test --workspace` **281 passed / 0 failed** (was 271; +7 invite-module tests, +1 api back-compat test, +2 CLI parser tests).
+
+---
+
 ## 2026-05-19 — T8.1: multi-hub publish/subscribe — daemon talks to N hubs in parallel; one hub dying loses nothing
 
 Second step in the "build up the relay setup" architecture. T8.0 made a single hub survive its own restart; T8.1 closes the remaining gap — **hub permanently dying** — at the client layer. Daemons now accept a repeatable `--hub onion:port,b32pubkey` flag and connect to as many hubs as the operator wants in parallel. Fan-out on send, fan-in on receive, dedup on the recipient via the existing replay guard. Strictly simpler than Matrix-style server-to-server federation, real durability + redundancy in ~one slice of work.

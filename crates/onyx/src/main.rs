@@ -202,12 +202,25 @@ enum Command {
     /// MLS-tier bootstrap (full PCS on every subsequent message).
     /// KPs are single-use in MLS — mint a fresh URL per recipient if
     /// you want both to succeed.
+    ///
+    /// With `--with-hubs` (T8.2+), the URL embeds the list of hubs
+    /// this daemon is currently configured to publish to and
+    /// subscribe on (`--hub` flags). The accepting peer's CLI shows
+    /// that list on `onyx accept` so they know where their
+    /// first-contact message will land — transparency over the
+    /// multi-hub fan-out path.
     Invite {
         /// Embed a fresh MLS KeyPackage in the URL so the accepting
         /// peer uses `SendBootstrapMls` (full MLS PCS on first
         /// contact) instead of msg/v1 (PFS only).
         #[arg(long)]
         with_kp: bool,
+        /// Embed the daemon's hub list in the URL so the accepting
+        /// peer sees where messages will land. Transparency, not
+        /// auto-config — the accepting peer still uses *their own*
+        /// daemon's hub config for the actual fan-out.
+        #[arg(long)]
+        with_hubs: bool,
     },
     /// Accept an `onyx://invite/v1?…` URL by sending the named
     /// fingerprint a first-contact message via the hub. Equivalent to
@@ -378,7 +391,9 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
             )
             .await
         }
-        Some(Command::Invite { with_kp }) => run_invite(&socket, with_kp).await,
+        Some(Command::Invite { with_kp, with_hubs }) => {
+            run_invite(&socket, with_kp, with_hubs).await
+        }
         Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
     }
 }
@@ -389,14 +404,19 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
 /// `with_kp`, also calls `ExportKeyPackage` and bundles a fresh KP
 /// in the URL so `onyx accept` on the other side will use MLS-tier
 /// bootstrap (full PCS) instead of msg/v1 (PFS only).
-async fn run_invite(socket: &std::path::Path, with_kp: bool) -> anyhow::Result<ExitCode> {
+async fn run_invite(
+    socket: &std::path::Path,
+    with_kp: bool,
+    with_hubs: bool,
+) -> anyhow::Result<ExitCode> {
     let id_resp = client::one_shot(socket, &ApiRequest::Identity).await?;
-    let (fingerprint, kem) = match id_resp {
+    let (fingerprint, kem, daemon_hubs) = match id_resp {
         ApiResponse::IdentityOk {
             fingerprint,
             identity_kem_pub_b32,
+            hubs,
             ..
-        } => (fingerprint, identity_kem_pub_b32),
+        } => (fingerprint, identity_kem_pub_b32, hubs),
         ApiResponse::Error { .. } => {
             println!("{}", serde_json::to_string_pretty(&id_resp)?);
             return Ok(ExitCode::from(1));
@@ -405,7 +425,7 @@ async fn run_invite(socket: &std::path::Path, with_kp: bool) -> anyhow::Result<E
     };
     let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
 
-    let invite = if with_kp {
+    let mut invite = if with_kp {
         let kp_resp = client::one_shot(socket, &ApiRequest::ExportKeyPackage).await?;
         let kp_b64_std = match kp_resp {
             ApiResponse::ExportKeyPackageOk { kp_b64 } => kp_b64,
@@ -425,6 +445,17 @@ async fn run_invite(socket: &std::path::Path, with_kp: bool) -> anyhow::Result<E
     } else {
         onyx_core::invite::Invite::new(fp, kem)
     };
+    if with_hubs {
+        if daemon_hubs.is_empty() {
+            eprintln!(
+                "onyx: warning — --with-hubs requested but daemon has no hubs configured; \
+                 the URL will not carry a hub list. Pass `--hub onion:port,b32pubkey` (one \
+                 or more times) to the daemon to populate it."
+            );
+        } else {
+            invite = invite.with_hubs(daemon_hubs);
+        }
+    }
     println!("{}", invite.to_url());
     Ok(ExitCode::SUCCESS)
 }
@@ -443,6 +474,23 @@ async fn run_invite(socket: &std::path::Path, with_kp: bool) -> anyhow::Result<E
 async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow::Result<ExitCode> {
     let invite = onyx_core::invite::Invite::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
+
+    // T8.2 transparency: if the inviter disclosed their hub list,
+    // surface it to stderr so the user can decide whether their own
+    // daemon's hub config will actually reach those hubs. Stays on
+    // stderr to keep stdout pipe-friendly for the JSON response.
+    if !invite.hubs.is_empty() {
+        eprintln!("onyx: recipient publishes to {} hub(s):", invite.hubs.len());
+        for hub in &invite.hubs {
+            eprintln!("  • {hub}");
+        }
+        eprintln!(
+            "onyx: your daemon will use ITS OWN configured --hub list for the fan-out. \
+             For maximum delivery reliability, ensure your daemon connects to at least \
+             one of the above hubs."
+        );
+    }
+
     let peer_fingerprint = invite.fingerprint.to_string();
     let req = if let Some(peer_kp_b64) = invite.kp_standard_b64() {
         ApiRequest::SendBootstrapMls {
@@ -609,13 +657,50 @@ mod tests {
     #[test]
     fn invite_subcommand_parses_with_no_args() {
         let args = Args::try_parse_from(["onyx", "invite"]).expect("parses");
-        assert!(matches!(args.cmd, Some(Command::Invite { with_kp: false })));
+        assert!(matches!(
+            args.cmd,
+            Some(Command::Invite {
+                with_kp: false,
+                with_hubs: false,
+            })
+        ));
     }
 
     #[test]
     fn invite_subcommand_parses_with_kp_flag() {
         let args = Args::try_parse_from(["onyx", "invite", "--with-kp"]).expect("parses");
-        assert!(matches!(args.cmd, Some(Command::Invite { with_kp: true })));
+        assert!(matches!(
+            args.cmd,
+            Some(Command::Invite {
+                with_kp: true,
+                with_hubs: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn invite_subcommand_parses_with_hubs_flag() {
+        let args = Args::try_parse_from(["onyx", "invite", "--with-hubs"]).expect("parses");
+        assert!(matches!(
+            args.cmd,
+            Some(Command::Invite {
+                with_kp: false,
+                with_hubs: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn invite_subcommand_parses_with_kp_and_hubs() {
+        let args =
+            Args::try_parse_from(["onyx", "invite", "--with-kp", "--with-hubs"]).expect("parses");
+        assert!(matches!(
+            args.cmd,
+            Some(Command::Invite {
+                with_kp: true,
+                with_hubs: true,
+            })
+        ));
     }
 
     #[test]
