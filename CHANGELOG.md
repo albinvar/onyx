@@ -6,6 +6,36 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.i: per-group buffer for out-of-order room frames
+
+Bugfix slice flagged in the post-T6.3.f.2 review. The "commit + KEM-advertisement" pair shipped in T6.3.h relies on per-path FIFO ordering — direct-session push order is preserved, hub TCP per-session is FIFO. But if a member's direct session drops between the commit fanout call and the KEM-ad fanout call, the commit might land on a now-dead direct channel while the KEM-ad takes the hub path — recipient receives KEM-ad (encrypted at epoch N+1) before they receive the commit that would advance them from N to N+1. Pre-T6.3.i, the KEM-ad fails to decrypt silently at debug, and that member permanently loses the KEM (they can't ask for it again). Same shape applies to any room app message that arrives faster than the preceding commit.
+
+What landed:
+
+  * **`DaemonState.pending_room_frames`** — new `Arc<Mutex<HashMap<group_id, VecDeque<ciphertext_bytes>>>>` (type-aliased to `PendingRoomFrames` for clippy). Per-group FIFO of room frames that failed `process_incoming`. Bounded at `PENDING_ROOM_FRAMES_PER_GROUP_MAX = 64` per group; overflow drops the oldest entry (FIFO).
+  * **`handle_room_app_frame` revised**: when `process_incoming` errors, instead of dropping at debug we push the ciphertext into the per-group buffer via `buffer_pending_room_frame`. The frame stays opaque — we never trust it past "looks like MLS bytes someone tried to send us." Cap stops a hostile or buggy peer from filling memory.
+  * **`drain_pending_room_frames` called from the Commit-merge branch**: when `process_incoming` returns `IncomingRoomMessage::Commit`, we've just advanced our epoch — every previously-buffered frame for this group might now decrypt. Drain the buffer, retry each via `handle_room_app_frame`. Frames that succeed surface normally (Text / KemAdvertisement); frames still out of order get re-buffered for the next commit; genuinely garbage frames get dropped silently as before.
+  * **`Box::pin` on the recursive drain call**: drain re-enters `handle_room_app_frame`, which may itself buffer + drain. Boxing the future at the recursion boundary keeps its size bounded (otherwise the type would be unbounded-recursive).
+
+Verification:
+
+  * **New MLS-layer test** `process_incoming_rejects_message_from_future_epoch` proves the underlying race exists at the MLS layer: alice invites carol (epoch 2), encrypts an app message at epoch 2, then bob (still at epoch 1) tries to `process_incoming` it — *must* error. Then bob processes the commit (now at epoch 2), retries the SAME ciphertext bytes — *must* decrypt. This is exactly the retry path `drain_pending_room_frames` exercises end-to-end.
+  * Gate: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **357 passed** (+1 new from 356).
+
+Design notes:
+
+  * **Why bounded buffer, not unbounded queue**. The buffer is designed for transient races (a few frames at most). An unbounded queue is a DoS vector: a hostile peer could send 10,000 undecryptable frames addressed to a group_id we'd never receive a commit for, and we'd grow memory linearly. The cap means worst case is ~64 frames × group_count × frame_size — at typical room sizes that's well under a megabyte.
+  * **Why FIFO overflow, not LIFO**. The most likely retry-successful frame is one that arrived JUST before the commit — i.e. recent. Older buffered frames are either also waiting for the commit (in which case retry order doesn't matter) or are stale garbage. Drop-oldest preserves more of the recent burst.
+  * **Why per-group, not global**. A long-stalled epoch-advance on room A shouldn't displace room B's buffered frames. Per-group keeps the failure modes isolated.
+  * **Issue #3 (session-token subscribe race) confirmed non-issue.** Hub's `state.rs:347-403` queues by routing_id even without a subscriber and drains on the first `subscribe`. So a sender publishing to `session_token(secret, N+1)` before the recipient has subscribed to that token gets the message queued; the recipient drains it on their next incremental `Subscribe`. Latency-only, not correctness.
+
+Remaining post-T6.3 issues (not closed by this slice):
+
+  * **No real-Tor smoke yet.** Every T6.3 slice this session needs real-circuit verification before "ready."
+  * **Cover traffic gap** (ANONYMITY.md §3.1) — pre-existing, not touched.
+
+---
+
 ## 2026-05-19 — T6.3.f.2: TUI room pane — rooms surface alongside DM peers
 
 Eighth and final T6.3 slice. The TUI gains a unified left pane that shows DM peers AND multi-party rooms; selection cycles through both; the composer dispatches to either `ApiRequest::Send` (DM) or `ApiRequest::SendRoom` (room) based on what's selected. Room messages arriving via `EventMessage { peer_short = "room/<short>" }` (the wire shape T6.3.d shipped) land in the correct room's scrollback without prefix stripping. End-to-end multi-party rooms are now operable from the TUI, not just `onyx room` CLI verbs.

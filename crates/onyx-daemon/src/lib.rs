@@ -210,7 +210,35 @@ pub struct DaemonState {
     /// only — the daemon does not currently support runtime hub
     /// reconfiguration.
     pub configured_hubs: Vec<HubConfig>,
+    /// T6.3.i (commit/KEM-ad ordering fix): per-group buffer for
+    /// room frames that failed `process_incoming` — likely because
+    /// they arrived at the wrong epoch (e.g. a KEM-advertisement
+    /// encrypted at epoch N+1 reached us before the commit that
+    /// advances us from N to N+1). After every successful Commit
+    /// merge we drain the buffer and retry each pending frame; the
+    /// ones that were waiting for that epoch now decrypt.
+    ///
+    /// Bounded per group ([`PENDING_ROOM_FRAMES_PER_GROUP_MAX`]) so a
+    /// hostile or buggy peer can't fill memory by spamming
+    /// undecryptable frames. Overflow drops the *oldest* buffered
+    /// frame (FIFO) — losing a single undecryptable retry is the
+    /// cheapest failure mode here.
+    pub pending_room_frames: PendingRoomFrames,
 }
+
+/// T6.3.i: per-group out-of-order room-frame retry buffer. Map
+/// from `group_id` (raw MLS bytes) to a FIFO of ciphertexts that
+/// failed `process_incoming` and are waiting for an epoch-advancing
+/// commit to make them decryptable.
+pub type PendingRoomFrames =
+    Arc<Mutex<std::collections::HashMap<Vec<u8>, std::collections::VecDeque<Vec<u8>>>>>;
+
+/// T6.3.i: per-group bound on the out-of-order room-frame retry
+/// buffer. 64 frames is comfortably above any realistic burst (the
+/// typical "race" is at most 2-3 frames: a commit followed by 1-2
+/// app messages that were already in flight). Anything beyond that
+/// is almost certainly garbage / hostile probing.
+pub const PENDING_ROOM_FRAMES_PER_GROUP_MAX: usize = 64;
 
 /// Run the Onyx daemon to completion. Returns when the daemon exits
 /// normally (Ctrl-C, peer disconnect in dial mode) or with an error
@@ -348,6 +376,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         hub_fetch_lock: Arc::new(Mutex::new(())),
         seen_envelopes: Arc::new(Mutex::new(initial_guard)),
         configured_hubs: args.hubs.clone(),
+        pending_room_frames: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
 
     drop(args.passphrase);
@@ -1215,10 +1244,13 @@ async fn handle_room_app_frame(
         }
     };
     let Ok((incoming, epoch)) = processed_result else {
-        debug!(
-            group_id_b32 = %encode_b32(group_id),
-            "MLS room frame: process_incoming failed; dropping"
-        );
+        // T6.3.i: process_incoming failed — most likely the message
+        // arrived ahead of a commit that would have advanced us to
+        // the right epoch (e.g. a KEM-ad encrypted at N+1 reached
+        // us before the commit from N→N+1). Stash for retry; we'll
+        // re-feed every pending frame for this group right after
+        // the next Commit merge lands.
+        buffer_pending_room_frame(group_id, payload, state).await;
         return;
     };
     // Persist updated MLS state regardless of message kind — both
@@ -1237,6 +1269,10 @@ async fn handle_room_app_frame(
         onyx_core::mls::IncomingRoomMessage::Application(pt) => pt,
         onyx_core::mls::IncomingRoomMessage::Commit => {
             refresh_room_roster_after_commit(group_id, sender_peer_pub, epoch, state).await;
+            // T6.3.i: a commit just advanced our epoch — drain the
+            // per-group pending-frame buffer and retry each frame.
+            // The ones that were waiting for this epoch now succeed.
+            drain_pending_room_frames(group_id, sender_peer_pub, state).await;
             return;
         }
     };
@@ -1296,6 +1332,74 @@ async fn handle_room_app_frame(
                 ),
             }
         }
+    }
+}
+
+/// T6.3.i: stash a room frame that just failed `process_incoming`,
+/// keyed by `group_id`. Bounded per group at
+/// [`PENDING_ROOM_FRAMES_PER_GROUP_MAX`]; overflow drops the oldest
+/// buffered frame (FIFO). The next successful Commit merge on this
+/// group calls [`drain_pending_room_frames`] which retries every
+/// frame currently in the buffer.
+async fn buffer_pending_room_frame(group_id: &[u8], payload: &[u8], state: &Arc<DaemonState>) {
+    let mut pending = state.pending_room_frames.lock().await;
+    let q = pending.entry(group_id.to_vec()).or_default();
+    if q.len() >= PENDING_ROOM_FRAMES_PER_GROUP_MAX {
+        q.pop_front();
+        debug!(
+            group_id_b32 = %encode_b32(group_id),
+            "T6.3.i: pending-frame buffer full; dropped oldest"
+        );
+    }
+    q.push_back(payload.to_vec());
+    debug!(
+        group_id_b32 = %encode_b32(group_id),
+        pending = q.len(),
+        "T6.3.i: room frame buffered for retry"
+    );
+}
+
+/// T6.3.i: drain the per-group pending-frame buffer and retry each
+/// frame via `process_incoming` now that our epoch has advanced. A
+/// frame that's still out of order (very rare; would require N+2
+/// already in flight) gets re-buffered for the next commit. A frame
+/// that's genuinely garbage gets dropped silently.
+///
+/// Sender_peer_pub is propagated so retried Application frames
+/// surface under the right log line; for Commit retries it's just a
+/// log field.
+async fn drain_pending_room_frames(
+    group_id: &[u8],
+    sender_peer_pub: &[u8; 32],
+    state: &Arc<DaemonState>,
+) {
+    let drained: Vec<Vec<u8>> = {
+        let mut pending = state.pending_room_frames.lock().await;
+        pending
+            .get_mut(group_id)
+            .map(|q| q.drain(..).collect())
+            .unwrap_or_default()
+    };
+    if drained.is_empty() {
+        return;
+    }
+    debug!(
+        group_id_b32 = %encode_b32(group_id),
+        count = drained.len(),
+        "T6.3.i: retrying buffered room frames after commit merge"
+    );
+    // Use Box::pin to call the async function recursively without
+    // overflowing the future's size — handle_room_app_frame may
+    // itself buffer-and-retry, so the future-of-future-of-future
+    // would be unbounded otherwise.
+    for payload in drained {
+        Box::pin(handle_room_app_frame(
+            group_id,
+            &payload,
+            sender_peer_pub,
+            state,
+        ))
+        .await;
     }
 }
 

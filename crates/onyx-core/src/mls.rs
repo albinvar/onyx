@@ -1014,6 +1014,56 @@ mod tests {
         );
     }
 
+    /// T6.3.i sanity-check: pre-fix, an app message encrypted at
+    /// epoch N+1 fails to decrypt on a peer still at epoch N
+    /// (returns Error rather than queuing). This pins that
+    /// behaviour at the MLS layer — `process_incoming` does NOT
+    /// magically queue out-of-order messages; the out-of-order
+    /// buffering is the daemon's responsibility (see
+    /// `buffer_pending_room_frame` in `onyx-daemon::lib`).
+    #[test]
+    fn process_incoming_rejects_message_from_future_epoch() {
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let bob = MlsParty::new(b"bob".to_vec()).unwrap();
+        let carol = MlsParty::new(b"carol".to_vec()).unwrap();
+        let bob_kp = bob.key_package_bytes().unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let (_, welcome_to_bob) = alice_group.invite(&alice, &bob_kp).unwrap();
+        let mut bob_group = bob.join_from_welcome(&welcome_to_bob).unwrap();
+        // Both at epoch 1. Alice invites carol → her epoch becomes 2.
+        // She encrypts an app message at epoch 2 BEFORE shipping the
+        // commit to bob (simulating the race).
+        let carol_kp = carol.key_package_bytes().unwrap();
+        let (commit_to_bob, _welcome_to_carol) =
+            alice_group.invite(&alice, &carol_kp).unwrap();
+        assert_eq!(alice_group.epoch(), 2);
+        let app_at_epoch_2 = alice_group
+            .encrypt_application(&alice, b"future-epoch message")
+            .unwrap();
+        assert_eq!(bob_group.epoch(), 1);
+
+        // Bob tries to decrypt the epoch-2 app message while still at
+        // epoch 1: MUST fail. (Daemon-side buffer would queue this.)
+        let early = bob_group.process_incoming(&bob, &app_at_epoch_2);
+        assert!(
+            early.is_err(),
+            "epoch-2 app on epoch-1 group must error, not silently succeed"
+        );
+
+        // Bob processes the commit, advancing to epoch 2. Now the
+        // SAME ciphertext bytes decrypt — that's exactly the retry
+        // path the daemon-side drain_pending_room_frames exercises.
+        let commit_result = bob_group.process_incoming(&bob, &commit_to_bob).unwrap();
+        assert!(matches!(commit_result, IncomingRoomMessage::Commit));
+        assert_eq!(bob_group.epoch(), 2);
+        let retry = bob_group.process_incoming(&bob, &app_at_epoch_2).unwrap();
+        assert_eq!(
+            retry,
+            IncomingRoomMessage::Application(b"future-epoch message".to_vec()),
+            "after commit merge, the buffered epoch-2 app must decrypt"
+        );
+    }
+
     /// After a commit advances the epoch, the session token MUST
     /// change. Otherwise per-epoch unlinkability (the T6.3.g
     /// privacy property) breaks — a hub watching the inbox would
