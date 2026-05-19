@@ -9,7 +9,8 @@ use std::sync::Arc;
 use onyx_core::crypto::IdentitySecret;
 use onyx_core::transport::{Session, handshake_responder, read_frame, write_frame};
 use onyx_core::wire::{
-    FRAME_DELIVER, FRAME_KP_FETCH, FRAME_KP_PUBLISH, FRAME_KP_RESPONSE, FRAME_SUBSCRIBE, InnerFrame,
+    FRAME_DELIVER, FRAME_GOSSIP_PUBLISH, FRAME_KP_FETCH, FRAME_KP_PUBLISH, FRAME_KP_RESPONSE,
+    FRAME_SUBSCRIBE, GossipFrame, InnerFrame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
@@ -35,8 +36,32 @@ where
     let mut session = handshake_responder(&mut stream, hub_x25519)
         .await
         .map_err(|e| anyhow::anyhow!("hub: noise handshake failed: {e}"))?;
-    info!("hub: noise XK complete, awaiting frames");
 
+    // T8.3.b.4: role detection. After Noise XK, the authenticated
+    // peer_static_key tells us whether this is a peer hub (in our
+    // operator's `--peer-hub` allowlist) or a client. Peer-hub
+    // sessions get a separate frame loop that only handles gossip
+    // frames; client sessions get the existing handler. We do NOT
+    // register peer-hub sessions in the client `senders` registry
+    // (peer hubs don't subscribe to routing-ids; the connection-id
+    // bookkeeping would just leak entries).
+    let peer_pk = session.peer_static_key();
+    let role_is_peer_hub = state.lock().await.is_peer_hub(&peer_pk);
+
+    if role_is_peer_hub {
+        info!(
+            peer_pk_prefix = format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                peer_pk[0], peer_pk[1], peer_pk[2], peer_pk[3]
+            ),
+            "hub: noise XK complete; inbound peer-hub session"
+        );
+        let result = serve_peer_frames(&mut stream, &mut session, &state, &peer_pk).await;
+        info!("hub: peer-hub session closed");
+        return result;
+    }
+
+    info!("hub: noise XK complete; inbound client session");
     // Per-connection mailbox. The state pushes here when something
     // arrives for us; we drain in the select loop and write out.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(PER_CONN_MAILBOX);
@@ -55,6 +80,124 @@ where
     info!(conn = conn_id, "hub: connection closed");
 
     result
+}
+
+/// Frame loop for peer-hub inbound sessions (T8.3.b.4). Only
+/// handles `FRAME_GOSSIP_PUBLISH` (and `FRAME_GOSSIP_DELIVER` once
+/// T8.3.c lands). Any other frame type from a peer hub is a
+/// protocol error from our perspective; we log a warning and drop
+/// the frame, but keep the session open so the peer can recover
+/// (a slightly-misconfigured peer is more useful alive than killed).
+///
+/// `source_pubkey` is the peer's authenticated Noise pubkey, used
+/// to skip the re-fanout target so a forwarded frame never goes
+/// straight back to its sender.
+async fn serve_peer_frames<S>(
+    stream: &mut S,
+    session: &mut Session,
+    state: &Arc<Mutex<HubState>>,
+    source_pubkey: &[u8; 32],
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let read_result = read_frame(stream, session).await;
+        let Ok(frame) = read_result else {
+            // Peer disconnected (or wire error). Clean exit.
+            return Ok(());
+        };
+        match frame.frame_type {
+            FRAME_GOSSIP_PUBLISH => {
+                handle_gossip_publish(&frame.payload, state, source_pubkey).await;
+            }
+            other => {
+                warn!(
+                    frame_type = format!("{other:#x}"),
+                    "hub: peer-hub session received unexpected frame type; dropping (keeping session open)"
+                );
+            }
+        }
+    }
+}
+
+/// Process one inbound `FRAME_GOSSIP_PUBLISH` from a peer hub
+/// (T8.3.b.4). Drops on loop detection, drops on T7.3-sec
+/// ownership-check failure, stores locally on success, and
+/// re-fans-out to OTHER peer hubs with decremented TTL.
+async fn handle_gossip_publish(
+    payload: &[u8],
+    state: &Arc<Mutex<HubState>>,
+    source_pubkey: &[u8; 32],
+) {
+    // Decode the gossip header + body. Malformed → drop silently
+    // (same posture as other malformed-frame handling).
+    let Ok(frame) = GossipFrame::decode(payload) else {
+        warn!("hub: peer-hub gossip frame did not decode; dropping");
+        return;
+    };
+
+    // Loop check. If the sender claims a `seen_by` that equals our
+    // own hub hash, this frame has already traversed us — dropping
+    // is the correct behaviour (avoids amplification storms).
+    {
+        let s = state.lock().await;
+        if frame.seen_by == s.self_hub_hash_for_test() {
+            tracing::debug!("hub: gossip loop detected (seen_by == our hash); dropping");
+            return;
+        }
+    }
+
+    // Per T7.3-sec: the KP's embedded Ed25519 signing key MUST
+    // derive the claimed routing id. Same ownership check we apply
+    // to direct client KP_PUBLISH. A peer hub that gossips a KP it
+    // shouldn't own gets silently rejected here.
+    let signing_pk = match onyx_core::mls::signing_key_from_kp_bytes(&frame.body) {
+        Ok(pk) => pk,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "hub: gossip KP did not validate as a well-formed MLS KeyPackage; dropping"
+            );
+            return;
+        }
+    };
+    let fingerprint = onyx_core::crypto::Fingerprint::from_bytes(signing_pk);
+    let expected_routing = onyx_core::routing::introduction_inbox(&fingerprint);
+    if expected_routing != frame.routing_id {
+        warn!(
+            "hub: gossip KP signing key does not derive the claimed routing id \
+             (ownership check failed); dropping"
+        );
+        return;
+    }
+
+    // Store locally + log directory size.
+    let dir_size = {
+        let mut s = state.lock().await;
+        s.publish_keypackage(frame.routing_id, frame.body.clone());
+        s.keypackage_count()
+    };
+    info!(
+        directory_size = dir_size,
+        kp_bytes = frame.body.len(),
+        "hub: gossiped KeyPackage accepted (ownership verified)"
+    );
+
+    // Forward to other peers (TTL decrement + seen_by rewrite via
+    // GossipFrame::forward). Skip the source peer to avoid bouncing.
+    if let Some(fwd) = frame.forward([0u8; 16]) {
+        // We re-encode via fan_out_kp_to_peers_except so the
+        // outgoing seen_by gets set to OUR hash (the dummy [0;16]
+        // we passed to forward() above is overwritten — we only
+        // used forward() for the TTL-decrement logic).
+        let _ = fwd; // suppress unused: we only needed the TTL check
+        let s = state.lock().await;
+        let new_ttl = frame.ttl.saturating_sub(1);
+        if new_ttl > 0 {
+            s.fan_out_kp_to_peers_except(source_pubkey, new_ttl, frame.routing_id, &frame.body);
+        }
+    }
 }
 
 // `serve_frames` is one linear `select!`-loop dispatcher; the body is

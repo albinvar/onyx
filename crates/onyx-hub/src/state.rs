@@ -93,14 +93,16 @@ pub struct HubState {
     /// means "no limit, accept everything." Bound on first frame
     /// per connection (lazy); cleared on unregister_conn.
     rate_limiter: Option<RateLimiter>,
-    /// One outbound channel per peer hub (T8.3.b.2+). When a client
-    /// publishes a KeyPackage that passes the T7.3-sec ownership
-    /// check, the hub pushes a pre-encoded `GossipFrame` payload
-    /// (TTL=3, seen_by=our hash) into every channel. The
-    /// `peer_link::run_peer_session` task that owns each channel
-    /// drains it and writes `FRAME_GOSSIP_PUBLISH` frames to the
-    /// peer hub. Empty Vec when no `--peer-hub` is configured.
-    peer_outbounds: Vec<mpsc::Sender<Vec<u8>>>,
+    /// One outbound channel per peer hub (T8.3.b.2+), keyed by the
+    /// peer's hub identity X25519 pubkey. The key serves two
+    /// purposes: (1) on inbound peer-hub recognition (T8.3.b.4) we
+    /// check `peer_outbounds.contains_key(&peer_static_key)` to
+    /// decide role; (2) on gossip re-fanout we skip the source
+    /// peer's channel via `fan_out_kp_to_peers_except(source_pk)`
+    /// to avoid bouncing the frame back where it came from.
+    ///
+    /// Empty HashMap when no `--peer-hub` is configured.
+    peer_outbounds: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
     /// Low 16 bytes of BLAKE2b-128 of our own hub identity pubkey
     /// (T8.3.b.2+). Used as the `seen_by` value when we originate
     /// or forward a gossip frame so peer hubs can detect loops
@@ -161,12 +163,28 @@ impl HubState {
         }
     }
 
-    /// Install the per-peer-hub outbound channels (T8.3.b.2+). One
-    /// sender per peer hub; each is drained by a dedicated
-    /// `peer_link::run_peer_session` task in `main.rs`. Empty Vec
-    /// (the default) disables federation entirely.
-    pub fn set_peer_outbounds(&mut self, peer_outbounds: Vec<mpsc::Sender<Vec<u8>>>) {
+    /// Install the per-peer-hub outbound channels (T8.3.b.2+),
+    /// keyed by the peer hub's X25519 identity pubkey. Empty
+    /// HashMap (the default) disables federation entirely.
+    pub fn set_peer_outbounds(&mut self, peer_outbounds: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>) {
         self.peer_outbounds = peer_outbounds;
+    }
+
+    /// T8.3.b.4: does this authenticated peer pubkey belong to a
+    /// configured peer hub? Used by `hub_handle_connection` after
+    /// the Noise XK handshake to decide role (peer hub vs client).
+    #[must_use]
+    pub fn is_peer_hub(&self, peer_pubkey: &[u8; 32]) -> bool {
+        self.peer_outbounds.contains_key(peer_pubkey)
+    }
+
+    /// Expose our own hub hash for the gossip loop-detection check
+    /// in `handler::handle_gossip_publish`. Named `_for_test` to
+    /// keep the public surface clearly internal; not actually
+    /// test-only — it's called from the handler too.
+    #[must_use]
+    pub fn self_hub_hash_for_test(&self) -> [u8; GOSSIP_SEEN_BY_LEN] {
+        self.self_hub_hash
     }
 
     /// Set our own hub-pubkey hash for gossip `seen_by` purposes
@@ -186,11 +204,17 @@ impl HubState {
     }
 
     /// Fan out a freshly-validated KeyPackage to every configured
-    /// peer hub (T8.3.b.3). Wraps the KP in a `GossipFrame` with
-    /// `seen_by` = our hash, encodes, and `try_send`s the bytes to
-    /// each peer-hub outbound channel. Best-effort: a full channel
-    /// drops the gossip for that peer, but the local store + the
-    /// other peers still succeed.
+    /// peer hub (T8.3.b.3). Wraps the KP in a fresh `GossipFrame`
+    /// at TTL=`GOSSIP_TTL_DEFAULT` with `seen_by` = our hash,
+    /// encodes, and `try_send`s the bytes to each peer-hub outbound
+    /// channel. Best-effort: a full channel drops the gossip for
+    /// that peer, but the local store + the other peers still
+    /// succeed.
+    ///
+    /// Use this for KPs received from local clients (the fresh-
+    /// origination case). For KPs received via gossip from a peer,
+    /// use [`Self::fan_out_kp_to_peers_except`] with the source
+    /// pubkey + the forwarded TTL to avoid bouncing back.
     ///
     /// No-op when `peer_outbounds` is empty (no federation).
     pub fn fan_out_kp_to_peers(&self, routing_id: RoutingId, kp_bytes: &[u8]) {
@@ -199,22 +223,59 @@ impl HubState {
         }
         let frame = GossipFrame::new(self.self_hub_hash, routing_id, kp_bytes.to_vec());
         let payload = frame.encode();
+        self.broadcast_to_peers(&payload, None, "gossip KP (origin)");
+    }
+
+    /// Fan out a gossip-forwarded KeyPackage to every configured
+    /// peer hub **except** the source (T8.3.b.4). `source_pubkey`
+    /// is the authenticated Noise pubkey of the peer hub we just
+    /// received the gossip from — skipping it on re-fanout avoids
+    /// bouncing the frame straight back across the same link.
+    ///
+    /// `ttl_already_decremented` is the TTL the caller wants on the
+    /// outgoing frame (already-decremented by `GossipFrame::forward`).
+    /// Returns the encoded outgoing frame for testability; in
+    /// production callers ignore the return value.
+    pub fn fan_out_kp_to_peers_except(
+        &self,
+        source_pubkey: &[u8; 32],
+        ttl_already_decremented: u8,
+        routing_id: RoutingId,
+        kp_bytes: &[u8],
+    ) {
+        if self.peer_outbounds.is_empty() {
+            return;
+        }
+        let frame = GossipFrame {
+            ttl: ttl_already_decremented,
+            seen_by: self.self_hub_hash,
+            routing_id,
+            body: kp_bytes.to_vec(),
+        };
+        let payload = frame.encode();
+        self.broadcast_to_peers(&payload, Some(source_pubkey), "gossip KP (forward)");
+    }
+
+    /// Internal: send the pre-encoded gossip payload to every peer
+    /// outbound channel, optionally skipping one source pubkey.
+    fn broadcast_to_peers(&self, payload: &[u8], skip: Option<&[u8; 32]>, op: &'static str) {
         let mut accepted = 0usize;
-        for (idx, tx) in self.peer_outbounds.iter().enumerate() {
-            match tx.try_send(payload.clone()) {
+        let total = self.peer_outbounds.len();
+        for (pk, tx) in &self.peer_outbounds {
+            if Some(pk) == skip {
+                continue;
+            }
+            match tx.try_send(payload.to_owned()) {
                 Ok(()) => accepted += 1,
                 Err(e) => warn!(
-                    peer_idx = idx,
+                    peer_pk_prefix = format!("{:02x}{:02x}{:02x}{:02x}", pk[0], pk[1], pk[2], pk[3]),
                     error = %e,
-                    "hub: peer-hub outbound queue full or closed; dropping gossip KP for this peer"
+                    op,
+                    "hub: peer-hub outbound queue full or closed; dropping gossip for this peer"
                 ),
             }
         }
-        tracing::debug!(
-            accepted,
-            total = self.peer_outbounds.len(),
-            "hub: gossiped KP to peer hubs"
-        );
+        tracing::debug!(accepted, total, op, "hub: gossip fan-out");
     }
 
     /// Register a fresh connection. Returns the [`ConnId`] the
@@ -611,7 +672,10 @@ mod tests {
         let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(8);
         let mut state = HubState::new();
         state.set_self_hub_hash([0xAA; 16]);
-        state.set_peer_outbounds(vec![tx_a, tx_b]);
+        let mut peers = HashMap::new();
+        peers.insert([0x01; 32], tx_a);
+        peers.insert([0x02; 32], tx_b);
+        state.set_peer_outbounds(peers);
 
         let rid: RoutingId = [0x11; 16];
         let kp = b"opaque kp bytes".to_vec();
@@ -652,7 +716,10 @@ mod tests {
 
         let mut state = HubState::new();
         state.set_self_hub_hash([0xCC; 16]);
-        state.set_peer_outbounds(vec![tx_full, tx_open]);
+        let mut peers = HashMap::new();
+        peers.insert([0x03; 32], tx_full);
+        peers.insert([0x04; 32], tx_open);
+        state.set_peer_outbounds(peers);
 
         // Should not panic; should successfully push to tx_open.
         state.fan_out_kp_to_peers([0x22; 16], b"kp");
@@ -661,6 +728,61 @@ mod tests {
         let bytes = rx_open.recv().await.expect("open peer received");
         let frame = onyx_core::wire::GossipFrame::decode(&bytes).unwrap();
         assert_eq!(frame.routing_id, [0x22; 16]);
+    }
+
+    /// T8.3.b.4 is_peer_hub: contains_key shorthand. Configured
+    /// peer pubkeys return true; anything else returns false.
+    #[tokio::test]
+    async fn is_peer_hub_recognises_configured_pubkeys() {
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let mut state = HubState::new();
+        let mut peers = HashMap::new();
+        peers.insert([0x77; 32], tx);
+        state.set_peer_outbounds(peers);
+
+        assert!(state.is_peer_hub(&[0x77; 32]));
+        assert!(!state.is_peer_hub(&[0x88; 32]));
+        // No peers installed → nothing is a peer.
+        let empty_state = HubState::new();
+        assert!(!empty_state.is_peer_hub(&[0x77; 32]));
+    }
+
+    /// T8.3.b.4 forward path: re-fanout to peers OTHER THAN the
+    /// source. Source pubkey's channel is silent; every other
+    /// peer's channel receives the forwarded frame.
+    #[tokio::test]
+    async fn fan_out_except_skips_source() {
+        let (tx_src, mut rx_src) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(8);
+
+        let mut state = HubState::new();
+        state.set_self_hub_hash([0xEE; 16]);
+        let mut peers = HashMap::new();
+        let src_pk = [0xAA; 32];
+        peers.insert(src_pk, tx_src);
+        peers.insert([0xBB; 32], tx_a);
+        peers.insert([0xCC; 32], tx_b);
+        state.set_peer_outbounds(peers);
+
+        state.fan_out_kp_to_peers_except(&src_pk, 2, [0x33; 16], b"forwarded kp");
+
+        // Source should have received NOTHING.
+        assert!(
+            rx_src.try_recv().is_err(),
+            "source must not receive its own forward"
+        );
+
+        // Other two peers got the gossip.
+        let bytes_a = rx_a.recv().await.expect("peer A received");
+        let bytes_b = rx_b.recv().await.expect("peer B received");
+        assert_eq!(bytes_a, bytes_b);
+
+        let frame = onyx_core::wire::GossipFrame::decode(&bytes_a).unwrap();
+        assert_eq!(frame.ttl, 2, "forwarded TTL preserved verbatim");
+        assert_eq!(frame.seen_by, [0xEE; 16], "seen_by = OUR hash (rewritten)");
+        assert_eq!(frame.routing_id, [0x33; 16]);
+        assert_eq!(frame.body, b"forwarded kp");
     }
 
     /// `hub_pubkey_to_hash` is a stable function of its input;

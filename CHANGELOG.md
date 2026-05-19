@@ -6,6 +6,69 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.b.4: inbound peer-hub recognition + gossip receive/re-fanout
+
+Third T8.3 implementation slice. T8.3.b.1 added the wire format; T8.3.b.2+.3 added the outbound side (we emit gossip). This slice adds the **inbound** side — the hub now recognises peer-hub sessions by their authenticated Noise pubkey and processes `FRAME_GOSSIP_PUBLISH` frames received from them. **KP gossip is now end-to-end functional**: a client publishing a KP on hub A causes the KP to appear in hub B's directory, given an `--peer-hub` link between them.
+
+What landed:
+
+**T8.3.b.4.a — `peer_outbounds` refactored to keyed `HashMap`.** `crates/onyx-hub/src/state.rs`. Was `Vec<mpsc::Sender>`, now `HashMap<[u8; 32], mpsc::Sender>` keyed by peer hub identity pubkey. Two reasons:
+  * `is_peer_hub(&[u8; 32]) -> bool` is now a single `contains_key` — used by `hub_handle_connection` after handshake to decide client vs peer-hub role.
+  * `fan_out_kp_to_peers_except(source_pubkey, ttl, routing_id, kp_bytes)` can skip the source peer on re-fanout — avoids the trivial "forward right back where it came from" amplification.
+
+Refactor touched `main.rs` (build the HashMap with `pubkey_bytes` as keys), the existing fan-out tests (provide HashMap entries with arbitrary `[u8; N]` pubkey keys), and adds `set_peer_outbounds(HashMap<...>)` as the new builder signature.
+
+**T8.3.b.4.b — `hub_handle_connection` role detection.** After the Noise XK handshake, the handler now reads `session.peer_static_key()` and asks `state.is_peer_hub(&peer_pk)`. Two branches:
+  * **Peer hub**: calls `serve_peer_frames(&mut stream, &mut session, &state, &peer_pk)`. Does NOT register in the client `senders`/`subscribers` registries (peer hubs don't subscribe to routing ids; bookkeeping would just leak).
+  * **Client**: existing path — register a conn id, run `serve_frames`, unregister on exit.
+
+A peer hub re-running its outbound link to us shows up as a fresh peer-hub session each time; no per-session state to clean up because we don't register it.
+
+**T8.3.b.4.c — `serve_peer_frames` loop.** New function in `handler.rs`. Linear `loop { read_frame; match frame_type }`. Only accepts `FRAME_GOSSIP_PUBLISH`; logs `warn!` and drops any other frame type while keeping the session alive (a slightly-misconfigured peer is more useful alive than killed). Future T8.3.c will add the `FRAME_GOSSIP_DELIVER` arm.
+
+**T8.3.b.4.d — `handle_gossip_publish`** is the new inbound-gossip processor. Per-frame algorithm:
+
+  1. **Decode** the `GossipFrame` from the payload. Malformed → `warn!` + drop.
+  2. **Loop check**: if `frame.seen_by == our self_hub_hash`, this frame has already passed through us → debug log + drop. Prevents amplification storms (FEDERATION.md §1, F2 defence).
+  3. **T7.3-sec ownership check**: extract the KP's embedded Ed25519 signing key via the same `onyx_core::mls::signing_key_from_kp_bytes` helper the direct-client path uses; verify the signing key derives `introduction_inbox(fingerprint) == frame.routing_id`. Mismatch or invalid KP → `warn!` + drop. **Gossip is authenticated to the same standard as direct client publish** (FEDERATION.md §1, F1 defence).
+  4. **Store locally** via `state.publish_keypackage(...)`. Same UPSERT semantics as client-direct path.
+  5. **Re-fanout**: decrement TTL via `frame.ttl.saturating_sub(1)`; if `new_ttl > 0`, call `state.fan_out_kp_to_peers_except(source_pubkey, new_ttl, routing_id, &body)` which broadcasts to every OTHER peer (HashMap skip-by-key). Source peer never receives back its own frame.
+
+**T8.3.b.4.e — `HubState::self_hub_hash_for_test()` accessor.** Public read of the internal `self_hub_hash` field so `handle_gossip_publish` can do the loop check without holding the state lock for the whole duration. Named `_for_test` despite being called from production — a hint to the next reader that the surface is internal-only.
+
+**T8.3.b.4.f — Three new state tests** on top of the four existing fan-out tests:
+  * `is_peer_hub_recognises_configured_pubkeys` — `contains_key` semantics.
+  * `fan_out_except_skips_source` — pre-populate three peers + a designated source; assert source's channel is silent while the other two receive the expected forwarded frame (correct TTL, our hash in `seen_by`, original routing_id + body intact).
+  * Updated the two existing fan-out tests to use the new HashMap signature.
+
+End-to-end behavioural property (now true in code, not yet covered by a single integration test):
+  * Client publishes KP for routing-id X to hub A.
+  * Hub A's `FRAME_KP_PUBLISH` handler validates ownership, stores locally, calls `fan_out_kp_to_peers(X, kp)` → encodes `GossipFrame { ttl=3, seen_by=hash(A), X, kp }`, pushes to every peer-hub outbound channel.
+  * `peer_link::run_peer_session` for hub B drains the channel, writes `FRAME_GOSSIP_PUBLISH(payload)` to hub B's session.
+  * Hub B's `hub_handle_connection` recognises A as a peer hub (it's in B's `--peer-hub` allowlist), enters `serve_peer_frames`, receives the frame.
+  * `handle_gossip_publish` decodes, checks `seen_by != hash(B)` (passes — it's hash(A)), validates the KP, stores under routing-id X in B's directory.
+  * If B has further peer hubs (say, C), forwards `GossipFrame { ttl=2, seen_by=hash(B), X, kp }` to C — but NOT back to A (source skip).
+
+Security and posture deltas:
+
+  * **F1 (hostile peer hub)**: defended. Same T7.3-sec ownership check as direct client publish. A peer hub cannot poison our directory by gossiping bogus KPs — the KP's signing key must derive the claimed routing id, and that's a property of the KP itself, not of the peer hub's authorisation.
+  * **F2 (gossip loop amplification)**: partial defence today. The seen-by loop check catches the immediate-self case (frame returns to us). The TTL=3 cap bounds worst-case fan-out at most ~26 hops (`3 → 2 → 1 → 0`). A full 3-hub triangle test will land in T8.3.d.
+  * **Source-skip on re-fanout**: extra defence beyond seen_by. Even if a peer rotates its hub-pubkey, source-skip prevents the immediate ping-pong A→B→A→B.
+  * **Peer-hub sessions are NOT rate-limited via T8.x-ratelimit**. They don't go through `register_conn`, so they don't have a conn_id and the limiter's `HashMap<ConnId, TokenBucket>` doesn't bind one. If a peer hub starts spamming gossip, our existing `publish_keypackage` MLS validation work scales linearly. Documented as a known follow-up; a separate per-peer-hub rate cap is appropriate but not urgent (peer hubs are operator-trusted by construction).
+
+What this did NOT do:
+
+  * Did not add `FRAME_GOSSIP_DELIVER` handling (queue gossip is T8.3.c).
+  * Did not add a peer-hub-specific rate limit (see above).
+  * Did not write an end-to-end "two hubs via duplex, KP gossips A→B" integration test — would require lifting `hub_handle_connection`'s Noise XK assumption to allow a test-mode handshake. Practical end-to-end testing is via `cargo run -p onyx-hub --no-tor ...` in two terminals with a hand-crafted local-TCP override (not yet wired).
+  * Did not update `FEDERATION.md` with implementation notes — that goes in T8.3.e (final docs slice).
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (one `needless_pass_by_value` cleanup on `broadcast_to_peers` — Vec<u8> → &[u8]), `cargo test --workspace` **307 passed / 0 failed** (was 305; +2 state tests: `is_peer_hub_recognises_configured_pubkeys` + `fan_out_except_skips_source`).
+
+**Next concrete slice**: T8.3.c — queue gossip via `FRAME_GOSSIP_DELIVER`. Same shape as the KP path: extend `serve_peer_frames` with a new arm, add `fan_out_envelope_to_peers_except` to state, hook the lazy/eager mode flag. The replay guard in the recipient daemon (T7.3-sec.2) handles cross-hub duplicates with no new code — same elegant property as T8.1 client-side multi-hub.
+
+---
+
 ## 2026-05-19 — T8.3.b.2 + T8.3.b.3: `--peer-hub` flag, outbound Noise XK sessions, KP fan-out on client publish
 
 Second implementation slice for T8.3 (hub federation). T8.3.b.1 added the wire format; this slice adds the runtime plumbing that **emits** gossip frames. The hub now opens an outbound Noise XK session per `--peer-hub` and fans out every validated client `FRAME_KP_PUBLISH` to those peer hubs as `FRAME_GOSSIP_PUBLISH`. **The inbound side (T8.3.b.4) is intentionally deferred** — a peer hub receiving our gossip today would drop the frame as "unknown frame type" (existing default). The slice is bounded so the outbound lifecycle can be reviewed before adding receive complexity.

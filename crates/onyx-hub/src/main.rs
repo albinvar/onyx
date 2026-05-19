@@ -267,7 +267,10 @@ async fn main() -> anyhow::Result<()> {
     // task per peer, install the resulting mpsc senders + our own
     // hub-pubkey hash into HubState so client KP_PUBLISH receives
     // can fan out via state.fan_out_kp_to_peers(...).
-    let mut peer_outbound_txs: Vec<tokio::sync::mpsc::Sender<Vec<u8>>> = Vec::new();
+    let mut peer_outbound_txs: std::collections::HashMap<
+        [u8; 32],
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+    > = std::collections::HashMap::new();
     if !args.peer_hubs.is_empty() {
         let our_hub_pubkey_bytes = identity.identity_key().public().to_bytes();
         let self_hub_hash = HubState::hub_pubkey_to_hash(&our_hub_pubkey_bytes);
@@ -300,7 +303,7 @@ async fn main() -> anyhow::Result<()> {
 
             let (tx, rx) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(crate::peer_link::PEER_OUTBOUND_CAPACITY);
-            peer_outbound_txs.push(tx);
+            peer_outbound_txs.insert(pubkey_bytes, tx);
             let tor_for_task = tor_arc.clone();
             let our_sk_for_task = our_sk.clone();
             let span = info_span!("peer-hub", idx, host = %host, port);
