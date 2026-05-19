@@ -6,6 +6,35 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — Docs: `DISCOVERY.md` — why public hub discovery (T8.4) is deferred
+
+Documentation-only. The user asked "what about public discovery hubs?" The honest answer is that T8.4 is mostly a *governance* problem, not a technical one, and shipping a discovery mechanism without a community of public hubs to populate it would be theatre. This commit captures that reasoning as a permanent repo artifact so the next reader who asks the same question gets a real answer instead of "I forgot."
+
+Structure (8 sections, mirrors `FEDERATION.md` style):
+
+  * **§0 honest framing**. Lead with the recommendation (defer) and the reason (governance, not tech). Sets reader expectations before they wade into options.
+  * **§1 the bootstrapping problem**. Two cases — Case A (you know someone on Onyx → T8.2 invite URL solves it today) and Case B (you don't → genuine bootstrap, no clean technical answer). The honest framing: every anonymity-focused tool has Case B as a structural property, not a bug.
+  * **§2 four approaches, honestly compared**. Bundled list, online directory, DHT, invite-based. Each with pros/cons/tech-effort/governance-effort. Online directory is flagged as the most tempting + most dangerous (introduces a fresh-install metadata-collection point that every Onyx user phones home to).
+  * **§3 comparison with other tools**. Six-row table — Onyx, Tor, Briar, Matrix, Cwtch, Session — on four axes (bundled list, online directory, DHT, invite-based). Observation: anonymity-focused tools (Briar, Cwtch) all chose invite-based; tools with central operators (Matrix, Session) chose directories. Onyx's invite-based shape is consistent with the anonymity cluster.
+  * **§4 recommendation**. Don't implement T8.4 today, with four explicit reasons. Three named conditions for revisiting: emergence of 5+ public hubs with stable operators, Onyx-recommended-without-bootstrap-path situations, formal maintainer body able to take on listing governance.
+  * **§5 what we'd actually build**. For the record, if T8.4 lands later, the minimum viable shape is approach (1) — bundled list — with strict opt-in (`use_well_known_hubs: bool`, default false), loud startup logging, predictable selection strategy. The technical work is ~half a session; the governance work is the real cost.
+  * **§6 project posture**. Why this matters for Onyx's broader stance: each implicit trust assumption gets removed deliberately, not accidentally added. Adding a bundled-list curator without policy + community would *add* a trust assumption that `ANONYMITY.md` §0's "no perfect anonymity" posture deliberately avoids.
+  * **§7 related documents**. Cross-references to FEDERATION, ANONYMITY, ROADMAP, THREAT_MODEL, and the existing T8.2 invite-URL implementation.
+
+`README.md` doc index updated to feature `DISCOVERY.md` below `FEDERATION.md`. `ROADMAP.md` §5 "Long-term" expanded with a paragraph pointing readers to `DISCOVERY.md` instead of leaving "T8.4" as an unexplained line item.
+
+What this commit deliberately does NOT do:
+
+  * No code. Not even an empty `well_known_hubs.toml` placeholder.
+  * No CLI flag for "enable discovery" — none would do anything today.
+  * No commitment to a future implementation timeline. The deferral conditions are written down so they can be checked against, but no deadline.
+
+The doc takes a clear position: **discovery without a community to discover is the wrong feature.** Onyx is small enough that this is the right time to write that down, before the temptation to bundle a random list of "test hubs" ever surfaces. The doc exists as the auditable record of that decision.
+
+Verification: documentation-only. `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test --workspace` (317) all unchanged from `6a2da15`.
+
+---
+
 ## 2026-05-19 — T8.3.e: federation closure — `THREAT_MODEL` §8.2 #17/#18, `ANONYMITY.md` §3.4 update, `ROADMAP.md` + `FEDERATION.md` decision log
 
 Final T8.3 slice. Pure documentation — no code change. T8.3 (hub-to-hub gossip federation) is now closed end-to-end with every doc reflecting the implementation reality.
