@@ -150,10 +150,21 @@ where
         .map_err(|e| anyhow::anyhow!("hub Noise handshake failed: {e}"))?;
     info!("hub: Noise XK complete; sending SUBSCRIBE");
 
-    write_subscribe(&mut stream, &mut session, subscribe_to)
-        .await
-        .map_err(|e| anyhow::anyhow!("hub SUBSCRIBE write failed: {e}"))?;
-    info!("hub: subscription registered");
+    // T-rotation.a: skip the SUBSCRIBE frame entirely when the
+    // subscription list is empty. The hub would log a warn and
+    // ignore it otherwise; that warn is now correct ("client
+    // connected with nothing to subscribe to") instead of an
+    // operator-actionable signal. Send-only daemons (with
+    // `--no-intro-inbox-subscribe` and no rooms yet) take this
+    // path.
+    if subscribe_to.is_empty() {
+        info!("hub: nothing to subscribe to (opt-out + no rooms); skipping SUBSCRIBE");
+    } else {
+        write_subscribe(&mut stream, &mut session, subscribe_to)
+            .await
+            .map_err(|e| anyhow::anyhow!("hub SUBSCRIBE write failed: {e}"))?;
+        info!("hub: subscription registered");
+    }
 
     if let Some(sp) = self_publish {
         write_kp_publish(&mut stream, &mut session, &sp.routing_id, &sp.kp_bytes)
@@ -207,9 +218,11 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("hub-tcp Noise handshake failed: {e}"))?;
 
-    write_subscribe(&mut stream, &mut session, subscribe_to)
-        .await
-        .map_err(|e| anyhow::anyhow!("hub-tcp SUBSCRIBE write failed: {e}"))?;
+    if !subscribe_to.is_empty() {
+        write_subscribe(&mut stream, &mut session, subscribe_to)
+            .await
+            .map_err(|e| anyhow::anyhow!("hub-tcp SUBSCRIBE write failed: {e}"))?;
+    }
 
     if let Some(sp) = self_publish {
         write_kp_publish(&mut stream, &mut session, &sp.routing_id, &sp.kp_bytes)

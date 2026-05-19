@@ -125,6 +125,27 @@ struct Args {
     #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS", global = true)]
     cover_traffic_mean_secs: Option<u64>,
 
+    /// **Privacy opt-out.** Skip subscribing to your fingerprint-
+    /// derived introduction inbox (`introduction_inbox(fp)`) on
+    /// every configured hub. You can still SEND first-contact
+    /// envelopes (msg/v1, mls/v1 bootstraps) and you still receive
+    /// in-room messages (rooms route via T6.3.g per-(room, epoch)
+    /// session tokens, NOT via intro_inbox), but anyone trying to
+    /// reach you via your fingerprint for the first time will have
+    /// their envelope queued at the hub indefinitely.
+    ///
+    /// **Privacy gain**: the hub no longer sees a subscription to
+    /// `introduction_inbox(your_fp)`, which was a strong "you are
+    /// online" signal anyone with your fingerprint could probe.
+    /// See `ROTATION.md` for the full analysis of what this closes
+    /// and what structural leaks remain.
+    ///
+    /// Off by default. For users who've established all their peer
+    /// relationships and prefer maximum unlinkability over first-
+    /// contact reachability.
+    #[arg(long, env = "ONYX_NO_INTRO_INBOX_SUBSCRIBE", global = true)]
+    no_intro_inbox_subscribe: bool,
+
     #[command(subcommand)]
     cmd: Option<Command>,
 }
@@ -416,6 +437,9 @@ fn build_daemon_config(
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
         cover_traffic_mean_secs: args.cover_traffic_mean_secs,
+        // T-rotation.a: --no-intro-inbox-subscribe flips this to
+        // false. Default true preserves first-contact reachability.
+        subscribe_intro_inbox: !args.no_intro_inbox_subscribe,
     })
 }
 

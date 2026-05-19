@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-rotation: `--no-intro-inbox-subscribe` opt-out + `ROTATION.md` honest analysis
+
+Tackles `ANONYMITY.md §3.2` (hub knows online/offline timing). The original entry said "What we have today: nothing — effort ~3 hours." That effort estimate was wrong. This slice does the honest accounting:
+
+  * `ROTATION.md`: structural analysis of why "subscription rotation" alone doesn't close §3.2 — the hub identifies alice through **three independent leaks** (Noise XK static key during handshake, fingerprint-derived intro_inbox subscription, KP publication carrying her signing key). Closing one alone changes nothing. A full fix would require ephemeral Noise keys per session + separated publish/subscribe connections + oblivious-recipient routing — each a medium-large protocol change.
+  * **`Config.subscribe_intro_inbox: bool`** (default `true`): when false, the daemon skips subscribing to `introduction_inbox(fingerprint)` on every configured hub. Closes leak #2 (the fingerprint-derived inbox subscription) in isolation. Doesn't close #1 (Noise still uses long-term key) or #3 (KP still published). Tradeoff: cannot receive first-contact bootstraps via the hub — envelopes queue at the hub indefinitely until the operator switches back. Useful for users who've established all their peer relationships and prefer maximum unlinkability over reachability.
+  * **CLI flag** `--no-intro-inbox-subscribe` (env var `ONYX_NO_INTRO_INBOX_SUBSCRIBE`) on both `onyx` and `onyxd`.
+  * **Empty-subscribe optimisation** in `hub_client::run_hub_session` + `run_hub_session_tcp`: when `subscribe_to.is_empty()`, skip the `FRAME_SUBSCRIBE` write entirely. The hub previously logged a warn for empty SUBSCRIBE frames and ignored them; with the opt-out, that warn would fire on every connect of a daemon that has the opt-out set and no rooms. Skipping the frame keeps the hub's stderr clean.
+  * **Smoke test** `rooms_e2e_no_intro_inbox_opt_out_queues_first_contact` (`crates/onyx-hub/tests/rooms_smoke.rs`): bob runs with the opt-out, alice tries first-contact via `SendBootstrapMls`. Asserts: (1) alice can still find bob in the directory (his KP publication is independent of subscribe state), (2) alice's send returns `SendBootstrapMlsOk` (hub accepts the DELIVER), (3) bob's tail does NOT receive the EventMessage live (no live subscriber → hub queues by routing_id). Pins the privacy/reachability trade explicitly.
+  * **`ANONYMITY.md §3.2` rewritten**: removed the misleading "What we have today: nothing — effort ~3 hours" framing. Replaced with the three-leak structural analysis, the five-layer mitigation stack we have today (multi-hub, bidirectional cover, room session-tokens, opt-out, onion-direct), and a pointer to `ROTATION.md` for the deeper design analysis.
+  * **`README.md` doc index** updated to list `ROTATION.md` next to `CHANNELS.md` / `DISCOVERY.md`.
+
+Honest framing of what this slice does NOT do:
+
+  * **Does not hide alice's identity from the hub.** Noise XK still uses her long-term key. The hub knows it's her.
+  * **Does not remove the KP-publication leak.** Her KP is still in the directory.
+  * **Does not enable a "lazy poll" mode** for periodic intro_inbox draining — that requires ephemeral Noise keys first (otherwise the brief side-connection's static key just relinks alice), and Noise-key rotation is its own future slice. Documented under `ROTATION.md §6`.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **411 passed** (+1 new: opt-out smoke). All 4 smoke tests pass.
+
+Final status of post-T6.3 review items + `ANONYMITY.md` §3.x:
+
+  * **#1 (real-Tor smoke)** → clearly addressed (TCP smoke + operator script).
+  * **#2 (T6.3.h ordering)** → fixed (T6.3.i).
+  * **#3 (T6.3.g subscribe race)** → non-issue.
+  * **#4 (cover traffic)** → clearly addressed (bidirectional).
+  * **§3.2 (hub knows you're online)** → **honestly accounted for** (this slice). One of three leaks closed in opt-out mode; the other two are structural and documented in `ROTATION.md`.
+  * **§3.1 (timing correlation)** → bidirectional cover ships; remaining gap is autocorrelation-vulnerability (statistical limit, not fixable in code).
+  * **XLARGE bucket bugfix** → fixed (T-smoke).
+  * **T6.3.g commit-routing-wrong-epoch** → fixed (Fix-#1+#4).
+
+---
+
 ## 2026-05-19 — Fix-#1+#4: 3-party smoke + real-Tor operator script + hub-side cover traffic
 
 Closes the "partial" status on post-T6.3 review **issues #1 (real-Tor smoke)** and **#4 (cover traffic)**. Both now have a clearly-defined "what's verified vs what's left to the operator" boundary instead of the prior hand-wave.

@@ -98,6 +98,14 @@ struct Args {
     /// smoke). Setting 0 also disables.
     #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS")]
     cover_traffic_mean_secs: Option<u64>,
+
+    /// **Privacy opt-out.** Skip subscribing to your fingerprint-
+    /// derived introduction inbox on every configured hub. You
+    /// lose first-contact reachability via the hub. Rooms still
+    /// work (they route via per-(room, epoch) session tokens).
+    /// See `ROTATION.md` for the full analysis.
+    #[arg(long, env = "ONYX_NO_INTRO_INBOX_SUBSCRIBE")]
+    no_intro_inbox_subscribe: bool,
 }
 
 impl TryFrom<Args> for Config {
@@ -140,6 +148,7 @@ impl TryFrom<Args> for Config {
             listen_tcp: a.listen_tcp,
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,
+            subscribe_intro_inbox: !a.no_intro_inbox_subscribe,
         })
     }
 }

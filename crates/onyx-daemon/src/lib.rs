@@ -175,6 +175,30 @@ pub struct Config {
     /// above 60s mean the gap between cover frames is long enough
     /// that real-traffic bursts still stand out.
     pub cover_traffic_mean_secs: Option<u64>,
+    /// T-rotation.a: when `true` (the v0 default), the daemon
+    /// subscribes to its own `introduction_inbox(fingerprint)` on
+    /// every configured hub so it can receive first-contact
+    /// envelopes (msg/v1, mls/v1 bootstraps).
+    ///
+    /// When `false`, the daemon skips that subscription — it can
+    /// still **send** first-contact envelopes and still receives
+    /// in-room messages (which route via T6.3.g per-(room, epoch)
+    /// session tokens, NOT via intro_inbox), but anyone trying to
+    /// reach this identity for the first time over the hub will
+    /// have their envelope queued indefinitely.
+    ///
+    /// **Privacy trade.** The hub-watching adversary loses one
+    /// observable: "alice is subscribed to introduction_inbox of
+    /// fingerprint F." That subscription, by itself, was a strong
+    /// "alice is online" signal (the routing id is fingerprint-
+    /// derived; anyone with alice's fingerprint can probe it). See
+    /// `ROTATION.md` for the full structural analysis of what this
+    /// closes and what remains.
+    ///
+    /// This is an OPT-OUT for users who've established all their
+    /// peer relationships and prefer maximum unlinkability over
+    /// first-contact reachability.
+    pub subscribe_intro_inbox: bool,
 }
 
 /// Bundle of state every handler needs.
@@ -439,6 +463,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         &args.hub_tcp_addrs,
         tor_hub_count,
         args.cover_traffic_mean_secs,
+        args.subscribe_intro_inbox,
         &mut hub_tcp_rxs,
     ) {
         warn!(error = %e, "failed to spawn TCP-hub tasks; continuing without them");
@@ -554,6 +579,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             let our_kem_bytes_task = our_kem_bytes.clone();
             let mut outbound_rx = hub_tor_rxs.remove(0);
             let host = host.clone();
+            let subscribe_intro_inbox_task = args.subscribe_intro_inbox;
             let span = info_span!("hub", idx, host = %host, port);
 
             hub_tasks.push(tokio::spawn(async move {
@@ -586,13 +612,19 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                     // are picked up via incremental
                     // `HubOutbound::Subscribe` pushes from
                     // handle_invite_to_room / refresh_room_roster.
-                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> =
-                        vec![our_inbox];
+                    // T-rotation.a: subscribe_intro_inbox=false skips
+                    // the fingerprint-derived intro_inbox; rooms
+                    // still subscribe normally.
+                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> = Vec::new();
+                    if subscribe_intro_inbox_task {
+                        subscriptions.push(our_inbox);
+                    }
                     subscriptions.extend(
                         current_room_session_tokens(&state_for_hub_task).await,
                     );
                     info!(
                         sub_count = subscriptions.len(),
+                        intro_inbox = subscribe_intro_inbox_task,
                         "hub: connect subscriptions (intro + room session tokens)"
                     );
                     let result = hub_client::run_hub_session(
@@ -1417,6 +1449,7 @@ fn spawn_tcp_hub_tasks(
     hub_tcp_addrs: &[HubConfig],
     tor_hub_count: usize,
     cover_traffic_mean_secs: Option<u64>,
+    subscribe_intro_inbox: bool,
     hub_tcp_rxs: &mut Vec<mpsc::Receiver<hub_client::HubOutbound>>,
 ) -> anyhow::Result<()> {
     if hub_tcp_addrs.is_empty() {
@@ -1455,7 +1488,10 @@ fn spawn_tcp_hub_tasks(
                                 kp_bytes,
                             })
                     };
-                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> = vec![our_inbox];
+                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> = Vec::new();
+                    if subscribe_intro_inbox {
+                        subscriptions.push(our_inbox);
+                    }
                     subscriptions.extend(current_room_session_tokens(&state_for_hub_task).await);
                     let kem_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
                         state_for_hub_task.identity.kem_secret().to_bytes().to_vec(),

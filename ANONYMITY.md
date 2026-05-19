@@ -91,13 +91,27 @@ A global passive adversary watching both your Tor entry guard and your peer's ca
     4. **Per-connection cadence on the hub side reveals "alice connected" + "alice disconnected" by absence.** A hub-watching adversary still sees TCP open / close events. Cover on the open session doesn't change that. Closing this would need session-resume routing-id rotation (the unrelated §3.2 fix; queued for a future slice).
   * **What's left to close it fully:** real-Tor verification (operator drill via `scripts/real_tor_smoke.sh`) and the §3.2 routing-id rotation for connect-time fingerprinting.
 
-### 3.2 Hub knows online/offline timing
+### 3.2 Hub knows online/offline timing — structural, partially mitigated
 
-When your daemon connects to the hub and subscribes to your inbox routing id, the hub learns "this client is online now." The subscription routing id is **stable** across reconnects (it's `introduction_inbox(your_fingerprint)`), so the hub can link "this same id came back" → "this is the same user."
+When your daemon connects to the hub, the hub learns "this client is online now" through **three independent leaks**:
 
-  * **What would close it: per-session subscription rotation.** Subscribe via a fresh routing id derived from a session secret + epoch, so reconnects look like different users to the hub. Recipient still learns about traffic in their real inbox via a separate (less-frequent) probe.
-  * **What we have today:** nothing.
-  * **Effort:** ~3 hours. Requires a small protocol change but no breaking wire-format work.
+  1. **Noise XK static key** — the handshake authenticates your long-term X25519 identity before any frame is exchanged. The hub knows it's you.
+  2. **Subscription to `introduction_inbox(fingerprint)`** — fingerprint-derived id; anyone with your fingerprint can probe the hub.
+  3. **`FRAME_KP_PUBLISH`** — your KP carries your signing key + signature, hub indexes by your fingerprint.
+
+Each leak independently identifies you. Closing one alone changes nothing. **See `ROTATION.md` for the full structural analysis** — including why "subscription rotation" as a single-fix doesn't close §3.2 the way the original text implied (it just moves the leak from observable to observable; the hub correlates them back).
+
+What Onyx v0 has, in layers of contribution:
+
+  * **Multi-hub fan-out (T8.1)** — leak is per-hub. No single hub sees your complete pattern. Pick your trust roots.
+  * **Bidirectional cover traffic (T-cover, T-cover.hub)** — mutes the timing leak (`§3.1`) but doesn't close the identity leaks above.
+  * **Per-(room, epoch) session-token routing (T6.3.g)** — closes §3.2 for **in-room traffic specifically**. Hub sees room activity but can't link rooms to each other or to specific members.
+  * **`--no-intro-inbox-subscribe` opt-out (T-rotation.a)** — closes leak #2. Tradeoff: cannot receive first-contact bootstraps via the hub. Useful for users who've established all their peers and prefer maximum unlinkability over reachability.
+  * **Onion-service direct dials** — bypass the hub entirely when both parties are online.
+
+What would actually close all three leaks together: ephemeral Noise keys per session + separated publish/subscribe connections + oblivious-recipient routing for first-contact. Each is a substantial protocol-level change. None planned for v0. See `ROTATION.md §3` for the design discussion.
+
+  * **Effort to close it fully**: not "~3 hours" as the original text claimed — that estimate was wrong. The full fix is medium-large protocol redesign work, deliberately deferred. The opt-out + multi-hub + cover traffic are the v0 mitigation stack.
 
 ### 3.3 Hub knows per-inbox message counts
 
