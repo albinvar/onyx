@@ -53,6 +53,30 @@ Per-identity hybrid KEM keypair (X25519+ML-KEM-768) persisted in vault schema v4
 ### T7.0 — `--listen-tcp` / `--dial-tcp` test modes
 Plain TCP transport for local testing. Bypasses Tor entirely. Loudly warned as test-only in logs + `SECURITY.md` §6.2. Two daemons on localhost can chat in ~5 seconds instead of 60-120 over Tor.
 
+### T7.1 — Single-binary `onyx`
+`onyx` (no args) launches daemon + TUI in one process. Drops the two-terminal recipe. `onyxd` still ships for headless/systemd use.
+
+### T7.2 + T7.2-mls + T7.2-mls-fu — Invite URLs end-to-end
+`onyx invite [--with-kp] [--with-hubs]` prints `onyx://invite/v1?fp=…&kem=…[&kp=…][&hub=…]`. `onyx accept <url> --text "…"` parses + dispatches the right send. MLS-tier when `kp` present; intersection check against sender's own daemon hubs.
+
+### T7.3-sec + T7.3-sec.2 + T7.3-sec.2-persist — Zero-trust hardening on the hub
+Hub validates KP ownership (closes §8.2 #15). Recipient daemon dedups envelope replays via FIFO seen-set (closes §8.2 #16); persists across restart.
+
+### T-zeroize-audit — End-to-end secret scrubbing
+`Config.passphrase`, hub-client key round-trips, TUI composer all wrapped in `Zeroizing`. `ANONYMITY.md` §3.8 has the explicit inventory of what's scrubbed and what isn't.
+
+### T8.0 + T8.0.gc — Hub durability
+Queue + KP directory SQLite-backed, survives hub restart. Periodic queue GC (configurable, default 30 days) keeps disk bounded.
+
+### T8.x-ratelimit — Per-connection token bucket
+Hub gates DELIVER + KP_PUBLISH at configurable rate (default 600/min). DoS defence for solo-connection floods.
+
+### T8.1 + T8.2 + T8.2-check — Multi-hub federation (client-side)
+Daemon talks to N hubs in parallel; recipient replay guard dedups duplicates for free. Invite URLs carry hub manifests; `onyx accept` warns when sender's hubs don't intersect recipient's.
+
+### T8.3 (a–e) — Hub-to-hub federation (server-side)
+`FEDERATION.md` design doc (T8.3.a), wire codec (T8.3.b.1), outbound sessions + KP fan-out (T8.3.b.2+.3), inbound peer recognition + receive + re-fanout (T8.3.b.4), queue gossip + lazy/eager modes (T8.3.c), loop-termination + forward-semantics test suite (T8.3.d), final docs + threat-model updates (T8.3.e). KP and envelope gossip both end-to-end. Source-skip + TTL + seen_by loop-prevention.
+
 ### Documentation
 - `DESIGN.md` (v0.2-draft) — the protocol specification.
 - `THREAT_MODEL.md` — adversaries + non-adversaries + §8 implementation status.
@@ -72,35 +96,27 @@ Nothing currently being worked on between commits. Pick from §3 ("next").
 
 These are the phases I'd recommend tackling in order. Each one is independently shippable; pick by which user-pain it most closes for you.
 
-### T7.1 — Single-binary `onyx`  *(recommended next)*
-**The change:** merge the `onyxd` crate into `onyx`. Running `onyx` (no args) opens the vault, starts Tor in the background, and renders the TUI in one process. One-shot subcommands (`onyx send`, `onyx identity`, etc.) auto-discover a running daemon's socket. `onyxd` and `onyx-hub` stay as separate binaries for advanced/server use; a normal user never touches them.
-
-**What you'll notice:** the recipe in `README.md` §4 collapses from 4 terminals + 6 commands to 2 terminals + 1 command each.
-
-**Why next:** every other UX gap stops mattering once the daemon-vs-client split isn't visible. Estimated 2–3 hours.
-
-### T7.2 — Invite URLs
-**The change:** `onyx invite` prints `onyx://<onion>?fp=...&kem=...` (or for `--listen-tcp` mode, `onyx://127.0.0.1:7710?fp=...`). `onyx accept <url>` (or pasting into the TUI) imports + dials in one shot.
-
-**What you'll notice:** no more copy-pasting fingerprint + KEM public + KP separately. One URL.
-
-**Why second:** completes the "one paste per person" UX after T7.1. Estimated 1–2 hours.
-
-### T6.3 — Channels / multi-party rooms
+### T6.3 — Channels / multi-party rooms *(headline IRC feature)*
 **The change:** new `Room` concept in `onyxd`. New API verbs `CreateRoom`/`InviteToRoom`/`JoinRoom`/`SendToRoom`. TUI gets a `#room-name` pane alongside per-peer DMs. The MLS layer already supports N-member groups (we use it for 2-party today, same call handles 8); what's missing is the surface around it.
 
 **What you'll notice:** Onyx becomes capable of small-group chat (e.g. five-person planning room) with all the MLS PCS properties.
 
-**Why third:** the headline IRC feature. Big lift (estimated 4–6 hours across several commits) but the crypto is in place. T6.1's KP directory already supports the multi-invite path.
+**Why next:** the headline IRC feature. Big lift (estimated 4–6 hours across several commits) but the crypto is in place. T6.1's KP directory already supports the multi-invite path.
 
----
-
-## 4. Later (after the next-queue lands)
+### Cover traffic on idle Tor circuits *(biggest remaining anonymity gap)*
+`ANONYMITY.md` §3.1. Today's frame size buckets shape transmitted frames; idle circuits leak presence. Adding constant-rate cover traffic raises the cost of timing-correlation attacks against A2 (hub) and global-passive observers. Substantial design + impl work (~1-2 sessions); needs careful sink discipline so dummies never surface as events.
 
 ### T6.4 — Async MLS application messages over hub
 Today's hub path establishes an MLS group via Welcome but ongoing in-group chat requires one peer to direct-dial the other (existing T2.x resume path takes over). T6.4 adds a wire format for MLS application messages routed via per-epoch session-token routing ids (`routing::session_token`). After it lands, **fully asynchronous chat works without ever needing both peers on Tor simultaneously.**
 
 Estimated 2–3 hours.
+
+---
+
+## 4. Later (after the next-queue lands)
+
+### Reproducible builds + signed releases
+`THREAT_MODEL.md` §4 trust assumptions. Without these you can't verify the binary you downloaded matches the source in this repo — a `THREAT_MODEL.md` §3 N4 (malicious-developer) attack would be undetectable. Standard tooling exists (`cargo-deb` + reproducible-builds.org guidance + cosign or minisign for signing). Estimated 4–6 hours including the GitHub Actions release pipeline.
 
 ### Hub invite-only authentication
 `THREAT_MODEL.md` §8.2 #4. Today the hub trusts any client that knows its static key. Add invite-token-based registration so only authorized clients can connect. Real security work — needs a clear admin model + token lifecycle. Estimated 3–4 hours.
@@ -108,14 +124,14 @@ Estimated 2–3 hours.
 ### Schema migration runner
 `THREAT_MODEL.md` §8.2 #13. Today every vault-schema bump requires the user to `rm` their vault. Add a migration runner that walks old → new schema versions in `Vault::open`. Quality-of-life; matters as soon as anyone has data they care about. Estimated 2–3 hours.
 
-### Hub-side KP-ownership validation
-`THREAT_MODEL.md` §8.2 #15. Today the recipient validates an inbound KP's signing key against the expected fingerprint — that's defence-in-depth, but it'd be cleaner if the hub also refused to store a KP whose embedded signing key doesn't hash to the routing id under which it's being published. Requires a sign-challenge: client signs a hub-supplied nonce with the Ed25519 key whose fingerprint maps to the target routing id. Estimated 3–4 hours.
+### Per-peer-hub rate limit
+T8.x-ratelimit added per-connection rate limiting on client connections; peer-hub connections are not currently bucket-tracked. A misbehaving peer hub could in principle spam gossip; the gossip ownership check + replay guard catch it functionally but burn CPU per frame. Add a per-peer-hub bucket as defence-in-depth. Estimated 1-2 hours.
 
-### Reproducible builds + signed releases
-`THREAT_MODEL.md` §4 trust assumptions. Without these you can't verify the binary you downloaded matches the source in this repo — a `THREAT_MODEL.md` §3 N4 (malicious-developer) attack would be undetectable. Standard tooling exists (`cargo-deb` + reproducible-builds.org guidance + cosign or minisign for signing). Estimated 4–6 hours including the GitHub Actions release pipeline.
+### Memory-locking (no-swap) + broader zeroization
+T-zeroize-audit closed the items we own at the type-system level. mlock'ing decrypted plaintext + working MLS state would close the swap-file leak. Platform-specific; significant work.
 
-### Cover traffic on idle Tor circuits
-`THREAT_MODEL.md` §5 residual linkability rows #1, #5. Today's frame size buckets shape transmitted frames; idle circuits leak presence. Adding constant-rate cover traffic raises the cost of timing-correlation attacks against A2 (hub) and §5#5 observers. Hard to test correctness of, but a real anonymity win.
+### Plausibly-deniable vault (duress passphrase)
+A second passphrase unlocks a decoy identity, hiding the existence of the real one. Hard to get right — PD vaults are notoriously easy to misdesign in ways that make the deniability claim worse than no vault at all. 1-2 sessions.
 
 ### External security audit *(the most important thing missing)*
 Single most impactful action anyone could take. Until this happens, `SECURITY.md` §1 and `HOW_IT_WORKS.md` §0 both stay loud. Not something I can self-do.
@@ -129,7 +145,7 @@ These items each open new threat surfaces and would each need a design doc + thr
 - **Multi-device support per identity.** Today one vault = one device. Bringing a new device means a new identity. Real multi-device needs key-sync (think Signal's PNI) which is its own crypto subproject.
 - **Mobile client.** Reuse `onyx-core` (pure Rust, `no_std`-ish), build native UI with Swift/Kotlin or via Tauri. Onyx-on-iOS would also need to deal with iOS push limitations (background daemon impossible) — probably needs a notification relay.
 - **Voice / video.** Entirely different threat surface (real-time leaks, codec metadata, jitter analysis). Would essentially be a sibling product reusing the identity + key-agreement layer.
-- **Federation between hubs.** Multi-hub trust model. Compounds the trust assumptions. Would need a clear protocol for hubs to forward sealed envelopes to each other without revealing more than the originating hub already saw.
+- ~~**Federation between hubs.**~~ Closed in T8.3.b–T8.3.e: `--peer-hub` opens operator-configured Noise XK sessions; KP and envelope gossip via `FRAME_GOSSIP_PUBLISH` / `FRAME_GOSSIP_DELIVER` with TTL + seen_by loop prevention; gossip authenticated to the same standard as direct client publish (T7.3-sec ownership check). See `FEDERATION.md`. What remains long-term: public-hub discovery (T8.4 — mostly a governance question, not a technical one).
 - **Onion-web tier.** The original `DESIGN.md` §3 envisions an opt-in web UI served by the hub (with the documented PCS trade-off — N6 in `THREAT_MODEL.md`). Not started.
 
 ---

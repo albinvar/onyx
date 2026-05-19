@@ -105,6 +105,8 @@ T8.1 closes the remaining gap (**hub permanently dying**) at the *client* layer.
 
 What this is **not**: full hub-to-hub federation (T8.3+, long-term). Hubs don't yet talk to each other; durability comes from **user-controlled redundancy** — pick N hubs you trust, publish to all of them. Strictly simpler than Matrix-style server-to-server federation, surprisingly effective.
 
+**Update (T8.3 — also now closed):** hub-to-hub gossip is implemented. With `--peer-hub`, two hubs establish a Noise XK link and federate KP-directory + queued envelope state via `FRAME_GOSSIP_PUBLISH` and `FRAME_GOSSIP_DELIVER` frames. Loop prevention via TTL + `seen_by`. Ownership check on incoming gossiped KPs uses the same T7.3-sec mitigation as client-direct publishes. See `FEDERATION.md` for the design and `THREAT_MODEL.md` §8.2 #17/#18 for the F1/F2 adversaries this defends against. **Anonymity disclosure surface is unchanged from T8.1**: hubs still see only routing-ids + opaque ciphertext + timing; federation just makes the storage and delivery more resilient without revealing anything new.
+
 ### 3.5 No reproducible builds, no signed releases
 
 If someone replaces your installed `onyx` binary on disk (supply chain compromise, malicious package mirror), you lose. We have `cargo deny` advisory + license checks at the workspace gate, which catches *known-CVE* dependencies but not a maliciously-published version that has yet to be flagged.

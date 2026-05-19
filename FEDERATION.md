@@ -1,6 +1,6 @@
 # Hub Federation (T8.3) — Design Doc
 
-> **Status: design phase.** No code yet. This document is the prerequisite to writing any of T8.3.b through T8.3.d. Open questions are flagged inline; resolve them before implementation begins. Last updated: 2026-05-19.
+> **Status: implementation complete (T8.3.a–T8.3.e).** Originally drafted as a design doc; T8.3.b through T8.3.d shipped the wire codec, outbound sessions, inbound recognition + receive, queue gossip (lazy/eager), and the loop-termination test suite. T8.3.e (this slice) closed the chapter with `THREAT_MODEL.md` §8.2 #17/#18 and `ANONYMITY.md` updates. The §7 open questions below all landed in line with their recommendations. Last updated: 2026-05-19.
 
 ---
 
@@ -227,4 +227,10 @@ These are recommendations, not decisions. Review + push back before T8.3.b begin
 
 ## 10. Decision log
 
-  * **2026-05-19** — Design doc drafted. No implementation yet. Awaiting review of §7 open questions before T8.3.b begins.
+  * **2026-05-19** — Design doc drafted. Awaited review of §7 open questions before T8.3.b began.
+  * **2026-05-19** — T8.3.b.1 landed: wire constants (`FRAME_GOSSIP_PUBLISH = 0x80`, `FRAME_GOSSIP_DELIVER = 0x81`) + `GossipFrame` codec + 9 codec tests. Recommendations Q2/Q3 confirmed.
+  * **2026-05-19** — T8.3.b.2 + T8.3.b.3 landed: `--peer-hub` flag, outbound Noise XK sessions per peer, KP fan-out on client `FRAME_KP_PUBLISH`. Recommendation Q1 (single-direction sessions) confirmed.
+  * **2026-05-19** — T8.3.b.4 landed: inbound peer-hub recognition via Noise pubkey allowlist, `FRAME_GOSSIP_PUBLISH` receive + ownership validation + re-fanout-except-source. Recommendation Q5 confirmed.
+  * **2026-05-19** — T8.3.c landed: queue gossip via `FRAME_GOSSIP_DELIVER` + `--gossip-mode lazy|eager` flag (default lazy). Recommendation Q4 confirmed: the recipient daemon's `EnvelopeReplayGuard` (T7.3-sec.2) handles cross-hub envelope duplicates with zero new code.
+  * **2026-05-19** — T8.3.d landed: 8 gossip-semantics tests including the 3-hub triangle termination property (proven inductively via `gossip_publish_ttl_one_stores_but_does_not_forward` + the source-skip + seen_by tests).
+  * **2026-05-19** — T8.3.e landed: `THREAT_MODEL.md` §8.2 #17 (F1 — hostile peer hub) + #18 (F2 — gossip-loop amplification) added as defended adversaries (NOT carry-forwards). `ANONYMITY.md` §3.4 updated to note federation closes the "hub permanently dies" gap end-to-end without expanding the disclosure surface. `ROADMAP.md` long-term "Federation between hubs" struck through.

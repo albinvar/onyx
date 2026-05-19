@@ -6,6 +6,43 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.e: federation closure — `THREAT_MODEL` §8.2 #17/#18, `ANONYMITY.md` §3.4 update, `ROADMAP.md` + `FEDERATION.md` decision log
+
+Final T8.3 slice. Pure documentation — no code change. T8.3 (hub-to-hub gossip federation) is now closed end-to-end with every doc reflecting the implementation reality.
+
+What landed:
+
+**T8.3.e.a — `THREAT_MODEL.md` §8.2 #17 + #18.** Two new entries, both marked closed-on-landing (defended adversary classes that arrived with T8.3 and were defended at the same time, never carry-forwards):
+
+  * **#17 (F1 — hostile peer hub poisoning a federated hub's KP directory)**: closed in T8.3.b.4 + T8.3.d. Gossip is authenticated to the same T7.3-sec standard as direct client publish — the KP's embedded signing key must derive the claimed routing id, or the hub silently rejects. Attack test `gossip_publish_ownership_check_propagates_to_gossip` proves the F1 mitigation works.
+  * **#18 (F2 — gossip-loop amplification across a peer-hub mesh)**: closed in T8.3.b.1 (wire format with TTL + seen_by) + T8.3.b.4 (loop check + source-skip on re-fanout) + T8.3.d (termination proven inductively for the 3-hub triangle case). Default TTL=3 caps worst-case propagation depth regardless of ring size.
+
+**T8.3.e.b — `ANONYMITY.md` §3.4 update.** "Hub durability — closed end-to-end" section gains a final paragraph noting T8.3 implementation status. Explicit statement: "Anonymity disclosure surface is unchanged from T8.1: hubs still see only routing-ids + opaque ciphertext + timing; federation just makes the storage and delivery more resilient without revealing anything new." Federation is a connectivity/durability property, not a new disclosure surface — that's the headline finding.
+
+**T8.3.e.c — `ROADMAP.md` rewrite of §1 ("Done") and §3 ("Next").** The "Next" section was stale (still listed T7.1 as recommended next). New "Next" section:
+
+  1. **T6.3 — Channels / multi-party rooms** (headline IRC feature, 4–6h)
+  2. **Cover traffic on idle Tor circuits** (biggest remaining anonymity gap, 1–2 sessions)
+  3. **T6.4 — Async MLS application messages over hub** (2–3h)
+
+§1 "Done" gains entries for everything that shipped since the doc was last touched: T7.1, T7.2 (incl. -mls + -mls-fu), T7.3-sec + T7.3-sec.2 + T7.3-sec.2-persist, T-zeroize-audit, T8.0 + T8.0.gc, T8.x-ratelimit, T8.1 + T8.2 + T8.2-check, T8.3 (a–e).
+
+§4 "Later" gains per-peer-hub rate limit, mlock + broader zeroization, plausibly-deniable vault as the future-work items unblocked by T8.3 closure. The §5 "Long-term" entry for "Federation between hubs" is struck through with a pointer to T8.3.
+
+**T8.3.e.d — `FEDERATION.md` decision log.** Header status flipped from "design phase" to "implementation complete (T8.3.a–T8.3.e)" with a one-paragraph summary of which sub-slices landed what. §10 decision log gains six new dated entries — one per T8.3 sub-slice — recording which §7 open-question recommendations got confirmed in code (Q1 single-direction sessions; Q2 new frame types; Q3 single seen_by + TTL=3; Q4 replay-guard-handles-duplicates; Q5 pubkey-allowlist role detection — all confirmed).
+
+What this did NOT do:
+
+  * Did not change any code. Pure docs.
+  * Did not add an end-to-end two-real-hubs integration test — still deferred (needs hub-handle-connection Noise handshake test-mode refactor).
+  * Did not write a T8.4 (public-hub discovery) design doc. T8.4 is mostly a governance question rather than a technical one; flagged in `ROADMAP.md` as long-term.
+
+**Federation status: closed.** All five T8.3 sub-slices (a/b.1/b.2+.3/b.4/c/d/e) landed in a single session. KP gossip, envelope gossip, loop prevention, ownership validation, lazy/eager modes, operator opt-in, threat-model defended-adversary entries, docs across THREAT_MODEL + ANONYMITY + ROADMAP + FEDERATION + CHANGELOG.
+
+Verification: documentation-only — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` (317) all unchanged from `39b2820`.
+
+---
+
 ## 2026-05-19 — T8.3.d: gossip loop-termination + forward-semantics test suite
 
 Fifth T8.3 implementation slice. Tests targeting `handle_gossip_publish` and `handle_gossip_deliver` directly to verify the loop-prevention properties and forward semantics that the previous slices documented but didn't actively exercise. These are the unit-level proofs that the design works as written; an end-to-end 3-hub-via-real-Noise integration test is still deferred (would require lifting `hub_handle_connection`'s Noise XK assumption to support a test-mode handshake — out of scope here).
