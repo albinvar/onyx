@@ -21,6 +21,10 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 base32 = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -97,39 +97,45 @@ When your daemon connects to the hub and subscribes to your inbox routing id, th
 
 Even without cover traffic, the hub can count "inbox X received 14 envelopes today." Over time this is a statistical fingerprint of how busy a user is. **Cover traffic (§3.1) defeats this** as a side effect; documented separately because it's a distinct observable.
 
-### 3.4 No reproducible builds, no signed releases
+### 3.4 Hub durability — partially closed
+
+Before T8.0 the hub kept queued envelopes and the KP directory in *in-memory* HashMaps. A hub restart (deploy, OOM-kill, machine reboot) silently lost every queued envelope and every published KP. T8.0 closes that for the single-hub case by SQLite-backing the two non-ephemeral state pieces. A hub now survives its own restart.
+
+What remains: **a hub permanently dying** (disk destroyed) still loses everything stored there. The fix is **multi-hub publish/subscribe** (T8.1, next slice): daemon publishes its KP to N hubs and subscribes on N hubs; recipient dedups duplicates via the existing T7.3-sec.2 replay guard. Pure sender-side redundancy, no inter-hub coordination needed.
+
+### 3.5 No reproducible builds, no signed releases
 
 If someone replaces your installed `onyx` binary on disk (supply chain compromise, malicious package mirror), you lose. We have `cargo deny` advisory + license checks at the workspace gate, which catches *known-CVE* dependencies but not a maliciously-published version that has yet to be flagged.
 
   * **What would close it:** rust-reproducible-builds wiring, Sigstore signing on releases, `cargo audit` in CI.
   * **Effort:** 1 session for reproducibility (assuming clean dependency tree), 0.5 session for Sigstore signing pipeline.
 
-### 3.5 Disk fingerprint — `~/.onyx/` reveals you use Onyx
+### 3.6 Disk fingerprint — `~/.onyx/` reveals you use Onyx
 
 Anyone with read access to your home directory sees the `~/.onyx` directory. The directory itself is mode 0700 (so other users on a shared system can't read inside), but the *name* is visible to anyone who can list your home, and the vault file's existence reveals you ran Onyx at some point.
 
   * **What would close it:** opt-in custom vault path (already supported via `--vault`), plausibly-deniable vault (duress passphrase that unlocks a decoy identity).
   * **Effort:** custom path is already there. PD vault is 1–2 sessions, and the threat model needs to be careful — PD vaults are notoriously hard to do without making the deniability claim worse than no vault at all.
 
-### 3.6 Process name in `ps`
+### 3.7 Process name in `ps`
 
 A local snooper running `ps aux` sees `onyx` / `onyxd` in your process list. Reveals usage to anyone with shell access on the same machine.
 
   * **What would close it:** prctl-rename on Linux, no equivalent on macOS that we'd trust. Document the limitation; rename if you care.
   * **Effort:** trivial documentation; harder if you want it actually invisible.
 
-### 3.7 Memory zeroization is partial
+### 3.8 Memory zeroization is partial
 
 We use the `zeroize` crate on vault keys and KEM secrets (`crates/onyx-core/src/crypto.rs` — see the `ZeroizeOnDrop` derives). MLS state in `openmls` and decrypted plaintext in the conversation registry / TUI are **not** aggressively scrubbed. An attacker who can read the daemon's memory (root access, coredump, swap) can recover recently-decrypted plaintext.
 
   * **What would close it:** broader zeroization audit, locking memory to prevent swap, secure-enclave integration.
   * **Effort:** ongoing — needs a dedicated pass through every crate.
 
-### 3.8 No anonymous-set cover (group membership)
+### 3.9 No anonymous-set cover (group membership)
 
 When you join an MLS group, every member learns your fingerprint (that's how MLS works — membership is explicit and verifiable, which is a *feature* for integrity but a *cost* for anonymity). For "I want to talk to this group of people without revealing my identity to all of them," Onyx is the wrong tool. SecureDrop, OnionShare, or Tor + a one-time identity are right tools.
 
-### 3.9 No traffic-shape obfuscation against state-level DPI
+### 3.10 No traffic-shape obfuscation against state-level DPI
 
 Even though Tor wraps the bytes, the *fact that you are running Tor* is visible at the IP layer. A state-level adversary running DPI can flag you as "uses Tor." Onyx does not configure Tor bridges (obfs4, snowflake) automatically.
 

@@ -3170,6 +3170,8 @@ dependencies = [
  "clap",
  "futures",
  "onyx-core",
+ "rusqlite",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -21,6 +21,9 @@
 use std::collections::{HashMap, HashSet};
 
 use tokio::sync::mpsc;
+use tracing::warn;
+
+use crate::store::Store;
 
 /// Routing identifier — 16 bytes from `BLAKE2b-128` per DESIGN §5.5.
 pub type RoutingId = [u8; 16];
@@ -35,6 +38,20 @@ pub type ConnId = u64;
 pub const PER_CONN_MAILBOX: usize = 64;
 
 /// All the mutable state the hub keeps.
+///
+/// **Persistence (T8.0):** `queues` and `keypackages` are write-through-
+/// cached against the optional [`Store`] (`durable_store`).  On
+/// construction via [`Self::with_store`], the in-memory caches are
+/// warmed from the store so reads stay fast.  Mutations (`deliver`'s
+/// queue path, `subscribe`'s drain path, `publish_keypackage`) write
+/// through to the store immediately; a failed write logs at `warn!`
+/// and continues — the in-memory state remains consistent, only
+/// durability is lost for that one operation. `senders` and
+/// `subscribers` are NOT persisted (they're per-connection state
+/// that reset by definition on restart).
+///
+/// In-memory-only `Self::new()` is preserved for tests and for
+/// operators who explicitly want ephemeral hub semantics.
 #[derive(Debug, Default)]
 pub struct HubState {
     next_conn_id: ConnId,
@@ -46,18 +63,41 @@ pub struct HubState {
     /// bytes they've published. Latest-wins: each `publish_keypackage`
     /// overwrites the previous entry for that routing id.
     ///
-    /// **Security note**: the hub does not validate that a publisher
-    /// "owns" the routing id they're publishing under. See the
-    /// `FRAME_KP_PUBLISH` doc in `onyx-core::wire` for the recipient-
-    /// side mitigation (verify KP's embedded signing key against the
-    /// expected fingerprint before trusting).
+    /// **Security note**: as of T7.3-sec, the hub *does* validate
+    /// publisher ownership in `handler.rs::FRAME_KP_PUBLISH` before
+    /// calling [`Self::publish_keypackage`] — see THREAT_MODEL §8.2 #15.
     keypackages: HashMap<RoutingId, Vec<u8>>,
+    /// Optional SQLite-backed durable store (T8.0). `None` means the
+    /// hub is running ephemeral — fine for tests and short-lived
+    /// dev runs. Production uses `Self::with_store`.
+    durable_store: Option<Store>,
 }
 
 impl HubState {
+    /// In-memory-only state. Hub data does not survive a restart of
+    /// the hub process. Preserved for tests and dev runs; production
+    /// hubs should use [`Self::with_store`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// State backed by the given SQLite store. On construct, loads
+    /// every queued envelope and every published KeyPackage from the
+    /// store into the in-memory caches so the hot path stays
+    /// in-memory. Subsequent mutations write through to the store.
+    pub fn with_store(store: Store) -> anyhow::Result<Self> {
+        let mut me = Self::default();
+        // Warm the KP cache.
+        for (rid, kp) in store.load_all_keypackages()? {
+            me.keypackages.insert(rid, kp);
+        }
+        // Warm the queue cache.
+        for (rid, payloads) in store.load_all_queues()? {
+            me.queues.insert(rid, payloads);
+        }
+        me.durable_store = Some(store);
+        Ok(me)
     }
 
     /// Register a fresh connection. Returns the [`ConnId`] the
@@ -73,12 +113,31 @@ impl HubState {
     /// Subscribe `conn` to the given routing ids and return any
     /// previously-queued payloads for those ids (so the caller can
     /// immediately flush them to the wire).
+    ///
+    /// When backed by a durable store (T8.0), the drained rows are
+    /// also deleted from disk in the same logical step so a hub
+    /// crash between "subscriber takes ownership" and "subscriber
+    /// processes the bytes" never results in a duplicate delivery.
+    /// (The recipient's `EnvelopeReplayGuard` would dedup such a
+    /// duplicate anyway, so this is belt-and-braces.)
     pub fn subscribe(&mut self, conn: ConnId, ids: &[RoutingId]) -> Vec<Vec<u8>> {
         let mut drained = Vec::new();
         for id in ids {
             self.subscribers.entry(*id).or_default().insert(conn);
             if let Some(q) = self.queues.remove(id) {
                 drained.extend(q);
+                if let Some(store) = &mut self.durable_store {
+                    // Best-effort: if the disk write fails, the
+                    // in-memory drain still happened and the
+                    // subscriber will still receive the bytes; we
+                    // just leave the on-disk rows present and they
+                    // re-warm into the cache on next hub restart
+                    // (causing a one-time duplicate the recipient's
+                    // replay guard then drops).
+                    if let Err(e) = store.drain_queue(id) {
+                        warn!(error = %e, "hub store: drain_queue failed");
+                    }
+                }
             }
         }
         drained
@@ -94,6 +153,7 @@ impl HubState {
         let subs = match self.subscribers.get(&target) {
             Some(s) if !s.is_empty() => s.clone(),
             _ => {
+                self.enqueue_durable(target, &payload);
                 self.queues.entry(target).or_default().push(payload);
                 return 0;
             }
@@ -115,9 +175,22 @@ impl HubState {
         // full or closed), queue it instead. This keeps the
         // promise that a slow client doesn't lose messages.
         if delivered == 0 {
+            self.enqueue_durable(target, &payload);
             self.queues.entry(target).or_default().push(payload);
         }
         delivered
+    }
+
+    /// Best-effort write-through enqueue to the durable store, if
+    /// one is attached.  Failure logs `warn!` and continues — the
+    /// in-memory queue still holds the payload, only durability is
+    /// lost for this one entry.
+    fn enqueue_durable(&mut self, target: RoutingId, payload: &[u8]) {
+        if let Some(store) = &self.durable_store {
+            if let Err(e) = store.enqueue(&target, payload) {
+                warn!(error = %e, "hub store: enqueue failed (in-memory queue still consistent)");
+            }
+        }
     }
 
     /// Remove a connection and all its subscriptions.
@@ -133,9 +206,18 @@ impl HubState {
     // ── KeyPackage directory (T6.1) ────────────────────────────────────────
 
     /// Store (or replace) the KeyPackage published at `routing_id`.
-    /// Latest-wins; no validation that the publisher owns the
-    /// routing id (see module-level doc).
+    /// Latest-wins. Publisher-ownership is verified in `handler.rs`
+    /// (T7.3-sec) BEFORE this call — `state.rs` trusts its caller.
+    ///
+    /// Write-through to the durable store (T8.0) if attached. A
+    /// failed disk write logs `warn!` and continues; the in-memory
+    /// cache stays consistent.
     pub fn publish_keypackage(&mut self, routing_id: RoutingId, bytes: Vec<u8>) {
+        if let Some(store) = &self.durable_store {
+            if let Err(e) = store.set_keypackage(&routing_id, &bytes) {
+                warn!(error = %e, "hub store: set_keypackage failed (in-memory cache still consistent)");
+            }
+        }
         self.keypackages.insert(routing_id, bytes);
     }
 
@@ -296,5 +378,91 @@ mod tests {
         );
         // And the directory size stays at 1 — we replaced, not appended.
         assert_eq!(state.keypackage_count(), 1);
+    }
+
+    // ── T8.0 durability ───────────────────────────────────────────────
+
+    /// Restart-survival: write some KPs + queue some envelopes,
+    /// "restart" the hub (drop + recreate HubState pointing at the
+    /// same on-disk store), assert everything is still there.
+    #[tokio::test]
+    async fn with_store_survives_restart() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let rid_a: RoutingId = [0xA1; 16];
+        let rid_b: RoutingId = [0xB2; 16];
+
+        // First lifetime: queue two envelopes for rid_a (no
+        // subscriber) and publish a KP for rid_b.
+        {
+            let store = Store::open(&path).unwrap();
+            let mut state = HubState::with_store(store).unwrap();
+            state.deliver(rid_a, b"queued-1".to_vec());
+            state.deliver(rid_a, b"queued-2".to_vec());
+            state.publish_keypackage(rid_b, b"kp-bytes".to_vec());
+            assert_eq!(state.queue_len(&rid_a), 2);
+            assert_eq!(state.keypackage_count(), 1);
+        }
+
+        // Second lifetime: reopen, expect both pieces of state.
+        {
+            let store = Store::open(&path).unwrap();
+            let mut state = HubState::with_store(store).unwrap();
+            assert_eq!(
+                state.queue_len(&rid_a),
+                2,
+                "queued envelopes must survive restart"
+            );
+            assert_eq!(
+                state.fetch_keypackage(&rid_b).as_deref(),
+                Some(b"kp-bytes".as_slice()),
+                "published KP must survive restart"
+            );
+
+            // Now a subscriber arrives and drains; both the in-memory
+            // cache and the on-disk rows should clear.
+            let (tx, _rx) = mpsc::channel(8);
+            let conn = state.register_conn(tx);
+            let drained = state.subscribe(conn, &[rid_a]);
+            assert_eq!(drained.len(), 2);
+            assert_eq!(state.queue_len(&rid_a), 0);
+        }
+
+        // Third lifetime: reopen one more time. The drained envelopes
+        // must NOT come back — that would be a duplicate-delivery
+        // bug (and would prove the drain-on-disk step failed).
+        {
+            let store = Store::open(&path).unwrap();
+            let state = HubState::with_store(store).unwrap();
+            assert_eq!(
+                state.queue_len(&rid_a),
+                0,
+                "drained envelopes must not reappear after restart"
+            );
+            // KP still there (drain doesn't touch KPs).
+            assert_eq!(
+                state.fetch_keypackage(&rid_b).as_deref(),
+                Some(b"kp-bytes".as_slice())
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// In-memory mode (`Self::new`) must continue to work without a
+    /// store attached — preserves the existing test path + dev
+    /// runs that don't care about durability.
+    #[tokio::test]
+    async fn new_is_ephemeral_no_store_no_panic() {
+        let mut state = HubState::new();
+        let id: RoutingId = [0xEE; 16];
+        state.deliver(id, b"x".to_vec()); // no subscriber → queue
+        state.publish_keypackage(id, b"kp".to_vec());
+        assert_eq!(state.queue_len(&id), 1);
+        assert_eq!(state.keypackage_count(), 1);
+        // No durable_store, no errors, no panics. Ephemeral semantics
+        // preserved.
     }
 }

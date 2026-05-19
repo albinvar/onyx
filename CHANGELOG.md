@@ -6,6 +6,64 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.0: hub durability — SQLite-back the queue + KP-directory so they survive hub restart
+
+First step in the "build up the relay setup" architectural slice. Before today, the hub kept its two non-ephemeral state pieces (offline-delivery queues, MLS KeyPackage directory) in *pure in-memory `HashMap`s*. A hub restart — `kill -HUP`, a deploy, an OOM, a machine reboot — silently lost every queued envelope and every published KP. Senders got no signal; recipients silently lost first-contact attempts. T8.0 makes the hub survive its own restart.
+
+What landed:
+
+**T8.0.a — new `onyx-hub::store` module** (`crates/onyx-hub/src/store.rs`, ~330 lines code + tests). SQLite-backed store with two tables:
+
+```sql
+CREATE TABLE queue_entry (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  routing_id   BLOB NOT NULL,   -- 16 bytes
+  payload      BLOB NOT NULL,   -- full DELIVER body, ready to forward
+  enqueued_at  INTEGER NOT NULL
+);
+CREATE INDEX queue_entry_routing_idx ON queue_entry(routing_id);
+
+CREATE TABLE keypackage (
+  routing_id    BLOB PRIMARY KEY,
+  kp_bytes      BLOB NOT NULL,
+  published_at  INTEGER NOT NULL
+);
+```
+
+Auto-incrementing `queue_entry.id` is the FIFO order — `drain_queue` does `SELECT … ORDER BY id ASC` + `DELETE` inside a single SQLite transaction so a concurrent enqueue cannot be partially taken. Tables created via `CREATE TABLE IF NOT EXISTS` so reopening an existing DB is a no-op (idempotent schema apply, no version cell needed). Six unit tests including the headline `survives_close_and_reopen` (write, close, reopen, read the same bytes back — models hub restart).
+
+**T8.0.b — `HubState::with_store(store)`** (`crates/onyx-hub/src/state.rs`). The existing `HubState::new()` (in-memory only) is preserved unchanged so all existing tests + ephemeral dev use keep working. The new `with_store` constructor:
+  - Calls `store.load_all_keypackages()` and `store.load_all_queues()` to **warm the in-memory caches from disk**, so the hot read path stays in-memory (no SQLite queries on `fetch_keypackage` / `deliver`).
+  - Records the store as `durable_store: Option<Store>`.
+  - All three mutation paths (`deliver` when no live subscriber → enqueue; `subscribe` when draining queue → delete-disk; `publish_keypackage` → UPSERT) now do **write-through**: in-memory + disk. Disk-write failures log `warn!` and *continue* — in-memory state stays consistent, only durability is lost for that one operation.
+
+Two new state-level tests:
+  - `with_store_survives_restart` — three "lifetimes" of the same on-disk store. Lifetime 1: queue two envelopes for rid_a + publish a KP for rid_b. Lifetime 2: reopen, assert both pieces of state are present, then a subscriber drains rid_a. Lifetime 3: reopen, assert the drained envelopes do NOT reappear (proves the on-disk drain ran) and the KP is still present.
+  - `new_is_ephemeral_no_store_no_panic` — preserves the contract that `HubState::new()` works without a store, just like before.
+
+**T8.0.c — `--state-db` flag.** New clap arg on `onyx-hub`, default `./onyx-hub-state.db`. Auto-creates parent directory if missing. Opt-out path: `--state-db ""` (empty string) keeps the pre-T8.0 ephemeral semantics for operators who explicitly want them — emits a loud `warn!` at startup so it can't be invoked silently.
+
+Security analysis (why this commit is safe):
+
+  * **No new attack surface.** Hub-side rows are **not** AEAD-sealed. They never were content the hub had a right to read — they're already AEAD-sealed by the *sender* under the *recipient's* hybrid KEM key. A hub operator with shell access could already read in-memory queues via core dump or memory inspection; durability doesn't change that. A future hub operator who tampers with rows on disk just produces malformed DELIVER bytes that the recipient's `open_bootstrap` rejects via the outer Ed25519 signature check (and the recipient's T7.3-sec.2 replay guard dedups any successful re-deliveries).
+  * **No new trust assumption.** Hub continues to see only routing-ids + opaque ciphertext + timing. Persistence does not change the threat model — only the *durability* axis.
+  * **Restart-derived duplicate deliveries are safe.** A hub crash between "subscriber takes ownership in memory" and "subscriber processes the bytes" could in principle re-deliver an envelope on next restart (the on-disk drain didn't complete). The recipient's `EnvelopeReplayGuard` (T7.3-sec.2) silently drops the duplicate. Belt-and-braces.
+
+`THREAT_MODEL`: no carry-forward changes today — hub durability isn't a security gap, it's a reliability one.
+
+`ANONYMITY.md` updated: new §3.4 "Hub durability — partially closed" notes T8.0 closes the single-hub case and points at T8.1 (multi-hub publish/subscribe) as the next slice for the "hub permanently dies" case. Renumbered the cascading §3.5–§3.10.
+
+What this did NOT do:
+
+  * Did not add multi-hub support — that's T8.1, the next slice. T8.0 only makes one hub survive its own restart.
+  * Did not add a public-hub discovery mechanism — that's T8.4 territory.
+  * Did not change the hub protocol, the wire format, or the daemon-side code at all. The hub's clients don't need any changes to benefit from T8.0.
+  * Did not encrypt-at-rest the hub's state-db. The bytes inside are already AEAD ciphertext (sender → recipient) — adding another encryption layer with a key the hub controls would protect against disk theft but not against an operator who can read process memory. Out-of-scope for v0; trivial follow-up if the threat model evolves.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (added `#[allow(clippy::too_many_lines)]` on `onyx-hub::main` after the new state-db branch pushed it past 100 lines; added `#[allow(dead_code)]` on `Store::open_memory` because it's currently only test-callers but will become operator-facing in a future flag), `cargo test --workspace` **268 passed / 0 failed** (was 260; +6 store unit tests + +2 HubState restart-survival tests).
+
+---
+
 ## 2026-05-19 — Docs: `ANONYMITY.md` — honest inventory of what Onyx hides and what it doesn't
 
 Documentation-only change. No code, no protocol, no behaviour delta. The four recent zero-trust hardenings (T7.3-sec, T7.3-sec.2, T7.3-sec.2-persist) closed real attacks, but the answer to "is Onyx anonymous?" still lived only in this changelog and in scattered module rustdocs. Users wanting to evaluate fit needed to reconstruct the picture from primary sources. `ANONYMITY.md` consolidates it — with the same discipline as `HOW_IT_WORKS.md`: file pointers for every claim, an explicit gap list, no marketing.

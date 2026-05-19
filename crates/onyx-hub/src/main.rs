@@ -43,6 +43,7 @@ use crate::state::HubState;
 
 mod handler;
 mod state;
+mod store;
 
 const DEFAULT_IDENTITY_NICKNAME: &str = "hub";
 const HS_NICKNAME: &str = "onyx-hub";
@@ -77,8 +78,22 @@ struct Args {
     /// its own directory to avoid fighting the state-file lock.
     #[arg(long, env = "ONYX_HUB_TOR_STATE_DIR")]
     tor_state_dir: Option<PathBuf>,
+
+    /// Path to the SQLite database that durably stores queued
+    /// envelopes + published KeyPackages (T8.0). Defaults to
+    /// `./onyx-hub-state.db` next to the vault file. Pass
+    /// `--state-db ""` (empty string) to opt out and run the hub
+    /// ephemeral — restart loses every queue + KP, same posture as
+    /// pre-T8.0.
+    #[arg(long, env = "ONYX_HUB_STATE_DB", default_value = "./onyx-hub-state.db")]
+    state_db: String,
 }
 
+// Linear startup: tracing → vault → identity → Tor → HS → state →
+// accept-loop. Splitting per-section helpers would only relocate
+// the same body into call sites without making startup easier to
+// follow.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -149,7 +164,33 @@ async fn main() -> anyhow::Result<()> {
         .take_accept_streams()
         .context("HS accept-stream already taken")?;
 
-    let state = Arc::new(Mutex::new(HubState::new()));
+    // T8.0: open the SQLite-backed store unless the operator
+    // explicitly opted out via `--state-db ""`. The HubState warms
+    // its in-memory caches from the store on construct so the hot
+    // path stays in-memory.
+    let state = if args.state_db.is_empty() {
+        warn!(
+            "--state-db is empty: running ephemeral. Queued envelopes \
+             and published KPs will NOT survive a hub restart."
+        );
+        Arc::new(Mutex::new(HubState::new()))
+    } else {
+        let db_path = std::path::PathBuf::from(&args.state_db);
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating hub state-db parent directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        info!(state_db = %db_path.display(), "opening hub durable state-db");
+        let store = crate::store::Store::open(&db_path).context("opening hub state-db")?;
+        let warm = HubState::with_store(store).context("warming HubState from store")?;
+        Arc::new(Mutex::new(warm))
+    };
     let hub_secret = Arc::new(IdentityHandle::new(identity));
 
     info!("onyx-hub running. Ctrl-C to stop.");
