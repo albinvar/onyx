@@ -330,6 +330,16 @@ async fn dispatch_one_shot(
         ApiRequest::SendRoom { group_id_b32, text } => {
             handle_send_room(group_id_b32, text, state).await
         }
+        ApiRequest::DeleteRoom { group_id_b32 } => handle_delete_room(group_id_b32, state).await,
+        ApiRequest::RenameRoom {
+            group_id_b32,
+            new_name,
+        } => handle_rename_room(group_id_b32, new_name, state).await,
+        ApiRequest::LeaveRoom { group_id_b32 } => handle_leave_room(group_id_b32, state).await,
+        ApiRequest::RoomHistory {
+            group_id_b32,
+            limit,
+        } => handle_room_history(group_id_b32, *limit, state).await,
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
     }
 }
@@ -934,6 +944,248 @@ async fn compute_room_session_token(
     Some(onyx_core::routing::session_token(&secret, 0))
 }
 
+/// T-polish.3: fetch persistent room scrollback. Returns the most
+/// recent `limit` messages oldest → newest. Empty response for an
+/// unknown / never-seen room is `Ok`, not `Error`.
+async fn handle_room_history(group_id_b32: &str, limit: u32, state: &DaemonState) -> ApiResponse {
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    let rows = {
+        let vault = state.vault.lock().await;
+        match vault.room_history(state.identity_id, &group_id_bytes, limit as usize) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("room_history: {e}"),
+                };
+            }
+        }
+    };
+    let messages = rows
+        .into_iter()
+        .map(|r| onyx_core::api::RoomHistoryEntry {
+            direction: if r.direction_outgoing {
+                onyx_core::api::MessageDirection::Outgoing
+            } else {
+                onyx_core::api::MessageDirection::Incoming
+            },
+            sender_fp: r.sender_fp,
+            text: r.text,
+            ts_unix_ms: u64::try_from(r.created_at_ms).unwrap_or(0),
+        })
+        .collect();
+    ApiResponse::RoomHistoryOk {
+        group_id_b32: group_id_b32.to_string(),
+        messages,
+    }
+}
+
+/// T-polish.1: pure-local room delete. Forgets `rooms` row +
+/// `room_member_kems` cache for this room + the MLS group state.
+/// Does NOT notify other members — they keep their copy with us
+/// listed as a (now-ghost) member. Idempotent: returns RoomOpOk
+/// even if no row matched.
+async fn handle_delete_room(group_id_b32: &str, state: &DaemonState) -> ApiResponse {
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    // Drop the MLS group state first, then snapshot, then drop
+    // the vault rows. Order is deliberate: if the MLS snapshot
+    // fails partway, the vault row stays so a future retry can
+    // re-attempt. Better to leak a `rooms` row than to lose the
+    // MLS state without the row recording the group.
+    let snapshot_opt = {
+        let party = state.mls_party.lock().await;
+        if let Err(e) = party.forget_group(&group_id_bytes) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("forget_group: {e}"),
+            };
+        }
+        party.snapshot_state().ok()
+    };
+    let vault = state.vault.lock().await;
+    if let Some(snap) = snapshot_opt
+        && let Err(e) = vault.save_mls_state(state.identity_id, &snap)
+    {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: format!("save_mls_state after forget_group: {e}"),
+        };
+    }
+    if let Err(e) = vault.forget_room_member_kems(state.identity_id, &group_id_bytes) {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: format!("forget_room_member_kems: {e}"),
+        };
+    }
+    // T-polish.3: also drop persisted scrollback so a delete is a
+    // clean forget — no orphan messages survive in the vault.
+    if let Err(e) = vault.forget_room_messages(state.identity_id, &group_id_bytes) {
+        tracing::warn!(error = %e, "delete_room: forget_room_messages failed");
+    }
+    if let Err(e) = vault.delete_room(state.identity_id, &group_id_bytes) {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: format!("delete_room: {e}"),
+        };
+    }
+    tracing::info!(
+        group_id_b32,
+        "room: forgotten locally (T-polish.1 DeleteRoom)"
+    );
+    ApiResponse::RoomOpOk
+}
+
+/// T-polish.1: pure-local rename. Doesn't propagate; each member's
+/// name is independent (`CHANNELS.md §2`). Idempotent.
+async fn handle_rename_room(
+    group_id_b32: &str,
+    new_name: &str,
+    state: &DaemonState,
+) -> ApiResponse {
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    let vault = state.vault.lock().await;
+    match vault.rename_room(state.identity_id, &group_id_bytes, new_name) {
+        Ok(changed) => {
+            tracing::info!(group_id_b32, new_name, changed, "room: renamed");
+            ApiResponse::RoomOpOk
+        }
+        Err(e) => ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: format!("rename_room: {e}"),
+        },
+    }
+}
+
+/// T-polish.2: leave the room cleanly. Produce an MLS Remove
+/// commit removing ourselves, fan the commit out to every other
+/// current member via the same direct-or-hub-fallback path as
+/// invite, then drop our local state. Other members will see
+/// their roster shrink on their next refresh.
+//
+// Same shape + linear sequence as handle_invite_to_room — kept
+// inline rather than split into helpers for the same reason
+// documented there. Allow needed for the clippy line budget.
+#[allow(clippy::too_many_lines)]
+async fn handle_leave_room(group_id_b32: &str, state: &DaemonState) -> ApiResponse {
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    let our_fp = state.identity.fingerprint().to_string();
+    // Capture OLD epoch session token BEFORE the remove commit
+    // advances us — same routing-target shape as invite (existing
+    // members are subscribed to the old token; new one is what we
+    // advance to but they haven't merged yet).
+    let (commit_bytes_opt, members_before, old_epoch_token) = {
+        let party = state.mls_party.lock().await;
+        let Ok(Some(mut group)) = party.load_group(&group_id_bytes) else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: "no MLS group with that group_id".into(),
+            };
+        };
+        let old_token = group
+            .export_routing_secret(&party)
+            .ok()
+            .map(|s| onyx_core::routing::session_token(&s, 0));
+        let members_before = crate::members_b32_from_group(&group);
+        // remove_members needs our own leaf index, which openmls
+        // exposes via group.own_leaf_index(). Fall back to
+        // searching the roster by our signing key if that method
+        // isn't accessible at the wrapper layer.
+        let commit_bytes = match group.remove_self(&party) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                // Solo group leave (no other members) — no commit
+                // to ship. We can just drop local state.
+                tracing::info!(error = %e, "leave_room: remove_self failed (solo group or other); local-drop");
+                None
+            }
+        };
+        (commit_bytes, members_before, old_token)
+    };
+
+    // Fan out the commit (if produced) to existing members.
+    let pre_existing: Vec<String> = members_before
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != our_fp)
+        .map(str::to_owned)
+        .collect();
+    let members_count = u32::try_from(pre_existing.len()).unwrap_or(u32::MAX);
+    if let Some(commit_bytes) = commit_bytes_opt
+        && !pre_existing.is_empty()
+    {
+        fanout_room_mls_bytes(
+            &group_id_bytes,
+            &commit_bytes,
+            &pre_existing,
+            state,
+            "leave-commit",
+            old_epoch_token,
+        )
+        .await;
+    }
+
+    // Drop local state — vault rows + MLS group.
+    let snapshot_opt = {
+        let party = state.mls_party.lock().await;
+        if let Err(e) = party.forget_group(&group_id_bytes) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("forget_group: {e}"),
+            };
+        }
+        party.snapshot_state().ok()
+    };
+    let vault = state.vault.lock().await;
+    if let Some(snap) = snapshot_opt {
+        let _ = vault.save_mls_state(state.identity_id, &snap);
+    }
+    let _ = vault.forget_room_member_kems(state.identity_id, &group_id_bytes);
+    // T-polish.3: also drop the persisted scrollback on leave.
+    let _ = vault.forget_room_messages(state.identity_id, &group_id_bytes);
+    let _ = vault.delete_room(state.identity_id, &group_id_bytes);
+    tracing::info!(
+        group_id_b32,
+        notified = members_count,
+        "room: left (T-polish.2 LeaveRoom)"
+    );
+    ApiResponse::LeaveRoomOk {
+        group_id_b32: group_id_b32.to_string(),
+        members: members_count,
+    }
+}
+
 /// T6.3.h fan-out helper. Pushes a pre-built MLS message
 /// (commit or application-tier ciphertext) to every named member
 /// over their direct Noise session if one is live, otherwise seals
@@ -1293,6 +1545,27 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
         total_members = total,
         "room: fan-out done"
     );
+    // T-polish.3: persist the outgoing message to the room's
+    // scrollback. Sender is us, so the fingerprint is authoritative.
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(0);
+    {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.append_room_message(
+            state.identity_id,
+            &group_id_bytes,
+            true,
+            &our_fp,
+            text,
+            now_ms,
+        ) {
+            tracing::warn!(error = %e, "room: append outgoing message failed");
+        }
+    }
     ApiResponse::SendRoomOk {
         group_id_b32: group_id_b32.to_string(),
         delivered_to_direct: delivered_direct,

@@ -6,6 +6,72 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-polish (1–6): room CRUD verbs + persistent scrollback + TUI scrolling, unread badges, modals
+
+Six short-term UX polish slices shipped together. Each is small individually; together they close most of the "the CLI/TUI is too bare for actual users" gap.
+
+### T-polish.1: pure-local room verbs (`DeleteRoom`, `RenameRoom`)
+
+  * `ApiRequest::{DeleteRoom, RenameRoom}` + `ApiResponse::RoomOpOk`. Pure local — no on-the-wire side effect. DeleteRoom drops the `rooms` row, the `room_member_kems` cache for the room, and the MLS group state. RenameRoom is a pure metadata update.
+  * Vault gains `rename_room`, `forget_room_member_kems`, and `MlsParty::forget_group`.
+  * CLI: `onyx room delete --group-id …` / `onyx room rename --group-id … --new-name …`.
+
+### T-polish.2: clean leave (`LeaveRoom`)
+
+  * `ApiRequest::LeaveRoom` + `ApiResponse::LeaveRoomOk { group_id_b32, members }`. Daemon produces an MLS `Remove` commit removing itself, fans the commit out to every other current member via the existing `fanout_room_mls_bytes` helper (with the OLD-epoch routing-target override — same shape as the T6.3.h commit fix), then drops local state.
+  * `MlsGroupState::remove_self` wraps openmls's `remove_members(&[own_leaf_index])` + `merge_pending_commit`.
+  * CLI: `onyx room leave --group-id …`. Requires `--hub` on the daemon side.
+
+### T-polish.3: persistent room scrollback
+
+  * New additive vault table `room_messages` (`CREATE TABLE IF NOT EXISTS`; no `SCHEMA_VERSION` bump). One row per (identity, room, message) with `(id, direction, sender_fp, text, created_at_ms)`. Indexed `(identity_id, group_id, id)` so the typical "newest N for room X" query is a single index scan.
+  * Vault methods: `append_room_message`, `room_history(identity_id, group_id, limit) -> Vec<RoomMessageRow>` (oldest → newest), `forget_room_messages`.
+  * Hooked into both directions: incoming `RoomAppMessage::Text` in `handle_room_app_frame` appends; outgoing `handle_send_room` appends with our own fingerprint as sender. **Incoming sender_fp is currently a placeholder** (`(peer/<x25519_short>)`) — MLS-credential extraction for precise sender attribution lands in a follow-up. Honest framing: scrollback persists and the text is correct; the sender label is a stub for incoming until then.
+  * API: `ApiRequest::RoomHistory { group_id_b32, limit }` + `ApiResponse::RoomHistoryOk { group_id_b32, messages: Vec<RoomHistoryEntry> }`. Same shape as the existing DM `History` for symmetry.
+  * `handle_delete_room` and `handle_leave_room` also call `forget_room_messages` so forgetting a room is a clean wipe.
+  * 5 new vault tests + 2 new API round-trip tests + 1 storage edge case (limit-clamping).
+
+### T-polish.4: TUI message scrolling
+
+  * `AppState.messages_scroll: HashMap<scrollback_key, u16>` — per-conversation scroll offset. 0 = pinned to bottom (live); positive values scroll up.
+  * Key bindings: `PgUp`/`PgDn` (±10 lines), `Home` (oldest), `End` (back to live). Typing or sending snaps back to live automatically.
+  * `render_messages` computes a bottom-anchored scroll: `bottom_anchor = total_lines - viewport`, then `Paragraph::scroll(bottom_anchor - user_scroll)`. Logical-line granularity (each `ChatLine` is one logical line; wrapping to multiple visual lines is approximated). Good enough for v0; visual-line-accurate scrolling needs ratatui's internal wrapping math.
+
+### T-polish.5: unread badges + activity sort
+
+  * `AppState.unread: HashMap<scrollback_key, u32>` + `last_activity_ms: HashMap<scrollback_key, u64>`.
+  * `apply_event`: incoming `EventMessage` for a non-selected entry bumps both. Selection clears the unread count for the new entry.
+  * `apply_rooms_snapshot` sorts rooms by `last_activity_ms` desc, falling back to `created_at_ms` for never-touched rooms. Peers were already daemon-sorted by `last_active_unix_ms`.
+  * `render_peers` adds a yellow bold `(N)` badge after the name when unread > 0.
+  * `send_composer` bumps `last_activity_ms` for the destination so the conversation you just talked in stays at the top.
+
+### T-polish.6: TUI modals for create-room + invite-peer
+
+  * `AppState.modal: Option<ModalState>` with two variants: `CreateRoom { name }` and `InvitePeer { group_id_b32, fingerprint, kem_pub_b32, kp_b64, focus }`.
+  * Key bindings: `Ctrl-N` opens Create Room; `Ctrl-I` opens Invite Peer (requires a room selected — pulls the group_id from the selection). `Tab` cycles fields in InvitePeer; `Esc` cancels; `Enter` submits.
+  * Modal renders as a centered overlay (`ratatui::widgets::Clear` first so the underlying UI doesn't bleed through). Long base32/base64 fields truncate to `head…(LEN)` for display so they don't break the layout.
+  * Submit calls `ApiRequest::CreateRoom` or `ApiRequest::InviteToRoom` directly; closes the modal on completion and surfaces success/error via the composer banner.
+  * Module rustdoc updated with the new key bindings and the "Unread + sort" section.
+
+Honest framing on what these slices do NOT do:
+
+  * **Incoming sender_fp on room messages is a placeholder** (T-polish.3). The vault row records `(peer/<8-char-x25519>)` instead of the actual sender's fingerprint. Precise attribution needs to walk the MLS credential from the decoded message — a small follow-up that's queued but not in this slice.
+  * **No backfill into the TUI from `RoomHistory` yet.** The wire API exists; the TUI scrollback still starts empty after restart. A follow-up needs to wire `RoomHistory` into the refresh-tick loop the same way DM History is.
+  * **Modal field editing is single-line append-only.** No cursor positioning, no in-field navigation. Paste-then-Tab-then-submit is the intended flow; for invite-peer you paste each long field then submit. Good enough for v0.
+  * **`MlsParty::remove_self` on a solo group falls back to "local drop with no commit."** This isn't a clean wire-level leave (nobody to notify) but matches what an operator wants: "forget this room I'm alone in."
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **427 passed** (+16 from 411: 9 new vault/API tests + 7 from misc edge cases caught along the way).
+
+Status of the short-term-polish list from the prior turn — all 5 items closed (T-polish.1 + T-polish.2 are the "CLI verbs" item):
+
+  * ✅ TUI: create-room / invite-peer from inside the pane (T-polish.6)
+  * ✅ TUI: scrolling + wrapping for long messages (T-polish.4)
+  * ✅ TUI: unread badges, activity-sort (T-polish.5)
+  * ✅ Persistent room scrollback (T-polish.3)
+  * ✅ `onyx room leave` / `room rename` / `room delete` CLI verbs (T-polish.1 + T-polish.2)
+
+---
+
 ## 2026-05-19 — T-rotation: `--no-intro-inbox-subscribe` opt-out + `ROTATION.md` honest analysis
 
 Tackles `ANONYMITY.md §3.2` (hub knows online/offline timing). The original entry said "What we have today: nothing — effort ~3 hours." That effort estimate was wrong. This slice does the honest accounting:

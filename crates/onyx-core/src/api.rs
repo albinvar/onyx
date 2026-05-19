@@ -227,6 +227,40 @@ pub enum ApiRequest {
         peer_kem_pub_b32: String,
         peer_kp_b64: String,
     },
+    /// Forget a room locally (T-polish.1). Drops the `rooms` row,
+    /// the `room_member_kems` rows for that room, and the underlying
+    /// MLS group state. Does **not** notify other members — they
+    /// keep their copy of the group with you as a still-listed
+    /// member who will simply never decrypt anything you send. For
+    /// a clean leave that informs the other members, use
+    /// [`Self::LeaveRoom`] instead.
+    ///
+    /// Idempotent — `Ok` even if no row matched.
+    DeleteRoom { group_id_b32: String },
+    /// Rename a room locally (T-polish.1). Pure-metadata update on
+    /// `rooms.name`. Doesn't propagate to other members — each
+    /// member's local name is independent (`CHANNELS.md §2`).
+    /// Idempotent (returns `Ok` even if the name was already that
+    /// value).
+    RenameRoom {
+        group_id_b32: String,
+        new_name: String,
+    },
+    /// Fetch the persisted scrollback for a room (T-polish.3).
+    /// Returns up to `limit` most recent messages oldest → newest
+    /// — same shape as [`Self::History`] for DMs. Empty Vec when
+    /// the room is unknown or has no messages yet.
+    RoomHistory { group_id_b32: String, limit: u32 },
+    /// Leave a room cleanly (T-polish.2). The daemon produces an
+    /// MLS `Remove` commit removing ourselves, fans the commit out
+    /// to every other current member, and then drops the local
+    /// `rooms` row + `room_member_kems` + MLS group state. Other
+    /// members will see their roster shrink and continue without
+    /// us.
+    ///
+    /// Requires `--hub` (the Remove commit fans out the same way
+    /// as an Add commit in [`Self::InviteToRoom`]).
+    LeaveRoom { group_id_b32: String },
     /// Send `text` to every current member of the room identified
     /// by `group_id_b32` (T6.3.d, direct path only). The daemon
     /// encrypts the plaintext **once** in the room's MLS group
@@ -347,6 +381,21 @@ pub enum ApiResponse {
         group_id_b32: String,
         members: Vec<String>,
     },
+    /// Reply to [`ApiRequest::RoomHistory`] (T-polish.3). Messages
+    /// are oldest → newest. May be shorter than `limit` if fewer
+    /// messages exist (or empty if the room has none).
+    RoomHistoryOk {
+        group_id_b32: String,
+        messages: Vec<RoomHistoryEntry>,
+    },
+    /// Reply to [`ApiRequest::DeleteRoom`] and
+    /// [`ApiRequest::RenameRoom`] (T-polish.1). Pure-local
+    /// operations; no on-the-wire side effect.
+    RoomOpOk,
+    /// Reply to [`ApiRequest::LeaveRoom`] (T-polish.2). `members`
+    /// is the pre-leave roster (the count of other members the
+    /// Remove commit was fanned out to).
+    LeaveRoomOk { group_id_b32: String, members: u32 },
     /// Reply to [`ApiRequest::SendRoom`]. Per-call delivery stats:
     ///
     ///   * `delivered_to_direct` — members reached over a live
@@ -468,6 +517,18 @@ pub struct RoomInfo {
     /// Daemon wall-clock at room creation. Used by clients to
     /// sort the room list; not authoritative across members.
     pub created_at_ms: u64,
+}
+
+/// One row in [`ApiResponse::RoomHistoryOk`] (T-polish.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomHistoryEntry {
+    pub direction: MessageDirection,
+    /// Sender fingerprint as a string (base32-grouped). For
+    /// outgoing messages this is the local identity's fingerprint;
+    /// for incoming it's the decoded sender from MLS.
+    pub sender_fp: String,
+    pub text: String,
+    pub ts_unix_ms: u64,
 }
 
 /// Direction of an [`ApiResponse::EventMessage`].
@@ -758,6 +819,88 @@ mod tests {
             line.contains("\"kind\":\"SendRoom\""),
             "wire must carry kind=SendRoom; got {line:?}"
         );
+    }
+
+    // ── T-polish.1 + T-polish.2: room CRUD verbs ──────────────────
+
+    #[test]
+    fn request_round_trip_delete_room() {
+        let r = ApiRequest::DeleteRoom {
+            group_id_b32: "groupabc".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_rename_room() {
+        let r = ApiRequest::RenameRoom {
+            group_id_b32: "groupabc".into(),
+            new_name: "still-general".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_leave_room() {
+        let r = ApiRequest::LeaveRoom {
+            group_id_b32: "groupabc".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_room_op_ok() {
+        let r = ApiResponse::RoomOpOk;
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_leave_room_ok() {
+        let r = ApiResponse::LeaveRoomOk {
+            group_id_b32: "g".into(),
+            members: 3,
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    // ── T-polish.3: persistent room scrollback ────────────────────
+
+    #[test]
+    fn request_round_trip_room_history() {
+        let r = ApiRequest::RoomHistory {
+            group_id_b32: "g".into(),
+            limit: 50,
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_room_history_ok() {
+        let r = ApiResponse::RoomHistoryOk {
+            group_id_b32: "g".into(),
+            messages: vec![
+                RoomHistoryEntry {
+                    direction: MessageDirection::Incoming,
+                    sender_fp: "(peer/abcd1234)".into(),
+                    text: "hi room".into(),
+                    ts_unix_ms: 1_000,
+                },
+                RoomHistoryEntry {
+                    direction: MessageDirection::Outgoing,
+                    sender_fp: "fp_alice".into(),
+                    text: "hi back".into(),
+                    ts_unix_ms: 1_500,
+                },
+            ],
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
     }
 
     #[test]

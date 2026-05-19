@@ -173,6 +173,44 @@ CREATE TABLE IF NOT EXISTS room_member_kems (
 );
 ";
 
+/// Additive extension for T-polish.3 — persistent room scrollback.
+/// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
+/// tables; no `SCHEMA_VERSION` bump.
+///
+/// One row per (identity, room, message). `direction` is 0 for
+/// incoming, 1 for outgoing (small ints over an enum string keeps
+/// the table tiny; the daemon translates back to
+/// [`crate::api::MessageDirection`] at the API surface). `text` is
+/// the plaintext as decoded from `RoomAppMessage::Text` (or our own
+/// outgoing text). `sender_fp` is the sender's fingerprint
+/// (the local user's for outgoing, the decoded sender for
+/// incoming); used to render attribution in the TUI without
+/// having to walk the MLS roster every time.
+///
+/// `id` is autoincrementing so ordering by id is stable (avoids
+/// the "two messages at the same timestamp shuffle on every
+/// fetch" issue). `created_at_ms` is wall-clock for display.
+///
+/// **Privacy posture**: the table holds decrypted plaintext at
+/// rest. This is the deliberate tradeoff for persistent scrollback
+/// — the same tradeoff the per-peer `ChatLine` ring buffer already
+/// makes for DMs (`ANONYMITY.md §3.8` "decrypted plaintext in the
+/// daemon's conversation registry"). Stored in the AEAD-protected
+/// vault file; readable only with the vault passphrase.
+const SCHEMA_ROOM_MESSAGES_ADD: &str = "
+CREATE TABLE IF NOT EXISTS room_messages (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  identity_id     INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  group_id        BLOB NOT NULL,
+  direction       INTEGER NOT NULL,
+  sender_fp       TEXT NOT NULL,
+  text            TEXT NOT NULL,
+  created_at_ms   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS room_messages_by_group
+  ON room_messages (identity_id, group_id, id);
+";
+
 /// Known plaintext used to detect a wrong passphrase. Encrypted under
 /// the vault key at creation; failure to decrypt at open means the
 /// passphrase doesn't match (or the file is corrupted — we don't
@@ -307,6 +345,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_ROOMS_ADD).map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOM_MEMBER_KEMS_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOM_MESSAGES_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -318,6 +358,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOMS_ADD).map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOM_MEMBER_KEMS_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOM_MESSAGES_ADD)
             .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
@@ -593,6 +635,114 @@ impl Vault {
         Ok(())
     }
 
+    /// Update the `name` column on a `rooms` row (T-polish.1).
+    /// Pure metadata; doesn't touch `members_b32` or `created_at_ms`.
+    /// Idempotent. Returns the number of rows actually changed (0
+    /// if the row didn't exist or the name was already equal).
+    pub fn rename_room(&self, identity_id: i64, group_id: &[u8], new_name: &str) -> Result<usize> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE rooms SET name = ? WHERE identity_id = ? AND group_id = ?",
+                params![new_name, identity_id, group_id],
+            )
+            .map_err(map_db_err)?;
+        Ok(changed)
+    }
+
+    /// T-polish.3: append one room message to the persistent
+    /// scrollback. `direction_outgoing = false` for incoming
+    /// (decoded `RoomAppMessage::Text`), `true` for outgoing
+    /// (locally-typed `SendRoom` text). `sender_fp` is the
+    /// sender's fingerprint as a string.
+    pub fn append_room_message(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        direction_outgoing: bool,
+        sender_fp: &str,
+        text: &str,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        let dir = i64::from(direction_outgoing);
+        self.conn
+            .execute(
+                "INSERT INTO room_messages \
+                 (identity_id, group_id, direction, sender_fp, text, created_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                params![identity_id, group_id, dir, sender_fp, text, created_at_ms],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// T-polish.3: return the most recent `limit` messages for a
+    /// room, oldest → newest. Returns an empty Vec for an unknown
+    /// or empty room; distinct from `Err`.
+    pub fn room_history(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        limit: usize,
+    ) -> Result<Vec<RoomMessageRow>> {
+        let i64_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT direction, sender_fp, text, created_at_ms \
+                 FROM room_messages \
+                 WHERE identity_id = ? AND group_id = ? \
+                 ORDER BY id DESC LIMIT ?",
+            )
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id, group_id, i64_limit], |r| {
+                let dir: i64 = r.get(0)?;
+                Ok(RoomMessageRow {
+                    direction_outgoing: dir == 1,
+                    sender_fp: r.get(1)?,
+                    text: r.get(2)?,
+                    created_at_ms: r.get(3)?,
+                })
+            })
+            .map_err(map_db_err)?;
+        let mut out: Vec<RoomMessageRow> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_db_err)?;
+        // Query returned newest-first (DESC); reverse for oldest-
+        // first so the caller can append straight to a scrollback.
+        out.reverse();
+        Ok(out)
+    }
+
+    /// T-polish.3: drop every persisted message for a room. Called
+    /// from delete_room / leave_room handlers so forgetting a room
+    /// also wipes its scrollback. Idempotent.
+    pub fn forget_room_messages(&self, identity_id: i64, group_id: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM room_messages WHERE identity_id = ? AND group_id = ?",
+                params![identity_id, group_id],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Drop every `room_member_kems` row for a given (identity, room)
+    /// pair (T-polish.1). Used alongside `delete_room` so leaving /
+    /// deleting a room doesn't leave orphan KEM cache entries that
+    /// could be returned by a future stale `lookup_room_member_kem`.
+    /// Idempotent.
+    pub fn forget_room_member_kems(&self, identity_id: i64, group_id: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM room_member_kems WHERE identity_id = ? AND group_id = ?",
+                params![identity_id, group_id],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
     /// Stash a room member's hybrid KEM public key keyed by
     /// `(identity_id, group_id, fingerprint)` (T6.3.e). The inviter
     /// calls this after a successful invite so the hub-fallback
@@ -648,6 +798,16 @@ pub struct RoomRow {
     pub name: String,
     /// Comma-separated base32 fingerprints; see [`Vault::save_room`].
     pub members_b32: String,
+    pub created_at_ms: i64,
+}
+
+/// One row of [`Vault::room_history`] (T-polish.3). Translated to
+/// the API surface by the daemon's `handle_room_history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomMessageRow {
+    pub direction_outgoing: bool,
+    pub sender_fp: String,
+    pub text: String,
     pub created_at_ms: i64,
 }
 
@@ -873,6 +1033,138 @@ mod tests {
     }
 
     // ── T6.3.e: room_member_kems ─────────────────────────────────
+
+    // ── T-polish.3: persistent room scrollback ────────────────────
+
+    #[test]
+    fn room_messages_append_and_history_round_trip() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let gid = b"room-1";
+        v.append_room_message(id, gid, false, "(peer/x1)", "hello", 100)
+            .unwrap();
+        v.append_room_message(id, gid, true, "fp_alice", "echo", 200)
+            .unwrap();
+        v.append_room_message(id, gid, false, "(peer/x2)", "third", 300)
+            .unwrap();
+        let hist = v.room_history(id, gid, 10).unwrap();
+        assert_eq!(hist.len(), 3);
+        // oldest → newest order
+        assert_eq!(hist[0].text, "hello");
+        assert_eq!(hist[1].text, "echo");
+        assert!(hist[1].direction_outgoing);
+        assert_eq!(hist[2].text, "third");
+    }
+
+    #[test]
+    fn room_messages_history_limit_returns_most_recent() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let gid = b"room-1";
+        for i in 0..10 {
+            v.append_room_message(id, gid, false, "x", &format!("msg{i}"), i64::from(i))
+                .unwrap();
+        }
+        let hist = v.room_history(id, gid, 3).unwrap();
+        assert_eq!(hist.len(), 3);
+        // Most recent 3 = msg7, msg8, msg9 in oldest-first order
+        assert_eq!(hist[0].text, "msg7");
+        assert_eq!(hist[2].text, "msg9");
+    }
+
+    #[test]
+    fn room_messages_history_unknown_room_is_empty_not_error() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let hist = v.room_history(id, b"nonexistent", 10).unwrap();
+        assert!(hist.is_empty());
+    }
+
+    #[test]
+    fn forget_room_messages_drops_only_that_room() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.append_room_message(id, &[0xA1], false, "x", "room-a-1", 1)
+            .unwrap();
+        v.append_room_message(id, &[0xA1], false, "x", "room-a-2", 2)
+            .unwrap();
+        v.append_room_message(id, &[0xB2], false, "x", "room-b-1", 3)
+            .unwrap();
+        v.forget_room_messages(id, &[0xA1]).unwrap();
+        assert!(v.room_history(id, &[0xA1], 10).unwrap().is_empty());
+        assert_eq!(v.room_history(id, &[0xB2], 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forget_room_messages_is_idempotent() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.forget_room_messages(id, &[0x99]).unwrap();
+        v.forget_room_messages(id, &[0x99]).unwrap();
+    }
+
+    // ── T-polish.1: rename_room + forget_room_member_kems ─────────
+
+    #[test]
+    fn rename_room_updates_name_only() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.save_room(id, &[0x01], "old-name", "fp_alice", 1234)
+            .unwrap();
+        let changed = v.rename_room(id, &[0x01], "new-name").unwrap();
+        assert_eq!(changed, 1);
+        let rooms = v.list_rooms(id).unwrap();
+        assert_eq!(rooms[0].name, "new-name");
+        // members + created_at preserved
+        assert_eq!(rooms[0].members_b32, "fp_alice");
+        assert_eq!(rooms[0].created_at_ms, 1234);
+    }
+
+    #[test]
+    fn rename_room_missing_is_idempotent_zero_changed() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let changed = v.rename_room(id, &[0xFF], "doesnt-exist").unwrap();
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn forget_room_member_kems_drops_only_that_room() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.save_room_member_kem(id, &[0xA1], "fp_bob", &[1u8; 8])
+            .unwrap();
+        v.save_room_member_kem(id, &[0xA1], "fp_carol", &[2u8; 8])
+            .unwrap();
+        v.save_room_member_kem(id, &[0xB2], "fp_dave", &[3u8; 8])
+            .unwrap();
+
+        v.forget_room_member_kems(id, &[0xA1]).unwrap();
+
+        // Room A's KEMs gone, room B's preserved.
+        assert!(
+            v.lookup_room_member_kem(id, &[0xA1], "fp_bob")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            v.lookup_room_member_kem(id, &[0xA1], "fp_carol")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            v.lookup_room_member_kem(id, &[0xB2], "fp_dave").unwrap(),
+            Some(vec![3u8; 8])
+        );
+    }
+
+    #[test]
+    fn forget_room_member_kems_is_idempotent() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.forget_room_member_kems(id, &[0x99]).unwrap();
+        v.forget_room_member_kems(id, &[0x99]).unwrap();
+    }
 
     #[test]
     fn room_member_kem_save_lookup_round_trip() {

@@ -361,6 +361,34 @@ enum RoomCommand {
         #[arg(long)]
         text: String,
     },
+    /// Forget a room **locally** (T-polish.1). Drops the room row,
+    /// the cached KEM list, and the MLS group state. Does NOT
+    /// notify the other members — they keep their copy with you
+    /// listed as a (now-ghost) member. For a clean leave that
+    /// informs the others, use `leave` instead.
+    ///
+    /// Idempotent — succeeds even if no room with that id exists.
+    Delete {
+        #[arg(long)]
+        group_id: String,
+    },
+    /// Rename a room **locally** (T-polish.1). Pure-metadata
+    /// update; doesn't propagate to other members (each member's
+    /// local name is independent per `CHANNELS.md §2`).
+    Rename {
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        new_name: String,
+    },
+    /// Leave a room cleanly (T-polish.2). Sends an MLS Remove
+    /// commit informing every other current member, then drops
+    /// local state. Other members will see their roster shrink
+    /// and continue without you. Requires `--hub` on the daemon.
+    Leave {
+        #[arg(long)]
+        group_id: String,
+    },
 }
 
 #[tokio::main]
@@ -562,6 +590,34 @@ async fn dispatch_room(socket: &std::path::Path, cmd: RoomCommand) -> anyhow::Re
                 ApiRequest::SendRoom {
                     group_id_b32: group_id,
                     text,
+                },
+            )
+            .await
+        }
+        RoomCommand::Delete { group_id } => {
+            one_shot_print(
+                socket,
+                ApiRequest::DeleteRoom {
+                    group_id_b32: group_id,
+                },
+            )
+            .await
+        }
+        RoomCommand::Rename { group_id, new_name } => {
+            one_shot_print(
+                socket,
+                ApiRequest::RenameRoom {
+                    group_id_b32: group_id,
+                    new_name,
+                },
+            )
+            .await
+        }
+        RoomCommand::Leave { group_id } => {
+            one_shot_print(
+                socket,
+                ApiRequest::LeaveRoom {
+                    group_id_b32: group_id,
                 },
             )
             .await

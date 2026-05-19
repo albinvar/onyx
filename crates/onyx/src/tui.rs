@@ -40,11 +40,17 @@
 //!
 //! ## Keys
 //!
-//!   * `Esc` or `Ctrl-C` — quit.
-//!   * `↑` / `↓`            — move peer selection.
-//!   * `Enter`              — send composer text into the selected peer.
-//!   * `Backspace`          — delete one char.
-//!   * any other char       — append to composer.
+//!   * `Esc` or `Ctrl-C` — quit (or close active modal).
+//!   * `↑` / `↓`            — move peer/room selection.
+//!   * `PgUp` / `PgDn`      — scroll the messages pane up / down by 10 lines (T-polish.4).
+//!   * `Home`               — jump to oldest scrollback (T-polish.4).
+//!   * `End`                — snap back to live (T-polish.4).
+//!   * `Ctrl-N`             — open the Create Room modal (T-polish.6).
+//!   * `Ctrl-I`             — open the Invite Peer modal (requires a room selected; T-polish.6).
+//!   * `Tab` (in modal)     — cycle between input fields.
+//!   * `Enter`              — send composer text / submit active modal.
+//!   * `Backspace`          — delete one char (in composer or modal).
+//!   * any other char       — append to composer (snaps back to live) or modal field.
 //!
 //! ## History backfill
 //!
@@ -55,11 +61,17 @@
 //! peer is in `backfilled` we don't ask again — live events take
 //! over.
 //!
-//! ## Things deliberately not here yet
+//! Room scrollback persists via `ApiRequest::RoomHistory` (T-polish.3);
+//! same backfill semantics.
 //!
-//!   * Visual indicator of unread per-peer counts beyond the bold
-//!     marker.
-//!   * Wrapping / scrolling for very long messages.
+//! ## Unread + sort (T-polish.5)
+//!
+//! Per-conversation unread counter increments on every incoming
+//! `EventMessage` that isn't for the currently-selected entry. Resets
+//! on selection. Rendered as a yellow `(N)` badge after the name in
+//! the peers/rooms list. Both peers and rooms are sorted by most-
+//! recent-activity descending (TUI-tracked `last_activity_ms`,
+//! falling back to `created_at_ms` for rooms with no activity yet).
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -130,6 +142,56 @@ struct AppState {
     /// Set of `short_id`s we've already fetched History for. Prevents
     /// re-firing the backfill request every refresh tick.
     backfilled: HashSet<String>,
+    /// T-polish.4: per-conversation scroll offset into the
+    /// scrollback. 0 = pinned to the bottom (most recent visible);
+    /// positive values scroll up by that many lines. Reset to 0
+    /// whenever the user selects a different entry OR types a new
+    /// character (the typing-while-scrolled-up case is "I want to
+    /// reply to what's on screen — bring me back to live").
+    messages_scroll: HashMap<String, u16>,
+    /// T-polish.5: per-conversation unread counter, keyed the
+    /// same way as `scrollback`. Increments on every incoming
+    /// `EventMessage` that isn't for the currently-selected
+    /// conversation. Resets to 0 on selection.
+    unread: HashMap<String, u32>,
+    /// T-polish.5: per-conversation last-activity timestamp
+    /// (daemon ms-since-epoch from the most recent EventMessage,
+    /// or 0 if we've never seen one). Drives the "most-recent
+    /// first" sort in `render_peers`. Outgoing messages also
+    /// bump this so the conversation you just talked in stays at
+    /// the top.
+    last_activity_ms: HashMap<String, u64>,
+    /// T-polish.6: active modal overlay. `None` = normal UI;
+    /// otherwise key events route to the modal handler and the
+    /// main UI is dimmed behind it.
+    modal: Option<ModalState>,
+}
+
+/// T-polish.6: TUI modals for room operations that can't easily
+/// be driven from the composer line. Currently two:
+///
+///   * **CreateRoom** — single-line input for the room name.
+///     Opens on `Ctrl-N`. Submits via `ApiRequest::CreateRoom`.
+///   * **InvitePeer** — three multi-line paste fields
+///     (fingerprint, KEM pub b32, KP b64). Opens on `Ctrl-I`
+///     ONLY when the selected entry is a room (we need its
+///     group_id_b32). Submits via `ApiRequest::InviteToRoom`.
+///
+/// `Tab` cycles between fields in InvitePeer; `Esc` closes
+/// without submitting; `Enter` submits.
+#[derive(Debug, Clone)]
+enum ModalState {
+    CreateRoom {
+        name: String,
+    },
+    InvitePeer {
+        group_id_b32: String,
+        fingerprint: String,
+        kem_pub_b32: String,
+        kp_b64: String,
+        /// Which of the three input fields has focus (0..3).
+        focus: usize,
+    },
 }
 
 /// What the current selection refers to (T6.3.f.2). `Peer` drives
@@ -188,6 +250,10 @@ impl AppState {
             last_send_result: None,
             tail_active: false,
             backfilled: HashSet::new(),
+            messages_scroll: HashMap::new(),
+            unread: HashMap::new(),
+            last_activity_ms: HashMap::new(),
+            modal: None,
         }
     }
 
@@ -208,6 +274,40 @@ impl AppState {
         }
     }
 
+    /// T-polish.4: scroll the message pane by `lines` (positive =
+    /// up, negative = down). Clamped at 0 (back to live); upper
+    /// bound is enforced by the render call (it caps to the actual
+    /// scrollback height).
+    fn scroll_messages(&mut self, lines: i16) {
+        let Some(key) = self.selected_entry().map(|e| e.scrollback_key()) else {
+            return;
+        };
+        let cur = self.messages_scroll.get(&key).copied().unwrap_or(0);
+        let next = if lines >= 0 {
+            cur.saturating_add(lines.unsigned_abs())
+        } else {
+            cur.saturating_sub(lines.unsigned_abs())
+        };
+        self.messages_scroll.insert(key, next);
+    }
+
+    /// T-polish.4: snap the messages pane back to live (offset 0)
+    /// for the current selection. Called on send/typing.
+    fn snap_messages_to_live(&mut self) {
+        if let Some(key) = self.selected_entry().map(|e| e.scrollback_key()) {
+            self.messages_scroll.insert(key, 0);
+        }
+    }
+
+    /// T-polish.4: read the current scroll offset for the selected
+    /// entry. Default 0 (live).
+    fn current_messages_scroll(&self) -> u16 {
+        self.selected_entry()
+            .map(|e| e.scrollback_key())
+            .and_then(|k| self.messages_scroll.get(&k).copied())
+            .unwrap_or(0)
+    }
+
     fn move_selection(&mut self, delta: isize) {
         let n = self.total_entries();
         if n == 0 {
@@ -224,7 +324,19 @@ impl AppState {
             let step = delta.unsigned_abs() % n;
             (cur + n - step) % n
         };
+        let changed = self.selected != next;
         self.selected = next;
+        if changed {
+            // T-polish.4: switching conversations resets the new
+            // entry's scroll to live (offset 0). Doesn't touch
+            // other entries' scrolls — they're preserved per-key.
+            self.snap_messages_to_live();
+            // T-polish.5: selecting an entry clears its unread
+            // count. The user is now looking at it.
+            if let Some(key) = self.selected_entry().map(|e| e.scrollback_key()) {
+                self.unread.remove(&key);
+            }
+        }
     }
 
     /// Apply one event coming from the tail subscription. Returns
@@ -238,6 +350,17 @@ impl AppState {
                 ts_unix_ms,
                 via_hub,
             } => {
+                // T-polish.5: bump activity timestamp + unread
+                // counter (only for incoming; outgoing doesn't
+                // imply "needs attention"). Don't bump unread if
+                // the event is for the currently-selected
+                // entry — the user is already looking at it.
+                self.last_activity_ms.insert(peer_short.clone(), ts_unix_ms);
+                let is_selected =
+                    self.selected_entry().map(|e| e.scrollback_key()) == Some(peer_short.clone());
+                if matches!(direction, MessageDirection::Incoming) && !is_selected {
+                    *self.unread.entry(peer_short.clone()).or_insert(0) += 1;
+                }
                 self.scrollback
                     .entry(peer_short)
                     .or_default()
@@ -291,7 +414,15 @@ impl AppState {
 
     /// T6.3.f.2: refresh the room list from a `ListRoomsOk`. Same
     /// "preserve selection by key" pattern as `apply_peers_snapshot`.
-    fn apply_rooms_snapshot(&mut self, new_rooms: Vec<RoomInfo>) {
+    /// T-polish.5: sort by last-activity desc (TUI-tracked
+    /// `last_activity_ms`, falling back to `created_at_ms` for
+    /// rooms that haven't seen activity yet).
+    fn apply_rooms_snapshot(&mut self, mut new_rooms: Vec<RoomInfo>) {
+        let activity_map = self.last_activity_ms.clone();
+        new_rooms.sort_by_key(|r| {
+            let key = format!("room/{}", short_id(&r.group_id_b32));
+            std::cmp::Reverse(activity_map.get(&key).copied().unwrap_or(r.created_at_ms))
+        });
         let prev_key = self.selected_entry().map(|e| e.scrollback_key());
         self.rooms = new_rooms;
         if let Some(key) = prev_key {
@@ -392,23 +523,224 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
     // Clear the transient banner on any keystroke.
     app.last_send_result = None;
 
+    // T-polish.6: route keys to the modal handler when one is
+    // open. The modal handler returns Ok(true) on close (back to
+    // main UI) or Err(_) if the key wasn't consumed and should
+    // fall through to the main handler — currently nothing falls
+    // through (Esc closes modal; everything else is consumed by
+    // the active field).
+    if app.modal.is_some() {
+        handle_modal_key(app, key).await;
+        return false;
+    }
+
     match (key.code, key.modifiers) {
+        // T-polish.6: Ctrl-N opens the create-room modal.
+        (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(ModalState::CreateRoom {
+                name: String::new(),
+            });
+            return false;
+        }
+        // T-polish.6: Ctrl-I opens the invite-peer modal — but
+        // only when the selected entry is a room (we need its
+        // group_id_b32 to invite into).
+        (KeyCode::Char('i'), m) if m.contains(KeyModifiers::CONTROL) => {
+            if let Some(SelectedEntry::Room(r)) = app.selected_entry() {
+                app.modal = Some(ModalState::InvitePeer {
+                    group_id_b32: r.group_id_b32.clone(),
+                    fingerprint: String::new(),
+                    kem_pub_b32: String::new(),
+                    kp_b64: String::new(),
+                    focus: 0,
+                });
+            } else {
+                app.last_send_result = Some(Err("invite-peer needs a room selected".to_string()));
+            }
+            return false;
+        }
         (KeyCode::Esc, _) => return true,
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return true,
         (KeyCode::Up, _) => app.move_selection(-1),
         (KeyCode::Down, _) => app.move_selection(1),
+        // T-polish.4: scroll the messages pane. PgUp/PgDn scroll
+        // by 10 lines (one "page" for typical terminal heights).
+        // Home jumps to oldest (huge offset, render clamps it to
+        // the actual scrollback length). End / Ctrl-End snaps
+        // back to live.
+        (KeyCode::PageUp, _) => app.scroll_messages(10),
+        (KeyCode::PageDown, _) => app.scroll_messages(-10),
+        (KeyCode::Home, _) => app.scroll_messages(i16::MAX),
+        (KeyCode::End, _) => app.snap_messages_to_live(),
         (KeyCode::Backspace, _) => {
             app.composer.pop();
         }
         (KeyCode::Enter, _) => {
             send_composer(app).await;
+            // T-polish.4: snap back to live on send so the user
+            // sees their own message land.
+            app.snap_messages_to_live();
         }
         (KeyCode::Char(c), _) => {
             app.composer.push(c);
+            // T-polish.4: typing while scrolled up is a strong
+            // "I want to reply to what's on screen" — snap back
+            // to live so the next render shows the message they
+            // were composing for.
+            app.snap_messages_to_live();
         }
         _ => {}
     }
     false
+}
+
+/// T-polish.6: route a key to the active modal. Esc closes
+/// without submitting; Enter submits; Tab cycles focus in the
+/// multi-field InvitePeer modal; everything else appends to the
+/// focused field (Backspace pops).
+// Modal handler is a single linear keystroke dispatcher with many
+// match arms; clippy lints fire on individual arms but the whole
+// shape is the most readable form (each arm handles one
+// (modal-variant, key) pair with explicit modal-put-back).
+#[allow(
+    clippy::too_many_lines,
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::if_not_else
+)]
+async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
+    // Take + put back so we can mutate without fighting the borrow
+    // checker over `app` being borrowed by `app.modal`.
+    let Some(mut modal) = app.modal.take() else {
+        return;
+    };
+    let submit_intent: Option<ModalState>;
+    match (&mut modal, key.code) {
+        (_, KeyCode::Esc) => {
+            // Close without submitting.
+            return;
+        }
+        (ModalState::CreateRoom { name }, KeyCode::Enter) => {
+            if name.trim().is_empty() {
+                app.modal = Some(modal);
+                return;
+            }
+            submit_intent = Some(modal.clone());
+        }
+        (ModalState::CreateRoom { name }, KeyCode::Backspace) => {
+            name.pop();
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::CreateRoom { name }, KeyCode::Char(c)) => {
+            name.push(c);
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::InvitePeer {
+                fingerprint,
+                kem_pub_b32,
+                kp_b64,
+                focus,
+                ..
+            },
+            KeyCode::Tab,
+        ) => {
+            *focus = (*focus + 1) % 3;
+            let _ = (fingerprint, kem_pub_b32, kp_b64);
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::InvitePeer {
+                fingerprint,
+                kem_pub_b32,
+                kp_b64,
+                focus,
+                ..
+            },
+            KeyCode::Backspace,
+        ) => {
+            match *focus {
+                0 => {
+                    fingerprint.pop();
+                }
+                1 => {
+                    kem_pub_b32.pop();
+                }
+                _ => {
+                    kp_b64.pop();
+                }
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::InvitePeer {
+                fingerprint,
+                kem_pub_b32,
+                kp_b64,
+                focus,
+                ..
+            },
+            KeyCode::Char(c),
+        ) => {
+            match *focus {
+                0 => fingerprint.push(c),
+                1 => kem_pub_b32.push(c),
+                _ => kp_b64.push(c),
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::InvitePeer { .. }, KeyCode::Enter) => {
+            submit_intent = Some(modal.clone());
+        }
+        _ => {
+            app.modal = Some(modal);
+            return;
+        }
+    }
+    // Submit path (modal was consumed; don't put back).
+    if let Some(submit) = submit_intent {
+        let req = match submit {
+            ModalState::CreateRoom { name } => Some(ApiRequest::CreateRoom { name }),
+            ModalState::InvitePeer {
+                group_id_b32,
+                fingerprint,
+                kem_pub_b32,
+                kp_b64,
+                ..
+            } => Some(ApiRequest::InviteToRoom {
+                group_id_b32,
+                peer_fingerprint: fingerprint,
+                peer_kem_pub_b32: kem_pub_b32,
+                peer_kp_b64: kp_b64,
+            }),
+        };
+        if let Some(req) = req {
+            match client::one_shot(&app.socket_path, &req).await {
+                Ok(ApiResponse::CreateRoomOk { name, .. }) => {
+                    app.last_send_result = Some(Ok(()));
+                    tracing::info!(room = %name, "room created via TUI modal");
+                }
+                Ok(ApiResponse::InviteToRoomOk { members, .. }) => {
+                    app.last_send_result = Some(Ok(()));
+                    tracing::info!(roster = members.len(), "invited via TUI modal");
+                }
+                Ok(ApiResponse::Error { message, .. }) => {
+                    app.last_send_result = Some(Err(message));
+                }
+                Ok(other) => {
+                    app.last_send_result = Some(Err(format!("unexpected response: {other:?}")));
+                }
+                Err(e) => {
+                    app.last_send_result = Some(Err(format!("{e:#}")));
+                }
+            }
+        }
+    }
 }
 
 async fn send_composer(app: &mut AppState) {
@@ -464,12 +796,19 @@ async fn send_composer(app: &mut AppState) {
             // T6.3.d note); push our own local line so the scrollback
             // shows what we said.
             let key = format!("room/{}", short_id(&dispatch.b32_key()));
-            app.scrollback.entry(key).or_default().push(ChatLine {
-                direction: MessageDirection::Outgoing,
-                text: text.clone(),
-                ts_unix_ms: now_unix_ms(),
-                via_hub: false,
-            });
+            let now = now_unix_ms();
+            app.scrollback
+                .entry(key.clone())
+                .or_default()
+                .push(ChatLine {
+                    direction: MessageDirection::Outgoing,
+                    text: text.clone(),
+                    ts_unix_ms: now,
+                    via_hub: false,
+                });
+            // T-polish.5: bump activity so this room stays at the
+            // top of the activity-sorted list.
+            app.last_activity_ms.insert(key, now);
             app.last_send_result = Some(Ok(()));
             tracing::info!(
                 delivered_to_direct,
@@ -715,6 +1054,122 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     render_messages(frame, messages_area, app);
     render_composer(frame, composer_area, app);
     render_status(frame, status_area, app);
+
+    // T-polish.6: modal overlay rendered LAST so it draws on top
+    // of the main UI. Centered, fixed width.
+    if let Some(modal) = &app.modal {
+        render_modal(frame, area, modal);
+    }
+}
+
+/// T-polish.6: render the active modal as a centered overlay.
+fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) {
+    // Compute a centered region. Width = min(76, area.width - 4).
+    let width = area.width.saturating_sub(4).min(76);
+    let height = match modal {
+        ModalState::CreateRoom { .. } => 7,
+        ModalState::InvitePeer { .. } => 17,
+    };
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+    // Clear behind the modal so the underlying UI doesn't bleed through.
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    match modal {
+        ModalState::CreateRoom { name } => {
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Create Room  (Esc=cancel, Enter=submit) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let body = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" Name: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " The name is local-only — each member can call ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    " the same MLS group whatever they like. ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+        ModalState::InvitePeer {
+            group_id_b32,
+            fingerprint,
+            kem_pub_b32,
+            kp_b64,
+            focus,
+        } => {
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Invite Peer  (Tab=cycle, Esc=cancel, Enter=submit) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let inviting = format!(" → room/{} ", short_id(group_id_b32));
+            let mk_field = |label: &str, val: &str, idx: usize| -> Line<'_> {
+                let focus_marker = if *focus == idx { "▶ " } else { "  " };
+                Line::from(vec![
+                    Span::styled(
+                        format!("{focus_marker}{label}: "),
+                        Style::default().fg(if *focus == idx {
+                            Color::Yellow
+                        } else {
+                            Color::Gray
+                        }),
+                    ),
+                    Span::styled(
+                        truncate_for_display(val, 60),
+                        Style::default().fg(Color::White),
+                    ),
+                ])
+            };
+            let body = Paragraph::new(vec![
+                Line::from(Span::styled(inviting, Style::default().fg(Color::Magenta))),
+                Line::from(""),
+                mk_field("Fingerprint", fingerprint, 0),
+                Line::from(""),
+                mk_field("KEM pub (b32)", kem_pub_b32, 1),
+                Line::from(""),
+                mk_field("KP (b64)", kp_b64, 2),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Paste each long field then press Tab.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    " Get KP via `onyx fetch-keypackage --peer-fingerprint X`.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+    }
+}
+
+/// Truncate `s` for display in the modal — long base32/base64 fields
+/// would otherwise wrap and break the layout. Shows the first N
+/// chars + "…(LEN)" so the user knows it's not empty even when
+/// hidden.
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(8)).collect();
+        format!("{head}…({})", s.len())
+    }
 }
 
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
@@ -776,14 +1231,38 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     Modifier::empty()
                 }),
         );
-        items.push(ListItem::new(Line::from(vec![dot, name])));
+        let mut spans = vec![dot, name];
+        // T-polish.5: unread badge on the right.
+        if let Some(&n) = app.unread.get(&p.short_id)
+            && n > 0
+        {
+            spans.push(Span::styled(
+                format!(" ({n})"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        items.push(ListItem::new(Line::from(spans)));
     }
     for r in &app.rooms {
         let label = format!("#{} ({}m)", r.name, r.members.len());
-        items.push(ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled("◆ ", Style::default().fg(Color::Magenta)),
             Span::styled(label, Style::default().fg(Color::White)),
-        ])));
+        ];
+        let room_key = format!("room/{}", short_id(&r.group_id_b32));
+        if let Some(&n) = app.unread.get(&room_key)
+            && n > 0
+        {
+            spans.push(Span::styled(
+                format!(" ({n})"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        items.push(ListItem::new(Line::from(spans)));
     }
     let list = List::new(items)
         .block(block)
@@ -857,9 +1336,23 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             Style::default().fg(Color::DarkGray),
         ))],
     };
+    // T-polish.4: bottom-anchored scroll. Live (offset 0) shows
+    // the most recent messages; PgUp scrolls back. We count
+    // LOGICAL lines (one per ChatLine), not visually-wrapped
+    // lines — close enough for a usable scroll without needing
+    // ratatui's internal wrapping math. PgUp(10) moves 10
+    // logical messages even if they each wrap to 3 visual lines.
+    let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let viewport = area.height.saturating_sub(2); // borders
+    let user_scroll = app.current_messages_scroll();
+    let bottom_anchor = total_lines.saturating_sub(viewport);
+    // Clamp user_scroll so we don't scroll past the oldest line.
+    let clamped_user_scroll = user_scroll.min(bottom_anchor);
+    let scroll = bottom_anchor.saturating_sub(clamped_user_scroll);
     let body = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(body, area);
 }
 

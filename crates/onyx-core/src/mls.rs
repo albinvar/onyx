@@ -407,6 +407,23 @@ impl MlsParty {
         Ok(group.map(|g| MlsGroupState { group: g }))
     }
 
+    /// Forget a previously-existing group: drop its ratchet state,
+    /// epoch secrets, and roster from the in-memory MLS storage
+    /// (T-polish.1). Returns `Ok(())` even if the group wasn't
+    /// loaded — idempotent. The caller is responsible for
+    /// `snapshot_state` + persisting after this so the deletion
+    /// survives a restart.
+    pub fn forget_group(&self, group_id_bytes: &[u8]) -> Result<()> {
+        let group_id = GroupId::from_slice(group_id_bytes);
+        let group = MlsGroup::load(self.provider.storage(), &group_id)
+            .map_err(internal("mls: forget_group load failed"))?;
+        if let Some(mut g) = group {
+            g.delete(self.provider.storage())
+                .map_err(internal("mls: group delete failed"))?;
+        }
+        Ok(())
+    }
+
     /// Join an existing group from a serialised Welcome (the bytes that
     /// arrived inside a sealed-sender bootstrap envelope —
     /// [`crate::routing::OpenedBootstrap::mls_welcome`]).
@@ -497,6 +514,32 @@ impl MlsGroupState {
         let commit_bytes = serialize_mls_message(&commit)?;
         let welcome_bytes = serialize_mls_message(&welcome_out)?;
         Ok((commit_bytes, welcome_bytes))
+    }
+
+    /// Produce an MLS `Remove` commit removing ourselves from the
+    /// group (T-polish.2). Returns the serialised commit bytes
+    /// that must be fanned out to every other current member so
+    /// their group state advances and our leaf vanishes. Internally
+    /// merges the pending commit so our own state is consistent
+    /// post-leave (even though we're about to forget the group
+    /// entirely — keeps the public-API contract symmetric with
+    /// [`Self::invite`]).
+    ///
+    /// Errors if we're not a member (`VerificationFailed`) or if
+    /// openmls refuses the remove (e.g. we'd remove the last
+    /// committer; that's a multi-party invariant that won't fire
+    /// for the leave-self case but we surface it as
+    /// `Error::Internal` rather than panic).
+    pub fn remove_self(&mut self, party: &MlsParty) -> Result<Vec<u8>> {
+        let own_leaf = self.group.own_leaf_index();
+        let (commit, _welcome, _group_info) = self
+            .group
+            .remove_members(&party.provider, &party.signature_keys, &[own_leaf])
+            .map_err(internal("mls: remove_members failed"))?;
+        self.group
+            .merge_pending_commit(&party.provider)
+            .map_err(internal("mls: merge_pending_commit after remove failed"))?;
+        serialize_mls_message(&commit)
     }
 
     /// Encrypt an application message for the group.

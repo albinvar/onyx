@@ -1316,6 +1316,13 @@ where
 /// and emits the message as a room-tagged event. Failures are debug-
 /// level only (a peer could route a frame to us that we don't have
 /// the group for — likely lag, not an attack).
+//
+// Body is a single linear sequence (peek → decrypt → snapshot →
+// dispatch by RoomAppMessage variant → emit). Each stage needs to
+// short-circuit on its own failure mode; per-step extraction would
+// yield small helpers each carrying its own typed error response
+// for no net readability win.
+#[allow(clippy::too_many_lines)]
 async fn handle_room_app_frame(
     group_id: &[u8],
     payload: &[u8],
@@ -1399,6 +1406,30 @@ async fn handle_room_app_frame(
                 text_bytes = text.len(),
                 "room: incoming text message"
             );
+            // T-polish.3: persist to room_messages so the TUI can
+            // backfill scrollback after restart. Sender_fp is a
+            // placeholder for now (MLS-credential extraction lands
+            // in a follow-up — see CHANGELOG note for T-polish.3).
+            let now_ms = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis()),
+            )
+            .unwrap_or(0);
+            let sender_fp_placeholder = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
+            {
+                let vault = state.vault.lock().await;
+                if let Err(e) = vault.append_room_message(
+                    state.identity_id,
+                    group_id,
+                    false,
+                    &sender_fp_placeholder,
+                    &text,
+                    now_ms,
+                ) {
+                    warn!(error = %e, "room: append_room_message failed");
+                }
+            }
             let _ = state.conversations.lock().await.push_room_message(
                 group_id,
                 *sender_peer_pub,
