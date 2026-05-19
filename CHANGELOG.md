@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.f.1: `onyx room` CLI verbs (create / list / invite / send)
+
+Fifth code slice of T6.3 — adds the user-facing CLI surface so the wired-up multi-party-room plumbing is actually callable from the terminal. Pure dispatcher code; no new daemon behaviour.
+
+What landed:
+
+  * Nested `Room` subcommand on `onyx` with four arms:
+    * `onyx room create --name X` → `ApiRequest::CreateRoom { name }`. Stdout is the daemon's JSON `CreateRoomOk { group_id_b32, name }` line, ready to pipe into subsequent `room invite` / `room send` calls.
+    * `onyx room list` → `ApiRequest::ListRooms` → JSON `ListRoomsOk { rooms: [...] }`.
+    * `onyx room invite --group-id … --peer-fingerprint … --peer-kem-pub-b32 … --peer-kp-b64 …` → `ApiRequest::InviteToRoom`. Same per-arg validation the daemon already does (THREAT_MODEL §8.2 #15 fingerprint↔KP-signing-key check).
+    * `onyx room send --group-id … --text "…"` → `ApiRequest::SendRoom`. Response carries the delivery counts (`delivered_to_direct`, `delivered_to_hub`, `skipped_no_kem`, `total_members`) so the operator can see who actually got it.
+  * Dispatcher extracted to a `dispatch_room` helper to keep top-level `dispatch` under clippy's `too_many_lines` budget. Pure refactor.
+  * Module rustdoc updated with all four new subcommands so `onyx --help` and the in-file overview stay coherent.
+
+What this slice deliberately does NOT do:
+
+  * **No TUI room pane**. The TUI today is DM-only; room events surface via `EventMessage` with `peer_short = "room/<short>"` (T6.3.d's forward-compat shape). A dedicated room pane lands when the basic CLI surface gets exercised end-to-end and the UX for room rendering settles. The CLI is sufficient to operate rooms today.
+  * **No discovery / browse**. Rooms are local to the daemon that created them. `room list` shows what *this* daemon knows; there is no cross-daemon directory of rooms (and won't be without governance — same posture as DISCOVERY.md for hubs).
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **343 passed** (unchanged — CLI dispatcher code is exercised end-to-end at the binary integration level, not via unit tests).
+
+End-to-end smoke (deferred to operator-on-real-Tor): launch alice + bob daemons against the same hub; `alice $ onyx room create --name general` → save the `group_id_b32`; `alice $ onyx fetch-keypackage --peer-fingerprint $BOB_FP` → save the KP; `alice $ onyx room invite --group-id $G --peer-fingerprint $BOB_FP --peer-kem-pub-b32 $BOB_KEM --peer-kp-b64 $BOB_KP`; `alice $ onyx room send --group-id $G --text "hi"` — bob's daemon should receive the room row and the message.
+
+Next: T6.3.f.2 — TUI room pane, OR T6.3.g — per-epoch session tokens follow-up. T6.3.f.2 is more user-visible but more UI-coding; T6.3.g closes a small but identified gap in routing (per CHANNELS.md §4). Operator preference dictates next pick.
+
+---
+
 ## 2026-05-19 — T6.3.e: send-to-room (hub-fallback path) via `BootstrapPayload::MlsApp`
 
 Fourth code slice of T6.3 (multi-party rooms). Closes the offline-recipient gap from T6.3.d: members without a live direct Noise session now receive the same room ciphertext via the hub, sealed in a new `BootstrapPayload::MlsApp` envelope. With this slice, end-to-end multi-party messaging works through both Tor direct and hub-relayed paths.

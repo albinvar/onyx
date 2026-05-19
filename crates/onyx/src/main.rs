@@ -26,6 +26,16 @@
 //! * `onyx tui` — open the multi-pane Ratatui interface against an
 //!   already-running daemon (won't start one for you — use the
 //!   no-subcommand form for that).
+//! * `onyx room create --name X` — create a new multi-party room
+//!   (T6.3.b). Prints `{ "group_id_b32": "..." }`. Pipe that into
+//!   subsequent `room invite` / `room send` calls.
+//! * `onyx room list` — list every room this daemon participates in.
+//! * `onyx room invite --group-id … --peer-fingerprint … --peer-kem-pub-b32 …
+//!   --peer-kp-b64 …` — invite a peer into a room (T6.3.c).
+//! * `onyx room send --group-id … --text "…"` — send a plaintext
+//!   message to every room member (T6.3.d direct + T6.3.e hub-fallback).
+//!   Response reports `delivered_to_direct` / `delivered_to_hub` /
+//!   `skipped_no_kem` / `total_members` so you see who got it.
 //!
 //! ## Planned subcommands (see DESIGN.md §4 + §5)
 //!
@@ -240,6 +250,84 @@ enum Command {
         #[arg(long)]
         text: String,
     },
+    /// Multi-party room (channel) operations (T6.3.b-e). One MLS
+    /// group per room, owned end-to-end; the daemon persists the
+    /// room + member list in the vault and routes outgoing messages
+    /// to each member over either their direct Noise session
+    /// (preferred) or the hub (fallback). The wire format and
+    /// crypto are identical to existing 2-party MLS DMs — a "room"
+    /// is just an MLS group with N members.
+    ///
+    /// **Honest scope**: this verb group exposes the daemon API
+    /// surface end-to-end. The TUI room pane (a dedicated split
+    /// alongside the existing DM pane) is queued for a follow-up.
+    Room {
+        #[command(subcommand)]
+        cmd: RoomCommand,
+    },
+}
+
+/// Subcommands under `onyx room`. Each maps directly to one
+/// `ApiRequest::*` variant; no daemon-side work — pure dispatch.
+#[derive(Subcommand, Debug)]
+enum RoomCommand {
+    /// Create a new room with just yourself as the sole member.
+    /// Prints `{ "group_id_b32": "...", "name": "..." }` on stdout
+    /// so you can pipe the id into subsequent `invite` / `send` calls.
+    /// `name` is a local-only display label — it does NOT propagate
+    /// over the wire; the cryptographic identity of the room is the
+    /// MLS `group_id`. Two rooms can share a name locally; the
+    /// daemon disambiguates by `group_id` everywhere.
+    Create {
+        /// Local display name for the room.
+        #[arg(long)]
+        name: String,
+    },
+    /// List every room this daemon participates in.
+    List,
+    /// Invite a peer into an existing room. Requires `--hub` on the
+    /// daemon side. Same fingerprint↔KP signing-key validation as
+    /// `send-bootstrap-mls` — the daemon refuses to add a member
+    /// whose KP signing key doesn't match the supplied fingerprint
+    /// (defends THREAT_MODEL §8.2 #15: hostile hub directory could
+    /// swap an attacker's KP under the target's routing id).
+    ///
+    /// After a successful invite, the room's cached member list is
+    /// refreshed in the vault and the inviter persists the
+    /// invitee's KEM pub so future `send` calls can hub-fall-back
+    /// to them when they're offline.
+    Invite {
+        /// Room id (the `group_id_b32` returned by `create` or
+        /// listed by `list`).
+        #[arg(long)]
+        group_id: String,
+        /// Invitee's base32-grouped fingerprint.
+        #[arg(long)]
+        peer_fingerprint: String,
+        /// Invitee's hybrid KEM public key, base32.
+        #[arg(long)]
+        peer_kem_pub_b32: String,
+        /// Invitee's MLS KeyPackage in base64. Get via
+        /// `onyx fetch-keypackage`.
+        #[arg(long)]
+        peer_kp_b64: String,
+    },
+    /// Send `text` to every current member of the room. The daemon
+    /// encrypts the plaintext once in the room's MLS group and
+    /// fans the resulting ciphertext to each member via their
+    /// direct Noise session (preferred) or the hub (fallback,
+    /// requires a cached KEM pub for that member — currently only
+    /// the inviter has KEMs cached for everyone they invited).
+    ///
+    /// Response reports `delivered_to_direct`, `delivered_to_hub`,
+    /// `skipped_no_kem`, `total_members` so you can see who
+    /// actually got it.
+    Send {
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        text: String,
+    },
 }
 
 #[tokio::main]
@@ -395,6 +483,47 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
             run_invite(&socket, with_kp, with_hubs).await
         }
         Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
+        Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
+    }
+}
+
+/// Dispatch the `onyx room *` subcommands. Extracted from
+/// [`dispatch`] so the top-level match block stays under clippy's
+/// `too_many_lines` budget. Each arm maps 1:1 to one
+/// `ApiRequest::*` variant; the daemon does the actual work.
+async fn dispatch_room(socket: &std::path::Path, cmd: RoomCommand) -> anyhow::Result<ExitCode> {
+    match cmd {
+        RoomCommand::Create { name } => {
+            one_shot_print(socket, ApiRequest::CreateRoom { name }).await
+        }
+        RoomCommand::List => one_shot_print(socket, ApiRequest::ListRooms).await,
+        RoomCommand::Invite {
+            group_id,
+            peer_fingerprint,
+            peer_kem_pub_b32,
+            peer_kp_b64,
+        } => {
+            one_shot_print(
+                socket,
+                ApiRequest::InviteToRoom {
+                    group_id_b32: group_id,
+                    peer_fingerprint,
+                    peer_kem_pub_b32,
+                    peer_kp_b64,
+                },
+            )
+            .await
+        }
+        RoomCommand::Send { group_id, text } => {
+            one_shot_print(
+                socket,
+                ApiRequest::SendRoom {
+                    group_id_b32: group_id,
+                    text,
+                },
+            )
+            .await
+        }
     }
 }
 
