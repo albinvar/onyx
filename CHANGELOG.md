@@ -6,6 +6,41 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.f.2: TUI room pane — rooms surface alongside DM peers
+
+Eighth and final T6.3 slice. The TUI gains a unified left pane that shows DM peers AND multi-party rooms; selection cycles through both; the composer dispatches to either `ApiRequest::Send` (DM) or `ApiRequest::SendRoom` (room) based on what's selected. Room messages arriving via `EventMessage { peer_short = "room/<short>" }` (the wire shape T6.3.d shipped) land in the correct room's scrollback without prefix stripping. End-to-end multi-party rooms are now operable from the TUI, not just `onyx room` CLI verbs.
+
+What landed:
+
+  * **`AppState`** gains `rooms: Vec<RoomInfo>` and the selection model becomes "indexes into peers ++ rooms" (peers first). New helpers `total_entries()` and `selected_entry() -> Option<SelectedEntry<'_>>` make the kind discriminator explicit.
+  * **`SelectedEntry<'a>`** enum: `Peer(&PeerInfo) | Room(&RoomInfo)`. Carries a `scrollback_key() -> String` method that produces the right HashMap key for either kind — `short_id` for peers, `room/<8-char-b32>` for rooms (same shape the daemon ships).
+  * **`apply_rooms_snapshot`** mirrors `apply_peers_snapshot` — preserves selection-by-key across the snapshot swap so the user's current selection survives every status tick.
+  * **`refresh_status_and_peers`** also fires `ApiRequest::ListRooms` every status tick (best-effort, same policy as the existing peers fetch).
+  * **`send_composer` dispatcher**: now branches on `SelectedEntry`:
+    * `Peer` → `ApiRequest::Send` (existing path).
+    * `Room` → `ApiRequest::SendRoom`; on `SendRoomOk` pushes a local "Outgoing" `ChatLine` into the room's scrollback (the daemon doesn't echo room sends back through the `EventMessage` stream, unlike DMs, since the conversation registry is DM-only by design — see T6.3.d note).
+    * Both paths zeroize the local plaintext on success.
+  * **`render_peers`** renders the combined list: ● live / ○ disconnected for peers (existing); ◆ #room-name (Nm) for rooms (new). Empty-state copy updated to mention both options.
+  * **`render_messages`** title and scrollback lookup branch on `SelectedEntry`. Room title shows " #name (room, N members) ". Same `ChatLine` rendering for both kinds — `via_hub` `[hub]` badge logic preserved.
+  * **`render_composer`** "no selection" branch updated copy: "(no peer or room to send to)".
+  * **Module rustdoc** updated with a new layout diagram showing both ● peers and ◆ rooms in the left pane.
+  * **3 new tests**:
+    * `dump_snapshot_with_rooms` — populated room list renders with #name + member-count + ◆ glyph.
+    * `selected_entry_indexes_rooms_after_peers` — pins the "peers first, rooms second" selection model.
+    * Updated `dump_snapshot_empty` for the new "Peers & Rooms" pane title + "(nothing yet)" empty-state copy.
+
+What this slice deliberately does NOT do:
+
+  * **No keybinding for "create room" / "invite to room"** — these stay CLI-only for now. The TUI doesn't have a text-input modal infrastructure, and inviting requires three multi-line base32/base64 inputs (KEM pub, KP, fingerprint) that paste-from-clipboard handles cleanly at the shell. A future polish slice could add a paste-modal.
+  * **No unread badge / activity sort for rooms** — same shape as the existing peer pane (which also doesn't surface unread). Future polish.
+  * **No persistent room scrollback** — room messages broadcast live but the daemon doesn't keep a per-room ring buffer (CHANNELS.md §8 deferred bullet). On TUI restart, room scrollback starts empty.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **356 passed** (+2 new from 354; one existing snapshot test updated for the new pane copy).
+
+This completes T6.3 (multi-party rooms). End-to-end shape: vault rooms table, MlsWelcome with `room_name` + member-KEM roster, send-to-room direct + hub-fallback paths, per-(room, epoch) session-token routing, structured `RoomAppMessage` plaintext with KEM-advertisements, 3-party commit distribution bugfix, `onyx room` CLI verbs, and now the TUI surface. Operator end-to-end smoke against real Tor is the next concrete step.
+
+---
+
 ## 2026-05-19 — T6.3.g: per-(room, epoch) session-token routing for hub-relayed room messages
 
 Seventh T6.3 slice. Closes the routing-privacy gap noted in CHANNELS.md §4 Q4: pre-T6.3.g, every room member's hub-relayed traffic landed in `introduction_inbox(member_fingerprint)` — the same inbox every other piece of traffic to that member used. A hub watching the inbox could correlate "this member is talking in *some* room" without being able to distinguish rooms, but it could fingerprint cross-room membership by observing simultaneous fetches across multiple intro inboxes. T6.3.g routes each hub-relayed room message to `session_token(per_epoch_secret, 0)` instead — one inbox per (room, epoch) shared across all room members.

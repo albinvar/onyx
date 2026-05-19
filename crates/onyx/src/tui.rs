@@ -4,17 +4,24 @@
 //!
 //! ```text
 //! ┌─ onyx ──────────────────────────────────────────┐
-//! │ Peers          │ #<peer-short>                  │
+//! │ Peers & Rooms  │ #<selected>                    │
 //! │ ────────────── │ ───────────────────────────── │
-//! │ <peer list>    │ <message scrollback>           │
-//! │                │                                │
-//! │                │ ┌────────────────────────────┐ │
+//! │ ● peer-a       │ <message scrollback>           │
+//! │ ○ peer-b       │                                │
+//! │ ◆ #general (3m)│                                │
+//! │ ◆ #audit   (2m)│ ┌────────────────────────────┐ │
 //! │                │ │ > <composer>               │ │
 //! │                │ └────────────────────────────┘ │
 //! ├────────────────┴────────────────────────────────┤
 //! │ <status bar: tor · onion · peers · unread>      │
 //! └──────────────────────────────────────────────────┘
 //! ```
+//!
+//! T6.3.f.2: the left pane shows DM peers (● live / ○ disconnected)
+//! AND multi-party rooms (◆ name + member count). Selection cycles
+//! through peers first, then rooms; sending dispatches to either
+//! [`ApiRequest::Send`] or [`ApiRequest::SendRoom`] based on the
+//! selected entry's kind.
 //!
 //! ## Wiring
 //!
@@ -66,8 +73,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use onyx_core::api::{
-    ApiRequest, ApiResponse, HistoryEntry, MessageDirection, PeerInfo, TorState, decode_response,
-    encode_request_line,
+    ApiRequest, ApiResponse, HistoryEntry, MessageDirection, PeerInfo, RoomInfo, TorState,
+    decode_response, encode_request_line,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -94,10 +101,24 @@ struct AppState {
     /// was unreachable on the last poll.
     last_status: Option<Result<StatusSnapshot, String>>,
     peers: Vec<PeerInfo>,
-    /// Index into `peers`; out of range means "no selection".
+    /// Multi-party rooms this daemon participates in (T6.3.f.2).
+    /// Fetched via `ApiRequest::ListRooms` alongside peers on every
+    /// status tick. Rendered in the same selection list as peers,
+    /// below them; selection-indexing logic lives in
+    /// [`Self::selected_entry`].
+    rooms: Vec<RoomInfo>,
+    /// Index into the combined `peers ++ rooms` list (peers first).
+    /// Out of range means "no selection". See
+    /// [`Self::selected_entry`] for the kind discriminator.
     selected: usize,
-    /// Per-peer scrollback (keyed by `short_id`). Populated from
-    /// live `EventMessage`s; not backfilled from server history yet.
+    /// Per-conversation scrollback keyed by selector identity:
+    ///   * DM peer entries are keyed by `short_id` (8-char base32
+    ///     of peer's X25519 pubkey) — same as today.
+    ///   * Room entries are keyed by `room/<8-char-b32-of-group_id>`
+    ///     — the same key the daemon ships in `EventMessage::peer_short`
+    ///     for room messages (T6.3.d), so the apply_event match
+    ///     stores them under the room's selector without prefix
+    ///     stripping.
     scrollback: HashMap<String, Vec<ChatLine>>,
     /// Bytes the user has typed but not yet sent.
     composer: String,
@@ -109,6 +130,26 @@ struct AppState {
     /// Set of `short_id`s we've already fetched History for. Prevents
     /// re-firing the backfill request every refresh tick.
     backfilled: HashSet<String>,
+}
+
+/// What the current selection refers to (T6.3.f.2). `Peer` drives
+/// DM `Send`s; `Room` drives multi-party `SendRoom`s. The composer
+/// pane title and the send dispatcher both branch on this.
+#[derive(Debug, Clone)]
+enum SelectedEntry<'a> {
+    Peer(&'a PeerInfo),
+    Room(&'a RoomInfo),
+}
+
+impl SelectedEntry<'_> {
+    /// User-facing short identifier — the key used in `scrollback`
+    /// and rendered in titles. Same shape on both wire and TUI.
+    fn scrollback_key(&self) -> String {
+        match self {
+            Self::Peer(p) => p.short_id.clone(),
+            Self::Room(r) => format!("room/{}", short_id(&r.group_id_b32)),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +181,7 @@ impl AppState {
             socket_path,
             last_status: None,
             peers: Vec::new(),
+            rooms: Vec::new(),
             selected: 0,
             scrollback: HashMap::new(),
             composer: String::new(),
@@ -149,16 +191,29 @@ impl AppState {
         }
     }
 
-    fn selected_peer(&self) -> Option<&PeerInfo> {
-        self.peers.get(self.selected)
+    /// Total count of selectable entries (peers + rooms).
+    fn total_entries(&self) -> usize {
+        self.peers.len() + self.rooms.len()
+    }
+
+    /// What's currently selected, if anything. Selection layout is
+    /// peers first, then rooms — so index `n < peers.len()` is a
+    /// peer, and `n - peers.len()` is the room slot.
+    fn selected_entry(&self) -> Option<SelectedEntry<'_>> {
+        if self.selected < self.peers.len() {
+            self.peers.get(self.selected).map(SelectedEntry::Peer)
+        } else {
+            let room_idx = self.selected - self.peers.len();
+            self.rooms.get(room_idx).map(SelectedEntry::Room)
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.peers.is_empty() {
+        let n = self.total_entries();
+        if n == 0 {
             self.selected = 0;
             return;
         }
-        let n = self.peers.len();
         let cur = self.selected.min(n - 1);
         // Stepwise so we never need signed arithmetic: handle the two
         // unit-step cases the UI actually emits (±1) directly. Other
@@ -227,12 +282,37 @@ impl AppState {
         // Most-recently-active first (descending). sort_by_key with
         // `Reverse` keeps clippy happy and avoids the manual closure.
         new_peers.sort_by_key(|p| std::cmp::Reverse(p.last_active_unix_ms));
-        let prev_short = self.selected_peer().map(|p| p.short_id.clone());
+        let prev_key = self.selected_entry().map(|e| e.scrollback_key());
         self.peers = new_peers;
-        if let Some(short) = prev_short {
-            if let Some(idx) = self.peers.iter().position(|p| p.short_id == short) {
-                self.selected = idx;
-            }
+        if let Some(key) = prev_key {
+            self.restore_selection_by_key(&key);
+        }
+    }
+
+    /// T6.3.f.2: refresh the room list from a `ListRoomsOk`. Same
+    /// "preserve selection by key" pattern as `apply_peers_snapshot`.
+    fn apply_rooms_snapshot(&mut self, new_rooms: Vec<RoomInfo>) {
+        let prev_key = self.selected_entry().map(|e| e.scrollback_key());
+        self.rooms = new_rooms;
+        if let Some(key) = prev_key {
+            self.restore_selection_by_key(&key);
+        }
+    }
+
+    /// Reposition `selected` to the entry whose `scrollback_key`
+    /// matches `key`, if it still exists in the combined list. No-op
+    /// otherwise.
+    fn restore_selection_by_key(&mut self, key: &str) {
+        if let Some(idx) = self.peers.iter().position(|p| p.short_id == *key) {
+            self.selected = idx;
+            return;
+        }
+        if let Some(idx) = self
+            .rooms
+            .iter()
+            .position(|r| format!("room/{}", short_id(&r.group_id_b32)) == key)
+        {
+            self.selected = self.peers.len() + idx;
         }
     }
 }
@@ -335,14 +415,27 @@ async fn send_composer(app: &mut AppState) {
     if app.composer.is_empty() {
         return;
     }
-    let Some(peer) = app.selected_peer().cloned() else {
-        app.last_send_result = Some(Err("no peer selected".to_string()));
-        return;
+    // T6.3.f.2: clone the bits we need out of the borrow before we
+    // mutate `app.composer` — the selection borrow holds `app`
+    // immutably otherwise.
+    let dispatch = match app.selected_entry() {
+        Some(SelectedEntry::Peer(p)) => SendDispatch::Dm(p.short_id.clone()),
+        Some(SelectedEntry::Room(r)) => SendDispatch::Room(r.group_id_b32.clone()),
+        None => {
+            app.last_send_result = Some(Err("no conversation selected".to_string()));
+            return;
+        }
     };
     let mut text = std::mem::take(&mut app.composer);
-    let req = ApiRequest::Send {
-        peer_short: peer.short_id.clone(),
-        text: text.clone(),
+    let req = match &dispatch {
+        SendDispatch::Dm(short) => ApiRequest::Send {
+            peer_short: short.clone(),
+            text: text.clone(),
+        },
+        SendDispatch::Room(gid_b32) => ApiRequest::SendRoom {
+            group_id_b32: gid_b32.clone(),
+            text: text.clone(),
+        },
     };
     match client::one_shot(&app.socket_path, &req).await {
         Ok(ApiResponse::SendOk) => {
@@ -355,6 +448,36 @@ async fn send_composer(app: &mut AppState) {
             // Outgoing }` for the send, which the tail loop will
             // deliver and apply_event will record. Pushing here
             // would double up.
+            text.zeroize();
+        }
+        Ok(ApiResponse::SendRoomOk {
+            delivered_to_direct,
+            delivered_to_hub,
+            skipped_no_kem,
+            total_members,
+            ..
+        }) => {
+            // T6.3.f.2: surface room-send delivery counts so the user
+            // sees which members got the message and which didn't.
+            // The daemon does NOT echo room sends back as Outgoing
+            // EventMessages (the conversation registry is DM-only,
+            // T6.3.d note); push our own local line so the scrollback
+            // shows what we said.
+            let key = format!("room/{}", short_id(&dispatch.b32_key()));
+            app.scrollback.entry(key).or_default().push(ChatLine {
+                direction: MessageDirection::Outgoing,
+                text: text.clone(),
+                ts_unix_ms: now_unix_ms(),
+                via_hub: false,
+            });
+            app.last_send_result = Some(Ok(()));
+            tracing::info!(
+                delivered_to_direct,
+                delivered_to_hub,
+                skipped_no_kem,
+                total_members,
+                "room send delivery counts"
+            );
             text.zeroize();
         }
         Ok(ApiResponse::Error { message, .. }) => {
@@ -370,6 +493,31 @@ async fn send_composer(app: &mut AppState) {
             app.last_send_result = Some(Err(format!("{e:#}")));
         }
     }
+}
+
+/// What a composer-send should target. Built from the selection
+/// before any borrow of `app` is mutated so the call site doesn't
+/// fight the borrow checker.
+#[derive(Debug, Clone)]
+enum SendDispatch {
+    Dm(String),
+    Room(String),
+}
+
+impl SendDispatch {
+    fn b32_key(&self) -> String {
+        match self {
+            Self::Dm(short) => short.clone(),
+            Self::Room(gid_b32) => gid_b32.clone(),
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
@@ -405,6 +553,15 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
     if let Ok(ApiResponse::PeersOk { entries }) = client::one_shot(socket, &ApiRequest::Peers).await
     {
         app.apply_peers_snapshot(entries);
+    }
+
+    // T6.3.f.2: rooms — same best-effort policy. Refreshed every
+    // status tick so newly created/joined rooms surface in the pane
+    // without restart.
+    if let Ok(ApiResponse::ListRoomsOk { rooms }) =
+        client::one_shot(socket, &ApiRequest::ListRooms).await
+    {
+        app.apply_rooms_snapshot(rooms);
     }
 
     // History backfill for any peer we haven't fetched yet. Cheap to
@@ -561,12 +718,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 }
 
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
-    let block = Block::default().borders(Borders::ALL).title(" Peers ");
-    if app.peers.is_empty() {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Peers & Rooms ");
+    if app.peers.is_empty() && app.rooms.is_empty() {
         let body = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                " (no peers yet)",
+                " (nothing yet)",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
@@ -579,7 +738,15 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                " to bring one up.",
+                " for a DM, or",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                " `onyx room create --name X`",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                " for a multi-party room.",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -588,49 +755,62 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
 
-    let items: Vec<ListItem<'_>> = app
-        .peers
-        .iter()
-        .map(|p| {
-            let dot = if p.connected {
-                Span::styled("● ", Style::default().fg(Color::Green))
-            } else {
-                Span::styled("○ ", Style::default().fg(Color::DarkGray))
-            };
-            let name = Span::styled(
-                p.short_id.clone(),
-                Style::default()
-                    .fg(if p.connected {
-                        Color::White
-                    } else {
-                        Color::DarkGray
-                    })
-                    .add_modifier(if p.connected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            );
-            ListItem::new(Line::from(vec![dot, name]))
-        })
-        .collect();
+    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(app.peers.len() + app.rooms.len());
+    for p in &app.peers {
+        let dot = if p.connected {
+            Span::styled("● ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("○ ", Style::default().fg(Color::DarkGray))
+        };
+        let name = Span::styled(
+            p.short_id.clone(),
+            Style::default()
+                .fg(if p.connected {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(if p.connected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        );
+        items.push(ListItem::new(Line::from(vec![dot, name])));
+    }
+    for r in &app.rooms {
+        let label = format!("#{} ({}m)", r.name, r.members.len());
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("◆ ", Style::default().fg(Color::Magenta)),
+            Span::styled(label, Style::default().fg(Color::White)),
+        ])));
+    }
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
         .highlight_symbol("▶ ");
+    let total = app.total_entries();
     let mut state = ListState::default();
-    state.select(Some(app.selected.min(app.peers.len().saturating_sub(1))));
+    state.select(Some(app.selected.min(total.saturating_sub(1))));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
-    let title = app.selected_peer().map_or_else(
-        || " Conversation ".to_string(),
-        |p| format!(" #{} ", p.short_id),
-    );
+    let (title, scrollback_key, who_label) = match app.selected_entry() {
+        Some(SelectedEntry::Peer(p)) => (
+            format!(" #{} ", p.short_id),
+            p.short_id.clone(),
+            p.short_id.clone(),
+        ),
+        Some(SelectedEntry::Room(r)) => (
+            format!(" #{} (room, {} members) ", r.name, r.members.len()),
+            format!("room/{}", short_id(&r.group_id_b32)),
+            format!("#{}", r.name),
+        ),
+        None => (" Conversation ".to_string(), String::new(), String::new()),
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
-
-    let Some(peer) = app.selected_peer() else {
+    if app.selected_entry().is_none() {
         let body = Paragraph::new(vec![
             Line::from(Span::styled(
                 "No conversation selected.",
@@ -638,7 +818,7 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "Use ↑/↓ to pick a peer once one shows up.",
+                "Use ↑/↓ to pick a peer or room once one shows up.",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -646,14 +826,13 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         .wrap(Wrap { trim: false });
         frame.render_widget(body, area);
         return;
-    };
-
-    let lines: Vec<Line<'_>> = match app.scrollback.get(&peer.short_id) {
+    }
+    let lines: Vec<Line<'_>> = match app.scrollback.get(&scrollback_key) {
         Some(scroll) if !scroll.is_empty() => scroll
             .iter()
             .map(|line| {
                 let (who, color) = match line.direction {
-                    MessageDirection::Incoming => (peer.short_id.as_str(), Color::Cyan),
+                    MessageDirection::Incoming => (who_label.as_str(), Color::Cyan),
                     MessageDirection::Outgoing => ("me", Color::Green),
                 };
                 let mut spans: Vec<Span<'_>> = Vec::with_capacity(3);
@@ -661,10 +840,6 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     format!("{who:>10}: "),
                     Style::default().fg(color),
                 ));
-                // `via_hub` messages use the msg/v1 sealed-sender path,
-                // which has per-message PFS but no MLS PCS (see
-                // SECURITY.md §6.1). Render a visible "[hub]" badge so
-                // the user can read the security tier at a glance.
                 if line.via_hub {
                     spans.push(Span::styled(
                         "[hub] ",
@@ -702,9 +877,9 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             Span::raw("— "),
             Span::raw(app.composer.clone()),
         ])
-    } else if app.selected_peer().is_none() {
+    } else if app.selected_entry().is_none() {
         Line::from(Span::styled(
-            " > (no peer to send to)",
+            " > (no peer or room to send to)",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
@@ -919,8 +1094,68 @@ mod snapshot_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tui-snapshot.txt"), &snap).unwrap();
         assert!(snap.contains("onyx"));
+        // T6.3.f.2: pane title is now "Peers & Rooms"; empty-state
+        // copy changed from "(no peers yet)" to "(nothing yet)".
         assert!(snap.contains("Peers"));
-        assert!(snap.contains("(no peers yet)"));
+        assert!(snap.contains("(nothing yet)"));
+    }
+
+    #[test]
+    fn dump_snapshot_with_rooms() {
+        // T6.3.f.2: a populated room list must render below peers
+        // with the [diamond] glyph + name + member count.
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.rooms = vec![
+            RoomInfo {
+                name: "general".into(),
+                group_id_b32: "abcdefghijkl".into(),
+                members: vec!["fp_alice".into(), "fp_bob".into()],
+                created_at_ms: 1_700_000_000_000,
+            },
+            RoomInfo {
+                name: "audit".into(),
+                group_id_b32: "mnopqrstuvwx".into(),
+                members: vec!["fp_alice".into(), "fp_bob".into(), "fp_carol".into()],
+                created_at_ms: 1_700_000_010_000,
+            },
+        ];
+        let snap = render_to_string(&app, 90, 24);
+        assert!(
+            snap.contains("#general"),
+            "room name must render with `#` prefix; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("(2m)"),
+            "room member count must render; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("#audit"),
+            "second room must render; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("(3m)"),
+            "second room's member count must render; got:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn selected_entry_indexes_rooms_after_peers() {
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.rooms = vec![RoomInfo {
+            name: "r1".into(),
+            group_id_b32: "g1".into(),
+            members: vec![],
+            created_at_ms: 0,
+        }];
+        // 2 peers (indices 0..1) + 1 room (index 2)
+        app.selected = 0;
+        assert!(matches!(app.selected_entry(), Some(SelectedEntry::Peer(_))));
+        app.selected = 1;
+        assert!(matches!(app.selected_entry(), Some(SelectedEntry::Peer(_))));
+        app.selected = 2;
+        assert!(matches!(app.selected_entry(), Some(SelectedEntry::Room(_))));
+        app.selected = 3;
+        assert!(app.selected_entry().is_none());
     }
 
     #[test]
