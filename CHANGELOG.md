@@ -6,6 +6,92 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — Infra (1–4): CI advisories + cargo-deny split + release workflow + sigstore signing + N-member room benchmarks
+
+Four supply-chain / observability slices shipped together. Closes the "infra hygiene" items from the medium-term inventory; sets up the foundation for releasing actual binaries that downstream users can verify.
+
+### Infra.1: `cargo-audit` job added to CI
+
+`.github/workflows/ci.yml` gains a new `audit` job using `rustsec/audit-check@v2`. This is **redundant** with `cargo-deny check advisories` (both consume the RustSec database) — kept as defense in depth. If `deny.toml`'s `[advisories]` config is ever weakened (e.g. an `ignore` entry gets added without justification), cargo-audit will still surface the unignored advisory. Two independent signals; either failing blocks the PR.
+
+Honest framing on what was already in place: `cargo-deny check --all-features` was already running all four checks (advisories, bans, licenses, sources) — the previous "we have license check; not advisory" line in my earlier inventory was wrong. The advisory check IS what cargo-audit does. This slice adds explicit second-source redundancy.
+
+### Infra.2: cargo-deny split into per-check jobs
+
+Single `deny` job replaced with four (`deny-advisories`, `deny-licenses`, `deny-bans`, `deny-sources`). Each runs the same `EmbarkStudios/cargo-deny-action@v2` with a specific subcommand. **Why**: when one check fails the CI status now names the failing check by job; previously you had to open the action log to know whether it was an advisory, license, ban, or source issue.
+
+### Infra.3: release workflow + reproducible builds + sigstore signing
+
+New `.github/workflows/release.yml`. Triggered on tag push matching `v*`. Builds release binaries for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` in a matrix with:
+
+  * `cargo build --release --locked --target <T>` — refuses to update `Cargo.lock`; same dep set every time.
+  * `SOURCE_DATE_EPOCH=1700000000` — pins file mtimes embedded in artifacts so two runners' outputs match.
+  * `--remap-path-prefix ${{ github.workspace }}=/onyx` + `${HOME}/.cargo=/cargo` — strips absolute paths from binary metadata.
+  * Symbol strip: `-C link-arg=-s` on Linux, `strip` post-build on macOS.
+
+After build, the `sign-and-release` job:
+
+  * Downloads all three matrix artifacts.
+  * Aggregates per-target `SHA256SUMS-<target>.txt` into one combined `SHA256SUMS.txt`.
+  * Signs the combined manifest with `cosign sign-blob` (keyless, OIDC-bound) → `SHA256SUMS.txt.cosign-bundle`.
+  * Signs each individual binary too → `<binary>.cosign-bundle`. Verifiers who download a single binary don't need the manifest round-trip.
+  * Creates a GitHub release with all artifacts + bundles, with auto-generated release notes prepended by the verifier instructions.
+
+Permissions: `contents: write` (for the release) + `id-token: write` (the magic that lets sigstore's Fulcio CA issue a code-signing certificate bound to the workflow identity: repo + ref + workflow file path + commit SHA).
+
+`RELEASES.md` documents the verifier-side walkthrough end-to-end:
+  * **§0 honest framing** of what sigstore proves + what it doesn't (catches release-tab tampering and CDN MitM; does NOT catch repo-write compromise or source-code backdoors).
+  * **§2** single-binary verify command.
+  * **§3** combined-manifest verify (faster for multi-binary downloads).
+  * **§4** reproducible-build flag explanation + how to rebuild from source.
+  * **§5** what the cert binding actually proves (repo + workflow + ref + commit).
+  * **§7** verification-failure reporting flow.
+
+### Infra.4: criterion benchmarks for N-member room operations
+
+New `crates/onyx-core/benches/rooms.rs` measuring four MLS ops across member counts {2, 4, 8, 16}:
+
+  * `mls.create_group/solo` — single-party create.
+  * `mls.invite_nth_member` — cost of adding the nth member to a group of n-1.
+  * `mls.encrypt_application` — single-sender encrypt at current epoch.
+  * `mls.decrypt_application` — fresh recipient decrypt.
+
+Baseline numbers captured on `aarch64-apple-darwin` and committed to `crates/onyx-core/benches/BASELINES.md`:
+
+| op                            | N=2   | N=4   | N=8   | N=16  |
+|-------------------------------|-------|-------|-------|-------|
+| `mls.create_group/solo`       | 53 µs | —     | —     | —     |
+| `mls.invite_nth_member`       | 256 µs| 413 µs| 559 µs| 719 µs|
+| `mls.encrypt_application`     | 28 µs | 32 µs | 36 µs | 40 µs |
+| `mls.decrypt_application`     | 36 µs | 36 µs | 36 µs | 37 µs |
+
+**The load-bearing property** the bench enforces: `decrypt_application` is flat in N. That's what MLS promises (one ratchet step per receive regardless of group size); if a future change drives this number up with N, an O(N²) crept in.
+
+`Cargo.toml` workspace + `crates/onyx-core/Cargo.toml`: added `criterion = "0.5"` as a `dev-dependency`. `[[bench]] name = "rooms" harness = false` so criterion's harness is used.
+
+**NOT in CI** — benchmark variance on shared runners would either flake-fail or hide real regressions. Operators run these manually before/after a perf-sensitive change. See `BASELINES.md` §"How to use these numbers" for the workflow.
+
+### Documentation updates
+
+  * `ANONYMITY.md §3.5` rewritten — removed the "what would close it / effort estimate" framing now that the work has shipped; replaced with the concrete primitives in place + the residual gaps (no third-party reproducer; workflow-file compromise remains in scope).
+  * `README.md` doc index — `RELEASES.md` added alongside the other design docs.
+
+### Verification
+
+  * `cargo fmt --check` ✓
+  * `cargo clippy --workspace --all-targets -- -D warnings` ✓
+  * `cargo test --workspace` → **427 passed** (unchanged from prior — infra slices don't add to the test suite; the benchmark is a separate target).
+  * Smoke ran `cargo bench -p onyx-core --bench rooms -- "mls.invite_nth_member" --sample-size 10` to confirm the bench compiles + runs + produces sensible numbers. Full baseline run committed to `BASELINES.md`.
+
+Status of medium-term infra hygiene from prior inventory — all 4 items closed:
+
+  * ✅ `cargo audit` in CI (Infra.1 — redundant with existing `cargo-deny check advisories`, kept as defense in depth)
+  * ✅ `cargo deny` advisories (was always present; Infra.2 split into per-check jobs for clearer failure surfacing)
+  * ✅ Reproducible builds + Sigstore release signing (Infra.3 + `RELEASES.md`)
+  * ✅ N-member room perf benchmarks (Infra.4 + `BASELINES.md`)
+
+---
+
 ## 2026-05-19 — T-polish (1–6): room CRUD verbs + persistent scrollback + TUI scrolling, unread badges, modals
 
 Six short-term UX polish slices shipped together. Each is small individually; together they close most of the "the CLI/TUI is too bare for actual users" gap.

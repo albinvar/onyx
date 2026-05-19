@@ -127,12 +127,23 @@ What this is **not**: full hub-to-hub federation (T8.3+, long-term). Hubs don't 
 
 **Update (T8.3 — also now closed):** hub-to-hub gossip is implemented. With `--peer-hub`, two hubs establish a Noise XK link and federate KP-directory + queued envelope state via `FRAME_GOSSIP_PUBLISH` and `FRAME_GOSSIP_DELIVER` frames. Loop prevention via TTL + `seen_by`. Ownership check on incoming gossiped KPs uses the same T7.3-sec mitigation as client-direct publishes. See `FEDERATION.md` for the design and `THREAT_MODEL.md` §8.2 #17/#18 for the F1/F2 adversaries this defends against. **Anonymity disclosure surface is unchanged from T8.1**: hubs still see only routing-ids + opaque ciphertext + timing; federation just makes the storage and delivery more resilient without revealing anything new.
 
-### 3.5 No reproducible builds, no signed releases
+### 3.5 Reproducible builds + signed releases (Infra.3 shipped)
 
-If someone replaces your installed `onyx` binary on disk (supply chain compromise, malicious package mirror), you lose. We have `cargo deny` advisory + license checks at the workspace gate, which catches *known-CVE* dependencies but not a maliciously-published version that has yet to be flagged.
+Supply-chain story now in place:
 
-  * **What would close it:** rust-reproducible-builds wiring, Sigstore signing on releases, `cargo audit` in CI.
-  * **Effort:** 1 session for reproducibility (assuming clean dependency tree), 0.5 session for Sigstore signing pipeline.
+  * **CI runs both `cargo-deny` (4 separate checks) AND `cargo-audit`** on every push + PR (`Infra.1` + `Infra.2`). Both consume the RustSec database; two independent signals fail closed if a known-CVE dep slips in.
+  * **Release workflow (`Infra.3`)** triggered on tag push (`v*`) builds binaries for `x86_64-linux`, `aarch64-darwin`, `x86_64-darwin` with:
+    * `--locked` (refuses to update `Cargo.lock` — same dep set every time)
+    * `SOURCE_DATE_EPOCH=1700000000` (pins file mtimes embedded in artifacts)
+    * `--remap-path-prefix` (strips absolute paths from binary metadata)
+    * symbol strip (Linux `-C link-arg=-s` / macOS `strip`)
+  * **Sigstore cosign keyless signing** via GitHub Actions OIDC. Every binary AND the combined `SHA256SUMS.txt` are signed with bundles uploaded to the GitHub release. Verifier instructions in `RELEASES.md` §2-§5.
+  * **What the signature actually proves**: the binary was built by this exact repo's `release.yml` workflow file, at this exact tag's commit, on GitHub's runners. It does NOT prove the source is honest — read the diff, run smoke tests, or build from source for that layer. (Documented in `RELEASES.md` §0.)
+
+Honest residual gaps:
+
+  * **No third-party reproducer yet.** The build flags make outputs deterministic across runners, but nobody has set up an independent rebuilder to confirm byte-identical results on different infrastructure. If you do, please PR a link.
+  * **GitHub workflow-file compromise is still in scope.** An attacker who can push to `main` and modify `release.yml` can sign tampered binaries with the legitimate workflow identity. Mitigation is upstream (branch protection, mandatory PR review) — see `RELEASES.md` §0.
 
 ### 3.6 Disk fingerprint — `~/.onyx/` reveals you use Onyx
 

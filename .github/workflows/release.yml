@@ -1,0 +1,219 @@
+name: Release
+
+# Triggered on tag push matching v* (e.g. v0.0.1, v0.1.0-rc.1). Builds
+# release binaries for the supported targets with deterministic flags,
+# computes SHA256 sums, signs the binaries + sum file with sigstore
+# cosign (keyless, OIDC-bound to the workflow), uploads everything to
+# a GitHub release.
+#
+# Infra.3: reproducible-builds + supply-chain signing. The goal is
+# that a user downloading `onyx-v0.0.1-x86_64-linux` and verifying
+# its sigstore signature can confirm it was built by THIS repository
+# at THIS commit, by THIS workflow — not by an attacker who got
+# write access to the release tab. See `RELEASES.md` for the
+# verifier-side walk-through.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual trigger for testing the build without cutting a release.
+  # The signing step is skipped on workflow_dispatch (sigstore
+  # would refuse the OIDC issuance for a non-tag ref anyway).
+  workflow_dispatch:
+
+# Permissions needed for sigstore cosign keyless signing via OIDC.
+# `id-token: write` is the magic that lets sigstore's Fulcio CA
+# issue a code-signing certificate bound to this workflow's
+# identity (repo + branch/tag + workflow file path).
+permissions:
+  contents: write   # to create a GitHub release + attach artifacts
+  id-token: write   # for sigstore keyless signing
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # Reproducible-build flags. SOURCE_DATE_EPOCH pins file mtimes;
+  # the cargo flags strip non-deterministic paths from the binary.
+  SOURCE_DATE_EPOCH: 1700000000  # fixed; same across all matrix builds
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            ext: ''
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            ext: ''
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            ext: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Reproducible release build
+        env:
+          # Strip absolute paths from debug info + panic messages so two
+          # runners' outputs match. `--remap-path-prefix` rewrites every
+          # path in the binary's metadata to a stable prefix.
+          # The `-C link-arg=-s` strips the symbol table on Linux; macOS
+          # uses `strip` separately.
+          RUSTFLAGS: >-
+            --remap-path-prefix ${{ github.workspace }}=/onyx
+            --remap-path-prefix ${HOME}/.cargo=/cargo
+            -C link-arg=-s
+        run: |
+          # --locked: refuse to update Cargo.lock; same dep set as
+          # committed. --release: optimized + stripped.
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Strip + rename binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          TARGET=${{ matrix.target }}
+          VERSION=${GITHUB_REF_NAME#v}
+          for bin in onyx onyxd onyx-hub; do
+            src="target/${TARGET}/release/${bin}${{ matrix.ext }}"
+            dst="artifacts/${bin}-v${VERSION}-${TARGET}${{ matrix.ext }}"
+            cp "$src" "$dst"
+            # Strip symbols on macOS (RUSTFLAGS -s only covers Linux).
+            if [[ "${TARGET}" == *-apple-darwin ]]; then
+              strip "$dst"
+            fi
+            chmod 755 "$dst"
+          done
+
+      - name: Compute SHA256 sums
+        shell: bash
+        run: |
+          cd artifacts
+          # GNU sha256sum on Linux, BSD shasum -a 256 on macOS — write
+          # both forms then keep the GNU-compatible one for the
+          # release manifest.
+          if command -v sha256sum >/dev/null; then
+            sha256sum * > SHA256SUMS-${{ matrix.target }}.txt
+          else
+            shasum -a 256 * > SHA256SUMS-${{ matrix.target }}.txt
+          fi
+          cat SHA256SUMS-${{ matrix.target }}.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: onyx-${{ matrix.target }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-and-release:
+    name: Sign + release
+    needs: build
+    # Tags only; workflow_dispatch (manual test) does not sign.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: onyx-*
+          merge-multiple: true
+
+      - name: Install sigstore cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Aggregate + sign
+        shell: bash
+        env:
+          COSIGN_YES: "true"  # auto-confirm keyless flow (we're in CI)
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+
+          # Aggregate per-target SHA256SUMS into one file so verifiers
+          # only need to fetch + verify a single sum manifest.
+          cat SHA256SUMS-*.txt > SHA256SUMS.txt
+          sort -k 2 -o SHA256SUMS.txt SHA256SUMS.txt
+          echo "── Combined SHA256SUMS:"
+          cat SHA256SUMS.txt
+
+          # Sign the combined sum manifest. Verifiers verify the
+          # signature against SHA256SUMS.txt, then verify each binary's
+          # hash against its line in the manifest. Two-step but signs
+          # exactly one artifact (faster + cheaper than per-binary
+          # sigs, and aligns with how Linux distro release sigs work).
+          cosign sign-blob \
+            --yes \
+            --bundle SHA256SUMS.txt.cosign-bundle \
+            SHA256SUMS.txt
+
+          # Also sign each individual binary so a user who only
+          # downloads one binary can verify it without the manifest
+          # round-trip. Bundle format (`*.cosign-bundle`) is
+          # self-contained — includes cert + sig + Rekor entry.
+          for bin in onyx-v* onyxd-v* onyx-hub-v*; do
+            [[ -f "$bin" ]] || continue
+            echo "── Signing $bin"
+            cosign sign-blob \
+              --yes \
+              --bundle "${bin}.cosign-bundle" \
+              "$bin"
+          done
+
+          ls -la
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/onyx-*
+            dist/onyxd-*
+            dist/onyx-hub-*
+            dist/SHA256SUMS.txt
+            dist/SHA256SUMS.txt.cosign-bundle
+          generate_release_notes: true
+          body: |
+            ## Verifying this release
+
+            Every binary and the combined `SHA256SUMS.txt` are signed
+            with [sigstore](https://www.sigstore.dev/) cosign (keyless
+            via GitHub Actions OIDC). To verify a binary you
+            downloaded:
+
+            ```
+            cosign verify-blob \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              --bundle onyx-${{ github.ref_name }}-x86_64-unknown-linux-gnu.cosign-bundle \
+              onyx-${{ github.ref_name }}-x86_64-unknown-linux-gnu
+            ```
+
+            Or verify the combined manifest then check the binary's hash:
+
+            ```
+            cosign verify-blob \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
+              --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+              --bundle SHA256SUMS.txt.cosign-bundle \
+              SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt --ignore-missing
+            ```
+
+            See `RELEASES.md` in the repo for the full verifier walkthrough.

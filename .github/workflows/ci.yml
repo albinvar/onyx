@@ -43,14 +43,62 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
-  deny:
-    name: cargo-deny
+  # Infra.2: split the four cargo-deny checks into separate jobs so
+  # a failure surfaces the specific check that fired (instead of one
+  # opaque "cargo-deny failed"). Each job runs the same action; they
+  # parallelise on the runner.
+  deny-advisories:
+    name: cargo-deny advisories
     runs-on: ubuntu-latest
-    # cargo-deny needs no Rust build; the action ships its own binary.
-    # Runs all four checks: advisories, bans, licenses, sources.
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check
+          command: check advisories
           arguments: --all-features
+
+  deny-licenses:
+    name: cargo-deny licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --all-features
+
+  deny-bans:
+    name: cargo-deny bans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans
+          arguments: --all-features
+
+  deny-sources:
+    name: cargo-deny sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check sources
+          arguments: --all-features
+
+  # Infra.1: cargo-audit. Redundant with `cargo-deny check
+  # advisories` above (both consume the RustSec database) but kept
+  # as defense in depth: if deny.toml's `[advisories]` config is
+  # ever weakened (e.g. an `ignore` entry gets added without
+  # justification), cargo-audit will still surface the unignored
+  # advisory. Two independent signals; either failing blocks the
+  # PR.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

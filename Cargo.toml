@@ -94,6 +94,10 @@ serde_json       = "1"
 
 # Test-only.
 proptest         = "1"
+# Benchmark-only. Used by `benches/` under onyx-core (Infra.4: N-member
+# room perf measurements). `html_reports` adds the criterion HTML output
+# under `target/criterion/`.
+criterion        = { version = "0.5", features = ["html_reports"] }
 
 # TUI for the `onyx` CLI client. Crossterm is ratatui's default
 # backend on macOS/Linux/Windows.

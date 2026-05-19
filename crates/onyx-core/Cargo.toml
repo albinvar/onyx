@@ -49,6 +49,16 @@ serde_json       = { workspace = true }
 [dev-dependencies]
 proptest         = { workspace = true }
 tempfile         = { workspace = true }
+criterion        = { workspace = true }
+
+# Infra.4: criterion benchmarks for N-member room operations. Run
+# locally with `cargo bench -p onyx-core`. NOT in CI by default —
+# benchmarks are noise-sensitive and CI runners' variance would
+# either flake-fail or hide real regressions. Run before/after a
+# perf-sensitive change to spot regressions manually.
+[[bench]]
+name = "rooms"
+harness = false
 
 [lints]
 workspace = true
