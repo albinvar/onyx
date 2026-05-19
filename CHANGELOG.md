@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — Fix-#1+#4: 3-party smoke + real-Tor operator script + hub-side cover traffic
+
+Closes the "partial" status on post-T6.3 review **issues #1 (real-Tor smoke)** and **#4 (cover traffic)**. Both now have a clearly-defined "what's verified vs what's left to the operator" boundary instead of the prior hand-wave.
+
+### Issue #1 work — coverage
+
+  * **3-party room smoke** added (`rooms_e2e_three_party_commit_distribution` in `crates/onyx-hub/tests/rooms_smoke.rs`). Alice creates a room, invites bob, then invites carol. Asserts on the wire that bob's daemon processes the commit alice produced for the carol-invite and his roster grows to 3. Then alice sends an app message and BOTH bob and carol decrypt it.
+    * **Real bug caught on the wire.** Pre-fix, alice's `handle_invite_to_room` was routing the commit envelope to `session_token(group_secret_at_new_epoch, 0)` — but bob is still at the OLD epoch and subscribed to the OLD session token. The commit landed in an inbox nobody was listening on, so bob never advanced, his roster stayed at 2, and the test failed with "room never reached 3 members."
+    * **Fix**: capture the OLD-epoch session token BEFORE `invite()` advances the group, pass it as `routing_target_override` to `fanout_room_mls_bytes` for the commit fan-out. KEM-ad still rides on the NEW-epoch token (existing members subscribe to it via `announce_room_subscribe` after merging the commit). `fanout_room_mls_bytes` signature gains `routing_target_override: Option<RoutingId>` — `None` for the existing send-room path (derive at current epoch), `Some(token)` for the invite-time commit (use captured old token).
+  * **`scripts/real_tor_smoke.sh`** — operator-driven golden-standard. Two-step workflow: (1) operator runs the hub manually in a separate terminal, (2) exports `ONYX_HUB_ONION` + `ONYX_HUB_PUBKEY`, then runs this script. The script spawns alice + bob daemons against real Tor, drives the same create-room → fetch-KP → invite → send → bob-receives flow as the TCP smoke, and asserts PASS/FAIL at each step. Documented as not-for-CI (Tor bootstrap takes 30-60s and needs network). Catches what TCP can't: real circuit latency, NAT, MTU, cold-start hsdesc race.
+
+### Issue #4 work — bidirectional cover
+
+  * **`hub_handle_connection_with_cover`** in `onyx-hub/src/handler.rs`: new variant of the existing handler that takes `cover_traffic_mean_secs: Option<u64>`. `serve_frames` grows a third `tokio::select!` branch — a `tokio::pin!`'d `Sleep` that fires at the next Poisson-distributed interval and writes a `FRAME_PAD`. After each fire, `Sleep::reset` re-arms with a fresh sample so inter-arrivals stay memoryless. When `cover_traffic_mean_secs` is `None`, the branch's `if cover_enabled` guard suppresses it entirely.
+  * **`sample_exponential_interval`** sampler: identical inverse-CDF method as the daemon-side `next_exponential_interval`. Kept private to the hub module to avoid a cross-crate API surface for the helper.
+  * **Hub CLI flag** `--cover-traffic-mean-secs N` (env var `ONYX_HUB_COVER_TRAFFIC_MEAN_SECS`) wired through both the Tor accept loop and the `--listen-tcp` accept loop. Both call `hub_handle_connection_with_cover` with the operator's mean. Existing `hub_handle_connection` (no cover) retained for tests / callers that don't care; `#[allow(dead_code)]` since the bin no longer uses it directly.
+  * **Refactor**: extracted `spawn_periodic_gc` so both Tor and listen-tcp paths share one queue-GC implementation (and to keep `run_listen_tcp_mode` under clippy's `too_many_lines` budget after adding the cover-traffic announcement).
+  * **Smoke test** `rooms_e2e_hub_cover_traffic_does_not_break_flow`: runs the same 2-party shape as the basic smoke but with the hub emitting PAD frames at mean=1s per connection. **Catches** any regression where the daemon ingests cover frames as junk envelopes or where the PAD frame's empty payload confuses something downstream. Pre-T-cover.hub the test wouldn't have run because the hub didn't emit PAD; post-fix it passes, proving the daemon's existing `EnvelopeReplayGuard` + `handle_hub_delivery` correctly silently-drop PAD frames at the size-bucket validation layer (PAD frames have empty payload → bucket::SMALL → not a valid sealed envelope).
+  * **`ANONYMITY.md §3.1` rewritten**: removed the "**one-directional only**" caveat; added explicit notes on (a) what bidirectional cover gives you (traffic-shape uniformity in both directions when both sides opt in), (b) what it still doesn't (multi-session autocorrelation, real-Tor verification, off-by-default bandwidth cost), and (c) the remaining "alice connected vs alice disconnected" leak that needs §3.2's routing-id rotation to close.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **410 passed** (+2 from 408: the 3-party smoke + the hub-cover smoke). Both smoke tests run in ~5s combined.
+
+Final status of post-T6.3 review issues:
+
+  * **#1 (real-Tor smoke)** → **clearly addressed**: TCP smoke now covers 2-party + 3-party flows on the wire; real-Tor smoke is operator-driven via `scripts/real_tor_smoke.sh`.
+  * **#2 (T6.3.h commit + KEM-ad ordering race)** → fixed by T6.3.i (`5c1bdb0`).
+  * **#3 (T6.3.g session-token subscribe race)** → confirmed non-issue (hub queues by routing_id).
+  * **#4 (cover traffic)** → **clearly addressed**: both client→hub and hub→client cover traffic ship as opt-in; both directions tested.
+  * **XLARGE bucket bugfix** → fixed in T-smoke (`c9c9c22`).
+  * **NEW (commit routing to wrong epoch in T6.3.g)** → fixed in this slice. Pre-fix, 3-party rooms would have silently broken in real Tor too.
+
+---
+
 ## 2026-05-19 — T-smoke: end-to-end room flow test harness (hub + 2 daemons over TCP) + XLARGE bucket bugfix
 
 Closes (mostly) post-T6.3 review's **issue #1** — "no real-Tor smoke yet." This isn't real Tor (TCP shortcut for speed), but it exercises every code path between the API surface and the wire encoding, including T6.3.h commit + KEM-ad fan-out, T6.3.i out-of-order retry buffer, and T6.3.g session-token routing. The remaining "differences from real Tor" are circuit-level (NAT, latency, packet loss, MTU) — out of scope for a CI test.

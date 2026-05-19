@@ -40,7 +40,7 @@ use tracing::{Instrument, error, info, info_span, warn};
 
 use onyx_core::crypto::{IdentityPublic, IdentitySecret};
 
-use crate::handler::hub_handle_connection;
+use crate::handler::hub_handle_connection_with_cover;
 use crate::state::{GossipMode, HubState, PeerHubConfig};
 
 mod handler;
@@ -167,6 +167,21 @@ struct Args {
     #[arg(long, env = "ONYX_HUB_LISTEN_TCP",
           conflicts_with_all = ["no_tor", "peer_hubs"])]
     listen_tcp: Option<String>,
+
+    /// **Opt-in.** Per-connection cover-traffic emitter (T-cover.hub).
+    /// When set, the hub injects `FRAME_PAD` frames to each connected
+    /// client at exponentially-distributed (Poisson-process) intervals
+    /// with mean `N` seconds. Closes the hub→client direction of the
+    /// cover-traffic story (the daemon-side handles client→hub via
+    /// its own `--cover-traffic-mean-secs`; when both sides opt in,
+    /// the channel becomes traffic-shape-uniform in both directions).
+    ///
+    /// Off by default. See `ANONYMITY.md` §3.1 for the full caveat
+    /// table. Bandwidth cost is `bucket::SMALL` per tick per connected
+    /// client — at mean=20s with 100 clients that's ~75 KB/s of pure
+    /// cover. Set to 0 to disable.
+    #[arg(long, env = "ONYX_HUB_COVER_TRAFFIC_MEAN_SECS")]
+    cover_traffic_mean_secs: Option<u64>,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -219,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
             args.state_db.clone(),
             args.max_queue_age_days,
             args.max_frames_per_minute,
+            args.cover_traffic_mean_secs,
         )
         .await;
     }
@@ -426,7 +442,15 @@ async fn main() -> anyhow::Result<()> {
     let hub_secret = Arc::new(IdentityHandle::new(identity));
 
     info!("onyx-hub running. Ctrl-C to stop.");
-
+    if let Some(mean_secs) = args.cover_traffic_mean_secs
+        && mean_secs > 0
+    {
+        info!(
+            cover_traffic_mean_secs = mean_secs,
+            "T-cover.hub: cover-traffic emitter enabled per inbound client connection"
+        );
+    }
+    let cover_secs = args.cover_traffic_mean_secs;
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
             let state = state.clone();
@@ -434,8 +458,13 @@ async fn main() -> anyhow::Result<()> {
             let span = info_span!("hub-inbound");
             tokio::spawn(
                 async move {
-                    if let Err(e) =
-                        hub_handle_connection(stream, hub_secret.identity_key(), state).await
+                    if let Err(e) = hub_handle_connection_with_cover(
+                        stream,
+                        hub_secret.identity_key(),
+                        state,
+                        cover_secs,
+                    )
+                    .await
                     {
                         warn!(error = %e, "hub connection handler failed");
                     }
@@ -471,6 +500,7 @@ async fn run_listen_tcp_mode(
     state_db: String,
     max_queue_age_days: u32,
     max_frames_per_minute: u32,
+    cover_traffic_mean_secs: Option<u64>,
 ) -> anyhow::Result<()> {
     warn!(
         addr = %addr,
@@ -515,35 +545,19 @@ async fn run_listen_tcp_mode(
         "hub TCP listener bound; share `--hub-tcp <addr>,<pubkey>` with daemons"
     );
 
-    // Periodic queue GC (mirrors the Tor path).
     if max_queue_age_days > 0 {
-        let gc_state = state.clone();
-        let age_days = max_queue_age_days;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|d| i64::try_from(d.as_millis()).ok())
-                    .unwrap_or(0);
-                let cutoff = now_ms - i64::from(age_days) * 24 * 60 * 60 * 1000;
-                let result = {
-                    let s = gc_state.lock().await;
-                    s.gc_queue_entries_older_than(cutoff)
-                };
-                if let Ok(n) = result
-                    && n > 0
-                {
-                    info!(deleted = n, "hub queue GC: dropped stale rows");
-                }
-            }
-        });
+        spawn_periodic_gc(state.clone(), max_queue_age_days);
     }
 
     let hub_secret = Arc::new(IdentityHandle::new(identity));
+    if let Some(mean_secs) = cover_traffic_mean_secs
+        && mean_secs > 0
+    {
+        info!(
+            cover_traffic_mean_secs = mean_secs,
+            "T-cover.hub: cover-traffic emitter enabled per inbound client connection (TCP test mode)"
+        );
+    }
     let accept_loop = async {
         loop {
             let (stream, peer_addr) = match listener.accept().await {
@@ -558,8 +572,13 @@ async fn run_listen_tcp_mode(
             let span = info_span!("hub-inbound-tcp", peer = %peer_addr);
             tokio::spawn(
                 async move {
-                    if let Err(e) =
-                        hub_handle_connection(stream, hub_secret.identity_key(), state).await
+                    if let Err(e) = hub_handle_connection_with_cover(
+                        stream,
+                        hub_secret.identity_key(),
+                        state,
+                        cover_traffic_mean_secs,
+                    )
+                    .await
                     {
                         warn!(error = %e, "hub TCP connection handler failed");
                     }
@@ -573,6 +592,34 @@ async fn run_listen_tcp_mode(
         () = wait_for_ctrl_c() => info!("hub shutting down on Ctrl-C"),
     }
     Ok(())
+}
+
+/// Periodic queue-GC tick. Extracted from both the Tor and
+/// listen-tcp accept paths so they share one shape. Runs forever
+/// in a tokio task; the runtime will reap it on shutdown.
+fn spawn_periodic_gc(gc_state: Arc<Mutex<HubState>>, age_days: u32) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.tick().await; // skip the immediate tick
+        loop {
+            interval.tick().await;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_millis()).ok())
+                .unwrap_or(0);
+            let cutoff = now_ms - i64::from(age_days) * 24 * 60 * 60 * 1000;
+            let result = {
+                let s = gc_state.lock().await;
+                s.gc_queue_entries_older_than(cutoff)
+            };
+            if let Ok(n) = result
+                && n > 0
+            {
+                info!(deleted = n, "hub queue GC: dropped stale rows");
+            }
+        }
+    });
 }
 
 /// Wrapper to keep the hub's [`Identity`] (and therefore its

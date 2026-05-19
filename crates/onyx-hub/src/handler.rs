@@ -25,10 +25,41 @@ use crate::state::{HubState, PER_CONN_MAILBOX, RoutingId};
 ///
 /// On exit (peer disconnect or fatal error), cleans up the
 /// connection's subscriptions before returning.
+// `pub` for the lib consumers (the smoke harness uses this in
+// `crates/onyx-hub/tests/rooms_smoke.rs`). The bin's own `mod
+// handler` doesn't call it (main.rs uses the _with_cover variant
+// to thread the operator's `--cover-traffic-mean-secs` through),
+// so the bin compilation's dead-code lint fires. `#[allow]` it
+// because the function IS used — just not from this specific
+// module tree.
+#[allow(dead_code)]
 pub async fn hub_handle_connection<S>(
+    stream: S,
+    hub_x25519: &IdentitySecret,
+    state: Arc<Mutex<HubState>>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    hub_handle_connection_with_cover(stream, hub_x25519, state, None).await
+}
+
+/// T-cover.hub: same as [`hub_handle_connection`] but with an
+/// explicit cover-traffic mean. When `Some(secs)`, the hub injects
+/// `FRAME_PAD` frames on this connection at exponentially-
+/// distributed intervals (Poisson process, mean = `secs`). When
+/// `None`, no cover traffic is emitted on this connection (the v0
+/// default for hubs that don't opt in).
+///
+/// The existing [`hub_handle_connection`] wrapper passes `None` so
+/// existing callers (e.g. tests) get byte-identical behaviour.
+/// `onyx-hub/src/main.rs`'s production accept loop reads the
+/// operator's `--cover-traffic-mean-secs` flag and threads it in.
+pub async fn hub_handle_connection_with_cover<S>(
     mut stream: S,
     hub_x25519: &IdentitySecret,
     state: Arc<Mutex<HubState>>,
+    cover_traffic_mean_secs: Option<u64>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -70,7 +101,15 @@ where
         s.register_conn(tx)
     };
 
-    let result = serve_frames(&mut stream, &mut session, &state, conn_id, &mut rx).await;
+    let result = serve_frames(
+        &mut stream,
+        &mut session,
+        &state,
+        conn_id,
+        &mut rx,
+        cover_traffic_mean_secs,
+    )
+    .await;
 
     // Always clean up subscriptions on exit.
     {
@@ -285,10 +324,24 @@ async fn serve_frames<S>(
     state: &Arc<Mutex<HubState>>,
     conn_id: u64,
     rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    cover_traffic_mean_secs: Option<u64>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // T-cover.hub: when cover traffic is enabled for this hub,
+    // arm a sleep that fires at the first Poisson-distributed
+    // interval. After each fire we re-arm with a fresh sample so
+    // the inter-arrival times stay memoryless. Disabled → arm a
+    // never-ready sleep so the select branch is a no-op.
+    let cover_enabled = matches!(cover_traffic_mean_secs, Some(s) if s > 0);
+    let initial_cover_dt = if cover_enabled {
+        sample_exponential_interval(cover_traffic_mean_secs.expect("checked above"))
+    } else {
+        std::time::Duration::MAX
+    };
+    let cover_sleep = tokio::time::sleep(initial_cover_dt);
+    tokio::pin!(cover_sleep);
     loop {
         tokio::select! {
             // Frame from the client.
@@ -523,8 +576,56 @@ where
                 }).await
                     .map_err(|e| anyhow::anyhow!("hub: write live: {e}"))?;
             }
+            // T-cover.hub: cover-traffic tick. Send a FRAME_PAD and
+            // re-arm with a fresh exponentially-distributed interval.
+            // The branch only fires when cover_enabled (the no-op
+            // arm uses Duration::MAX which never elapses).
+            () = &mut cover_sleep, if cover_enabled => {
+                write_frame(stream, session, &InnerFrame {
+                    frame_type: onyx_core::wire::FRAME_PAD,
+                    payload: Vec::new(),
+                }).await
+                    .map_err(|e| anyhow::anyhow!("hub: write PAD: {e}"))?;
+                tracing::trace!(conn = conn_id, "hub: outbound PAD sent");
+                // Re-arm with a fresh Poisson sample. `set` reuses
+                // the same Sleep allocation; cheaper than dropping
+                // and recreating.
+                if let Some(secs) = cover_traffic_mean_secs {
+                    let dt = sample_exponential_interval(secs);
+                    cover_sleep.as_mut().reset(tokio::time::Instant::now() + dt);
+                }
+            }
         }
     }
+}
+
+/// T-cover.hub: sample an exponentially-distributed inter-arrival
+/// interval with mean `mean_secs`. Inverse-CDF method using OS
+/// random bytes. Same algorithm as the daemon's
+/// `next_exponential_interval`; kept private here to avoid a
+/// cross-crate dependency. Clamped to `[1s, 10×mean]` for the same
+/// reasons documented daemon-side (avoid CSPRNG-outlier circuit
+/// saturation + long-tail "we never sent anything" gaps).
+//
+// Float precision/truncation casts intentional — feeding a sleep
+// duration, not maintaining cryptographic precision. Clamp keeps
+// the result sane regardless of float weirdness.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn sample_exponential_interval(mean_secs: u64) -> std::time::Duration {
+    let mut buf = [0u8; 8];
+    onyx_core::crypto::fill_random(&mut buf);
+    let raw = u64::from_le_bytes(buf);
+    let u = (raw as f64 + 1.0) / (u64::MAX as f64 + 1.0);
+    let mean = mean_secs as f64;
+    let secs = -mean * u.ln();
+    let max_secs = mean * 10.0;
+    let clamped = secs.clamp(1.0, max_secs);
+    let millis = (clamped * 1000.0) as u64;
+    std::time::Duration::from_millis(millis)
 }
 
 /// SUBSCRIBE payload is concatenated 16-byte routing IDs.

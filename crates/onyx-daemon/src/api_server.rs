@@ -621,7 +621,14 @@ async fn handle_invite_to_room(
     //    bytes (T6.3.h: pre-T6.3.h discarded the commit and silently
     //    broke 3+-party rooms). Existing-member commit distribution
     //    happens in step 9 below.
-    let (commit_bytes, welcome_bytes, snapshot, refreshed_members_b32, members_before) = {
+    let (
+        commit_bytes,
+        welcome_bytes,
+        snapshot,
+        refreshed_members_b32,
+        members_before,
+        old_epoch_token,
+    ) = {
         let party = state.mls_party.lock().await;
         let mut group = match party.load_group(&group_id_bytes) {
             Ok(Some(g)) => g,
@@ -638,6 +645,17 @@ async fn handle_invite_to_room(
                 };
             }
         };
+        // T-smoke fix: capture the OLD-epoch session token BEFORE
+        // invite() advances the group. Commits must route to the
+        // OLD token — existing members are subscribed to that;
+        // they don't have the new token's subscription yet because
+        // they haven't seen the commit. T6.3.g's session-token
+        // routing assumed sender + receiver always at the same
+        // epoch, which is false during a member-add transition.
+        let old_token = group
+            .export_routing_secret(&party)
+            .ok()
+            .map(|s| onyx_core::routing::session_token(&s, 0));
         // Capture the pre-invite roster — these are the members who
         // need the commit (the new joiner doesn't, they bootstrap
         // from the Welcome). We pull this BEFORE invite() so the
@@ -659,7 +677,7 @@ async fn handle_invite_to_room(
         // the recipient uses on join — keeps the cache shape
         // symmetric.
         let members = crate::members_b32_from_group(&group);
-        (commit, welcome, snap, members, members_before)
+        (commit, welcome, snap, members, members_before, old_token)
     };
 
     // 5. Persist post-invite MLS state and refresh the cached
@@ -821,6 +839,11 @@ async fn handle_invite_to_room(
             &pre_existing_members,
             state,
             "commit",
+            // T-smoke fix: route the commit to the OLD-epoch token
+            // because existing members are subscribed to that;
+            // they haven't seen the commit yet so they don't have
+            // the new token's subscription.
+            old_epoch_token,
         )
         .await;
     }
@@ -862,6 +885,13 @@ async fn handle_invite_to_room(
                     &pre_existing_members,
                     state,
                     "kem-ad",
+                    // KEM-ad rides on the NEW-epoch token; existing
+                    // members will have subscribed via
+                    // announce_room_subscribe after processing the
+                    // commit above. Hub queues by routing_id so if
+                    // the KEM-ad arrives before the subscribe, the
+                    // recipient drains it on next subscribe.
+                    None,
                 )
                 .await;
             }
@@ -920,18 +950,24 @@ async fn fanout_room_mls_bytes(
     members: &[String],
     state: &DaemonState,
     op_label: &'static str,
+    routing_target_override: Option<onyx_core::routing::RoutingId>,
 ) {
     let mut delivered_direct: u32 = 0;
     let mut delivered_hub: u32 = 0;
     let mut skipped_no_kem: u32 = 0;
-    // T6.3.g: compute the room's per-epoch session token ONCE — all
-    // hub-routed copies of this MLS payload go to the same inbox
-    // regardless of recipient. The hub sees one inbox per (room,
-    // epoch) rather than one per (room, member). On `None`
-    // (load/export failure), fall back to introduction-inbox-per-
-    // member routing so the message still flows — log it so an
-    // operator can investigate.
-    let room_target = compute_room_session_token(group_id_bytes, state).await;
+    // T6.3.g + T-smoke fix: compute the room's per-epoch session
+    // token ONCE — all hub-routed copies of this MLS payload go to
+    // the same inbox regardless of recipient. Override is used
+    // by handle_invite_to_room's commit fan-out, where the commit
+    // must route to the OLD-epoch token (existing members are
+    // subscribed to that; they haven't seen the commit yet so
+    // they don't have the new token's subscription). For app
+    // messages routed at the current epoch, override is None and
+    // we derive from the current group state.
+    let room_target = match routing_target_override {
+        Some(t) => Some(t),
+        None => compute_room_session_token(group_id_bytes, state).await,
+    };
     let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
         let reg = state.conversations.lock().await;
         members

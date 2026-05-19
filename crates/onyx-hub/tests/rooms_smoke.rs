@@ -40,7 +40,7 @@ use onyx_core::api::{
 };
 use onyx_core::crypto::Argon2Params;
 use onyx_core::storage::Vault;
-use onyx_hub::handler::hub_handle_connection;
+use onyx_hub::handler::hub_handle_connection_with_cover;
 use onyx_hub::state::HubState;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -55,6 +55,14 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Returns `(addr, hub_pub_b32)` — pass these into the daemon as
 /// `hub_tcp_addrs = [HubConfig { onion: addr, pubkey: hub_pub_b32 }]`.
 async fn spawn_hub() -> (String, String, TempDir) {
+    spawn_hub_with_cover(None).await
+}
+
+/// Variant that enables hub-side cover traffic with the given mean
+/// (Some(secs)) or no cover (None). Used by
+/// `rooms_e2e_hub_cover_traffic_does_not_break_flow` to prove the
+/// T-cover.hub emitter doesn't interfere with real messages.
+async fn spawn_hub_with_cover(cover_traffic_mean_secs: Option<u64>) -> (String, String, TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let vault_path = dir.path().join("hub-vault.db");
     let passphrase = b"smoke-hub-pass";
@@ -84,7 +92,13 @@ async fn spawn_hub() -> (String, String, TempDir) {
             let state = state.clone();
             let identity_sk = identity_sk.clone();
             tokio::spawn(async move {
-                let _ = hub_handle_connection(stream, identity_sk.identity_key(), state).await;
+                let _ = hub_handle_connection_with_cover(
+                    stream,
+                    identity_sk.identity_key(),
+                    state,
+                    cover_traffic_mean_secs,
+                )
+                .await;
             });
         }
     });
@@ -307,6 +321,321 @@ async fn rooms_e2e_alice_invites_bob_and_sends() {
     })
     .await;
     assert_eq!(event, "hello smoke room");
+}
+
+/// T-cover.hub: hub-side cover traffic must NOT interfere with the
+/// real flow. Runs the same 2-party room shape as
+/// `rooms_e2e_alice_invites_bob_and_sends`, but with the hub
+/// emitting FRAME_PAD frames at mean=1s per connection. The
+/// daemon's recipient path must silently swallow PAD frames in
+/// `handle_hub_delivery` and surface only real DELIVER bodies.
+///
+/// **Catches**: any regression where the daemon ingests cover
+/// frames as junk envelopes (would surface as
+/// `EnvelopeReplayGuard` accepting opaque bytes that fail
+/// `open_bootstrap` → debug-level drops). Or worse, where the
+/// PAD frame's empty payload makes it past the bucket check and
+/// confuses something downstream.
+#[tokio::test(flavor = "multi_thread")]
+async fn rooms_e2e_hub_cover_traffic_does_not_break_flow() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
+        .with_test_writer()
+        .try_init();
+
+    // Hub emits PAD frames at mean=1s per client. Over the ~3-4s
+    // smoke runtime, alice + bob each see roughly 3-4 PAD frames
+    // injected into their hub-session inbound stream.
+    let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub_with_cover(Some(1)).await;
+    let (alice_sock, _alice_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "alice_cv").await;
+    let (bob_sock, _bob_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "bob_cv").await;
+
+    let _ = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
+    let bob_id = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
+    let (bob_fp, bob_kem_b32) = match bob_id {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => (fingerprint, identity_kem_pub_b32),
+        other => panic!("bob Identity: {other:?}"),
+    };
+
+    let group_id_b32 = match one_shot(
+        &alice_sock,
+        &ApiRequest::CreateRoom {
+            name: "cover-room".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::CreateRoomOk { group_id_b32, .. } => group_id_b32,
+        other => panic!("CreateRoom: {other:?}"),
+    };
+
+    let bob_kp_b64 = match one_shot_until_ok(
+        &alice_sock,
+        &ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: bob_fp.clone(),
+        },
+        "fetch bob KP",
+    )
+    .await
+    {
+        ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+        other => panic!("fetch bob KP: {other:?}"),
+    };
+
+    let mut bob_tail = open_tail(&bob_sock).await;
+
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::InviteToRoom {
+            group_id_b32: group_id_b32.clone(),
+            peer_fingerprint: bob_fp,
+            peer_kem_pub_b32: bob_kem_b32,
+            peer_kp_b64: bob_kp_b64,
+        },
+    )
+    .await
+    {
+        ApiResponse::InviteToRoomOk { .. } => {}
+        other => panic!("InviteToRoom: {other:?}"),
+    }
+    let _ = wait_for_room_in_list(&bob_sock, &group_id_b32).await;
+
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::SendRoom {
+            group_id_b32: group_id_b32.clone(),
+            text: "hello despite cover traffic".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::SendRoomOk { .. } => {}
+        other => panic!("SendRoom: {other:?}"),
+    }
+
+    let expected_peer_short = format!("room/{}", &group_id_b32.chars().take(8).collect::<String>());
+    let event = wait_for_tail_event(&mut bob_tail, |e| match e {
+        ApiResponse::EventMessage {
+            peer_short,
+            direction: MessageDirection::Incoming,
+            text,
+            ..
+        } if *peer_short == expected_peer_short && text == "hello despite cover traffic" => {
+            Some(text.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(event, "hello despite cover traffic");
+}
+
+/// 3-party room flow: alice creates a room, invites bob, then
+/// invites carol. **Pins T6.3.h's commit-distribution bugfix on the
+/// wire** — pre-T6.3.h, when alice invited carol the commit she
+/// produced was discarded (only the Welcome was sent), so bob never
+/// advanced past epoch 1 and every subsequent room message would
+/// silently fail to decrypt for him. The MLS-unit test
+/// `three_party_room_commit_distribution` pinned the fix at the
+/// crypto layer; this test pins it at the wire layer — bob's
+/// daemon, on its own, must receive and process the commit alice
+/// fans out and then successfully decrypt a message alice sends
+/// post-carol-invite.
+#[tokio::test(flavor = "multi_thread")]
+async fn rooms_e2e_three_party_commit_distribution() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
+        .with_test_writer()
+        .try_init();
+
+    let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
+    let (alice_sock, _alice_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "alice3").await;
+    let (bob_sock, _bob_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "bob3").await;
+    let (carol_sock, _carol_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "carol3").await;
+
+    // Wait for all three to come up + publish KPs to the hub.
+    let _ = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
+    let bob_ident = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
+    let carol_ident = one_shot_until_ok(&carol_sock, &ApiRequest::Identity, "carol ready").await;
+    let (bob_fp, bob_kem_b32) = match bob_ident {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => (fingerprint, identity_kem_pub_b32),
+        other => panic!("bob Identity returned {other:?}"),
+    };
+    let (carol_fp, carol_kem_b32) = match carol_ident {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => (fingerprint, identity_kem_pub_b32),
+        other => panic!("carol Identity returned {other:?}"),
+    };
+
+    // alice creates the room.
+    let group_id_b32 = match one_shot(
+        &alice_sock,
+        &ApiRequest::CreateRoom {
+            name: "trio".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::CreateRoomOk { group_id_b32, .. } => group_id_b32,
+        other => panic!("CreateRoom: {other:?}"),
+    };
+
+    // alice fetches bob's KP, invites bob (solo → 2-party, no
+    // existing members need a commit). Subscribe to bob's tail
+    // BEFORE the invite so we don't miss anything.
+    let mut bob_tail = open_tail(&bob_sock).await;
+    let bob_kp_b64 = match one_shot_until_ok(
+        &alice_sock,
+        &ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: bob_fp.clone(),
+        },
+        "alice fetch bob KP",
+    )
+    .await
+    {
+        ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+        other => panic!("fetch bob KP: {other:?}"),
+    };
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::InviteToRoom {
+            group_id_b32: group_id_b32.clone(),
+            peer_fingerprint: bob_fp.clone(),
+            peer_kem_pub_b32: bob_kem_b32.clone(),
+            peer_kp_b64: bob_kp_b64,
+        },
+    )
+    .await
+    {
+        ApiResponse::InviteToRoomOk { .. } => {}
+        other => panic!("InviteToRoom (bob): {other:?}"),
+    }
+    // Bob's daemon must persist the room.
+    let bob_room = wait_for_room_in_list(&bob_sock, &group_id_b32).await;
+    assert_eq!(bob_room.members.len(), 2);
+
+    // alice fetches carol's KP, invites carol. This is the 2 → 3
+    // transition. **PRE-T6.3.h, the commit-fan-out for bob would
+    // have been silent-dropped** (or rather, not produced at all
+    // because invite() discarded the commit). Post-fix, bob's
+    // daemon must process the commit and advance his epoch.
+    let carol_kp_b64 = match one_shot_until_ok(
+        &alice_sock,
+        &ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: carol_fp.clone(),
+        },
+        "alice fetch carol KP",
+    )
+    .await
+    {
+        ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+        other => panic!("fetch carol KP: {other:?}"),
+    };
+    let mut carol_tail = open_tail(&carol_sock).await;
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::InviteToRoom {
+            group_id_b32: group_id_b32.clone(),
+            peer_fingerprint: carol_fp.clone(),
+            peer_kem_pub_b32: carol_kem_b32.clone(),
+            peer_kp_b64: carol_kp_b64,
+        },
+    )
+    .await
+    {
+        ApiResponse::InviteToRoomOk { ref members, .. } => {
+            assert_eq!(members.len(), 3, "post-invite roster must be 3");
+        }
+        other => panic!("InviteToRoom (carol): {other:?}"),
+    }
+
+    // Carol's daemon persists the room on Welcome.
+    let carol_room = wait_for_room_in_list(&carol_sock, &group_id_b32).await;
+    assert_eq!(carol_room.members.len(), 3);
+
+    // **Key bugfix check**: bob's daemon must have processed the
+    // commit and advanced his epoch — observable via his roster
+    // growing from 2 to 3. Pre-T6.3.h this would have stayed at 2
+    // and the test below would have failed silently when bob's
+    // decrypt fails.
+    let bob_room_post = poll_room_members(&bob_sock, &group_id_b32, 3).await;
+    assert_eq!(
+        bob_room_post.members.len(),
+        3,
+        "T6.3.h bugfix: bob's roster must reflect carol's add"
+    );
+
+    // alice sends an app message at the new (post-carol) epoch.
+    // BOTH bob and carol must decrypt it. Pre-T6.3.h, bob would
+    // silently fail.
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::SendRoom {
+            group_id_b32: group_id_b32.clone(),
+            text: "trio echo".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::SendRoomOk {
+            total_members,
+            delivered_to_hub,
+            ..
+        } => {
+            assert_eq!(total_members, 2);
+            assert_eq!(delivered_to_hub, 2, "expected hub delivery to bob + carol");
+        }
+        other => panic!("SendRoom: {other:?}"),
+    }
+
+    let expected_peer_short = format!("room/{}", &group_id_b32.chars().take(8).collect::<String>());
+    let pred = |e: &ApiResponse| match e {
+        ApiResponse::EventMessage {
+            peer_short,
+            direction: MessageDirection::Incoming,
+            text,
+            ..
+        } if *peer_short == expected_peer_short && text == "trio echo" => Some(text.clone()),
+        _ => None,
+    };
+    assert_eq!(wait_for_tail_event(&mut bob_tail, pred).await, "trio echo");
+    assert_eq!(
+        wait_for_tail_event(&mut carol_tail, pred).await,
+        "trio echo"
+    );
+}
+
+/// Poll `ListRooms` on the named daemon until the room's roster
+/// reaches at least `min_members`, or timeout. Used by the 3-party
+/// test to wait out bob's commit-merge → roster-refresh latency.
+async fn poll_room_members(socket: &Path, group_id_b32: &str, min_members: usize) -> RoomInfo {
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let resp = one_shot(socket, &ApiRequest::ListRooms).await;
+        if let ApiResponse::ListRoomsOk { rooms } = resp
+            && let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32)
+            && r.members.len() >= min_members
+        {
+            return r;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "room {group_id_b32} on {} never reached {min_members} members",
+                socket.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Subscribe to a daemon's `Tail` stream. Returns the open reader
