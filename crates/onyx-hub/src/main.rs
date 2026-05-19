@@ -41,7 +41,7 @@ use tracing::{Instrument, error, info, info_span, warn};
 use onyx_core::crypto::{IdentityPublic, IdentitySecret};
 
 use crate::handler::hub_handle_connection;
-use crate::state::{HubState, PeerHubConfig};
+use crate::state::{GossipMode, HubState, PeerHubConfig};
 
 mod handler;
 mod peer_link;
@@ -140,6 +140,19 @@ struct Args {
     /// behaviour. Per-hub operator-opt-in.
     #[arg(long = "peer-hub", action = clap::ArgAction::Append)]
     peer_hubs: Vec<String>,
+
+    /// Queue-gossip policy when federation is enabled (T8.3.c).
+    /// `lazy` (default) only forwards envelopes that we couldn't
+    /// deliver to a local subscriber — bandwidth-efficient for
+    /// star topologies. `eager` always forwards, giving stronger
+    /// eventual consistency across the mesh at ~3× bandwidth.
+    /// The recipient daemon's replay guard dedups any duplicates
+    /// at zero added complexity. FEDERATION.md §3.2 has the full
+    /// tradeoff.
+    ///
+    /// Ignored when no `--peer-hub` is configured.
+    #[arg(long, value_parser = ["lazy", "eager"], default_value = "lazy")]
+    gossip_mode: String,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -269,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
     // can fan out via state.fan_out_kp_to_peers(...).
     let mut peer_outbound_txs: std::collections::HashMap<
         [u8; 32],
-        tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::sync::mpsc::Sender<onyx_core::wire::InnerFrame>,
     > = std::collections::HashMap::new();
     if !args.peer_hubs.is_empty() {
         let our_hub_pubkey_bytes = identity.identity_key().public().to_bytes();
@@ -301,8 +314,9 @@ async fn main() -> anyhow::Result<()> {
             let pubkey_bytes = decode_b32_32(&cfg.pubkey).context("--peer-hub pubkey")?;
             let peer_pubkey = IdentityPublic::from_bytes(pubkey_bytes);
 
-            let (tx, rx) =
-                tokio::sync::mpsc::channel::<Vec<u8>>(crate::peer_link::PEER_OUTBOUND_CAPACITY);
+            let (tx, rx) = tokio::sync::mpsc::channel::<onyx_core::wire::InnerFrame>(
+                crate::peer_link::PEER_OUTBOUND_CAPACITY,
+            );
             peer_outbound_txs.insert(pubkey_bytes, tx);
             let tor_for_task = tor_arc.clone();
             let our_sk_for_task = our_sk.clone();
@@ -326,9 +340,15 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         state.set_peer_outbounds(peer_outbound_txs);
+        let mode = match args.gossip_mode.as_str() {
+            "eager" => GossipMode::Eager,
+            _ => GossipMode::Lazy,
+        };
+        state.set_gossip_mode(mode);
         info!(
             peer_count = args.peer_hubs.len(),
-            "T8.3.b.2: peer-hub federation enabled; KPs will be gossiped on client KP_PUBLISH"
+            ?mode,
+            "T8.3 federation enabled; KPs gossiped on client publish; envelopes gossiped per --gossip-mode"
         );
     }
 

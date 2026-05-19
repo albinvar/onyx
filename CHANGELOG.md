@@ -6,6 +6,76 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.c: queue gossip via `FRAME_GOSSIP_DELIVER` + `--gossip-mode lazy|eager`
+
+Fourth T8.3 implementation slice. T8.3.b.x landed KP gossip end-to-end; T8.3.c does the same for queued envelopes — when a client sends a DELIVER frame and either has no local subscriber or the operator opts into eager mode, the envelope rides the existing peer-hub Noise XK sessions to other hubs. The recipient daemon's existing T7.3-sec.2 replay guard handles cross-hub duplicates with zero new dedup logic. **Federation is now functionally complete for both KP-directory and offline-queue paths**; the remaining T8.3.d/e slices are loop-test hardening + docs.
+
+What landed:
+
+**T8.3.c.a — `GossipMode { Lazy, Eager }` enum.** `crates/onyx-hub/src/state.rs`. Default `Lazy`. Tradeoff captured in the type's rustdoc — lazy is bandwidth-efficient in star topologies but can fail in mesh topologies where subscribers are spread across hubs; eager is ~3× bandwidth but eventually consistent across the mesh. `set_gossip_mode` / `gossip_mode()` accessors.
+
+**T8.3.c.b — channel type refactor: `Sender<Vec<u8>>` → `Sender<InnerFrame>`.** Peer-hub outbound channels now carry already-wrapped `InnerFrame`s so the same channel can carry both `FRAME_GOSSIP_PUBLISH` (KPs) and `FRAME_GOSSIP_DELIVER` (envelopes) without losing frame-type discriminator at the channel layer. Touches `state.rs` (peer_outbounds type), `peer_link.rs` (drain InnerFrame directly, no wrapping in run_once), `main.rs` (channel type), and all four existing fan-out tests (assert `inner.frame_type` matches expected).
+
+**T8.3.c.c — envelope fan-out methods.** Mirror of the KP versions:
+  * `fan_out_envelope_to_peers(routing_id, envelope_bytes)` — origin path. Wraps in fresh `GossipFrame` (TTL=3, seen_by=our hash) and broadcasts to all peer channels as `FRAME_GOSSIP_DELIVER`.
+  * `fan_out_envelope_to_peers_except(source_pubkey, ttl_already_decremented, routing_id, envelope_bytes)` — forward path. Skips the source peer to avoid bouncing.
+
+**T8.3.c.d — `deliver_from_client`** wrapper around the existing `deliver(...)`. Calls deliver locally, then conditionally gossips per `GossipMode`:
+  * `Eager`: always gossip after delivery (regardless of local subscriber count).
+  * `Lazy`: gossip only when `delivered == 0` (no live subscriber accepted).
+
+Returns the same `delivered` count for caller logging.
+
+**T8.3.c.e — client `FRAME_DELIVER` handler uses `deliver_from_client`.** Single one-line swap in `handler.rs` so existing client behaviour gains federation transparently. No protocol change visible to clients.
+
+**T8.3.c.f — peer `FRAME_GOSSIP_DELIVER` handler.** New `handle_gossip_deliver` function. Algorithm:
+  1. Decode `GossipFrame`. Malformed → warn + drop.
+  2. Loop check (`seen_by == our hash`) → debug log + drop.
+  3. Call `state.deliver(routing_id, body)` — same code path as a client-origin DELIVER (live-deliver if any subscriber accepts; enqueue otherwise). Records the `delivered` count.
+  4. Read `state.gossip_mode()`.
+  5. Compute `new_ttl = ttl.saturating_sub(1)`.
+  6. Re-fanout to OTHER peers (source skip) if `new_ttl > 0 AND (mode == Eager OR delivered == 0)`. Same policy as the origin path — lazy mode doesn't propagate if we delivered locally; eager always propagates.
+
+Unlike KP gossip, we cannot validate the envelope body — it's AEAD-sealed under the recipient's hybrid KEM key. End-to-end integrity is enforced by the recipient daemon (`open_bootstrap` Ed25519 signature check + replay guard). A peer hub gossiping garbage envelope bytes just gets them silently dropped at the recipient.
+
+**T8.3.c.g — `--gossip-mode lazy|eager` flag.** New clap arg with `value_parser = ["lazy", "eager"]`, default `lazy`. Ignored when no `--peer-hub` is configured. main.rs parses to `GossipMode` and calls `state.set_gossip_mode(...)` immediately after `set_peer_outbounds`.
+
+**Two new state tests:**
+  * `deliver_from_client_lazy_only_gossips_when_no_local_sub` — exercises both code paths (no local sub → gossiped + queued; live sub → delivered locally, no gossip).
+  * `deliver_from_client_eager_always_gossips` — local subscriber receives, peer channel ALSO receives.
+
+End-to-end behavioural property (now true in code; integration test needs the duplex-pair scaffolding deferred to T8.3.d):
+  * Alice's daemon sends DELIVER for routing-id X to hub A (where bob doesn't subscribe).
+  * Hub A's `deliver_from_client` enqueues locally (no subscriber), then gossips `FRAME_GOSSIP_DELIVER` to peer hub B.
+  * Hub B's `serve_peer_frames` receives the gossip, calls `deliver(X, body)`. Bob is subscribed on B → live delivery → bob's daemon receives.
+  * If bob ever later connects to A, A's queue still has the envelope; recipient's T7.3-sec.2 replay guard dedups so bob sees exactly one message.
+
+Security and posture deltas:
+
+  * **No new attack surface beyond T8.3.b.4.** Envelope gossip uses the same peer-hub authenticated channel that KP gossip already used. The body is opaque AEAD ciphertext; the hub can't decrypt, the gossip path can't expose plaintext.
+  * **No new dedup primitive at the recipient.** The same `EnvelopeReplayGuard` (T7.3-sec.2) that catches replays and multi-hub-fan-out duplicates catches gossip duplicates byte-for-byte. The elegant property keeps paying for itself.
+  * **Lazy mode failure mode**: a hub that has *any* local subscriber for the routing-id swallows the gossip and never propagates. If subscribers are spread across hubs, only some receive. Documented in the `GossipMode` rustdoc. Operators wanting strong eventual consistency set `--gossip-mode eager`.
+  * **Eager mode bandwidth**: roughly N× where N is the peer-hub count. For a typical operator-mesh of ≤3-5 peer hubs, the multiplier is modest. The recipient's replay guard means duplicates cost zero application-layer work; the cost is purely hub-to-hub bandwidth.
+  * **Source-skip on re-fanout**: same as KP path. Prevents trivial A→B→A ping-pong. TTL=3 default caps worst-case propagation depth.
+
+What this did NOT do:
+
+  * Did not add the 3-hub triangle loop test (T8.3.d).
+  * Did not write an end-to-end two-hub integration test using `tokio::io::duplex` — needs hub-handle-connection rework to permit test-mode Noise handshake. Property is verified at the unit-test level via the `deliver_from_client_*` tests + the existing `fan_out_*` tests.
+  * Did not update `FEDERATION.md` with implementation notes — that goes in T8.3.e (final docs slice).
+  * Did not add a peer-hub-specific rate limit. Peer-hub bandwidth is operator-bounded by `--peer-hub` count + the existing per-connection token bucket on client conns. A per-peer-hub bucket is a reasonable follow-up if measured needed.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (one `needless_pass_by_value` cleanup on `broadcast_to_peers` — `InnerFrame` → `&InnerFrame`, callers pass `&frame`), `cargo test --workspace` **309 passed / 0 failed** (was 307; +2 new `deliver_from_client_*` mode tests).
+
+**Federation status after T8.3.c:**
+  * KP gossip: ✅ end-to-end (T8.3.b.x)
+  * Envelope gossip: ✅ end-to-end (T8.3.c)
+  * Loop prevention: ✅ seen_by + TTL=3 (mechanism in place; 3-hub loop test deferred to T8.3.d)
+  * Operator opt-in: ✅ `--peer-hub` + `--gossip-mode`
+  * Threat-model carry-forwards: ⏳ written up; needs THREAT_MODEL.md update in T8.3.e
+
+---
+
 ## 2026-05-19 — T8.3.b.4: inbound peer-hub recognition + gossip receive/re-fanout
 
 Third T8.3 implementation slice. T8.3.b.1 added the wire format; T8.3.b.2+.3 added the outbound side (we emit gossip). This slice adds the **inbound** side — the hub now recognises peer-hub sessions by their authenticated Noise pubkey and processes `FRAME_GOSSIP_PUBLISH` frames received from them. **KP gossip is now end-to-end functional**: a client publishing a KP on hub A causes the KP to appear in hub B's directory, given an `--peer-hub` link between them.

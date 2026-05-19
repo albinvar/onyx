@@ -9,8 +9,8 @@ use std::sync::Arc;
 use onyx_core::crypto::IdentitySecret;
 use onyx_core::transport::{Session, handshake_responder, read_frame, write_frame};
 use onyx_core::wire::{
-    FRAME_DELIVER, FRAME_GOSSIP_PUBLISH, FRAME_KP_FETCH, FRAME_KP_PUBLISH, FRAME_KP_RESPONSE,
-    FRAME_SUBSCRIBE, GossipFrame, InnerFrame,
+    FRAME_DELIVER, FRAME_GOSSIP_DELIVER, FRAME_GOSSIP_PUBLISH, FRAME_KP_FETCH, FRAME_KP_PUBLISH,
+    FRAME_KP_RESPONSE, FRAME_SUBSCRIBE, GossipFrame, InnerFrame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
@@ -111,6 +111,9 @@ where
             FRAME_GOSSIP_PUBLISH => {
                 handle_gossip_publish(&frame.payload, state, source_pubkey).await;
             }
+            FRAME_GOSSIP_DELIVER => {
+                handle_gossip_deliver(&frame.payload, state, source_pubkey).await;
+            }
             other => {
                 warn!(
                     frame_type = format!("{other:#x}"),
@@ -200,6 +203,77 @@ async fn handle_gossip_publish(
     }
 }
 
+/// Process one inbound `FRAME_GOSSIP_DELIVER` from a peer hub
+/// (T8.3.c). Decodes, drops on loop or expired TTL, delivers the
+/// envelope locally (which may live-deliver to subscribers OR
+/// enqueue, same semantics as a client-origin DELIVER), and
+/// conditionally re-fans-out to OTHER peer hubs.
+///
+/// Re-fanout policy per [`GossipMode`]:
+///   * `Eager`: always forward (when TTL allows).
+///   * `Lazy`: forward only when we couldn't deliver locally
+///     (i.e., no live subscriber for the routing id).
+///
+/// Unlike KP gossip, we cannot validate the envelope body — it's
+/// AEAD-sealed under the recipient's hybrid KEM key and the hub
+/// has no decryption capability. End-to-end integrity is enforced
+/// by the recipient daemon via `open_bootstrap` (Ed25519 sig over
+/// canonical bytes) and the replay guard (T7.3-sec.2). A peer hub
+/// that gossips garbage envelope bytes just gets them silently
+/// dropped at the recipient daemon, the same as a client gossiping
+/// garbage. No new defense needed at this layer.
+async fn handle_gossip_deliver(
+    payload: &[u8],
+    state: &Arc<Mutex<HubState>>,
+    source_pubkey: &[u8; 32],
+) {
+    let Ok(frame) = GossipFrame::decode(payload) else {
+        warn!("hub: peer-hub gossip envelope did not decode; dropping");
+        return;
+    };
+
+    // Loop check: dropping a frame we already forwarded keeps the
+    // mesh from amplifying. Same logic as the KP path.
+    {
+        let s = state.lock().await;
+        if frame.seen_by == s.self_hub_hash_for_test() {
+            tracing::debug!("hub: gossip envelope loop detected; dropping");
+            return;
+        }
+    }
+
+    // Deliver locally. The deliver() method tries live subscribers
+    // first; falls back to queueing when none accept. We bypass
+    // `deliver_from_client` here because that would gossip back
+    // out (it doesn't know about source-skip); we manually handle
+    // the re-fanout below with the source skip.
+    let (delivered, mode) = {
+        let mut s = state.lock().await;
+        let d = s.deliver(frame.routing_id, frame.body.clone());
+        (d, s.gossip_mode())
+    };
+    tracing::info!(
+        live_subscribers = delivered,
+        ttl = frame.ttl,
+        ?mode,
+        "hub: gossiped envelope delivered locally"
+    );
+
+    // Re-fanout to OTHER peers under the same policy as origin:
+    // - Eager: always forward.
+    // - Lazy: forward only when we couldn't deliver locally.
+    let new_ttl = frame.ttl.saturating_sub(1);
+    let should_forward = new_ttl > 0
+        && match mode {
+            crate::state::GossipMode::Eager => true,
+            crate::state::GossipMode::Lazy => delivered == 0,
+        };
+    if should_forward {
+        let s = state.lock().await;
+        s.fan_out_envelope_to_peers_except(source_pubkey, new_ttl, frame.routing_id, &frame.body);
+    }
+}
+
 // `serve_frames` is one linear `select!`-loop dispatcher; the body is
 // long because each branch handles a complete protocol verb inline.
 // Splitting per-verb helpers would just rename code into call sites
@@ -266,9 +340,14 @@ where
                         // *which* of their subscriptions matched. The
                         // recipient strips the prefix before decrypting.
                         let target = parse_target_prefix(&frame.payload)?;
+                        // T8.3.c: use deliver_from_client so federation
+                        // gossip happens per the configured GossipMode
+                        // (lazy = forward only when no local subscriber;
+                        // eager = always forward). No-op when no
+                        // --peer-hub is configured.
                         let delivered = {
                             let mut s = state.lock().await;
-                            s.deliver(target, frame.payload)
+                            s.deliver_from_client(target, frame.payload)
                         };
                         info!(
                             conn = conn_id,

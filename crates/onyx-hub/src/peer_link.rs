@@ -39,7 +39,7 @@ use anyhow::Context;
 use onyx_core::crypto::{IdentityPublic, IdentitySecret};
 use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{handshake_initiator, write_frame};
-use onyx_core::wire::{FRAME_GOSSIP_PUBLISH, InnerFrame};
+use onyx_core::wire::InnerFrame;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -64,7 +64,7 @@ pub async fn run_peer_session(
     port: u16,
     peer_pubkey: IdentityPublic,
     our_sk: Arc<IdentitySecret>,
-    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
+    mut outbound_rx: mpsc::Receiver<InnerFrame>,
 ) -> anyhow::Result<()> {
     let mut backoff = BACKOFF_INITIAL;
     loop {
@@ -100,7 +100,7 @@ async fn run_once(
     port: u16,
     peer_pubkey: &IdentityPublic,
     our_sk: &IdentitySecret,
-    outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
+    outbound_rx: &mut mpsc::Receiver<InnerFrame>,
 ) -> anyhow::Result<()> {
     info!(host, port, "peer-hub: dialing");
     let mut stream = tor
@@ -119,11 +119,7 @@ async fn run_once(
         port, "peer-hub: Noise XK complete; draining outbound gossip queue"
     );
 
-    while let Some(payload) = outbound_rx.recv().await {
-        let frame = InnerFrame {
-            frame_type: FRAME_GOSSIP_PUBLISH,
-            payload,
-        };
+    while let Some(frame) = outbound_rx.recv().await {
         write_frame(&mut stream, &mut session, &frame)
             .await
             .context("peer-hub: write_frame")?;

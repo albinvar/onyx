@@ -21,12 +21,41 @@
 use std::collections::{HashMap, HashSet};
 
 use onyx_core::crypto::blake2b_128;
-use onyx_core::wire::{GOSSIP_SEEN_BY_LEN, GossipFrame};
+use onyx_core::wire::{
+    FRAME_GOSSIP_DELIVER, FRAME_GOSSIP_PUBLISH, GOSSIP_SEEN_BY_LEN, GossipFrame, InnerFrame,
+};
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::rate_limit::RateLimiter;
 use crate::store::Store;
+
+/// Queue-gossip policy (T8.3.c). Controls when this hub forwards
+/// an envelope it has just received (from a client or from a peer
+/// hub) to its other peer hubs.
+///
+///   * `Lazy` (default): forward only when the envelope could NOT
+///     be delivered to a local subscriber. Minimal bandwidth;
+///     works well when most users subscribe to the same hub
+///     (typical small deployment). May fail in mesh topologies
+///     where subscribers are spread across peer hubs — a hub that
+///     happens to have ANY local subscriber for the routing-id
+///     swallows the gossip and never tells the peer hubs the
+///     other subscribers are on.
+///   * `Eager`: forward to every peer hub regardless of local
+///     delivery. Stronger eventual consistency at ~3× bandwidth.
+///     The recipient daemon's `EnvelopeReplayGuard` (T7.3-sec.2)
+///     dedups any duplicate arrivals at zero added complexity.
+///
+/// FEDERATION.md §3.2 has the full tradeoff analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GossipMode {
+    /// Forward only when not delivered locally. Default.
+    #[default]
+    Lazy,
+    /// Forward to all peers regardless of local delivery.
+    Eager,
+}
 
 /// Configuration for one peer hub the operator wants this hub to
 /// federate with (T8.3). Each entry produces one outbound Noise XK
@@ -102,7 +131,7 @@ pub struct HubState {
     /// to avoid bouncing the frame back where it came from.
     ///
     /// Empty HashMap when no `--peer-hub` is configured.
-    peer_outbounds: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>,
+    peer_outbounds: HashMap<[u8; 32], mpsc::Sender<InnerFrame>>,
     /// Low 16 bytes of BLAKE2b-128 of our own hub identity pubkey
     /// (T8.3.b.2+). Used as the `seen_by` value when we originate
     /// or forward a gossip frame so peer hubs can detect loops
@@ -111,6 +140,9 @@ pub struct HubState {
     /// existing tests that don't enable federation don't have to
     /// supply a value.
     self_hub_hash: [u8; GOSSIP_SEEN_BY_LEN],
+    /// Queue-gossip policy (T8.3.c). Default `Lazy`. See
+    /// [`GossipMode`] for the tradeoff.
+    gossip_mode: GossipMode,
 }
 
 impl HubState {
@@ -166,7 +198,10 @@ impl HubState {
     /// Install the per-peer-hub outbound channels (T8.3.b.2+),
     /// keyed by the peer hub's X25519 identity pubkey. Empty
     /// HashMap (the default) disables federation entirely.
-    pub fn set_peer_outbounds(&mut self, peer_outbounds: HashMap<[u8; 32], mpsc::Sender<Vec<u8>>>) {
+    pub fn set_peer_outbounds(
+        &mut self,
+        peer_outbounds: HashMap<[u8; 32], mpsc::Sender<InnerFrame>>,
+    ) {
         self.peer_outbounds = peer_outbounds;
     }
 
@@ -194,6 +229,20 @@ impl HubState {
         self.self_hub_hash = hash;
     }
 
+    /// Set the queue-gossip policy (T8.3.c). Default at construct
+    /// is `Lazy`.
+    pub fn set_gossip_mode(&mut self, mode: GossipMode) {
+        self.gossip_mode = mode;
+    }
+
+    /// Current queue-gossip policy. Read by `deliver_from_client`
+    /// and the inbound `handle_gossip_deliver` path to decide
+    /// whether to re-fanout.
+    #[must_use]
+    pub fn gossip_mode(&self) -> GossipMode {
+        self.gossip_mode
+    }
+
     /// Build a [`blake2b_128`] hash of the given hub pubkey and
     /// return its low 16 bytes — the canonical `seen_by` value for
     /// gossip frames originating from / forwarded by that hub.
@@ -206,24 +255,18 @@ impl HubState {
     /// Fan out a freshly-validated KeyPackage to every configured
     /// peer hub (T8.3.b.3). Wraps the KP in a fresh `GossipFrame`
     /// at TTL=`GOSSIP_TTL_DEFAULT` with `seen_by` = our hash,
-    /// encodes, and `try_send`s the bytes to each peer-hub outbound
-    /// channel. Best-effort: a full channel drops the gossip for
-    /// that peer, but the local store + the other peers still
-    /// succeed.
-    ///
-    /// Use this for KPs received from local clients (the fresh-
-    /// origination case). For KPs received via gossip from a peer,
-    /// use [`Self::fan_out_kp_to_peers_except`] with the source
-    /// pubkey + the forwarded TTL to avoid bouncing back.
-    ///
-    /// No-op when `peer_outbounds` is empty (no federation).
+    /// encodes, and `try_send`s a `FRAME_GOSSIP_PUBLISH` InnerFrame
+    /// to each peer-hub outbound channel.
     pub fn fan_out_kp_to_peers(&self, routing_id: RoutingId, kp_bytes: &[u8]) {
         if self.peer_outbounds.is_empty() {
             return;
         }
-        let frame = GossipFrame::new(self.self_hub_hash, routing_id, kp_bytes.to_vec());
-        let payload = frame.encode();
-        self.broadcast_to_peers(&payload, None, "gossip KP (origin)");
+        let gossip = GossipFrame::new(self.self_hub_hash, routing_id, kp_bytes.to_vec());
+        let frame = InnerFrame {
+            frame_type: FRAME_GOSSIP_PUBLISH,
+            payload: gossip.encode(),
+        };
+        self.broadcast_to_peers(&frame, None, "gossip KP (origin)");
     }
 
     /// Fan out a gossip-forwarded KeyPackage to every configured
@@ -246,26 +289,29 @@ impl HubState {
         if self.peer_outbounds.is_empty() {
             return;
         }
-        let frame = GossipFrame {
+        let gossip = GossipFrame {
             ttl: ttl_already_decremented,
             seen_by: self.self_hub_hash,
             routing_id,
             body: kp_bytes.to_vec(),
         };
-        let payload = frame.encode();
-        self.broadcast_to_peers(&payload, Some(source_pubkey), "gossip KP (forward)");
+        let frame = InnerFrame {
+            frame_type: FRAME_GOSSIP_PUBLISH,
+            payload: gossip.encode(),
+        };
+        self.broadcast_to_peers(&frame, Some(source_pubkey), "gossip KP (forward)");
     }
 
     /// Internal: send the pre-encoded gossip payload to every peer
     /// outbound channel, optionally skipping one source pubkey.
-    fn broadcast_to_peers(&self, payload: &[u8], skip: Option<&[u8; 32]>, op: &'static str) {
+    fn broadcast_to_peers(&self, frame: &InnerFrame, skip: Option<&[u8; 32]>, op: &'static str) {
         let mut accepted = 0usize;
         let total = self.peer_outbounds.len();
         for (pk, tx) in &self.peer_outbounds {
             if Some(pk) == skip {
                 continue;
             }
-            match tx.try_send(payload.to_owned()) {
+            match tx.try_send(frame.clone()) {
                 Ok(()) => accepted += 1,
                 Err(e) => warn!(
                     peer_pk_prefix = format!("{:02x}{:02x}{:02x}{:02x}", pk[0], pk[1], pk[2], pk[3]),
@@ -369,6 +415,84 @@ impl HubState {
                 warn!(error = %e, "hub store: enqueue failed (in-memory queue still consistent)");
             }
         }
+    }
+
+    /// T8.3.c: deliver an envelope received from a local client,
+    /// then conditionally gossip it to peer hubs per the configured
+    /// `GossipMode`.
+    ///
+    ///   * `Eager`: always gossip after delivery (regardless of
+    ///     local subscribe count). Higher bandwidth, stronger
+    ///     eventual consistency across the mesh.
+    ///   * `Lazy` (default): only gossip when the envelope wasn't
+    ///     delivered to any local subscriber (`delivered == 0`).
+    ///     Bandwidth-efficient for star topologies where most
+    ///     users subscribe to the same hub.
+    ///
+    /// Returns the same `delivered` count as [`Self::deliver`] so
+    /// the caller can log the live-subscriber result.
+    pub fn deliver_from_client(&mut self, target: RoutingId, payload: Vec<u8>) -> usize {
+        let payload_for_gossip = payload.clone();
+        let delivered = self.deliver(target, payload);
+        let should_gossip = match self.gossip_mode {
+            GossipMode::Eager => true,
+            GossipMode::Lazy => delivered == 0,
+        };
+        if should_gossip {
+            self.fan_out_envelope_to_peers(target, &payload_for_gossip);
+        }
+        delivered
+    }
+
+    /// Fan out a freshly-received envelope to every configured
+    /// peer hub (T8.3.c origin path). Wraps the envelope in a
+    /// fresh `GossipFrame` at TTL=`GOSSIP_TTL_DEFAULT` with
+    /// `seen_by` = our hash, encodes as a `FRAME_GOSSIP_DELIVER`
+    /// payload, `try_send`s to each peer-hub outbound channel.
+    ///
+    /// Same best-effort semantics as KP fan-out: a full channel
+    /// drops the gossip for that peer; the local store + other
+    /// peers still succeed.
+    ///
+    /// No-op when `peer_outbounds` is empty (no federation).
+    pub fn fan_out_envelope_to_peers(&self, routing_id: RoutingId, envelope_bytes: &[u8]) {
+        if self.peer_outbounds.is_empty() {
+            return;
+        }
+        let gossip = GossipFrame::new(self.self_hub_hash, routing_id, envelope_bytes.to_vec());
+        let frame = InnerFrame {
+            frame_type: FRAME_GOSSIP_DELIVER,
+            payload: gossip.encode(),
+        };
+        self.broadcast_to_peers(&frame, None, "gossip envelope (origin)");
+    }
+
+    /// Fan out a gossip-forwarded envelope to every configured peer
+    /// hub EXCEPT the source (T8.3.c forward path). Mirror of
+    /// [`Self::fan_out_kp_to_peers_except`]. `ttl_already_decremented`
+    /// is the TTL the caller wants on the outgoing frame (already
+    /// reduced by `GossipFrame::forward`).
+    pub fn fan_out_envelope_to_peers_except(
+        &self,
+        source_pubkey: &[u8; 32],
+        ttl_already_decremented: u8,
+        routing_id: RoutingId,
+        envelope_bytes: &[u8],
+    ) {
+        if self.peer_outbounds.is_empty() {
+            return;
+        }
+        let gossip = GossipFrame {
+            ttl: ttl_already_decremented,
+            seen_by: self.self_hub_hash,
+            routing_id,
+            body: envelope_bytes.to_vec(),
+        };
+        let frame = InnerFrame {
+            frame_type: FRAME_GOSSIP_DELIVER,
+            payload: gossip.encode(),
+        };
+        self.broadcast_to_peers(&frame, Some(source_pubkey), "gossip envelope (forward)");
     }
 
     /// Remove a connection and all its subscriptions.
@@ -668,8 +792,8 @@ mod tests {
     /// encoded GossipFrame payload to every peer channel.
     #[tokio::test]
     async fn fan_out_kp_to_peers_pushes_to_all_peers() {
-        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(8);
-        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_a, mut rx_a) = mpsc::channel::<InnerFrame>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<InnerFrame>(8);
         let mut state = HubState::new();
         state.set_self_hub_hash([0xAA; 16]);
         let mut peers = HashMap::new();
@@ -681,16 +805,17 @@ mod tests {
         let kp = b"opaque kp bytes".to_vec();
         state.fan_out_kp_to_peers(rid, &kp);
 
-        // Each peer received one frame.
-        let bytes_a = rx_a.recv().await.expect("peer A received");
-        let bytes_b = rx_b.recv().await.expect("peer B received");
+        // Each peer received one InnerFrame.
+        let inner_a = rx_a.recv().await.expect("peer A received");
+        let inner_b = rx_b.recv().await.expect("peer B received");
 
-        // Same payload to both — fan-out, not per-peer customisation.
-        assert_eq!(bytes_a, bytes_b);
+        // Same wrapper to both — fan-out, not per-peer customisation.
+        assert_eq!(inner_a, inner_b);
+        assert_eq!(inner_a.frame_type, FRAME_GOSSIP_PUBLISH);
 
-        // Decode and inspect.
-        let frame = onyx_core::wire::GossipFrame::decode(&bytes_a)
-            .expect("payload is a well-formed gossip frame");
+        // Decode the inner GossipFrame and inspect.
+        let frame =
+            GossipFrame::decode(&inner_a.payload).expect("payload is a well-formed gossip frame");
         assert_eq!(
             frame.ttl,
             onyx_core::wire::GOSSIP_TTL_DEFAULT,
@@ -706,12 +831,15 @@ mod tests {
     /// here directly) is unaffected by the fan-out's behaviour.
     #[tokio::test]
     async fn fan_out_kp_to_peers_full_channel_only_drops_that_peer() {
-        let (tx_full, _rx_full_never_read) = mpsc::channel::<Vec<u8>>(1);
-        let (tx_open, mut rx_open) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_full, _rx_full_never_read) = mpsc::channel::<InnerFrame>(1);
+        let (tx_open, mut rx_open) = mpsc::channel::<InnerFrame>(8);
 
         // Pre-fill the "full" channel so the next try_send fails.
         tx_full
-            .try_send(b"pre-fill".to_vec())
+            .try_send(InnerFrame {
+                frame_type: 0x99,
+                payload: b"pre-fill".to_vec(),
+            })
             .expect("seed full channel");
 
         let mut state = HubState::new();
@@ -725,8 +853,9 @@ mod tests {
         state.fan_out_kp_to_peers([0x22; 16], b"kp");
 
         // The open channel got the gossip.
-        let bytes = rx_open.recv().await.expect("open peer received");
-        let frame = onyx_core::wire::GossipFrame::decode(&bytes).unwrap();
+        let inner = rx_open.recv().await.expect("open peer received");
+        assert_eq!(inner.frame_type, FRAME_GOSSIP_PUBLISH);
+        let frame = GossipFrame::decode(&inner.payload).unwrap();
         assert_eq!(frame.routing_id, [0x22; 16]);
     }
 
@@ -734,7 +863,7 @@ mod tests {
     /// peer pubkeys return true; anything else returns false.
     #[tokio::test]
     async fn is_peer_hub_recognises_configured_pubkeys() {
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        let (tx, _rx) = mpsc::channel::<InnerFrame>(8);
         let mut state = HubState::new();
         let mut peers = HashMap::new();
         peers.insert([0x77; 32], tx);
@@ -752,9 +881,9 @@ mod tests {
     /// peer's channel receives the forwarded frame.
     #[tokio::test]
     async fn fan_out_except_skips_source() {
-        let (tx_src, mut rx_src) = mpsc::channel::<Vec<u8>>(8);
-        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(8);
-        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_src, mut rx_src) = mpsc::channel::<InnerFrame>(8);
+        let (tx_a, mut rx_a) = mpsc::channel::<InnerFrame>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<InnerFrame>(8);
 
         let mut state = HubState::new();
         state.set_self_hub_hash([0xEE; 16]);
@@ -774,15 +903,77 @@ mod tests {
         );
 
         // Other two peers got the gossip.
-        let bytes_a = rx_a.recv().await.expect("peer A received");
-        let bytes_b = rx_b.recv().await.expect("peer B received");
-        assert_eq!(bytes_a, bytes_b);
+        let inner_a = rx_a.recv().await.expect("peer A received");
+        let inner_b = rx_b.recv().await.expect("peer B received");
+        assert_eq!(inner_a, inner_b);
+        assert_eq!(inner_a.frame_type, FRAME_GOSSIP_PUBLISH);
 
-        let frame = onyx_core::wire::GossipFrame::decode(&bytes_a).unwrap();
+        let frame = GossipFrame::decode(&inner_a.payload).unwrap();
         assert_eq!(frame.ttl, 2, "forwarded TTL preserved verbatim");
         assert_eq!(frame.seen_by, [0xEE; 16], "seen_by = OUR hash (rewritten)");
         assert_eq!(frame.routing_id, [0x33; 16]);
         assert_eq!(frame.body, b"forwarded kp");
+    }
+
+    /// T8.3.c lazy mode: deliver_from_client gossips ONLY when the
+    /// envelope wasn't delivered to a local subscriber.
+    #[tokio::test]
+    async fn deliver_from_client_lazy_only_gossips_when_no_local_sub() {
+        let (tx_peer, mut rx_peer) = mpsc::channel::<InnerFrame>(8);
+        let mut state = HubState::new();
+        state.set_self_hub_hash([0x99; 16]);
+        let mut peers = HashMap::new();
+        peers.insert([0xDE; 32], tx_peer);
+        state.set_peer_outbounds(peers);
+        // Default mode is Lazy; no explicit set_gossip_mode call needed.
+        assert_eq!(state.gossip_mode(), GossipMode::Lazy);
+
+        // Path 1: no local subscriber → envelope queued AND gossiped.
+        state.deliver_from_client([0xA0; 16], b"queued envelope".to_vec());
+        let inner = rx_peer.recv().await.expect("lazy mode gossiped");
+        assert_eq!(inner.frame_type, FRAME_GOSSIP_DELIVER);
+        let frame = GossipFrame::decode(&inner.payload).unwrap();
+        assert_eq!(frame.routing_id, [0xA0; 16]);
+        assert_eq!(frame.body, b"queued envelope");
+
+        // Path 2: live subscriber present → envelope delivered locally
+        // and NOT gossiped (lazy).
+        let (sub_tx, _sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let conn = state.register_conn(sub_tx);
+        state.subscribe(conn, &[[0xB0; 16]]);
+        state.deliver_from_client([0xB0; 16], b"live-delivered".to_vec());
+        assert!(
+            rx_peer.try_recv().is_err(),
+            "lazy mode must NOT gossip when local subscriber accepted"
+        );
+    }
+
+    /// T8.3.c eager mode: deliver_from_client always gossips, even
+    /// when a local subscriber accepted.
+    #[tokio::test]
+    async fn deliver_from_client_eager_always_gossips() {
+        let (tx_peer, mut rx_peer) = mpsc::channel::<InnerFrame>(8);
+        let mut state = HubState::new();
+        state.set_self_hub_hash([0x88; 16]);
+        let mut peers = HashMap::new();
+        peers.insert([0xAD; 32], tx_peer);
+        state.set_peer_outbounds(peers);
+        state.set_gossip_mode(GossipMode::Eager);
+        assert_eq!(state.gossip_mode(), GossipMode::Eager);
+
+        // Add a local subscriber so the envelope IS delivered locally;
+        // eager mode should still gossip.
+        let (sub_tx, mut sub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let conn = state.register_conn(sub_tx);
+        state.subscribe(conn, &[[0xC0; 16]]);
+        state.deliver_from_client([0xC0; 16], b"eager-tier".to_vec());
+
+        // Local subscriber got it.
+        let local = sub_rx.recv().await.expect("local subscriber received");
+        assert_eq!(local, b"eager-tier");
+        // Peer ALSO got the gossip (eager).
+        let inner = rx_peer.recv().await.expect("eager mode gossiped");
+        assert_eq!(inner.frame_type, FRAME_GOSSIP_DELIVER);
     }
 
     /// `hub_pubkey_to_hash` is a stable function of its input;
