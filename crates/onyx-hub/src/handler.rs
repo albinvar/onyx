@@ -217,6 +217,15 @@ where
 
                         let dir_size = {
                             let mut s = state.lock().await;
+                            // T8.3.b.3: gossip the validated KP to
+                            // every configured peer hub BEFORE the
+                            // local publish consumes kp_bytes. No-op
+                            // when no peer hubs configured. Best-
+                            // effort (full peer-outbound channel →
+                            // dropped for that peer; the recipient's
+                            // replay guard would have dedup'd
+                            // anyway if it arrived twice).
+                            s.fan_out_kp_to_peers(routing_id, &kp_bytes);
                             s.publish_keypackage(routing_id, kp_bytes);
                             s.keypackage_count()
                         };

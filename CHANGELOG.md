@@ -6,6 +6,70 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.b.2 + T8.3.b.3: `--peer-hub` flag, outbound Noise XK sessions, KP fan-out on client publish
+
+Second implementation slice for T8.3 (hub federation). T8.3.b.1 added the wire format; this slice adds the runtime plumbing that **emits** gossip frames. The hub now opens an outbound Noise XK session per `--peer-hub` and fans out every validated client `FRAME_KP_PUBLISH` to those peer hubs as `FRAME_GOSSIP_PUBLISH`. **The inbound side (T8.3.b.4) is intentionally deferred** — a peer hub receiving our gossip today would drop the frame as "unknown frame type" (existing default). The slice is bounded so the outbound lifecycle can be reviewed before adding receive complexity.
+
+What landed:
+
+**T8.3.b.2.a — `--peer-hub` flag + `PeerHubConfig` type.** `crates/onyx-hub/src/state.rs` exposes `PeerHubConfig { onion, pubkey }`. `crates/onyx-hub/src/main.rs` has a new repeatable `--peer-hub onion:port,b32pubkey` clap arg. Parse with the same shape as the daemon's `--hub` flag (split on `,`, validate non-empty). Default = empty Vec → no federation, byte-identical pre-T8.3 behaviour.
+
+**T8.3.b.2.b — `HubState` fan-out state.** Two new fields:
+  * `peer_outbounds: Vec<mpsc::Sender<Vec<u8>>>` — one per peer hub. Each sender carries pre-encoded `GossipFrame` payloads; the corresponding receiver is drained by a `peer_link::run_peer_session` task that writes `FRAME_GOSSIP_PUBLISH` to the peer's wire.
+  * `self_hub_hash: [u8; 16]` — low 128 bits of `BLAKE2b-128(our_hub_pubkey)`. Used as the `seen_by` value when we originate a gossip frame (and, eventually in T8.3.b.4, the loop-check value we compare against when receiving).
+
+Builders: `set_peer_outbounds(...)`, `set_self_hub_hash(...)`. Convenience: `HubState::hub_pubkey_to_hash(&[u8; 32]) -> [u8; 16]` (stateless; both originator and receiver compute it the same way).
+
+**T8.3.b.2.c — `peer_link.rs` module.** Stripped-down counterpart to the daemon's `hub_client.rs`. ~125 lines. Public surface:
+  * `PEER_OUTBOUND_CAPACITY = 256` — bounded mailbox per peer.
+  * `run_peer_session(tor, host, port, peer_pubkey, our_sk, outbound_rx) -> anyhow::Result<()>` — drives one outbound forever. Dials the peer's onion, runs Noise XK as initiator with our hub identity + the peer's authenticated pubkey, drains the mpsc, wraps each payload in `InnerFrame { frame_type: FRAME_GOSSIP_PUBLISH, payload }`, writes on the wire. Reconnects with exponential backoff (500ms → 30s) on any per-session error. Returns `Ok(())` only when the receiver closes (clean shutdown signal from the parent task).
+
+What this task **does not** do (documented in the module rustdoc + flag rustdoc):
+  * Read inbound gossip — that's T8.3.b.4.
+  * Handle `FRAME_GOSSIP_DELIVER` — that's T8.3.c (queue gossip).
+  * Validate that the peer hub on the other end of the session is actually running the gossip handler — best-effort one-way emit; if the peer is a pre-T8.3 hub it'll close the connection on the unknown frame type, and our reconnect-with-backoff loop will pin uselessly but harmlessly.
+
+**T8.3.b.3.a — fan-out hook in client `FRAME_KP_PUBLISH`.** `crates/onyx-hub/src/handler.rs`. After the T7.3-sec ownership check passes and BEFORE `publish_keypackage` consumes `kp_bytes`, the handler calls `state.fan_out_kp_to_peers(routing_id, &kp_bytes)`. Best-effort via `try_send` — a full peer-outbound channel drops the gossip for that one peer (the recipient's existing replay guard would have dedup'd anyway if it arrived twice). Other peers + the local store succeed regardless.
+
+**T8.3.b.3.b — `HubState::fan_out_kp_to_peers(routing_id, kp_bytes)`.** Builds a fresh `GossipFrame::new(self_hub_hash, routing_id, kp_bytes.to_vec())` (TTL=3 by default per `GOSSIP_TTL_DEFAULT`), encodes via `frame.encode()`, `try_send`s the bytes to every channel in `peer_outbounds`. Logs accepted/total at `debug!`. No-op when `peer_outbounds` is empty (federation not configured).
+
+**T8.3.b.2+.3.c — main.rs wiring.** New section between rate-limiter setup and `Arc::new(Mutex::new(state))`:
+  1. Parse every `--peer-hub` raw string into `PeerHubConfig`.
+  2. Compute `self_hub_hash` from our identity pubkey.
+  3. `Arc::new(IdentitySecret::from_bytes(our_sk_bytes))` so we can share the secret across N peer-link tasks without cloning the underlying StaticSecret per task.
+  4. `Arc::new(tor)` so the same TorRuntime serves the accept loop AND every peer-link task.
+  5. For each peer config: create a bounded mpsc channel, spawn a peer_link task that owns the receiver, collect the senders.
+  6. `state.set_peer_outbounds(senders)` + `state.set_self_hub_hash(hash)`.
+  7. Then wrap state in `Arc<Mutex<>>` (existing).
+
+Helper `parse_host_port(s, default_port)` + `decode_b32_32(s)` added in `main.rs` (mirror the daemon's hub_client helpers — we don't want to depend on `onyx-daemon` from `onyx-hub`).
+
+Four new state tests:
+  * `fan_out_kp_to_peers_noop_when_no_peers` — empty Vec → no-op, no panic.
+  * `fan_out_kp_to_peers_pushes_to_all_peers` — installed senders receive identical pre-encoded GossipFrame bytes; decode confirms TTL=GOSSIP_TTL_DEFAULT, seen_by=our hash, routing_id+body match.
+  * `fan_out_kp_to_peers_full_channel_only_drops_that_peer` — pre-fill one channel to capacity-1; verify the other still receives.
+  * `hub_pubkey_to_hash_is_deterministic` — same input → same output; different input → different output (sanity, not collision resistance).
+
+Security and posture:
+
+  * **No new inbound attack surface this slice.** We only *send* gossip. We don't yet accept it from peers. A peer can return any bytes they want over the Noise XK session and we ignore them (the `outbound_rx.recv().await` loop never reads from the stream). Future T8.3.b.4 adds the inbound path with the T7.3-sec ownership check on every received KP.
+  * **Peer-hub identity is operator-configured only.** No auto-discovery, no transitive trust. The peer's pubkey must be explicitly in `--peer-hub` for any session to open.
+  * **Best-effort semantics.** A failing peer-link task (peer down, network partition) drops gossip for that peer until reconnect. Other peers and the local store are unaffected. Same posture as multi-hub on the daemon side (T8.1).
+  * **No protocol change for clients.** Clients see the same hub behaviour: KP_PUBLISH → ack via existing path. The fan-out is invisible to them.
+
+What this did NOT do:
+
+  * Did not add the inbound peer-hub role detection or handler (T8.3.b.4).
+  * Did not implement `FRAME_GOSSIP_DELIVER` (T8.3.c).
+  * Did not add a peer-hub-specific rate limit. Peer hubs share the existing T8.x-ratelimit budget *if* T8.3.b.4's inbound path lands and routes them through the handler — but they don't even reach the handler yet, so this is academic until then.
+  * Did not test the end-to-end peer-to-peer link via `tokio::io::duplex` (would require the inbound side to exist). Outbound is tested via the channel-bytes assertion.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (one `cast_possible_truncation` cleanup in `peer_link.rs` backoff logging — swapped `as u64` for `u64::try_from(...).unwrap_or(u64::MAX)`), `cargo test --workspace` **305 passed / 0 failed** (was 301; +4 fan-out tests). All 21 existing hub tests still pass — `HubState::new()` defaults to empty `peer_outbounds`, so the federation code is dormant for non-federated hubs and tests.
+
+**Next concrete step**: T8.3.b.4 — inbound peer-hub recognition. After Noise XK handshake, check if `session.peer_static_key()` matches a `--peer-hub` allowlist entry. If yes, treat the connection as a peer hub: accept `FRAME_GOSSIP_PUBLISH`, run T7.3-sec ownership check on the inner KP, store + re-fanout to *other* peer hubs (TTL decrement, seen_by rewrite); reject client frames. If no, existing client-handler path.
+
+---
+
 ## 2026-05-19 — T8.3.b.1: wire constants + codec for `FRAME_GOSSIP_PUBLISH` / `FRAME_GOSSIP_DELIVER`
 
 First implementation slice for T8.3 (hub federation). Pure types + codec — no protocol behaviour change, no peer-hub sessions yet. Sets up T8.3.b.2 through T8.3.b.4 to be straightforward additive wiring.

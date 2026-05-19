@@ -38,10 +38,13 @@ use onyx_core::tor::TorRuntime;
 use tokio::sync::Mutex;
 use tracing::{Instrument, error, info, info_span, warn};
 
+use onyx_core::crypto::{IdentityPublic, IdentitySecret};
+
 use crate::handler::hub_handle_connection;
-use crate::state::HubState;
+use crate::state::{HubState, PeerHubConfig};
 
 mod handler;
+mod peer_link;
 mod rate_limit;
 mod state;
 mod store;
@@ -118,6 +121,25 @@ struct Args {
     /// production hub).
     #[arg(long, env = "ONYX_HUB_MAX_FRAMES_PER_MINUTE", default_value_t = 600)]
     max_frames_per_minute: u32,
+
+    /// Repeatable: each `--peer-hub onion:port,b32pubkey` adds one
+    /// peer hub this hub will gossip KPs to (T8.3.b.2+). Each peer
+    /// gets its own outbound Noise XK session; on success, every
+    /// validated client `FRAME_KP_PUBLISH` is fanned out to peer
+    /// hubs as `FRAME_GOSSIP_PUBLISH` (TTL=3, our hub's hash as
+    /// `seen_by`).
+    ///
+    /// The peer hub's pubkey doubles as a role allowlist entry:
+    /// inbound Noise XK sessions whose authenticated peer_static_key
+    /// matches one of these are treated as peer hubs, NOT clients
+    /// (T8.3.b.4 — currently the inbound side is not yet wired, so
+    /// peer-hub gossip we receive will be dropped as "unknown
+    /// frame type" until that slice lands).
+    ///
+    /// Empty default → no federation, byte-identical pre-T8.3
+    /// behaviour. Per-hub operator-opt-in.
+    #[arg(long = "peer-hub", action = clap::ArgAction::Append)]
+    peer_hubs: Vec<String>,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -175,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
     };
+    // Arc-wrap so peer-link tasks can share the runtime (T8.3.b.2+).
+    let tor = Arc::new(tor);
     info!("Tor bootstrap complete");
 
     let mut hs = tor
@@ -224,22 +248,88 @@ async fn main() -> anyhow::Result<()> {
     // T8.x-ratelimit: install the per-connection rate limiter.
     // Operator can opt out with `--max-frames-per-minute 0` (loudly
     // discouraged for production hubs).
-    let state = if args.max_frames_per_minute == 0 {
+    let mut state = if args.max_frames_per_minute == 0 {
         warn!(
             "--max-frames-per-minute 0: rate limiting is DISABLED. \
              Any single connection can spam DELIVER / KP_PUBLISH \
              frames as fast as the wire allows."
         );
-        Arc::new(Mutex::new(state))
+        state
     } else {
         info!(
             max_frames_per_minute = args.max_frames_per_minute,
             "per-connection rate limit installed (DELIVER + KP_PUBLISH; SUBSCRIBE unlimited)"
         );
-        Arc::new(Mutex::new(
-            state.with_rate_limit(args.max_frames_per_minute),
-        ))
+        state.with_rate_limit(args.max_frames_per_minute)
     };
+
+    // T8.3.b.2: parse --peer-hub flags, spawn one outbound Noise XK
+    // task per peer, install the resulting mpsc senders + our own
+    // hub-pubkey hash into HubState so client KP_PUBLISH receives
+    // can fan out via state.fan_out_kp_to_peers(...).
+    let mut peer_outbound_txs: Vec<tokio::sync::mpsc::Sender<Vec<u8>>> = Vec::new();
+    if !args.peer_hubs.is_empty() {
+        let our_hub_pubkey_bytes = identity.identity_key().public().to_bytes();
+        let self_hub_hash = HubState::hub_pubkey_to_hash(&our_hub_pubkey_bytes);
+        state.set_self_hub_hash(self_hub_hash);
+
+        // IdentitySecret doesn't impl Clone — round-trip via bytes
+        // once and Arc-wrap so peer-link tasks share without
+        // duplicating the secret material.
+        let our_sk_bytes: [u8; 32] = *identity.identity_key().to_bytes();
+        let our_sk = Arc::new(IdentitySecret::from_bytes(our_sk_bytes));
+        let tor_arc = tor.clone();
+
+        for (idx, raw) in args.peer_hubs.iter().enumerate() {
+            let (onion, pubkey) = raw.split_once(',').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--peer-hub value must be `onion:port,b32pubkey` (missing comma): {raw}"
+                )
+            })?;
+            if onion.is_empty() || pubkey.is_empty() {
+                anyhow::bail!("--peer-hub value has empty field: {raw}");
+            }
+            let cfg = PeerHubConfig {
+                onion: onion.to_string(),
+                pubkey: pubkey.to_string(),
+            };
+            let (host, port) =
+                parse_host_port(&cfg.onion, HUB_HS_PORT).context("--peer-hub onion")?;
+            let pubkey_bytes = decode_b32_32(&cfg.pubkey).context("--peer-hub pubkey")?;
+            let peer_pubkey = IdentityPublic::from_bytes(pubkey_bytes);
+
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Vec<u8>>(crate::peer_link::PEER_OUTBOUND_CAPACITY);
+            peer_outbound_txs.push(tx);
+            let tor_for_task = tor_arc.clone();
+            let our_sk_for_task = our_sk.clone();
+            let span = info_span!("peer-hub", idx, host = %host, port);
+            tokio::spawn(
+                async move {
+                    if let Err(e) = crate::peer_link::run_peer_session(
+                        tor_for_task,
+                        host,
+                        port,
+                        peer_pubkey,
+                        our_sk_for_task,
+                        rx,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "peer-hub session task exited with error");
+                    }
+                }
+                .instrument(span),
+            );
+        }
+        state.set_peer_outbounds(peer_outbound_txs);
+        info!(
+            peer_count = args.peer_hubs.len(),
+            "T8.3.b.2: peer-hub federation enabled; KPs will be gossiped on client KP_PUBLISH"
+        );
+    }
+
+    let state = Arc::new(Mutex::new(state));
 
     // T8.0.gc: spawn the periodic queue-GC task. Runs hourly,
     // deletes queue rows older than --max-queue-age-days. Disabled
@@ -372,6 +462,31 @@ fn ensure_default_identity(vault: &mut Vault) -> anyhow::Result<(i64, Identity)>
 
 fn encode_b32(bytes: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, bytes)
+}
+
+/// Parse `host:port` (or `host`, using `default_port`). Mirrors
+/// `onyx_daemon::hub_client::parse_host_port` — we don't want to
+/// depend on the daemon crate from the hub binary, so the helper
+/// is re-implemented here.
+fn parse_host_port(s: &str, default_port: u16) -> anyhow::Result<(String, u16)> {
+    match s.rsplit_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p.parse().with_context(|| format!("bad port in {s:?}"))?;
+            Ok((h.to_string(), port))
+        }
+        None => Ok((s.to_string(), default_port)),
+    }
+}
+
+/// Decode an RFC4648-lower base32 string of expected-32-byte
+/// content into `[u8; 32]`. Used by `--peer-hub` parsing.
+fn decode_b32_32(s: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes = base32::decode(base32::Alphabet::Rfc4648Lower { padding: false }, s)
+        .ok_or_else(|| anyhow::anyhow!("not valid base32"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("base32 must decode to exactly 32 bytes"))?;
+    Ok(arr)
 }
 
 async fn wait_for_ctrl_c() {

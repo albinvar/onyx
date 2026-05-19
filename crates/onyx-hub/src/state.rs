@@ -20,11 +20,27 @@
 
 use std::collections::{HashMap, HashSet};
 
+use onyx_core::crypto::blake2b_128;
+use onyx_core::wire::{GOSSIP_SEEN_BY_LEN, GossipFrame};
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::rate_limit::RateLimiter;
 use crate::store::Store;
+
+/// Configuration for one peer hub the operator wants this hub to
+/// federate with (T8.3). Each entry produces one outbound Noise XK
+/// session managed by [`crate::peer_link`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHubConfig {
+    /// `onion:port` (or just `onion`; port defaults to the hub HS port).
+    pub onion: String,
+    /// X25519 identity public key of the peer hub, base32. Doubles
+    /// as the **role allowlist entry** — an incoming Noise XK
+    /// session whose authenticated peer_static_key matches this hub
+    /// is treated as a peer hub (T8.3.b.4), not a client.
+    pub pubkey: String,
+}
 
 /// Routing identifier — 16 bytes from `BLAKE2b-128` per DESIGN §5.5.
 pub type RoutingId = [u8; 16];
@@ -77,6 +93,22 @@ pub struct HubState {
     /// means "no limit, accept everything." Bound on first frame
     /// per connection (lazy); cleared on unregister_conn.
     rate_limiter: Option<RateLimiter>,
+    /// One outbound channel per peer hub (T8.3.b.2+). When a client
+    /// publishes a KeyPackage that passes the T7.3-sec ownership
+    /// check, the hub pushes a pre-encoded `GossipFrame` payload
+    /// (TTL=3, seen_by=our hash) into every channel. The
+    /// `peer_link::run_peer_session` task that owns each channel
+    /// drains it and writes `FRAME_GOSSIP_PUBLISH` frames to the
+    /// peer hub. Empty Vec when no `--peer-hub` is configured.
+    peer_outbounds: Vec<mpsc::Sender<Vec<u8>>>,
+    /// Low 16 bytes of BLAKE2b-128 of our own hub identity pubkey
+    /// (T8.3.b.2+). Used as the `seen_by` value when we originate
+    /// or forward a gossip frame so peer hubs can detect loops
+    /// involving us. Set once at startup via
+    /// [`Self::set_self_hub_hash`]; zero-initialised by default so
+    /// existing tests that don't enable federation don't have to
+    /// supply a value.
+    self_hub_hash: [u8; GOSSIP_SEEN_BY_LEN],
 }
 
 impl HubState {
@@ -127,6 +159,62 @@ impl HubState {
             Some(rl) => rl.check(conn),
             None => true,
         }
+    }
+
+    /// Install the per-peer-hub outbound channels (T8.3.b.2+). One
+    /// sender per peer hub; each is drained by a dedicated
+    /// `peer_link::run_peer_session` task in `main.rs`. Empty Vec
+    /// (the default) disables federation entirely.
+    pub fn set_peer_outbounds(&mut self, peer_outbounds: Vec<mpsc::Sender<Vec<u8>>>) {
+        self.peer_outbounds = peer_outbounds;
+    }
+
+    /// Set our own hub-pubkey hash for gossip `seen_by` purposes
+    /// (T8.3.b.2+). Compute once at startup from
+    /// `blake2b_128(our_hub_pubkey.to_bytes())`, low 16 bytes.
+    pub fn set_self_hub_hash(&mut self, hash: [u8; GOSSIP_SEEN_BY_LEN]) {
+        self.self_hub_hash = hash;
+    }
+
+    /// Build a [`blake2b_128`] hash of the given hub pubkey and
+    /// return its low 16 bytes — the canonical `seen_by` value for
+    /// gossip frames originating from / forwarded by that hub.
+    /// Stateless convenience.
+    #[must_use]
+    pub fn hub_pubkey_to_hash(pubkey_bytes: &[u8; 32]) -> [u8; GOSSIP_SEEN_BY_LEN] {
+        blake2b_128(&[pubkey_bytes.as_slice()])
+    }
+
+    /// Fan out a freshly-validated KeyPackage to every configured
+    /// peer hub (T8.3.b.3). Wraps the KP in a `GossipFrame` with
+    /// `seen_by` = our hash, encodes, and `try_send`s the bytes to
+    /// each peer-hub outbound channel. Best-effort: a full channel
+    /// drops the gossip for that peer, but the local store + the
+    /// other peers still succeed.
+    ///
+    /// No-op when `peer_outbounds` is empty (no federation).
+    pub fn fan_out_kp_to_peers(&self, routing_id: RoutingId, kp_bytes: &[u8]) {
+        if self.peer_outbounds.is_empty() {
+            return;
+        }
+        let frame = GossipFrame::new(self.self_hub_hash, routing_id, kp_bytes.to_vec());
+        let payload = frame.encode();
+        let mut accepted = 0usize;
+        for (idx, tx) in self.peer_outbounds.iter().enumerate() {
+            match tx.try_send(payload.clone()) {
+                Ok(()) => accepted += 1,
+                Err(e) => warn!(
+                    peer_idx = idx,
+                    error = %e,
+                    "hub: peer-hub outbound queue full or closed; dropping gossip KP for this peer"
+                ),
+            }
+        }
+        tracing::debug!(
+            accepted,
+            total = self.peer_outbounds.len(),
+            "hub: gossiped KP to peer hubs"
+        );
     }
 
     /// Register a fresh connection. Returns the [`ConnId`] the
@@ -501,6 +589,93 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── T8.3.b.2+.3: peer-hub fan-out ─────────────────────────────────
+
+    /// `fan_out_kp_to_peers` is a no-op when no peer hubs are
+    /// configured. Real KP path keeps working unchanged.
+    #[tokio::test]
+    async fn fan_out_kp_to_peers_noop_when_no_peers() {
+        let state = HubState::new();
+        // No peer_outbounds, no senders to push to. Just shouldn't
+        // panic and shouldn't block.
+        state.fan_out_kp_to_peers([0x42; 16], b"opaque kp bytes");
+    }
+
+    /// With peer_outbounds installed, a fan-out pushes a properly-
+    /// encoded GossipFrame payload to every peer channel.
+    #[tokio::test]
+    async fn fan_out_kp_to_peers_pushes_to_all_peers() {
+        let (tx_a, mut rx_a) = mpsc::channel::<Vec<u8>>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<Vec<u8>>(8);
+        let mut state = HubState::new();
+        state.set_self_hub_hash([0xAA; 16]);
+        state.set_peer_outbounds(vec![tx_a, tx_b]);
+
+        let rid: RoutingId = [0x11; 16];
+        let kp = b"opaque kp bytes".to_vec();
+        state.fan_out_kp_to_peers(rid, &kp);
+
+        // Each peer received one frame.
+        let bytes_a = rx_a.recv().await.expect("peer A received");
+        let bytes_b = rx_b.recv().await.expect("peer B received");
+
+        // Same payload to both — fan-out, not per-peer customisation.
+        assert_eq!(bytes_a, bytes_b);
+
+        // Decode and inspect.
+        let frame = onyx_core::wire::GossipFrame::decode(&bytes_a)
+            .expect("payload is a well-formed gossip frame");
+        assert_eq!(
+            frame.ttl,
+            onyx_core::wire::GOSSIP_TTL_DEFAULT,
+            "fresh frames use default TTL"
+        );
+        assert_eq!(frame.seen_by, [0xAA; 16], "seen_by = our hub hash");
+        assert_eq!(frame.routing_id, rid);
+        assert_eq!(frame.body, kp);
+    }
+
+    /// A full peer-outbound channel drops gossip for THAT peer
+    /// only; other peers still receive. Local store (not exercised
+    /// here directly) is unaffected by the fan-out's behaviour.
+    #[tokio::test]
+    async fn fan_out_kp_to_peers_full_channel_only_drops_that_peer() {
+        let (tx_full, _rx_full_never_read) = mpsc::channel::<Vec<u8>>(1);
+        let (tx_open, mut rx_open) = mpsc::channel::<Vec<u8>>(8);
+
+        // Pre-fill the "full" channel so the next try_send fails.
+        tx_full
+            .try_send(b"pre-fill".to_vec())
+            .expect("seed full channel");
+
+        let mut state = HubState::new();
+        state.set_self_hub_hash([0xCC; 16]);
+        state.set_peer_outbounds(vec![tx_full, tx_open]);
+
+        // Should not panic; should successfully push to tx_open.
+        state.fan_out_kp_to_peers([0x22; 16], b"kp");
+
+        // The open channel got the gossip.
+        let bytes = rx_open.recv().await.expect("open peer received");
+        let frame = onyx_core::wire::GossipFrame::decode(&bytes).unwrap();
+        assert_eq!(frame.routing_id, [0x22; 16]);
+    }
+
+    /// `hub_pubkey_to_hash` is a stable function of its input;
+    /// matters because every hub computes its own hash this way
+    /// and they need to compare equal across implementations.
+    #[test]
+    fn hub_pubkey_to_hash_is_deterministic() {
+        let pk = [0x55; 32];
+        let h1 = HubState::hub_pubkey_to_hash(&pk);
+        let h2 = HubState::hub_pubkey_to_hash(&pk);
+        assert_eq!(h1, h2);
+        // Different pubkey → different hash (sanity, not a strong
+        // collision-resistance check — BLAKE2b is presumed safe).
+        let h3 = HubState::hub_pubkey_to_hash(&[0x56; 32]);
+        assert_ne!(h1, h3);
     }
 
     /// In-memory mode (`Self::new`) must continue to work without a
