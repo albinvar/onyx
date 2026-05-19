@@ -6,6 +6,60 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.b.1: wire constants + codec for `FRAME_GOSSIP_PUBLISH` / `FRAME_GOSSIP_DELIVER`
+
+First implementation slice for T8.3 (hub federation). Pure types + codec — no protocol behaviour change, no peer-hub sessions yet. Sets up T8.3.b.2 through T8.3.b.4 to be straightforward additive wiring.
+
+What landed:
+
+**T8.3.b.1.a — frame-type constants.** `crates/onyx-core/src/wire.rs`:
+  * `FRAME_GOSSIP_PUBLISH: u16 = 0x80` — hub → peer hub, gossiped KP.
+  * `FRAME_GOSSIP_DELIVER: u16 = 0x81` — hub → peer hub, gossiped envelope (reserved; T8.3.c will wire actual handling).
+
+Both have rustdoc explaining the loop-prevention header layout (`ttl(1) ‖ seen_by(16) ‖ routing_id(16) ‖ body(rest)`), the peer-hub allowlist trust model (clients receiving 0x80/0x81 should drop with `FRAME_ERROR` — covered by the existing "unknown frame → drop" default), and the link to `FEDERATION.md` for the full semantics.
+
+**T8.3.b.1.b — `GossipFrame` codec + helpers.** Same file. Four pieces:
+
+  * `pub const GOSSIP_TTL_DEFAULT: u8 = 3` — small mesh sizes (≤3-5 peer hubs typical) make TTL=3 enough; per FEDERATION.md §2.3 recommendation.
+  * `pub const GOSSIP_SEEN_BY_LEN: usize = 16` and `GOSSIP_ROUTING_ID_LEN: usize = 16` — uniform 16-byte layout matching other hub frames.
+  * `pub const GOSSIP_HEADER_LEN: usize = 33` — the constant other code reasons about; sanity-checked by a test.
+  * `pub struct GossipFrame { ttl, seen_by, routing_id, body }` — parsed/builder type. Methods:
+    - `new(self_hub_hash, routing_id, body) -> Self` — fresh frame at default TTL with our hash as the `seen_by`.
+    - `encode() -> Vec<u8>` — single-pass serialise; `GOSSIP_HEADER_LEN + body.len()` total.
+    - `decode(&[u8]) -> Result<Self>` — rejects payload shorter than the header with `InvalidEncoding`. Does NOT validate body against outer frame type (caller's job: KP-validate for `FRAME_GOSSIP_PUBLISH`, envelope-validate for `FRAME_GOSSIP_DELIVER`).
+    - `forward(self_hub_hash) -> Option<Self>` — produces the outgoing copy: TTL decremented, `seen_by` rewritten to OUR hash. Returns `None` when TTL would underflow to 0 (TTL=1 → drop; TTL=0 → defensive None via `checked_sub`). Loop check (`seen_by == our_hash`) is the caller's responsibility BEFORE calling `forward` because a loop should drop the frame entirely, not just skip the forward.
+
+**T8.3.b.1.c — nine new tests** covering:
+  * `gossip_frame_round_trip` — base codec.
+  * `gossip_frame_round_trip_empty_body` — header-only frame is valid (semantically useless but byte-valid).
+  * `gossip_frame_decode_rejects_short_payload` — every length 0..HEADER_LEN fails.
+  * `gossip_frame_decode_exact_header_succeeds` — minimum valid frame.
+  * `gossip_frame_new_sets_default_ttl` — builder sanity.
+  * `gossip_forward_decrements_and_rewrites_seen_by` — happy path TTL=3 → TTL=2 + new seen_by.
+  * `gossip_forward_returns_none_at_ttl_1` — last-hop case.
+  * `gossip_forward_returns_none_at_ttl_0` — defensive case.
+  * `gossip_frame_constants_match_documented_layout` — sanity that the wire constants haven't drifted from FEDERATION.md's documented byte layout.
+
+Security and posture:
+
+  * **No new attack surface yet.** These are bytes on a wire, no I/O. The hub does not yet emit or accept the new frame types — that's T8.3.b.2 (peer-hub outbound sessions) + T8.3.b.4 (inbound receive). A client that somehow received these frames today would hit the existing "unknown frame → drop" default; we have not introduced a new exploitable path.
+  * **`decode` is conservative.** Rejects under-length payloads explicitly. Does not allocate beyond `body.len()`. Caller validates the body separately.
+  * **`forward` semantics make loop prevention explicit.** A future implementer of T8.3.b.4 cannot accidentally infinite-loop because (a) `forward` returns `None` at TTL≤1, and (b) the loop check (`seen_by == our_hash`) is documented as the caller's responsibility BEFORE calling forward — the type signature reminds them.
+
+What this did NOT do (these are T8.3.b.2 / T8.3.b.3 / T8.3.b.4 / T8.3.c):
+
+  * No `--peer-hub` flag yet. Operators can't configure federation today; the codec exists in the binary but is unreachable from the CLI.
+  * No outbound peer-hub Noise XK sessions.
+  * No inbound peer-hub recognition (pubkey allowlist).
+  * No KP fan-out on client `FRAME_KP_PUBLISH` receive.
+  * No actual `FRAME_GOSSIP_DELIVER` handling (constant defined and documented, but the queue gossip path is T8.3.c).
+
+The slice is intentionally small so the wire format gets reviewed in isolation before the runtime plumbing builds on top of it.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (one `range_plus_one` cleanup in `decode` — `&bytes[1..1+N]` → `&bytes[1..=N]`), `cargo test --workspace` **301 passed / 0 failed** (was 292; +9 gossip codec tests).
+
+---
+
 ## 2026-05-19 — T8.3.a: hub-federation design doc — `FEDERATION.md`
 
 Documentation-only. T8.3 (hub-to-hub gossip — real federation in the Matrix/XMPP sense) is genuinely complex enough that doing it inline at today's slice cadence would skip the design step and produce something fragile. This commit is the design step: a written specification of wire protocol, gossip semantics, loop prevention, threat-model deltas, and a 4-slice implementation plan, with open questions flagged for review before code begins.

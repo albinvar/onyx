@@ -85,6 +85,45 @@ pub const FRAME_KP_FETCH: u16 = 0x51;
 ///     KeyPackage. Recipient validates the embedded signing key
 ///     against the expected fingerprint before trusting.
 pub const FRAME_KP_RESPONSE: u16 = 0x52;
+
+// ── Hub-to-hub federation (T8.3) ────────────────────────────────────────
+//
+// These frames travel on the *peer-hub link* — Noise XK sessions
+// between two hub processes, distinguished from client sessions by
+// the authenticated Noise pubkey matching an operator's
+// `--peer-hub` allowlist (per `FEDERATION.md` §4).
+//
+// Loop prevention: each gossip frame carries a `ttl: u8` (decrement
+// per hop, drop at 0) and a 16-byte `seen_by` = low 16 bytes of
+// BLAKE2b-128 of the last forwarding hub's identity pubkey. A hub
+// receiving its own `seen_by` drops without forwarding.
+//
+// Wire-format compatibility: peer-hub frames are **never** sent on
+// client sessions. A client receiving 0x80/0x81 should treat it as
+// a protocol error (FRAME_ERROR + disconnect), same as any other
+// unknown frame type — covered by the existing client-side wire
+// handler's "unknown frame → drop" default.
+
+/// `GOSSIP_PUBLISH` — hub → peer hub (T8.3). Carries a KeyPackage
+/// originally received from a client via `FRAME_KP_PUBLISH`, plus a
+/// loop-prevention header so peer hubs can re-fanout without amplifying.
+///
+/// Payload layout: `ttl(1) ‖ seen_by(16) ‖ routing_id(16) ‖ kp_bytes(rest)`.
+/// Recipient peer hub runs the **same T7.3-sec ownership check** as
+/// for a client `FRAME_KP_PUBLISH` before storing — gossip is
+/// authenticated to the same standard as direct client publish.
+/// `FEDERATION.md` §2.3 + §3.1.
+pub const FRAME_GOSSIP_PUBLISH: u16 = 0x80;
+
+/// `GOSSIP_DELIVER` — hub → peer hub (T8.3, queue gossip). Currently
+/// reserved; not yet emitted or handled by the hub. T8.3.c will wire
+/// it in once the basic peer-hub link (T8.3.b) has bedded in. Same
+/// loop-prevention header as `FRAME_GOSSIP_PUBLISH`.
+///
+/// Payload layout (planned):
+///   `ttl(1) ‖ seen_by(16) ‖ routing_id(16) ‖ sealed_envelope(rest)`.
+pub const FRAME_GOSSIP_DELIVER: u16 = 0x81;
+
 /// `PING` — either direction, keepalive.
 pub const FRAME_PING: u16 = 0x40;
 /// `PONG` — either direction, keepalive response.
@@ -343,6 +382,130 @@ impl MessageEnvelope {
     }
 }
 
+// ── Hub-to-hub gossip codec (T8.3.b.1) ──────────────────────────────────
+
+/// Default TTL for fresh gossip frames the hub emits. Per
+/// FEDERATION.md §2.3 — small mesh sizes (≤3–5 peer hubs in typical
+/// operator deployments) mean TTL=3 is enough headroom while keeping
+/// the worst-case fan-out bounded.
+pub const GOSSIP_TTL_DEFAULT: u8 = 3;
+
+/// Length of the `seen_by` segment — 16 bytes = low 128 bits of
+/// BLAKE2b-128 of the last forwarding hub's identity pubkey. Same
+/// width as a routing id; intentional, for layout uniformity.
+pub const GOSSIP_SEEN_BY_LEN: usize = 16;
+
+/// Length of the routing-id segment, mirroring the other DELIVER /
+/// KP-related frames.
+pub const GOSSIP_ROUTING_ID_LEN: usize = 16;
+
+/// Minimum length of a gossip-frame payload before the variable-
+/// length body (KP for GOSSIP_PUBLISH, sealed envelope for
+/// GOSSIP_DELIVER): 1 (ttl) + 16 (seen_by) + 16 (routing_id) = 33.
+pub const GOSSIP_HEADER_LEN: usize = 1 + GOSSIP_SEEN_BY_LEN + GOSSIP_ROUTING_ID_LEN;
+
+/// Parsed header of a `FRAME_GOSSIP_PUBLISH` / `FRAME_GOSSIP_DELIVER`
+/// payload. The `body` field carries either the KP bytes or the
+/// sealed envelope bytes, depending on the outer frame type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipFrame {
+    /// Hops remaining. Sender sets to [`GOSSIP_TTL_DEFAULT`]; each
+    /// forwarder decrements; receiver drops at 0.
+    pub ttl: u8,
+    /// Low 16 bytes of BLAKE2b-128 of the LAST forwarder's hub
+    /// pubkey. A receiver whose own hash equals this value treats
+    /// the frame as a loop and drops without forwarding.
+    pub seen_by: [u8; GOSSIP_SEEN_BY_LEN],
+    /// The inner routing id this gossip frame is about. Same
+    /// 16-byte routing-id format used by every other hub frame.
+    pub routing_id: [u8; GOSSIP_ROUTING_ID_LEN],
+    /// Variable-length body. For `FRAME_GOSSIP_PUBLISH`, this is the
+    /// TLS-serialised KeyPackage. For `FRAME_GOSSIP_DELIVER` (T8.3.c),
+    /// this is the sealed-sender envelope bytes.
+    pub body: Vec<u8>,
+}
+
+impl GossipFrame {
+    /// Build a fresh gossip frame from local hub state. `self_hub_hash`
+    /// is `low_16(BLAKE2b-128(our_hub_pubkey))`; callers compute it
+    /// once at hub startup and reuse.
+    #[must_use]
+    pub fn new(
+        self_hub_hash: [u8; GOSSIP_SEEN_BY_LEN],
+        routing_id: [u8; GOSSIP_ROUTING_ID_LEN],
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            ttl: GOSSIP_TTL_DEFAULT,
+            seen_by: self_hub_hash,
+            routing_id,
+            body,
+        }
+    }
+
+    /// Serialise to the wire format that goes inside an
+    /// `InnerFrame::payload`. Total length is
+    /// [`GOSSIP_HEADER_LEN`] + `body.len()`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(GOSSIP_HEADER_LEN + self.body.len());
+        out.push(self.ttl);
+        out.extend_from_slice(&self.seen_by);
+        out.extend_from_slice(&self.routing_id);
+        out.extend_from_slice(&self.body);
+        out
+    }
+
+    /// Parse from the wire bytes inside an `InnerFrame::payload`.
+    /// Returns [`Error::InvalidEncoding`] if the payload is shorter
+    /// than the fixed header. Does **not** validate the body against
+    /// the outer frame type — that's the caller's job (KP-validate
+    /// for GOSSIP_PUBLISH, envelope-validate for GOSSIP_DELIVER).
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < GOSSIP_HEADER_LEN {
+            return Err(Error::InvalidEncoding(
+                "gossip frame: payload shorter than header",
+            ));
+        }
+        let ttl = bytes[0];
+        let mut seen_by = [0u8; GOSSIP_SEEN_BY_LEN];
+        seen_by.copy_from_slice(&bytes[1..=GOSSIP_SEEN_BY_LEN]);
+        let mut routing_id = [0u8; GOSSIP_ROUTING_ID_LEN];
+        let rid_start = 1 + GOSSIP_SEEN_BY_LEN;
+        routing_id.copy_from_slice(&bytes[rid_start..rid_start + GOSSIP_ROUTING_ID_LEN]);
+        let body = bytes[GOSSIP_HEADER_LEN..].to_vec();
+        Ok(Self {
+            ttl,
+            seen_by,
+            routing_id,
+            body,
+        })
+    }
+
+    /// Build the forward variant of this frame: TTL decremented,
+    /// `seen_by` rewritten to *our* hub hash. Returns `None` when the
+    /// frame should not be forwarded (TTL would underflow to 0, or
+    /// `seen_by` equals our own hash → loop).
+    ///
+    /// Callers check the loop case BEFORE processing the frame's body
+    /// (loop → drop entirely, do not store); this method assumes the
+    /// loop check has already been done and is only being called to
+    /// prepare the outgoing copies.
+    #[must_use]
+    pub fn forward(&self, self_hub_hash: [u8; GOSSIP_SEEN_BY_LEN]) -> Option<Self> {
+        let new_ttl = self.ttl.checked_sub(1)?;
+        if new_ttl == 0 {
+            return None;
+        }
+        Some(Self {
+            ttl: new_ttl,
+            seen_by: self_hub_hash,
+            routing_id: self.routing_id,
+            body: self.body.clone(),
+        })
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -593,5 +756,126 @@ mod tests {
             let f = MessageEnvelope::from_cbor(&bytes).unwrap();
             prop_assert_eq!(e, f);
         }
+    }
+
+    // ── Hub-to-hub gossip codec (T8.3.b.1) ────────────────────────────
+
+    #[test]
+    fn gossip_frame_round_trip() {
+        let f = GossipFrame {
+            ttl: 3,
+            seen_by: [0xAB; GOSSIP_SEEN_BY_LEN],
+            routing_id: [0xCD; GOSSIP_ROUTING_ID_LEN],
+            body: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let bytes = f.encode();
+        assert_eq!(bytes.len(), GOSSIP_HEADER_LEN + 4);
+        let decoded = GossipFrame::decode(&bytes).expect("round-trip decode");
+        assert_eq!(decoded, f);
+    }
+
+    #[test]
+    fn gossip_frame_round_trip_empty_body() {
+        // A gossip frame with no body shouldn't crash — the header
+        // alone is a valid frame (though semantically useless).
+        let f = GossipFrame {
+            ttl: 1,
+            seen_by: [0x00; GOSSIP_SEEN_BY_LEN],
+            routing_id: [0xFF; GOSSIP_ROUTING_ID_LEN],
+            body: Vec::new(),
+        };
+        let bytes = f.encode();
+        assert_eq!(bytes.len(), GOSSIP_HEADER_LEN);
+        assert_eq!(GossipFrame::decode(&bytes).unwrap(), f);
+    }
+
+    #[test]
+    fn gossip_frame_decode_rejects_short_payload() {
+        // Anything shorter than the fixed header is malformed.
+        for short_len in 0..GOSSIP_HEADER_LEN {
+            let bytes = vec![0u8; short_len];
+            assert!(
+                GossipFrame::decode(&bytes).is_err(),
+                "expected decode failure at len {short_len}, but it succeeded"
+            );
+        }
+    }
+
+    #[test]
+    fn gossip_frame_decode_exact_header_succeeds() {
+        // Exactly header-len with no body is the minimum valid frame.
+        let bytes = vec![0u8; GOSSIP_HEADER_LEN];
+        let decoded = GossipFrame::decode(&bytes).expect("header-only decode");
+        assert_eq!(decoded.ttl, 0);
+        assert_eq!(decoded.seen_by, [0u8; GOSSIP_SEEN_BY_LEN]);
+        assert_eq!(decoded.routing_id, [0u8; GOSSIP_ROUTING_ID_LEN]);
+        assert!(decoded.body.is_empty());
+    }
+
+    #[test]
+    fn gossip_frame_new_sets_default_ttl() {
+        let f = GossipFrame::new([0x01; 16], [0x02; 16], b"kp".to_vec());
+        assert_eq!(f.ttl, GOSSIP_TTL_DEFAULT);
+        assert_eq!(f.seen_by, [0x01; 16]);
+        assert_eq!(f.routing_id, [0x02; 16]);
+        assert_eq!(f.body, b"kp");
+    }
+
+    #[test]
+    fn gossip_forward_decrements_and_rewrites_seen_by() {
+        let received = GossipFrame {
+            ttl: 3,
+            seen_by: [0xAA; 16], // came from "hub AA"
+            routing_id: [0x11; 16],
+            body: b"payload".to_vec(),
+        };
+        let our_hash = [0xBB; 16];
+        let fwd = received.forward(our_hash).expect("ttl=3 → can forward");
+        assert_eq!(fwd.ttl, 2);
+        assert_eq!(
+            fwd.seen_by, our_hash,
+            "seen_by must be rewritten to OUR hash"
+        );
+        assert_eq!(fwd.routing_id, received.routing_id);
+        assert_eq!(fwd.body, received.body);
+    }
+
+    #[test]
+    fn gossip_forward_returns_none_at_ttl_1() {
+        // TTL=1 means we're the last hop; forwarding would
+        // decrement to 0 and the next hop would drop. Save the
+        // bandwidth and don't forward at all.
+        let received = GossipFrame {
+            ttl: 1,
+            seen_by: [0xAA; 16],
+            routing_id: [0x11; 16],
+            body: b"end-of-line".to_vec(),
+        };
+        assert!(received.forward([0xBB; 16]).is_none());
+    }
+
+    #[test]
+    fn gossip_forward_returns_none_at_ttl_0() {
+        // TTL=0 → checked_sub returns None. Defensive: should never
+        // happen in practice because the receiver drops TTL=0
+        // frames before forward() is even considered, but the type
+        // signature guarantees it.
+        let received = GossipFrame {
+            ttl: 0,
+            seen_by: [0xAA; 16],
+            routing_id: [0x11; 16],
+            body: b"unreachable".to_vec(),
+        };
+        assert!(received.forward([0xBB; 16]).is_none());
+    }
+
+    #[test]
+    fn gossip_frame_constants_match_documented_layout() {
+        // Sanity: the byte-level constants other code reasons about
+        // must agree with the documented FEDERATION.md layout.
+        assert_eq!(GOSSIP_SEEN_BY_LEN, 16);
+        assert_eq!(GOSSIP_ROUTING_ID_LEN, 16);
+        assert_eq!(GOSSIP_HEADER_LEN, 33); // 1 + 16 + 16
+        assert_eq!(GOSSIP_TTL_DEFAULT, 3); // FEDERATION.md §2.3 recommendation
     }
 }
