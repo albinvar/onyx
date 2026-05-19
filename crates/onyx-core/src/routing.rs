@@ -186,6 +186,43 @@ pub enum BootstrapPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         room_name: Option<String>,
     },
+    /// "mlsapp/v1" (T6.3.e) — already-encrypted MLS application
+    /// message routed via the hub. Wraps a single ciphertext
+    /// produced by [`crate::mls::MlsGroupState::encrypt_application`]
+    /// against a room's MLS group state, addressed at the routing
+    /// layer to one specific member's introduction inbox.
+    ///
+    /// `group_id` is duplicated here at the bootstrap layer so the
+    /// recipient daemon can route the inner ciphertext to the right
+    /// `MlsGroupState` without first parsing the MLS framing
+    /// (`crate::mls::peek_group_id` does the same on the direct
+    /// path; carrying it explicitly here saves a TLS-decode for
+    /// the hub path). This is the same group_id MLS already carries
+    /// in the ciphertext's cleartext header, so it leaks nothing
+    /// extra: the bytes are observable to anyone with access to
+    /// the sealed envelope's *inner* CBOR, which means the
+    /// recipient and only the recipient (the outer envelope is
+    /// sealed under their hybrid KEM).
+    ///
+    /// **Security tier**: the inner ciphertext has full MLS PCS
+    /// for everything that follows in the room's ratchet. The outer
+    /// sealed-sender envelope adds per-message PFS via the hybrid
+    /// X25519 + ML-KEM-768 encapsulation, identical to
+    /// `BootstrapPayload::MlsWelcome`'s envelope properties.
+    ///
+    /// Unlike `MlsWelcome`, `MlsApp` does NOT create new MLS state
+    /// on receive — both sides must already share the group (i.e.
+    /// the recipient must have processed a prior `MlsWelcome` for
+    /// this `group_id`). Recipients that don't have the group drop
+    /// the envelope silently at debug level — could be the
+    /// recipient hasn't joined the room yet, or a hostile sender
+    /// trying to probe whether we're in a given room (which we
+    /// refuse to reveal).
+    #[serde(rename = "mlsapp/v1")]
+    MlsApp {
+        group_id: ByteBuf,
+        ciphertext: ByteBuf,
+    },
 }
 
 impl BootstrapPayload {
@@ -626,6 +663,47 @@ mod tests {
             !s.contains("msg/v1"),
             "mls/v1 variant must not leak msg/v1 tag; got {bytes:?}"
         );
+    }
+
+    #[test]
+    fn bootstrap_payload_round_trip_mls_app() {
+        // T6.3.e: MlsApp must round-trip the group_id + ciphertext.
+        let p = BootstrapPayload::MlsApp {
+            group_id: ByteBuf::from(b"group-id-bytes".to_vec()),
+            ciphertext: ByteBuf::from(b"opaque-mls-application-ciphertext".to_vec()),
+        };
+        let bytes = p.to_cbor().expect("encode");
+        let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn bootstrap_payload_mls_app_carries_version_tag() {
+        let p = BootstrapPayload::MlsApp {
+            group_id: ByteBuf::from(b"g".to_vec()),
+            ciphertext: ByteBuf::from(b"c".to_vec()),
+        };
+        let bytes = p.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("mlsapp/v1"),
+            "mlsapp/v1 variant must carry its version tag; got {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_payload_mls_app_round_trips_inside_sealed_envelope() {
+        let (alice_sign, alice_id, bob_kem, _) = alice_to_bob_setup();
+        let payload = BootstrapPayload::MlsApp {
+            group_id: ByteBuf::from(b"shared-room-gid".to_vec()),
+            ciphertext: ByteBuf::from(b"opaque-app-msg".to_vec()),
+        };
+        let payload_bytes = payload.to_cbor().unwrap();
+        let sealed =
+            seal_bootstrap(&alice_sign, &alice_id, &payload_bytes, &bob_kem.public()).unwrap();
+        let opened = open_bootstrap(&sealed, &bob_kem).unwrap();
+        let recovered = BootstrapPayload::from_cbor(&opened.mls_welcome).unwrap();
+        assert_eq!(recovered, payload);
     }
 
     #[test]

@@ -347,15 +347,27 @@ pub enum ApiResponse {
         group_id_b32: String,
         members: Vec<String>,
     },
-    /// Reply to [`ApiRequest::SendRoom`]. `delivered_to_direct` is
-    /// the count of room members the daemon successfully pushed
-    /// the ciphertext to over their live direct Noise session;
-    /// `total_members` is the room's full member count *after*
-    /// excluding ourselves. Their difference is the hub-fallback
-    /// gap that T6.3.e will fill in.
+    /// Reply to [`ApiRequest::SendRoom`]. Per-call delivery stats:
+    ///
+    ///   * `delivered_to_direct` — members reached over a live
+    ///     direct Noise session (one-shot push of the same MLS
+    ///     ciphertext).
+    ///   * `delivered_to_hub` (T6.3.e) — members the daemon
+    ///     hub-fanned-out a sealed `BootstrapPayload::MlsApp` to
+    ///     because they had no live direct session.
+    ///   * `skipped_no_kem` (T6.3.e) — members with no live
+    ///     session AND no cached hybrid KEM pub (a structural gap
+    ///     for non-inviters until KEM-pub exchange ships). These
+    ///     won't receive the message via this call.
+    ///   * `total_members` — the room's full member count, *after*
+    ///     excluding ourselves.
     SendRoomOk {
         group_id_b32: String,
         delivered_to_direct: u32,
+        #[serde(default)]
+        delivered_to_hub: u32,
+        #[serde(default)]
+        skipped_no_kem: u32,
         total_members: u32,
     },
 
@@ -706,10 +718,33 @@ mod tests {
         let r = ApiResponse::SendRoomOk {
             group_id_b32: "groupabc".into(),
             delivered_to_direct: 2,
+            delivered_to_hub: 1,
+            skipped_no_kem: 0,
             total_members: 3,
         };
         let line = encode_response_line(&r).unwrap();
         assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_send_room_ok_back_compat_pre_t6_3_e() {
+        // Older daemons returning SendRoomOk without the new fields
+        // (delivered_to_hub, skipped_no_kem) must still decode — both
+        // fields default to 0.
+        let line =
+            r#"{"kind":"SendRoomOk","group_id_b32":"g","delivered_to_direct":2,"total_members":2}"#;
+        let parsed = decode_response(line).unwrap();
+        match parsed {
+            ApiResponse::SendRoomOk {
+                delivered_to_hub,
+                skipped_no_kem,
+                ..
+            } => {
+                assert_eq!(delivered_to_hub, 0);
+                assert_eq!(skipped_no_kem, 0);
+            }
+            other => panic!("expected SendRoomOk, got {other:?}"),
+        }
     }
 
     #[test]

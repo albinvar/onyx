@@ -1322,97 +1322,54 @@ async fn handle_hub_delivery(
             first_message,
             room_name,
         } => {
-            // 3'. mls/v1: the sender invited us into a fresh MLS group.
-            //     Join the group (creates persistent MLS state on our
-            //     side), snapshot to vault so a future direct-dial to
-            //     this peer can resume the same group, then register
-            //     the peer in the conversation registry as hub-only
-            //     (we have no direct transport yet — but the *MLS
-            //     group* is real and ready).
-            //
-            //     Silent failure on join (debug-level only): a hostile
-            //     hub or attacker could send junk Welcome bytes; we
-            //     don't want to spam operator logs.
-            let join_result = {
-                let party = state.mls_party.lock().await;
-                party.join_from_welcome(welcome.as_ref())
-            };
-            let Ok(group) = join_result else {
-                debug!(
-                    welcome_bytes = welcome.len(),
-                    "hub: mls/v1 Welcome did not join into a group; dropping"
-                );
-                return;
-            };
-
-            // Persist the post-join MLS state so the group survives
-            // a daemon restart.
-            let snapshot_result = {
-                let party = state.mls_party.lock().await;
-                party.snapshot_state()
-            };
-            if let Ok(snap) = snapshot_result {
-                let vault = state.vault.lock().await;
-                if let Err(e) = vault.save_mls_state(state.identity_id, &snap) {
-                    warn!(error = %e, "hub: mls/v1 snapshot save failed");
-                }
-            }
-
-            // T6.3.c: if the Welcome carried a `room_name`, this is a
-            // multi-party room invite rather than a 2-party DM
-            // bootstrap. Persist the room row and skip the DM
-            // register path (the conversation registry is DM-only;
-            // room surfacing in the TUI lands in T6.3.f). For DM
-            // bootstraps (room_name = None) we fall through to the
-            // existing T7.2-mls path.
-            if let Some(name) = room_name.clone() {
-                process_room_welcome(&group, &name, &sender_fingerprint, state).await;
-                return;
-            }
-
-            // Register the peer. They surface as a hub-only
-            // conversation (no direct Tor transport yet), but the
-            // MLS group is real — future direct-dial will lift them
-            // to a live `Direct` conversation via the existing
-            // resume path.
-            {
-                let mut reg = state.conversations.lock().await;
-                let handle =
-                    reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
-                let group_id_b32 = encode_b32(&group.group_id_bytes());
-                // T7.2-mls-fu: when the sender bundled an introduction
-                // text alongside the Welcome (via `onyx accept <url>
-                // --text "..."`), surface that as the first message of
-                // the conversation. Otherwise fall back to the
-                // synthetic "joined" placeholder so the TUI still
-                // shows *something* happened on first contact.
-                //
-                // The text inherits the sealed-envelope's per-message
-                // PFS and is authenticated by the outer Ed25519
-                // signature — but predates the MLS ratchet, so it
-                // shares the Welcome's lack of MLS PCS (the ratchet
-                // covers everything sent *inside* the group from now
-                // on). Same `via_hub` tag either way so the TUI
-                // renders the weaker-tier badge consistently.
-                let (text, has_first_message) = if let Some(intro) = first_message {
-                    (intro, true)
-                } else {
-                    (
-                        format!("(joined MLS group {group_id_b32} via hub Welcome)"),
-                        false,
-                    )
-                };
-                reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text);
-                info!(
-                    from_short = %handle.short_id,
-                    mls_epoch = group.epoch(),
-                    group_id_b32 = %group_id_b32,
-                    has_first_message,
-                    "hub: mls/v1 Welcome processed, MLS group joined"
-                );
-            }
+            process_hub_mls_welcome(
+                welcome.as_ref(),
+                first_message,
+                room_name,
+                sender_x25519,
+                &sender_pub_b32,
+                sender_fingerprint,
+                state,
+            )
+            .await;
+        }
+        onyx_core::routing::BootstrapPayload::MlsApp {
+            group_id,
+            ciphertext,
+        } => {
+            process_hub_mls_app(
+                group_id.as_ref(),
+                ciphertext.as_ref(),
+                &sender_x25519,
+                &sender_fingerprint,
+                state,
+            )
+            .await;
         }
     }
+}
+
+/// Handle a T6.3.e `BootstrapPayload::MlsApp` hub-delivery. Extracted
+/// so `handle_hub_delivery`'s match block stays under the clippy
+/// `too_many_lines` budget. Both sides must already share the MLS
+/// group; if we don't know it, drop silently at debug level — could
+/// be a hostile sender probing whether we're in a given room, or the
+/// recipient hasn't joined yet. Either way, the sender learns
+/// nothing.
+async fn process_hub_mls_app(
+    group_id: &[u8],
+    ciphertext: &[u8],
+    sender_x25519: &[u8; 32],
+    sender_fingerprint: &str,
+    state: &Arc<DaemonState>,
+) {
+    handle_room_app_frame(group_id, ciphertext, sender_x25519, state).await;
+    info!(
+        from_fingerprint = %sender_fingerprint,
+        group_id_b32 = %encode_b32(group_id),
+        ciphertext_bytes = ciphertext.len(),
+        "hub: mlsapp/v1 room frame processed"
+    );
 }
 
 // ── Vault helpers ──────────────────────────────────────────────────────────
@@ -1456,6 +1413,80 @@ fn ensure_default_identity(vault: &mut Vault) -> anyhow::Result<(i64, Identity)>
 
 fn encode_b32(bytes: &[u8]) -> String {
     base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, bytes)
+}
+
+/// Receive-side processing of an `mls/v1` `BootstrapPayload::MlsWelcome`.
+/// Extracted from [`handle_hub_delivery`] so its match block stays
+/// under the clippy `too_many_lines` budget. Joins the MLS group,
+/// snapshots state, then dispatches to either room-row persistence
+/// (when `room_name = Some`) or the existing DM register-hub-only
+/// path (when `room_name = None`).
+#[allow(clippy::too_many_arguments)]
+async fn process_hub_mls_welcome(
+    welcome_bytes: &[u8],
+    first_message: Option<String>,
+    room_name: Option<String>,
+    sender_x25519: [u8; 32],
+    sender_pub_b32: &str,
+    sender_fingerprint: String,
+    state: &Arc<DaemonState>,
+) {
+    // Silent failure on join (debug-level only): a hostile hub or
+    // attacker could send junk Welcome bytes; we don't want to spam
+    // operator logs.
+    let join_result = {
+        let party = state.mls_party.lock().await;
+        party.join_from_welcome(welcome_bytes)
+    };
+    let Ok(group) = join_result else {
+        debug!(
+            welcome_bytes = welcome_bytes.len(),
+            "hub: mls/v1 Welcome did not join into a group; dropping"
+        );
+        return;
+    };
+
+    // Persist the post-join MLS state so the group survives a daemon
+    // restart.
+    let snapshot_result = {
+        let party = state.mls_party.lock().await;
+        party.snapshot_state()
+    };
+    if let Ok(snap) = snapshot_result {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_mls_state(state.identity_id, &snap) {
+            warn!(error = %e, "hub: mls/v1 snapshot save failed");
+        }
+    }
+
+    // T6.3.c: if the Welcome carried a `room_name`, this is a multi-
+    // party room invite rather than a 2-party DM bootstrap.
+    if let Some(name) = room_name.clone() {
+        process_room_welcome(&group, &name, &sender_fingerprint, state).await;
+        return;
+    }
+
+    // Register the peer as hub-only. Future direct-dial lifts them
+    // to a live Direct conversation via the existing resume path.
+    let mut reg = state.conversations.lock().await;
+    let handle = reg.register_hub_only(sender_x25519, sender_pub_b32, sender_fingerprint);
+    let group_id_b32 = encode_b32(&group.group_id_bytes());
+    let (text, has_first_message) = if let Some(intro) = first_message {
+        (intro, true)
+    } else {
+        (
+            format!("(joined MLS group {group_id_b32} via hub Welcome)"),
+            false,
+        )
+    };
+    reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text);
+    info!(
+        from_short = %handle.short_id,
+        mls_epoch = group.epoch(),
+        group_id_b32 = %group_id_b32,
+        has_first_message,
+        "hub: mls/v1 Welcome processed, MLS group joined"
+    );
 }
 
 /// Persist a freshly-joined room on the recipient side (T6.3.c).

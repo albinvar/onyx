@@ -673,6 +673,22 @@ async fn handle_invite_to_room(
                 message: format!("save_room: {e}"),
             };
         }
+        // T6.3.e: stash the invitee's hybrid KEM pub keyed by
+        // (group_id, fingerprint) so handle_send_room can hub-
+        // fallback to them when they're offline. The pubkey
+        // bytes are the validated `kem_pub_bytes` we already
+        // decoded above; persisting them here is upsert by PK.
+        if let Err(e) = vault.save_room_member_kem(
+            state.identity_id,
+            &group_id_bytes,
+            peer_fingerprint,
+            &kem_pub_bytes,
+        ) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_room_member_kem: {e}"),
+            };
+        }
     }
 
     // 6. Seal the Welcome with room_name = Some(room.name) so the
@@ -841,41 +857,127 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             };
         }
     }
-    // 3. Walk room members (excluding ourselves), push ciphertext to
-    //    each live direct session. Skipped silently when a member has
-    //    no live session — T6.3.e fills that gap via the hub.
-    let mut delivered: u32 = 0;
+    // 3. Walk room members (excluding ourselves). For each member:
+    //    - try direct push first; if a live Noise session exists,
+    //      push PeerOutbound::RoomFrame(ciphertext.clone()).
+    //    - otherwise (T6.3.e hub-fallback): if we have their cached
+    //      hybrid KEM pub, seal the same MLS ciphertext as a
+    //      BootstrapPayload::MlsApp envelope and fan it out across
+    //      all configured hubs.
+    //    - otherwise (no KEM cached): skip and count under
+    //      skipped_no_kem so the caller can warn.
+    let mut delivered_direct: u32 = 0;
+    let mut delivered_hub: u32 = 0;
+    let mut skipped_no_kem: u32 = 0;
     let mut total: u32 = 0;
-    let reg = state.conversations.lock().await;
-    for fp in &members {
-        if fp == &our_fp {
-            continue;
-        }
+    let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
+        let reg = state.conversations.lock().await;
+        members
+            .iter()
+            .filter(|fp| **fp != our_fp)
+            .map(|fp| (fp.clone(), reg.handle_for_fingerprint(fp)))
+            .collect()
+    };
+    for (fp, maybe_handle) in direct_targets {
         total += 1;
-        let Some(handle) = reg.handle_for_fingerprint(fp) else {
+        if let Some(handle) = maybe_handle {
+            if handle
+                .outbound_tx
+                .try_send(crate::conversations::PeerOutbound::RoomFrame(
+                    ciphertext.clone(),
+                ))
+                .is_ok()
+            {
+                delivered_direct += 1;
+                continue;
+            }
+            // Send failed (queue full / closed): fall through to hub.
+        }
+        // Hub-fallback path.
+        let kem_bytes_opt = {
+            let vault = state.vault.lock().await;
+            vault
+                .lookup_room_member_kem(state.identity_id, &group_id_bytes, &fp)
+                .unwrap_or(None)
+        };
+        let Some(kem_bytes) = kem_bytes_opt else {
+            skipped_no_kem += 1;
+            tracing::warn!(
+                op = "send_room",
+                missing_member = %fp,
+                "no cached KEM pub for member; hub-fallback skipped \
+                 (KEM-pub exchange is a T6.3 follow-up)"
+            );
             continue;
         };
-        if handle
-            .outbound_tx
-            .try_send(crate::conversations::PeerOutbound::RoomFrame(
-                ciphertext.clone(),
-            ))
-            .is_ok()
-        {
-            delivered += 1;
+        let Ok(kem_pub) = onyx_core::crypto::HybridKemPublic::from_bytes(&kem_bytes) else {
+            skipped_no_kem += 1;
+            tracing::warn!(
+                op = "send_room",
+                missing_member = %fp,
+                "cached KEM pub did not decode as HybridKemPublic; skipping"
+            );
+            continue;
+        };
+        let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
+            skipped_no_kem += 1;
+            tracing::warn!(missing_member = %fp, "fingerprint did not parse");
+            continue;
+        };
+        let payload = onyx_core::routing::BootstrapPayload::MlsApp {
+            group_id: serde_bytes::ByteBuf::from(group_id_bytes.clone()),
+            ciphertext: serde_bytes::ByteBuf::from(ciphertext.clone()),
+        };
+        let Ok(payload_bytes) = payload.to_cbor() else {
+            tracing::warn!(missing_member = %fp, "MlsApp CBOR encode failed; skipping");
+            continue;
+        };
+        let Ok(sealed) = onyx_core::routing::seal_bootstrap(
+            state.identity.signing(),
+            state.identity.identity_key(),
+            &payload_bytes,
+            &kem_pub,
+        ) else {
+            tracing::warn!(missing_member = %fp, "seal_bootstrap failed; skipping");
+            continue;
+        };
+        let target = onyx_core::routing::introduction_inbox(&target_fp_parsed);
+        let mut any_accepted = false;
+        for hub_outbound in &state.hub_outbounds {
+            if hub_outbound
+                .try_send(crate::hub_client::HubOutbound::deliver(
+                    target,
+                    sealed.clone(),
+                ))
+                .is_ok()
+            {
+                any_accepted = true;
+            }
+        }
+        if any_accepted {
+            delivered_hub += 1;
+        } else {
+            tracing::warn!(
+                missing_member = %fp,
+                "no hub accepted the MlsApp envelope; recipient won't get this message \
+                 until a hub session recovers"
+            );
         }
     }
-    drop(reg);
     tracing::info!(
         op = "send_room",
         group_id_b32,
-        delivered_to_direct = delivered,
+        delivered_to_direct = delivered_direct,
+        delivered_to_hub = delivered_hub,
+        skipped_no_kem,
         total_members = total,
-        "room: direct-path fan-out"
+        "room: fan-out done"
     );
     ApiResponse::SendRoomOk {
         group_id_b32: group_id_b32.to_string(),
-        delivered_to_direct: delivered,
+        delivered_to_direct: delivered_direct,
+        delivered_to_hub: delivered_hub,
+        skipped_no_kem,
         total_members: total,
     }
 }
@@ -1543,6 +1645,9 @@ mod tests {
             }
             onyx_core::routing::BootstrapPayload::MlsWelcome { .. } => {
                 panic!("expected PlainMessage, got MlsWelcome")
+            }
+            onyx_core::routing::BootstrapPayload::MlsApp { .. } => {
+                panic!("expected PlainMessage, got MlsApp")
             }
         }
         // The opened envelope also authenticates the sender — we

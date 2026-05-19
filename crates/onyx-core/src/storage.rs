@@ -147,6 +147,32 @@ CREATE TABLE IF NOT EXISTS rooms (
 );
 ";
 
+/// Additive extension for T6.3.e — per-room cache of member hybrid
+/// KEM public keys, used by [`Vault::lookup_room_member_kem`] for
+/// the hub-fallback path. Same `CREATE TABLE IF NOT EXISTS` pattern
+/// as the other additive tables — no schema-version bump.
+///
+/// One row per (our identity, MLS group_id, peer fingerprint). The
+/// inviter persists each invitee's KEM pub at invite time (we
+/// already accept it on the wire via `InviteToRoom`'s
+/// `peer_kem_pub_b32`). Recipients of a Welcome don't yet receive
+/// other members' KEM pubs — they hub-fallback only to members
+/// they've directly invited; KEM-pub exchange via the hub
+/// directory (or in-Welcome bundling) is a separate follow-up
+/// (CHANNELS.md §6 / §8). Plaintext columns (the bytes are public
+/// keys; their privacy property is "anyone who has them can send
+/// you sealed envelopes," not confidentiality of the bytes
+/// themselves).
+const SCHEMA_ROOM_MEMBER_KEMS_ADD: &str = "
+CREATE TABLE IF NOT EXISTS room_member_kems (
+  identity_id     INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  group_id        BLOB NOT NULL,
+  fingerprint     TEXT NOT NULL,
+  kem_pub         BLOB NOT NULL,
+  PRIMARY KEY (identity_id, group_id, fingerprint)
+);
+";
+
 /// Known plaintext used to detect a wrong passphrase. Encrypted under
 /// the vault key at creation; failure to decrypt at open means the
 /// passphrase doesn't match (or the file is corrupted — we don't
@@ -279,6 +305,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOMS_ADD).map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOM_MEMBER_KEMS_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -289,6 +317,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOMS_ADD).map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOM_MEMBER_KEMS_ADD)
+            .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -562,6 +592,52 @@ impl Vault {
             .map_err(map_db_err)?;
         Ok(())
     }
+
+    /// Stash a room member's hybrid KEM public key keyed by
+    /// `(identity_id, group_id, fingerprint)` (T6.3.e). The inviter
+    /// calls this after a successful invite so the hub-fallback
+    /// `handle_send_room` path can seal sealed-sender envelopes to
+    /// the member even when they're offline. Upsert by primary key.
+    pub fn save_room_member_kem(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        fingerprint: &str,
+        kem_pub: &[u8],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO room_member_kems \
+                 (identity_id, group_id, fingerprint, kem_pub) \
+                 VALUES (?, ?, ?, ?)",
+                params![identity_id, group_id, fingerprint, kem_pub],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Look up a room member's stashed KEM pub. Returns `Ok(None)` if
+    /// we don't have one cached — caller should skip hub-fallback for
+    /// that member (a Warning-level log is appropriate; the missing
+    /// cache entry is structural for non-inviter members today).
+    pub fn lookup_room_member_kem(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        fingerprint: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT kem_pub FROM room_member_kems \
+                 WHERE identity_id = ? AND group_id = ? AND fingerprint = ?",
+                params![identity_id, group_id, fingerprint],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(map_db_err)?;
+        Ok(row)
+    }
 }
 
 /// One row of [`Vault::list_rooms`]. Plain data; the daemon
@@ -794,6 +870,47 @@ mod tests {
         let bob_rooms = v.list_rooms(bob).unwrap();
         assert_eq!(bob_rooms.len(), 1);
         assert_eq!(bob_rooms[0].name, "bob-room");
+    }
+
+    // ── T6.3.e: room_member_kems ─────────────────────────────────
+
+    #[test]
+    fn room_member_kem_save_lookup_round_trip() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let group_id = b"room-1";
+        let fp = "AAAA-BBBB-CCCC";
+        let kem = vec![7u8; 1216];
+
+        v.save_room_member_kem(id, group_id, fp, &kem).unwrap();
+        let got = v.lookup_room_member_kem(id, group_id, fp).unwrap();
+        assert_eq!(got, Some(kem));
+    }
+
+    #[test]
+    fn room_member_kem_lookup_missing_is_none() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let got = v
+            .lookup_room_member_kem(id, b"room-x", "fp-never-saved")
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn room_member_kem_save_is_upsert() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let group_id = b"room-1";
+        let fp = "fp_bob";
+
+        v.save_room_member_kem(id, group_id, fp, &[1u8; 10])
+            .unwrap();
+        v.save_room_member_kem(id, group_id, fp, &[2u8; 10])
+            .unwrap();
+        let got = v.lookup_room_member_kem(id, group_id, fp).unwrap();
+        // Upsert: second call's bytes win.
+        assert_eq!(got, Some(vec![2u8; 10]));
     }
 
     #[test]

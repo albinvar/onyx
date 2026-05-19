@@ -6,6 +6,37 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.e: send-to-room (hub-fallback path) via `BootstrapPayload::MlsApp`
+
+Fourth code slice of T6.3 (multi-party rooms). Closes the offline-recipient gap from T6.3.d: members without a live direct Noise session now receive the same room ciphertext via the hub, sealed in a new `BootstrapPayload::MlsApp` envelope. With this slice, end-to-end multi-party messaging works through both Tor direct and hub-relayed paths.
+
+What landed:
+
+  * **Vault `room_member_kems` table** (`crates/onyx-core/src/storage.rs`). Additive `CREATE TABLE IF NOT EXISTS` via new `SCHEMA_ROOM_MEMBER_KEMS_ADD` — same pattern as `rooms` / `replay_state`, **no `SCHEMA_VERSION` bump**. One row per (`identity_id`, `group_id`, `fingerprint`) with the member's hybrid KEM pub bytes. Vault methods: `save_room_member_kem` (upsert), `lookup_room_member_kem` (returns `Result<Option<Vec<u8>>>`). 3 new vault tests.
+  * **Wire format**: `BootstrapPayload::MlsApp { group_id: ByteBuf, ciphertext: ByteBuf }` — `v: mlsapp/v1`. Carries the `group_id` explicitly at the bootstrap layer so the recipient can route the inner ciphertext to the right `MlsGroupState` without first TLS-decoding the MLS framing. Leaks nothing extra (the group_id is already in MLS's cleartext header). The outer sealed-sender Ed25519 + hybrid X25519 + ML-KEM-768 envelope properties are identical to `MlsWelcome`'s. 3 new round-trip + wire-shape + envelope tests.
+  * **API**: `ApiResponse::SendRoomOk` gains `delivered_to_hub: u32` and `skipped_no_kem: u32` fields (both `#[serde(default)]` for wire back-compat — old daemons that returned just `delivered_to_direct`/`total_members` still decode). New back-compat test `response_send_room_ok_back_compat_pre_t6_3_e`.
+  * **Daemon — sender side** (`handle_send_room` extended):
+    1. For each room member (excluding ourselves), tries the direct path first (existing T6.3.d behaviour).
+    2. If no live direct session, looks up the member's cached KEM pub via `vault.lookup_room_member_kem`.
+    3. If found: wraps the **same** room ciphertext in `BootstrapPayload::MlsApp { group_id, ciphertext }`, seals via `seal_bootstrap` under the member's KEM pub, fans out across all configured hubs via `HubOutbound::deliver` to the member's `introduction_inbox(fingerprint)`. Bumps `delivered_to_hub`.
+    4. If not found: bumps `skipped_no_kem` + emits a `tracing::warn` line. KEM-pub exchange via hub directory / in-Welcome bundling is a deliberate follow-up — for v0, only members the local daemon has personally invited have cached KEMs.
+  * **`handle_invite_to_room` extended**: after a successful invite commit, stashes the invitee's KEM pub in the new table so `handle_send_room` can hub-fallback to them on subsequent sends.
+  * **Daemon — recipient side** (`process_hub_mls_app` in `lib.rs`): new arm in `handle_hub_delivery`'s match. Reuses the existing `handle_room_app_frame` helper (introduced in T6.3.d for the direct path) — same `load_group` + `decrypt_application` + snapshot + `push_room_message` pipeline. Both sides must already share the MLS group; recipients without the group drop silently at debug level (could be hostile sender probing whether we're in a given room, or recipient hasn't joined yet — neither reveals anything to the sender).
+  * **Helper extraction** (`process_hub_mls_welcome`): pulled out of `handle_hub_delivery` so the match block stays under clippy's `too_many_lines` budget. Pure refactor; behaviour identical to the prior inline implementation.
+
+Design notes:
+
+  * **Why duplicate `group_id` at the bootstrap layer**. The inner MLS ciphertext already carries the group_id in its cleartext header (RFC 9420 §6). Recipients of an `MlsApp` envelope *could* parse the framing first to extract it, then load the group. Carrying it explicitly at the bootstrap layer skips that TLS-decode round trip on the hot path. No metadata leak: the recipient is the only entity that can decrypt the outer envelope, and they're the only entity that sees the inner CBOR. A hostile hub watching the wire sees encrypted bytes — they don't get to peek at `group_id` either way.
+  * **Why the inviter-only KEM cache is acceptable for v0**. The structural property is: alice invites bob+carol → alice has both KEMs cached → alice can hub-fallback to both. bob (who joined via Welcome from alice) only has alice's KEM cached (because alice is the only person bob has actually invited so far in this room). So bob can hub-fallback to alice but not carol. This is honest and documented. The fix (KEM-pub exchange in the Welcome itself, or via a hub-directory verb) is a separate follow-up — CHANNELS.md §6 / §8.
+  * **Same ciphertext via two paths**. The `EnvelopeReplayGuard` (T7.3-sec.2) handles direct + hub duplication for free: if the recipient has both a direct session AND receives the hub envelope (because the sender didn't realise the direct session existed), the hub copy gets dropped silently as a replay. Same elegant property recycled.
+  * **`#[allow(clippy::too_many_arguments)]` on `process_hub_mls_welcome`**. Seven parameters threading state through. Refactor to a context struct would add ceremony without changing the structure; the function is a single linear sequence and reads top-to-bottom.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **343 passed** (+7 new from 336).
+
+Next: T6.3.f — TUI room pane + `onyx room create / invite / send / list` CLI verbs. The plumbing is complete; T6.3.f is the user-facing surface for it. After that we can finally end-to-end smoke a 3-party room across two Tor identities + a hub.
+
+---
+
 ## 2026-05-19 — T6.3.d: send-to-room (direct path) + group_id-routed receive
 
 Third code slice of T6.3 (multi-party rooms). Lets a sender encrypt **once** in the room's MLS group and fan the same ciphertext out to every room member who has a live direct Noise session. Hub-fallback for offline / hub-only members is T6.3.e. With this slice, end-to-end direct-path multi-party messaging works: alice → invite bob → invite carol → send-to-room delivers one MLS ciphertext to both bob and carol over their respective DM Noise tunnels, and each decrypts it against the *room* group state rather than the DM group state.
