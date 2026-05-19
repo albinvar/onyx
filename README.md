@@ -72,6 +72,20 @@ What's **not** done yet (carry-forward, with item numbers from `THREAT_MODEL.md`
 
 ## 3. Install
 
+### Easy path — one-liner installer
+
+```sh
+curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh | bash
+```
+
+Auto-detects your OS + CPU (macOS arm64/x86_64, Linux x86_64/aarch64), downloads the right prebuilt binary, **verifies it with sigstore cosign**, and drops `onyx` in `~/.local/bin/onyx`. Then run `onyx` — it boots the daemon + TUI in one process.
+
+For Windows: use WSL2 + the Linux installer, or build from source below.
+
+For the security-conscious recipe (download → read → run) and all the threat-model caveats, see **[INSTALL.md](./INSTALL.md)**. For the verifier-side walkthrough of cosign and `SHA256SUMS`, see **[RELEASES.md](./RELEASES.md)**.
+
+### Source path — for hackers / contributors
+
 You need **Rust stable** (we test on 1.95+) and a C toolchain (the Arti dep set pulls some C-backed crypto). On macOS that's just `xcode-select --install`.
 
 ```sh

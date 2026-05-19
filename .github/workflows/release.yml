@@ -48,18 +48,31 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             ext: ''
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            ext: ''
+            cross: true   # cross-compile via gcc-aarch64-linux-gnu
           - target: aarch64-apple-darwin
             runner: macos-latest
             ext: ''
+            cross: false
           - target: x86_64-apple-darwin
             runner: macos-13
             ext: ''
+            cross: false
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         run: |
           rustup target add ${{ matrix.target }}
+
+      - name: Install cross-compile toolchain (Linux aarch64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
 
@@ -74,6 +87,9 @@ jobs:
             --remap-path-prefix ${{ github.workspace }}=/onyx
             --remap-path-prefix ${HOME}/.cargo=/cargo
             -C link-arg=-s
+          # Cross-compile linker for aarch64-unknown-linux-gnu. Cargo
+          # reads CARGO_TARGET_<TARGET>_LINKER for the per-target linker.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           # --locked: refuse to update Cargo.lock; same dep set as
           # committed. --release: optimized + stripped.
@@ -179,6 +195,25 @@ jobs:
 
           ls -la
 
+      - name: Copy install script into release dir
+        # T-install.b: ship the install script alongside the release so
+        # `curl .../releases/download/v0.1.0/install.sh | bash` works,
+        # and that URL is immutable (the release-tag URL doesn't change
+        # like raw.githubusercontent.com/.../main/scripts/install.sh
+        # would). The release tag in the URL also pins which version
+        # the script will install by default when invoked without
+        # ONYX_VERSION set.
+        run: |
+          cp scripts/install.sh dist/install.sh
+          chmod +x dist/install.sh
+          # Sign the install script itself so a verifier can confirm it
+          # was produced by this workflow. Sigstore bundle is
+          # self-contained, no separate signature file.
+          cosign sign-blob \
+            --yes \
+            --bundle dist/install.sh.cosign-bundle \
+            dist/install.sh
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -188,8 +223,22 @@ jobs:
             dist/onyx-hub-*
             dist/SHA256SUMS.txt
             dist/SHA256SUMS.txt.cosign-bundle
+            dist/install.sh
+            dist/install.sh.cosign-bundle
           generate_release_notes: true
           body: |
+            ## Install (one-liner)
+
+            ```
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+            ```
+
+            The script auto-detects your platform (macOS arm64/x86_64, Linux
+            x86_64/aarch64), downloads + verifies the right binary, and
+            installs `onyx` to `~/.local/bin`. See `INSTALL.md` for manual
+            install and the security-conscious recipe (download → read →
+            run).
+
             ## Verifying this release
 
             Every binary and the combined `SHA256SUMS.txt` are signed

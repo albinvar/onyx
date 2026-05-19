@@ -6,6 +6,70 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-install (a–c): one-liner installer + Linux ARM64 builds + INSTALL.md
+
+The install path before this change was either `cargo build --release` (assumes a Rust toolchain) or *"download the binary from the GitHub release page, verify it with cosign, drop it on your PATH, deal with the macOS quarantine xattr yourself."* Neither is a "non-developer can install this in 30 seconds" experience.
+
+This slice closes that gap with a verified one-liner.
+
+### What landed
+
+**`scripts/install.sh`** (T-install.a — ~280 lines, shellcheck-clean):
+
+  * Auto-detects target from `uname` (macOS arm64/x86_64, Linux x86_64/aarch64).
+  * Resolves the latest release tag from GitHub's `/releases/latest` redirect — no `jq` needed.
+  * Downloads the binary + its `.cosign-bundle` + the combined `SHA256SUMS.txt`.
+  * **SHA256 verification against the manifest** — catches transport corruption / partial downloads.
+  * **`cosign verify-blob`** (when cosign is installed) — catches a tampered binary in the release tab, because the attacker doesn't hold an OIDC token bound to this repo's `release.yml`. If cosign is missing, prints a loud warning explaining exactly what verification was skipped and what that means for the threat model.
+  * Drops the `com.apple.quarantine` xattr on macOS so Gatekeeper doesn't block the unsigned binary (we don't have Apple Developer ID notarization yet — documented as a follow-up).
+  * Installs to `~/.local/bin/onyx` by default; configurable via `ONYX_INSTALL_DIR`.
+  * Detects whether the install dir is on `$PATH` and prints an `export PATH=…` line if not.
+  * Knobs: `ONYX_VERSION` (pin a tag), `ONYX_BINS` (default `"onyx"`, set to `"onyx onyxd onyx-hub"` to grab them all), `ONYX_NO_VERIFY=1` (skip cosign, loud warning), `ONYX_SKIP_PATH_HINT=1`.
+
+**Release workflow** (T-install.b — `.github/workflows/release.yml`):
+
+  * **`install.sh` shipped as a release asset**, sigstore-signed (own `.cosign-bundle`). Means the install URL `https://github.com/<repo>/releases/download/<tag>/install.sh` is *immutable* — the script that ran for `v0.1.0` will always be the script that ran for `v0.1.0`, even if `main`'s `scripts/install.sh` later changes. (Mutability of `raw.githubusercontent.com/.../main/scripts/install.sh` is a real concern — fixing the install URL to a release tag is the right answer.)
+  * **Linux aarch64 target added to the build matrix** (`aarch64-unknown-linux-gnu`). Cross-compiled from `ubuntu-latest` via `gcc-aarch64-linux-gnu` + the `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` env. Closes the "Raspberry Pi / Asahi Linux / ARM cloud VM users blocked" gap I called out earlier today.
+  * **Release notes body** now leads with the one-liner install command and points at INSTALL.md + RELEASES.md.
+
+**`INSTALL.md`** (T-install.c) — full 3-path install guide:
+
+  * §1 one-liner (recommended for most people).
+  * §2 manual download + verify (recommended for the security-conscious — explicit `cosign verify-blob` + `sha256sum -c` recipe).
+  * §3 build from source (recommended if you don't trust any prebuilt).
+  * §4 first-run UX (Ctrl-N / Ctrl-I / Ctrl-F / invite URLs).
+  * §5 uninstall.
+  * §6 reporting install bugs.
+  * **Honest threat-model section** for the installer itself: what the script catches, what it doesn't, and the explicit instruction to fetch the script from a *release-tag* URL, not `raw.githubusercontent.com/.../main/`.
+
+**README.md** install section rewritten — leads with the one-liner; the source path moved to "for hackers / contributors."
+
+### What's still missing (queued, not in this slice)
+
+  * **Windows builds.** Matrix doesn't include `x86_64-pc-windows-msvc` yet. Install script tells Windows users explicitly: "use WSL2 or build from source." Adding Windows means a separate matrix entry + dealing with `.exe` suffix + SmartScreen complaints. Maybe 2 hours.
+  * **macOS code-signing + Apple Developer ID notarization.** Without it, even after stripping the quarantine xattr, opening `onyx` for the first time on a fresh Mac may still produce a Gatekeeper warning depending on macOS version and how the user invoked it. Apple Developer Program is $99/year. Maybe 3 hours of CI work once you have the certificate.
+  * **`brew tap` formula.** `brew install albinvar/onyx/onyx` is the muscle-memory install for Mac users. ~1 hour to set up a `homebrew-onyx` tap repo with a formula that points at the release assets. Cleanly separable.
+  * **AUR (Arch) + nixpkg + scoop + apt repo.** Same story for Linux/Windows package managers. Mostly community-maintainable once the binaries exist; some are easier than others.
+  * **A bootstrap public hub.** Onyx is useless without at least one hub address. Right now every user has to know somebody running a hub. Either you (the maintainer) run one and bake its `.onion` into a default config, or you accept "download → run → stare at empty screen." This is a *decision*, not a *code change* — see DISCOVERY.md.
+
+### Verification
+
+Gates: `cargo test --workspace` → 447 passed (unchanged; this slice is docs + scripts + CI, no Rust code). `shellcheck scripts/install.sh` → clean. `python3 -c "yaml.safe_load(open(...release.yml))"` → parses.
+
+End-to-end install verification requires an actual published release to test against, which we don't have yet (the local commits aren't pushed). The first `v0.1.0` tag will be the first real test of the install script — recommend cutting it on a branch first, watching the workflow, then doing `bash <(curl -fsSL .../install.sh)` on a fresh VM/container before cutting `v0.1.0` proper.
+
+### How to use the new path
+
+```sh
+# what a new user types from a fresh laptop:
+curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh | bash
+onyx
+```
+
+That's the entire UX, once `v0.1.0` is tagged.
+
+---
+
 ## 2026-05-19 — T-files.e: TUI file-picker modal + inline attachment rendering (last T-files slice)
 
 Final T-files slice. The operator no longer needs to drop to a shell to share a file in a room — `Ctrl-F` from the TUI opens a modal that wraps the same `ApiRequest::SendFileToRoom` path the CLI uses. Incoming files render inline in the room's scrollback as `📎 received <name> (<size> bytes, <mime>) → <path>`, sorted by timestamp.
