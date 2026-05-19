@@ -1034,8 +1034,7 @@ mod tests {
         // She encrypts an app message at epoch 2 BEFORE shipping the
         // commit to bob (simulating the race).
         let carol_kp = carol.key_package_bytes().unwrap();
-        let (commit_to_bob, _welcome_to_carol) =
-            alice_group.invite(&alice, &carol_kp).unwrap();
+        let (commit_to_bob, _welcome_to_carol) = alice_group.invite(&alice, &carol_kp).unwrap();
         assert_eq!(alice_group.epoch(), 2);
         let app_at_epoch_2 = alice_group
             .encrypt_application(&alice, b"future-epoch message")

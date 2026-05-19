@@ -6,6 +6,41 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-cover (1–3): opt-in client → hub cover traffic via `FRAME_PAD`
+
+Tackles the post-T6.3 review's issue #4: the timing-correlation gap documented in `ANONYMITY.md §3.1`. Pre-T-cover, a passive hub-watching adversary could fingerprint "alice is actively chatting" vs "alice is idle but online" purely from when frames arrived on her hub connection (real traffic only when she sends; nothing otherwise). T-cover adds an opt-in Poisson cover-traffic emitter that injects `FRAME_PAD` frames at exponentially-distributed intervals — same wire shape as a real small frame, indistinguishable to the hub.
+
+What landed:
+
+  * **Hub side** (`onyx-hub/handler.rs`): explicit `FRAME_PAD` arm that silently discards at `tracing::trace!` level — no `warn!`, no `info!`. The whole privacy property hinges on the hub being unable to distinguish cover from real traffic, **including via its own logs**. An operator scrolling stderr who saw "alice's daemon is sending PAD frames" could subtract those entries and recover alice's real send pattern. Trace-level keeps it under the default subscriber's threshold.
+  * **Daemon outbound channel** (`onyx-daemon/hub_client.rs`): new `HubOutbound::Pad` variant; outbound match writes a `FRAME_PAD` with empty payload (wire layer pads to `bucket::SMALL` so on-wire bytes are the same size as a real small frame). Extracted to `write_cover_pad` helper to keep `serve_session` under clippy `too_many_lines`.
+  * **Daemon cover-traffic task** (`onyx-daemon/lib.rs::run_cover_traffic_loop`): per-hub task that pushes `HubOutbound::Pad` at intervals sampled from `next_exponential_interval(mean_secs)`. The sampler uses the inverse-CDF method: `dt = -mean × ln(uniform_(0,1])` where the uniform comes from 8 OS-random bytes via `onyx_core::crypto::fill_random`. **Why exponential / Poisson, not fixed-clock**: a fixed-clock cover-traffic emitter is itself a fingerprint that an adversary can subtract; Poisson inter-arrivals are memoryless — the time until the next frame doesn't depend on how long it's been since the last, so there's no rhythm to subtract.
+  * **Two clamps on the sampler**: minimum 1s (a CSPRNG outlier near 1 shouldn't produce a microsecond gap that saturates the Tor circuit), maximum 10 × mean (the long tail of the exponential producing a "we never sent anything" gap that itself signals something). Documented inline with the rationale.
+  * **Config + CLI flag** in both `onyx` and `onyxd`: `--cover-traffic-mean-secs <N>` (env var `ONYX_COVER_TRAFFIC_MEAN_SECS`). `None` or `0` disables — the v0 default. Documentation steers operators toward values in [5, 60] seconds with the rationale (below 5 burns bandwidth without proportional gain; above 60 means real bursts stand out against sparse cover).
+  * **2 new tests** (`cover_traffic_tests` module in `lib.rs`):
+    * `next_exponential_interval_is_clamped` — 10k samples; every result lies in [1s, 10 × mean]. Pins both clamps and rules out the buggy "constant zero" / "Duration::MAX" failure modes.
+    * `next_exponential_interval_average_is_reasonable` — 10k samples; average within ±50% of `mean_secs × 1000ms`. Generous band because the clamps skew the true mean slightly off `mean_secs`; a bug like "always return mean" or "always return 1s" would fall well outside.
+
+Design notes:
+
+  * **Why client → hub only.** Today's implementation covers one direction. The hub → client direction still leaks "alice has friends who are active right now" by their absence in the cover stream. Hub-side cover (hub injecting PAD frames to each subscribing client at the same cadence) is the obvious next slice. Not built yet because it requires hub-side scheduler infrastructure and a story for "what does the daemon do if its hub burns CPU on cover traffic when bandwidth is tight."
+  * **Why opt-in default-off.** Cover traffic costs bandwidth — at mean=20s on a single hub, that's ~5 cover frames per minute per daemon (bucket::SMALL = 256 bytes). For Tor circuits with limited throughput, that's not free. The honest framing: until we have real-Tor smoke verifying the cadence is actually indistinguishable on the wire to a passive Tor-circuit observer, we'd rather not ship it on-by-default and have it turn out to be theater (or worse, an itself-fingerprintable signal).
+  * **`ANONYMITY.md §3.1` rewritten** from "What we have today: nothing" to a four-bullet honest accounting of what cover does and doesn't do. Explicitly documents the four caveats above (one-directional, autocorrelation-vulnerable for sophisticated adversaries, unverified in real Tor, off by default).
+  * **The empty `FRAME_PAD` payload is the right shape.** The wire layer (`onyx-core::wire::InnerFrame::encode_padded`) pads every frame to the next bucket boundary regardless of payload size — so an empty-payload PAD becomes a bucket::SMALL (256-byte) frame, byte-identical in size to a 240-byte real PlainMessage at the same bucket. The frame_type byte is encrypted inside Noise, so a passive observer on Tor sees only an opaque 256-byte chunk — exactly the privacy property.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **359 passed** (+2 new from 357).
+
+End-to-end smoke still required: actually launching a daemon with `--cover-traffic-mean-secs 20` against a real hub and confirming (a) the PAD frames make it on the wire, (b) the hub's log stays clean, (c) the timing distribution at the hub matches the configured exponential.
+
+Issues resolved this session:
+
+  * **#2 (T6.3.h commit + KEM-ad ordering race)** → fixed by T6.3.i (`5c1bdb0`).
+  * **#3 (T6.3.g session-token subscribe race)** → confirmed non-issue (hub queues by routing_id even without a subscriber).
+  * **#4 (cover traffic absence)** → partial mitigation in place (this slice).
+  * **#1 (real-Tor smoke)** → still outstanding; the meta-issue that hides everything else.
+
+---
+
 ## 2026-05-19 — T6.3.i: per-group buffer for out-of-order room frames
 
 Bugfix slice flagged in the post-T6.3.f.2 review. The "commit + KEM-advertisement" pair shipped in T6.3.h relies on per-path FIFO ordering — direct-session push order is preserved, hub TCP per-session is FIFO. But if a member's direct session drops between the commit fanout call and the KEM-ad fanout call, the commit might land on a now-dead direct channel while the KEM-ad takes the hub path — recipient receives KEM-ad (encrypted at epoch N+1) before they receive the commit that would advance them from N to N+1. Pre-T6.3.i, the KEM-ad fails to decrypt silently at debug, and that member permanently loses the KEM (they can't ask for it again). Same shape applies to any room app message that arrives faster than the preceding commit.

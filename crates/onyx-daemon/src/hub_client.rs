@@ -66,6 +66,12 @@ pub enum HubOutbound {
     /// Subscriptions are additive at the hub layer — see
     /// `onyx_hub::state::ConnState::subscribe`.
     Subscribe(Vec<RoutingId>),
+    /// Push a `FRAME_PAD` cover-traffic frame to the hub (T-cover.2).
+    /// The hub silently discards it. Sent at Poisson intervals by the
+    /// cover-traffic task when `--cover-traffic-mean-secs` is set, to
+    /// blunt the timing-correlation signal a hub-watching adversary
+    /// gets from observing when alice publishes vs idles.
+    Pad,
 }
 
 /// Backwards-compat helper so existing call sites that built a
@@ -187,6 +193,30 @@ where
         },
     )
     .await
+}
+
+/// T-cover.2: write a single `FRAME_PAD` cover-traffic frame.
+/// Empty payload; the wire layer pads it to bucket::SMALL so it's
+/// size-indistinguishable from a real small frame. Errors surface
+/// as session-end (caller treats it as a reconnect cue) — silently
+/// dropping a PAD would defeat the cadence the privacy property
+/// relies on.
+async fn write_cover_pad<S>(stream: &mut S, session: &mut Session) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    write_frame(
+        stream,
+        session,
+        &InnerFrame {
+            frame_type: onyx_core::wire::FRAME_PAD,
+            payload: Vec::new(),
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("hub: PAD write failed: {e}"))?;
+    tracing::trace!("hub: PAD sent");
+    Ok(())
 }
 
 /// T6.3.g: thin wrapper around `write_subscribe` for the
@@ -365,6 +395,7 @@ where
                     HubOutbound::Subscribe(ids) => {
                         write_incremental_subscribe(stream, session, &ids).await?;
                     }
+                    HubOutbound::Pad => write_cover_pad(stream, session).await?,
                 }
             }
             // Outbound channel closed → daemon shutting down.

@@ -154,6 +154,21 @@ pub struct Config {
     pub hubs: Vec<HubConfig>,
     pub listen_tcp: Option<String>,
     pub dial_tcp: Option<String>,
+    /// T-cover.3: mean interval (in seconds) between client → hub
+    /// FRAME_PAD cover-traffic frames, on each configured hub.
+    /// `None` disables (the v0 default — opt-in until real-Tor
+    /// smoke verifies the cadence doesn't itself leak).
+    ///
+    /// Honest framing: cover traffic raises a hub-watching
+    /// adversary's cost to fingerprint "alice is actively chatting
+    /// vs idling" by injecting indistinguishable PAD frames at
+    /// exponentially-distributed (Poisson-process) intervals. It
+    /// does NOT defeat a sophisticated traffic-analysis adversary
+    /// — see `ANONYMITY.md` §3.1 for the full caveat. Mean values
+    /// below 5s burn bandwidth without proportional gain; values
+    /// above 60s mean the gap between cover frames is long enough
+    /// that real-traffic bursts still stand out.
+    pub cover_traffic_mean_secs: Option<u64>,
 }
 
 /// Bundle of state every handler needs.
@@ -569,6 +584,24 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                     backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
                 }
             }.instrument(span)));
+
+            // T-cover.2: per-hub cover-traffic emitter. Opt-in via
+            // `--cover-traffic-mean-secs <N>`. The emitter clones the
+            // hub's outbound Sender and pushes HubOutbound::Pad at
+            // exponentially-distributed intervals (Poisson process
+            // with mean N). Stops cleanly when the channel closes.
+            if let Some(mean_secs) = args.cover_traffic_mean_secs
+                && mean_secs > 0
+            {
+                let hub_tx = state.hub_outbounds[idx].clone();
+                let cover_span = info_span!("cover", hub_idx = idx, mean_secs);
+                hub_tasks.push(tokio::spawn(
+                    async move {
+                        run_cover_traffic_loop(hub_tx, mean_secs).await;
+                    }
+                    .instrument(cover_span),
+                ));
+            }
         }
     }
 
@@ -1335,6 +1368,69 @@ async fn handle_room_app_frame(
     }
 }
 
+/// T-cover.2: emit `HubOutbound::Pad` at exponentially-distributed
+/// intervals (Poisson process with mean `mean_secs`). Sender clone
+/// is consumed when the channel closes (daemon shutdown) — that's
+/// the clean termination signal.
+///
+/// **Why Poisson, not fixed-interval.** A fixed-clock cover-traffic
+/// emitter is itself a fingerprint: an adversary correlating frame
+/// arrival times across the whole hub population can pick out the
+/// "tick" cadence and silently subtract it from each user's stream.
+/// A Poisson process — where inter-arrival times are exponentially
+/// distributed — produces gaps that are memoryless: the time until
+/// the next frame doesn't depend on how long it's been since the
+/// last one, so there's no rhythm to subtract.
+///
+/// Two clamps:
+///   * minimum 1s between frames so a CSPRNG outlier doesn't
+///     accidentally produce a microsecond gap that would saturate
+///     the Tor circuit.
+///   * Hard maximum at 10 × mean to avoid the long-tail of the
+///     exponential producing a "we never sent anything" gap that
+///     itself signals something.
+async fn run_cover_traffic_loop(tx: mpsc::Sender<hub_client::HubOutbound>, mean_secs: u64) {
+    info!(mean_secs, "cover-traffic emitter: started");
+    loop {
+        let dt = next_exponential_interval(mean_secs);
+        tokio::time::sleep(dt).await;
+        if tx.send(hub_client::HubOutbound::Pad).await.is_err() {
+            info!("cover-traffic emitter: outbound channel closed; ending");
+            return;
+        }
+        tracing::trace!(interval_ms = dt.as_millis(), "cover: PAD queued");
+    }
+}
+
+/// Sample an exponentially-distributed inter-arrival interval with
+/// mean `mean_secs`. Uses the inverse-CDF method: `-mean * ln(u)`
+/// where `u` is uniform on `(0, 1]`. Both clamps documented on
+/// [`run_cover_traffic_loop`].
+//
+// Precision-loss + truncation casts are intentional here: the f64
+// computations only need to drive a sleep duration, not maintain
+// cryptographic precision. The clamp keeps the result in a sane
+// range regardless of float weirdness.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn next_exponential_interval(mean_secs: u64) -> std::time::Duration {
+    let mut buf = [0u8; 8];
+    onyx_core::crypto::fill_random(&mut buf);
+    // Map 0..2^64 → (0, 1]. We add 1 before dividing to avoid the
+    // exact-zero case (which would make ln(0) = -∞).
+    let raw = u64::from_le_bytes(buf);
+    let u = (raw as f64 + 1.0) / (u64::MAX as f64 + 1.0);
+    let mean = mean_secs as f64;
+    let secs = -mean * u.ln();
+    let max_secs = mean * 10.0;
+    let clamped = secs.clamp(1.0, max_secs);
+    let millis = (clamped * 1000.0) as u64;
+    std::time::Duration::from_millis(millis)
+}
+
 /// T6.3.i: stash a room frame that just failed `process_incoming`,
 /// keyed by `group_id`. Bounded per group at
 /// [`PENDING_ROOM_FRAMES_PER_GROUP_MAX`]; overflow drops the oldest
@@ -1997,5 +2093,58 @@ async fn final_replay_snapshot(state: &DaemonState) {
             "final replay snapshot persisted on shutdown"
         ),
         Err(e) => warn!(error = %e, "final replay snapshot save failed on shutdown"),
+    }
+}
+
+#[cfg(test)]
+mod cover_traffic_tests {
+    use super::*;
+
+    /// T-cover.2: every sampled interval is bounded by the
+    /// documented clamp [1s, 10×mean]. Important: a buggy sampler
+    /// returning Duration::ZERO would saturate the Tor circuit;
+    /// returning enormous Durations would create gaps that
+    /// themselves signal something. Pin both clamps over a large
+    /// sample.
+    #[test]
+    fn next_exponential_interval_is_clamped() {
+        let mean_secs: u64 = 5;
+        let lo = std::time::Duration::from_secs(1);
+        let hi = std::time::Duration::from_secs(mean_secs * 10);
+        for _ in 0..10_000 {
+            let dt = next_exponential_interval(mean_secs);
+            assert!(
+                dt >= lo,
+                "interval {dt:?} below lower clamp {lo:?}"
+            );
+            assert!(
+                dt <= hi,
+                "interval {dt:?} above upper clamp {hi:?}"
+            );
+        }
+    }
+
+    /// Statistical sanity: across many samples the average should
+    /// be in the right ballpark relative to the mean. Because of
+    /// the [1s, 10×mean] clamp, the true mean is slightly lower
+    /// than `mean_secs` (the long tail is cut off) and slightly
+    /// higher than `mean_secs - 1` (the bottom is cut off). A
+    /// generous ±50% band around `mean_secs` catches a bug where
+    /// the sampler is constant or wildly skewed without flaking on
+    /// CSPRNG randomness.
+    #[test]
+    fn next_exponential_interval_average_is_reasonable() {
+        let mean_secs: u64 = 10;
+        const N: u32 = 10_000;
+        let mut sum_ms: u128 = 0;
+        for _ in 0..N {
+            sum_ms += next_exponential_interval(mean_secs).as_millis();
+        }
+        let avg_ms = sum_ms / u128::from(N);
+        let target_ms = u128::from(mean_secs) * 1000;
+        assert!(
+            avg_ms >= target_ms / 2 && avg_ms <= target_ms * 3 / 2,
+            "avg {avg_ms}ms should be within ±50% of target {target_ms}ms"
+        );
     }
 }

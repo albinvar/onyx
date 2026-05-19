@@ -10,7 +10,7 @@ use onyx_core::crypto::IdentitySecret;
 use onyx_core::transport::{Session, handshake_responder, read_frame, write_frame};
 use onyx_core::wire::{
     FRAME_DELIVER, FRAME_GOSSIP_DELIVER, FRAME_GOSSIP_PUBLISH, FRAME_KP_FETCH, FRAME_KP_PUBLISH,
-    FRAME_KP_RESPONSE, FRAME_SUBSCRIBE, GossipFrame, InnerFrame,
+    FRAME_KP_RESPONSE, FRAME_PAD, FRAME_SUBSCRIBE, GossipFrame, InnerFrame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
@@ -492,6 +492,19 @@ where
                             found,
                             "hub: KP_FETCH answered"
                         );
+                    }
+                    FRAME_PAD => {
+                        // T-cover.1: client-side cover traffic. Silently
+                        // discard — no warn, no info, even no debug per-
+                        // frame. The whole point is that the hub MUST
+                        // NOT be able to distinguish cover from real
+                        // traffic, including via its own logs (an
+                        // operator scrolling stderr would otherwise see
+                        // "alice's daemon is sending PAD frames" and
+                        // know exactly when alice's actual sends
+                        // happened by absence of PAD lines). Log at the
+                        // coarsest "trace" level only.
+                        tracing::trace!(conn = conn_id, "hub: dropped FRAME_PAD");
                     }
                     other => {
                         warn!(

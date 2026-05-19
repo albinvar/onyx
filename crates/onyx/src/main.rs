@@ -113,6 +113,18 @@ struct Args {
     #[arg(long = "hub", action = clap::ArgAction::Append, global = true)]
     hubs: Vec<String>,
 
+    /// **Opt-in.** Mean interval (in seconds) between cover-traffic
+    /// PAD frames on each configured hub. When set, the embedded
+    /// daemon publishes a sealed-sender-indistinguishable FRAME_PAD
+    /// at exponentially-distributed (Poisson-process) intervals so
+    /// a hub watching frame timing can't easily fingerprint "alice
+    /// is actively chatting vs idle." Set to 0 or omit to disable
+    /// (the v0 default — cover traffic burns bandwidth and isn't
+    /// yet verified in real-Tor smoke). See `ANONYMITY.md` §3.1
+    /// for the full threat model.
+    #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS", global = true)]
+    cover_traffic_mean_secs: Option<u64>,
+
     #[command(subcommand)]
     cmd: Option<Command>,
 }
@@ -398,6 +410,7 @@ fn build_daemon_config(
         hubs,
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
+        cover_traffic_mean_secs: args.cover_traffic_mean_secs,
     })
 }
 

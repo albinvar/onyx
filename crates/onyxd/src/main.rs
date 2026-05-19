@@ -91,6 +91,13 @@ struct Args {
     #[arg(long, env = "ONYX_DIAL_TCP", requires = "dial_pubkey",
           conflicts_with_all = ["dial_onion", "listen_tcp"])]
     dial_tcp: Option<String>,
+
+    /// **Opt-in.** Mean interval (in seconds) between cover-traffic
+    /// PAD frames on each configured hub. See `ANONYMITY.md` §3.1.
+    /// Off by default (the v0 default; not yet verified in real-Tor
+    /// smoke). Setting 0 also disables.
+    #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS")]
+    cover_traffic_mean_secs: Option<u64>,
 }
 
 impl TryFrom<Args> for Config {
@@ -131,6 +138,7 @@ impl TryFrom<Args> for Config {
             hubs,
             listen_tcp: a.listen_tcp,
             dial_tcp: a.dial_tcp,
+            cover_traffic_mean_secs: a.cover_traffic_mean_secs,
         })
     }
 }

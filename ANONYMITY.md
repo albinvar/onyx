@@ -77,13 +77,18 @@ Concrete defences with file pointers, in approximate order of how much they buy 
 
 Ranked by impact on anonymity, with the realistic effort to close each.
 
-### 3.1 Timing correlation — **biggest open gap**
+### 3.1 Timing correlation — partial mitigation in place (T-cover.1–3)
 
 A global passive adversary watching both your Tor entry guard and your peer's can correlate "Alice's daemon emitted a sealed envelope at 09:23:14.221" with "Bob's daemon emitted an `EventMessage` at 09:23:14.398." The hub knows this trivially because it sits in the middle.
 
-  * **What would close it: cover traffic.** Constant-rate dummy envelopes between every daemon and its hub, indistinguishable on the wire from real ones. Recipient drops dummies silently. The hub no longer learns *when* you send a real message because there's always a message.
-  * **What we have today:** nothing. The hub sees real envelopes only when there is real traffic.
-  * **Effort:** 1–2 sessions of focused work. Significant because it touches the generator, the recipient sink discipline (must not surface dummies as events), and the bucket strategy.
+  * **What we have today (T-cover.2):** opt-in client → hub cover traffic via `--cover-traffic-mean-secs <N>`. When enabled, the daemon emits a `FRAME_PAD` (empty payload, padded to bucket::SMALL so it's size-indistinguishable from a small real frame) at **exponentially-distributed intervals** with mean N seconds. Hub silently discards FRAME_PAD frames (`tracing::trace!` only — no warn/info log lines that would themselves let an operator-side observer fingerprint PAD timing). The exponential distribution is **memoryless** by design: a fixed-clock cadence would itself become a fingerprint an adversary could subtract from each user's stream. With Poisson inter-arrivals, the gap until the next frame doesn't depend on how long it's been since the last one, so there's no rhythm to subtract.
+  * **What this raises the adversary's cost to do:** distinguishing "alice is actively chatting right now" vs "alice is idle but online" purely from the daemon→hub frame timing. Pre-cover, idle alice generates zero frames; chatting alice generates one frame per message. With cover at mean=20s, idle alice generates ~3 frames per minute of indistinguishable bytes; chatting alice adds her real frames *on top of* that constant noise floor.
+  * **What this does NOT do (be honest):**
+    1. **One-directional only.** Today's implementation covers the client → hub direction. The hub → client direction (real inbound deliveries) still leaks "alice has friends who are active right now" by their absence in the cover stream. Hub-side cover is a future slice — see `THREAT_MODEL.md` for the asymmetric-cover gap.
+    2. **No guarantee against multi-session correlation.** A sophisticated adversary running long enough can still distinguish "real burst plus cover" from "pure cover" by autocorrelation on the rate. The mitigation costs them more — they need many more samples to be confident — but doesn't refuse them an answer eventually.
+    3. **Not verified in real-Tor smoke yet.** The unit tests pin the statistical properties of the sampler (`next_exponential_interval_is_clamped`, `next_exponential_interval_average_is_reasonable`) but the end-to-end "hub really can't distinguish" claim needs real-circuit measurement that hasn't happened.
+    4. **Off by default.** Cover traffic burns bandwidth (mean=20s × N hubs × bucket::SMALL bytes per daemon). The v0 default leaves it off until the operator opts in and we have smoke results.
+  * **What's left to close it fully:** hub-side cover frames (hub → client at the same Poisson cadence), and real-Tor verification that the cadence + bucket size are actually indistinguishable on the wire to a passive Tor-circuit observer.
 
 ### 3.2 Hub knows online/offline timing
 
