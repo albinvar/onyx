@@ -475,20 +475,60 @@ async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow
     let invite = onyx_core::invite::Invite::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
 
-    // T8.2 transparency: if the inviter disclosed their hub list,
-    // surface it to stderr so the user can decide whether their own
-    // daemon's hub config will actually reach those hubs. Stays on
-    // stderr to keep stdout pipe-friendly for the JSON response.
+    // T8.2 transparency + T8.2-check intersection: if the inviter
+    // disclosed their hub list, surface it to stderr AND check it
+    // against our own daemon's configured hub list. If the
+    // intersection is empty, warn loudly — the delivery will go out
+    // via our hubs and never reach a hub the recipient subscribes
+    // to. If non-empty, confirm "via N matching hub(s)" so the
+    // operator sees the path. All on stderr; stdout stays JSON for
+    // pipe-friendliness.
     if !invite.hubs.is_empty() {
         eprintln!("onyx: recipient publishes to {} hub(s):", invite.hubs.len());
         for hub in &invite.hubs {
             eprintln!("  • {hub}");
         }
-        eprintln!(
-            "onyx: your daemon will use ITS OWN configured --hub list for the fan-out. \
-             For maximum delivery reliability, ensure your daemon connects to at least \
-             one of the above hubs."
-        );
+
+        // Query our own daemon's hub list. If the Identity call
+        // fails or returns Error, fall back to "no intersection
+        // check possible" — better than refusing to send.
+        let our_hubs = match client::one_shot(socket, &ApiRequest::Identity).await {
+            Ok(ApiResponse::IdentityOk { hubs, .. }) => Some(hubs),
+            _ => None,
+        };
+        if let Some(our_hubs) = our_hubs {
+            let matching: Vec<&String> = invite
+                .hubs
+                .iter()
+                .filter(|h| our_hubs.contains(*h))
+                .collect();
+            if our_hubs.is_empty() {
+                eprintln!(
+                    "onyx: WARNING — your daemon has NO hubs configured. The send will \
+                     fail with NotReady. Pass `--hub onion:port,b32pubkey` (one or more \
+                     times) to the daemon."
+                );
+            } else if matching.is_empty() {
+                eprintln!(
+                    "onyx: WARNING — your daemon's hubs ({}) do NOT intersect any of \
+                     the recipient's hubs above. The envelope will be delivered to YOUR \
+                     hubs, none of which the recipient subscribes to — they will \
+                     never see it. Add at least one of the recipient's hubs to your \
+                     daemon's `--hub` list.",
+                    our_hubs.len()
+                );
+            } else {
+                eprintln!(
+                    "onyx: sending via {} matching hub(s) (out of {} your daemon \
+                     publishes to and {} the recipient subscribes on).",
+                    matching.len(),
+                    our_hubs.len(),
+                    invite.hubs.len()
+                );
+            }
+        } else {
+            eprintln!("onyx: (couldn't query daemon's own hub list; skipping intersection check)");
+        }
     }
 
     let peer_fingerprint = invite.fingerprint.to_string();

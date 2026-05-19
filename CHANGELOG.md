@@ -6,6 +6,70 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.2-check: `onyx accept` does the hub-intersection check (closes the T8.2 usability gap)
+
+Tiny follow-up to T8.2. The morning's T8.2 made the URL carry the recipient's hub list and surfaced it to stderr on `onyx accept` — but the user still had to *manually* eyeball whether their own daemon's `--hub` config intersected the recipient's. T8.2-check does the intersection automatically and warns loudly when it's empty.
+
+What landed:
+
+**T8.2-check.a — `run_accept` now calls `Identity` before the send.** `crates/onyx/src/main.rs`. After parsing the invite URL, if it carries any hubs, the CLI:
+
+  1. Issues `ApiRequest::Identity` to read the sender's own daemon's configured `hubs` list (already exposed in T8.2.b).
+  2. Computes the intersection between recipient's hubs (from URL) and sender's hubs (from local daemon).
+  3. Surfaces one of three messages to stderr:
+     * **`our_hubs` empty** — "your daemon has NO hubs configured. The send will fail with NotReady. Pass `--hub …` to the daemon." (Actionable error.)
+     * **intersection empty** — "WARNING — your daemon's hubs (N) do NOT intersect any of the recipient's hubs above. The envelope will be delivered to YOUR hubs, none of which the recipient subscribes to — they will never see it. Add at least one of the recipient's hubs to your daemon's `--hub` list." (Loud preemptive warning.)
+     * **intersection non-empty** — "sending via N matching hub(s) (out of M your daemon publishes to and K the recipient subscribes on)." (Reassurance + path visibility.)
+
+  4. Then proceeds with the existing `SendBootstrap` / `SendBootstrapMls` dispatch — **the send still happens regardless of the intersection result**. v1 of T8.2-check is *advisory*, not *blocking*. Rationale: the recipient may be temporarily on a different hub set, may not actually need same-hub delivery (e.g., they'll come online later via a hub the URL didn't list), and a blocking failure mode for what's ultimately a "delivery is uncertain" warning would be worse than just telling the operator what's happening.
+
+If the `Identity` call itself fails (daemon unreachable, returns Error), the CLI surfaces "(couldn't query daemon's own hub list; skipping intersection check)" and proceeds. Better to ship the envelope than refuse over a check that's diagnostic, not protocol-critical.
+
+**The full operator experience** when `onyx accept` runs against a multi-hub URL:
+
+```
+$ onyx accept "onyx://invite/v1?fp=…&kem=…&hub=h1,K1&hub=h2,K2" --text "hi"
+onyx: recipient publishes to 2 hub(s):
+  • h1,K1
+  • h2,K2
+onyx: sending via 1 matching hub(s) (out of 3 your daemon publishes
+to and 2 the recipient subscribes on).
+{"kind":"SendBootstrapOk"}
+```
+
+Or in the misconfigured case:
+
+```
+$ onyx accept "onyx://invite/v1?…&hub=h99,K99" --text "hi"
+onyx: recipient publishes to 1 hub(s):
+  • h99,K99
+onyx: WARNING — your daemon's hubs (3) do NOT intersect any of the
+recipient's hubs above. The envelope will be delivered to YOUR hubs,
+none of which the recipient subscribes to — they will never see it.
+Add at least one of the recipient's hubs to your daemon's `--hub`
+list.
+{"kind":"SendBootstrapOk"}
+```
+
+Note the `SendBootstrapOk` still appears in the second case — the daemon successfully queued the envelope for delivery via its own hubs. The warning is the user's actionable signal that the *recipient* probably won't receive it, but the local send succeeded.
+
+Security and posture:
+
+  * **No new attack surface.** The check is purely client-side and never sends new data anywhere. Just reads what the daemon already exposes.
+  * **No auto-config.** v1 explicitly does not mutate the sender's daemon to add the recipient's hubs. That's the *next* slice (call it `T8.2-autoconfig`), which needs design work on: transient hub sessions (don't pollute long-term config), security around "URL can make my daemon dial arbitrary onions," runtime hub add/remove API surface. Keeping v1 advisory keeps it tight.
+  * **Fail-open on Identity errors.** If the daemon doesn't respond to Identity, the check is skipped rather than blocking the send. The send is the primary operation; the check is diagnostic.
+
+What this did NOT do:
+
+  * Did not auto-configure the sender's daemon — see above, future slice.
+  * Did not block the send on intersection-empty — advisory only.
+  * Did not change any wire format or API. Purely uses T8.2's existing `IdentityOk.hubs` field.
+  * Did not add CLI parser tests — the behaviour is a stderr surface, the existing tests already verify the `Command::Accept` shape.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` **281 passed / 0 failed** (no count change — pure behaviour addition on the `accept` path, no new test surface introduced this slice).
+
+---
+
 ## 2026-05-19 — T8.2: multi-hub invite URLs — recipients disclose their hub list, senders see where messages will land
 
 Third step in the relay-setup arc. T8.0 made one hub durable; T8.1 made the daemon talk to N hubs in parallel; T8.2 extends invite URLs to carry the recipient's hub list, plus surfaces it on the sender's `onyx accept` for transparency. No auto-config in this slice — that's a future T8.2.b. v1 of T8.2 is: **the URL becomes a complete hub manifest**, and the user *sees* where their message is going before they send it.
