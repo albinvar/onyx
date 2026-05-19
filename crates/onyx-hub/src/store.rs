@@ -216,6 +216,37 @@ impl Store {
         Ok(())
     }
 
+    /// Delete every queue row older than `cutoff_unix_ms` (i.e.,
+    /// rows where `enqueued_at < cutoff_unix_ms`). Returns the
+    /// number of rows deleted. Idempotent — safe to call repeatedly.
+    ///
+    /// **Why only queue rows, not KPs.** KeyPackages are designed to
+    /// be republished on every reconnect (`hub_client::SelfPublish`
+    /// does it per session start). Pruning a stale KP silently would
+    /// break first-contact for a peer that hasn't reconnected in a
+    /// while — the recipient's `fetch_keypackage` would return
+    /// not-found, and the sender would fail. Queue entries, by
+    /// contrast, are one-shot offline mailbox deliveries — if a
+    /// recipient hasn't been online in 30 days, the sender's first-
+    /// contact attempt has already failed in every meaningful sense.
+    /// Pruning the row is the right call.
+    ///
+    /// **What this defends against (T8.0.gc).** Unbounded queue
+    /// growth. Before today, an envelope addressed to a
+    /// routing-id whose owner never comes back online lived in the
+    /// hub's `queue_entry` table forever. A hub running for months
+    /// would eventually fill its disk. GC bounds that.
+    pub fn gc_queue_entries_older_than(&self, cutoff_unix_ms: i64) -> anyhow::Result<usize> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM queue_entry WHERE enqueued_at < ?",
+                params![cutoff_unix_ms],
+            )
+            .context("gc_queue_entries_older_than")?;
+        Ok(deleted)
+    }
+
     /// Load all stored KeyPackages. Used at hub startup to populate
     /// the in-memory KP cache; the hot fetch path then reads from
     /// memory.
@@ -385,5 +416,85 @@ mod tests {
         assert_eq!(drained, vec![b"queued before restart".to_vec()]);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── T8.0.gc: queue garbage collection ─────────────────────────────
+
+    #[test]
+    fn gc_deletes_old_rows_only() {
+        // Three queue entries; we'll hand-set their enqueued_at via
+        // direct SQL so the test doesn't depend on wall-clock timing.
+        let s = fresh();
+        let rid: RoutingId = [0xA0; 16];
+        s.enqueue(&rid, b"old-1").unwrap();
+        s.enqueue(&rid, b"old-2").unwrap();
+        s.enqueue(&rid, b"recent").unwrap();
+
+        // Backdate the first two rows to 100 days ago.
+        let now = epoch_ms();
+        let old_ts = now - 100 * 24 * 60 * 60 * 1000;
+        s.conn
+            .execute(
+                "UPDATE queue_entry SET enqueued_at = ? \
+                 WHERE payload IN (?, ?)",
+                params![old_ts, b"old-1", b"old-2"],
+            )
+            .unwrap();
+
+        // GC anything older than 30 days.
+        let cutoff = now - 30 * 24 * 60 * 60 * 1000;
+        let deleted = s.gc_queue_entries_older_than(cutoff).unwrap();
+        assert_eq!(deleted, 2, "two backdated rows were GC'd");
+
+        // The "recent" entry survives.
+        let mut s_mut = s;
+        let remaining = s_mut.drain_queue(&rid).unwrap();
+        assert_eq!(remaining, vec![b"recent".to_vec()]);
+    }
+
+    #[test]
+    fn gc_with_far_future_cutoff_deletes_everything() {
+        // Sanity: cutoff in the year 9999 → every row in the future
+        // (which is none of them — they're all in the past) → wait,
+        // that's the opposite. Cutoff in the FUTURE means "anything
+        // older than the future" which is everything. Test that.
+        let s = fresh();
+        let rid: RoutingId = [0xB0; 16];
+        s.enqueue(&rid, b"a").unwrap();
+        s.enqueue(&rid, b"b").unwrap();
+
+        let far_future = epoch_ms() + 1_000_000_000;
+        let deleted = s.gc_queue_entries_older_than(far_future).unwrap();
+        assert_eq!(deleted, 2);
+    }
+
+    #[test]
+    fn gc_with_far_past_cutoff_deletes_nothing() {
+        let s = fresh();
+        let rid: RoutingId = [0xC0; 16];
+        s.enqueue(&rid, b"x").unwrap();
+
+        let far_past = 0i64;
+        let deleted = s.gc_queue_entries_older_than(far_past).unwrap();
+        assert_eq!(deleted, 0, "nothing older than the epoch");
+    }
+
+    #[test]
+    fn gc_does_not_touch_keypackages() {
+        // GC is queue-only by design (see rustdoc). Verify the KP
+        // table is untouched even when we GC with a future cutoff.
+        let s = fresh();
+        let rid: RoutingId = [0xD0; 16];
+        s.set_keypackage(&rid, b"kp-bytes").unwrap();
+        s.enqueue(&rid, b"some-queued-payload").unwrap();
+
+        let far_future = epoch_ms() + 1_000_000_000;
+        let deleted = s.gc_queue_entries_older_than(far_future).unwrap();
+        assert_eq!(deleted, 1, "the queue row was GC'd");
+
+        // KP still there.
+        let kps = s.load_all_keypackages().unwrap();
+        assert_eq!(kps.len(), 1);
+        assert_eq!(kps[0].1, b"kp-bytes");
     }
 }

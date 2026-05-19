@@ -87,6 +87,20 @@ struct Args {
     /// pre-T8.0.
     #[arg(long, env = "ONYX_HUB_STATE_DB", default_value = "./onyx-hub-state.db")]
     state_db: String,
+
+    /// Maximum age (in days) for queued envelopes (T8.0.gc).
+    /// Periodic GC drops queue rows older than this threshold so
+    /// the hub's `queue_entry` table doesn't grow without bound
+    /// when a recipient never returns to drain their inbox. KPs
+    /// are NOT pruned (they're designed to be republished per
+    /// reconnect; silent pruning would break first-contact for a
+    /// peer that hasn't reconnected in a while).
+    ///
+    /// Set to 0 to disable GC entirely (keeps every queued
+    /// envelope forever — only do this if you have unbounded
+    /// disk or are running ephemeral via `--state-db ""`).
+    #[arg(long, env = "ONYX_HUB_MAX_QUEUE_AGE_DAYS", default_value_t = 30)]
+    max_queue_age_days: u32,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -191,6 +205,48 @@ async fn main() -> anyhow::Result<()> {
         let warm = HubState::with_store(store).context("warming HubState from store")?;
         Arc::new(Mutex::new(warm))
     };
+
+    // T8.0.gc: spawn the periodic queue-GC task. Runs hourly,
+    // deletes queue rows older than --max-queue-age-days. Disabled
+    // via `--max-queue-age-days 0`.
+    if args.max_queue_age_days > 0 {
+        let gc_state = state.clone();
+        let age_days = args.max_queue_age_days;
+        info!(
+            max_queue_age_days = age_days,
+            "spawning periodic queue-GC task (hourly tick)"
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            // First tick fires immediately; skip it so we don't GC at
+            // startup before the warm-from-disk even completes.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    .unwrap_or(0);
+                let cutoff = now_ms - i64::from(age_days) * 24 * 60 * 60 * 1000;
+                let result = {
+                    let s = gc_state.lock().await;
+                    s.gc_queue_entries_older_than(cutoff)
+                };
+                match result {
+                    Ok(0) => {} // nothing to GC; stay quiet
+                    Ok(n) => info!(deleted = n, "hub queue GC: dropped stale rows"),
+                    Err(e) => warn!(error = %e, "hub queue GC failed; will retry next tick"),
+                }
+            }
+        });
+    } else {
+        warn!(
+            "--max-queue-age-days 0: queue GC is DISABLED. Queued envelopes \
+             will accumulate forever for routing-ids whose owner never returns."
+        );
+    }
+
     let hub_secret = Arc::new(IdentityHandle::new(identity));
 
     info!("onyx-hub running. Ctrl-C to stop.");

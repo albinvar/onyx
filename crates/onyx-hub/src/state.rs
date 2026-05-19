@@ -205,6 +205,24 @@ impl HubState {
 
     // ── KeyPackage directory (T6.1) ────────────────────────────────────────
 
+    /// Garbage-collect queued envelopes older than `cutoff_unix_ms`
+    /// (T8.0.gc). No-op when running ephemeral (no durable store).
+    /// Removes rows from the persisted `queue_entry` table; does NOT
+    /// touch the in-memory `queues` HashMap because the in-memory
+    /// queue is what's CURRENTLY live (an entry in the in-memory
+    /// queue is by definition recent — the entry was either just
+    /// enqueued, or it survived the last warm-from-disk on startup,
+    /// in which case the next subscriber will drain it momentarily).
+    ///
+    /// Returns the number of on-disk rows deleted. Callers should
+    /// log this for visibility into hub operability.
+    pub fn gc_queue_entries_older_than(&self, cutoff_unix_ms: i64) -> anyhow::Result<usize> {
+        match &self.durable_store {
+            Some(store) => store.gc_queue_entries_older_than(cutoff_unix_ms),
+            None => Ok(0),
+        }
+    }
+
     /// Store (or replace) the KeyPackage published at `routing_id`.
     /// Latest-wins. Publisher-ownership is verified in `handler.rs`
     /// (T7.3-sec) BEFORE this call — `state.rs` trusts its caller.

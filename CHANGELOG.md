@@ -6,6 +6,48 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.0.gc: hub-side queue garbage collection — bounded `queue_entry` growth
+
+Operational follow-up to T8.0. T8.0 made queued envelopes durable (good); it did *not* prune them (bad — unbounded growth). A hub running for months accumulates queue rows for every routing-id whose owner never returned to drain their inbox. Real "disk fills, hub dies" risk. T8.0.gc closes it.
+
+What landed:
+
+**T8.0.gc.a — `Store::gc_queue_entries_older_than(cutoff_unix_ms)`.** New method in `crates/onyx-hub/src/store.rs`. Single `DELETE FROM queue_entry WHERE enqueued_at < ?`. Returns the row count for operator visibility.
+
+**Why queues but not KPs.** KeyPackages are designed to be republished on every reconnect (`hub_client::SelfPublish` does it per session start). Silently pruning a stale KP would break first-contact for any peer that hasn't reconnected in the GC window — the recipient's `fetch_keypackage` would surface `NotReady` and the sender would fail. Queue entries are different: if a routing id has had no live subscriber for 30 days, the sender's first-contact has already failed in every meaningful sense; pruning the row is the right call. Documented in detail in the method's rustdoc.
+
+Four new store tests in `gc_*` family:
+  * `gc_deletes_old_rows_only` — three rows, two backdated 100 days, GC with 30-day cutoff, only the recent one survives.
+  * `gc_with_far_future_cutoff_deletes_everything` — sanity: cutoff in the year ~3000 means "older than the future" = everything.
+  * `gc_with_far_past_cutoff_deletes_nothing` — sanity: cutoff at epoch 0 = nothing is older.
+  * `gc_does_not_touch_keypackages` — the explicit invariant.
+
+**T8.0.gc.b — `HubState::gc_queue_entries_older_than` proxy.** Thin forwarder so the hub binary doesn't need to reach through `HubState` into the `Store` directly. Returns `Ok(0)` in ephemeral mode (`Self::new()` — no durable store).
+
+**T8.0.gc.c — `--max-queue-age-days` flag + periodic GC task.** `crates/onyx-hub/src/main.rs`:
+  * New `--max-queue-age-days` (env `ONYX_HUB_MAX_QUEUE_AGE_DAYS`), default `30`. Set to `0` to disable GC entirely (emits a loud `warn!` at startup so the operator can't disable it by accident).
+  * Spawn a periodic `tokio::spawn` task that ticks every hour. First tick is immediate but skipped so we don't GC at startup before the warm-from-disk completes. Each subsequent tick computes `cutoff = now_ms - age_days * 24h_ms` and calls `state.lock().await.gc_queue_entries_older_than(cutoff)`. Result is logged at `info!` (rows deleted) or `warn!` (DB error; retry next tick).
+
+The GC task holds the `HubState` mutex while running (the inner `DELETE` is fast — even at scale, a single SQL statement on an indexed BLOB column is sub-millisecond), so concurrent deliveries block briefly during each tick. That's acceptable for an hourly cadence.
+
+Operational impact:
+
+  * **Bounded disk growth.** Worst-case queue_entry size now scales with "ingress rate × 30 days" instead of "ingress rate × forever."
+  * **No security change.** GC only drops rows whose recipient has been offline for >30 days — those envelopes were already operationally undeliverable. No new attack surface, no new info disclosure.
+  * **No backwards-compat break.** Existing T8.0 state DBs migrate cleanly (no schema change; GC just deletes rows that the operator's policy has decided are stale).
+  * **Senders are not notified.** A sender who fired a sealed-sender envelope to a long-offline recipient never gets an "expired" signal — same as today, where they get no signal whatsoever. Adding sender-side expiration receipts is a separate, much bigger slice (`T8.0.gc-receipts`?).
+
+What this did NOT do:
+
+  * Did not add per-routing-id GC policy (e.g., "keep 90 days for VIP routing-ids, 7 days for others"). Single global age threshold for v0.
+  * Did not GC KPs (see above — would break first-contact).
+  * Did not GC orphan `keypackage` rows whose owner has rotated identity. Identity rotation is itself a future feature (DESIGN.md §4); GC for it follows.
+  * Did not add a `--gc-now` operator command for one-shot manual GC. Periodic task is enough for v0; manual trigger is a small follow-up if useful.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` **285 passed / 0 failed** (was 281; +4 store GC tests).
+
+---
+
 ## 2026-05-19 — T8.2-check: `onyx accept` does the hub-intersection check (closes the T8.2 usability gap)
 
 Tiny follow-up to T8.2. The morning's T8.2 made the URL carry the recipient's hub list and surfaced it to stderr on `onyx accept` — but the user still had to *manually* eyeball whether their own daemon's `--hub` config intersected the recipient's. T8.2-check does the intersection automatically and warns loudly when it's empty.
