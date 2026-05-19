@@ -58,6 +58,14 @@ pub enum HubOutbound {
         routing_id: RoutingId,
         responder: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// Push an additional `FRAME_SUBSCRIBE` (T6.3.g) so the hub starts
+    /// routing the supplied routing ids to our connection without
+    /// requiring a full reconnect. Used when a new room is created or
+    /// joined and the per-epoch session token comes into scope, and
+    /// when an existing room's epoch advances after a commit.
+    /// Subscriptions are additive at the hub layer — see
+    /// `onyx_hub::state::ConnState::subscribe`.
+    Subscribe(Vec<RoutingId>),
 }
 
 /// Backwards-compat helper so existing call sites that built a
@@ -179,6 +187,34 @@ where
         },
     )
     .await
+}
+
+/// T6.3.g: thin wrapper around `write_subscribe` for the
+/// mid-session incremental-subscribe path. Extracted so
+/// `serve_session`'s match block stays under the clippy
+/// `too_many_lines` budget. Empty `ids` is a no-op (defensive —
+/// the caller in [`crate::announce_room_subscribe`] never sends
+/// an empty list, but the hub-side handler rejects it too).
+async fn write_incremental_subscribe<S>(
+    stream: &mut S,
+    session: &mut Session,
+    ids: &[RoutingId],
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let id_count = ids.len();
+    write_subscribe(stream, session, ids)
+        .await
+        .map_err(|e| anyhow::anyhow!("hub: incremental SUBSCRIBE write failed: {e}"))?;
+    debug!(
+        id_count,
+        "hub: incremental SUBSCRIBE sent (T6.3.g room session-token)"
+    );
+    Ok(())
 }
 
 /// Write one `FRAME_SUBSCRIBE` carrying the concatenated routing ids.
@@ -325,6 +361,9 @@ where
                             return Err(anyhow::anyhow!("hub: outbound KP_FETCH write failed: {e}"));
                         }
                         debug!("hub: outbound KP_FETCH sent");
+                    }
+                    HubOutbound::Subscribe(ids) => {
+                        write_incremental_subscribe(stream, session, &ids).await?;
                     }
                 }
             }

@@ -991,6 +991,57 @@ mod tests {
         assert!(peek_group_id(b"not MLS-encoded bytes").is_err());
     }
 
+    // ── T6.3.g: per-epoch session-token derivation ────────────────
+
+    /// Two members of the same group at the same epoch derive the
+    /// **same** session-token routing id. This is the property
+    /// `current_room_session_tokens` + `compute_room_session_token`
+    /// rely on for hub-routed room messages: alice publishes to
+    /// `session_token(alice's exporter at epoch N, 0)` and bob
+    /// fetches from `session_token(bob's exporter at epoch N, 0)`
+    /// — must be byte-identical.
+    #[test]
+    fn session_token_matches_across_members_at_same_epoch() {
+        use crate::routing::session_token;
+        let (alice, bob, alice_group, bob_group) = established_2party();
+        let alice_secret = alice_group.export_routing_secret(&alice).unwrap();
+        let bob_secret = bob_group.export_routing_secret(&bob).unwrap();
+        assert_eq!(alice_secret, bob_secret, "per-epoch secret must match");
+        assert_eq!(
+            session_token(&alice_secret, 0),
+            session_token(&bob_secret, 0),
+            "session_token at index 0 must match across members"
+        );
+    }
+
+    /// After a commit advances the epoch, the session token MUST
+    /// change. Otherwise per-epoch unlinkability (the T6.3.g
+    /// privacy property) breaks — a hub watching the inbox would
+    /// see the same id span multiple epochs.
+    #[test]
+    fn session_token_changes_after_commit() {
+        use crate::routing::session_token;
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let bob = MlsParty::new(b"bob".to_vec()).unwrap();
+        let carol = MlsParty::new(b"carol".to_vec()).unwrap();
+        let bob_kp = bob.key_package_bytes().unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let (_, welcome_to_bob) = alice_group.invite(&alice, &bob_kp).unwrap();
+        let _bob_group = bob.join_from_welcome(&welcome_to_bob).unwrap();
+        let secret_epoch_1 = alice_group.export_routing_secret(&alice).unwrap();
+        let token_epoch_1 = session_token(&secret_epoch_1, 0);
+
+        let carol_kp = carol.key_package_bytes().unwrap();
+        let (_, _welcome_to_carol) = alice_group.invite(&alice, &carol_kp).unwrap();
+        let secret_epoch_2 = alice_group.export_routing_secret(&alice).unwrap();
+        let token_epoch_2 = session_token(&secret_epoch_2, 0);
+
+        assert_ne!(
+            token_epoch_1, token_epoch_2,
+            "session token must rotate on epoch advance"
+        );
+    }
+
     // ── T6.3.h bugfix: 3-party room commit distribution ───────────
 
     /// Pre-T6.3.h, `invite()` discarded the commit it produced; the
@@ -1011,8 +1062,7 @@ mod tests {
         // Round 1: alice creates a group, invites bob.
         let bob_kp = bob.key_package_bytes().unwrap();
         let mut alice_group = alice.create_group().unwrap();
-        let (_commit_solo_to_2, welcome_to_bob) =
-            alice_group.invite(&alice, &bob_kp).unwrap();
+        let (_commit_solo_to_2, welcome_to_bob) = alice_group.invite(&alice, &bob_kp).unwrap();
         let mut bob_group = bob.join_from_welcome(&welcome_to_bob).unwrap();
         assert_eq!(alice_group.epoch(), 1);
         assert_eq!(bob_group.epoch(), 1);
@@ -1021,8 +1071,7 @@ mod tests {
         // pending; bob is the lone existing member who needs the
         // commit.
         let carol_kp = carol.key_package_bytes().unwrap();
-        let (commit_to_bob, welcome_to_carol) =
-            alice_group.invite(&alice, &carol_kp).unwrap();
+        let (commit_to_bob, welcome_to_carol) = alice_group.invite(&alice, &carol_kp).unwrap();
         let mut carol_group = carol.join_from_welcome(&welcome_to_carol).unwrap();
         assert_eq!(alice_group.epoch(), 2);
         assert_eq!(carol_group.epoch(), 2);
@@ -1046,8 +1095,14 @@ mod tests {
             .unwrap();
         let pt_bob = bob_group.process_incoming(&bob, &ct).unwrap();
         let pt_carol = carol_group.process_incoming(&carol, &ct).unwrap();
-        assert_eq!(pt_bob, IncomingRoomMessage::Application(b"hello room".to_vec()));
-        assert_eq!(pt_carol, IncomingRoomMessage::Application(b"hello room".to_vec()));
+        assert_eq!(
+            pt_bob,
+            IncomingRoomMessage::Application(b"hello room".to_vec())
+        );
+        assert_eq!(
+            pt_carol,
+            IncomingRoomMessage::Application(b"hello room".to_vec())
+        );
     }
 
     #[test]

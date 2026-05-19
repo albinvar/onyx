@@ -497,13 +497,29 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                             }
                         }
                     };
+                    // T6.3.g: subscribe to our intro_inbox AND every
+                    // current room's per-epoch session token.
+                    // Computed per (re)connect so vault state at
+                    // connect time wins; mid-session room changes
+                    // are picked up via incremental
+                    // `HubOutbound::Subscribe` pushes from
+                    // handle_invite_to_room / refresh_room_roster.
+                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> =
+                        vec![our_inbox];
+                    subscriptions.extend(
+                        current_room_session_tokens(&state_for_hub_task).await,
+                    );
+                    info!(
+                        sub_count = subscriptions.len(),
+                        "hub: connect subscriptions (intro + room session tokens)"
+                    );
                     let result = hub_client::run_hub_session(
                         &tor_clone,
                         &host,
                         port,
                         &hub_pubkey,
                         &our_sk,
-                        &[our_inbox],
+                        &subscriptions,
                         &mut outbound_rx,
                         |target, body| {
                             let state = state_for_hub_cb.clone();
@@ -1283,6 +1299,92 @@ async fn handle_room_app_frame(
     }
 }
 
+/// T6.3.g: push an incremental `HubOutbound::Subscribe` for a room's
+/// current-epoch session token across every configured hub. Used
+/// when an epoch advances mid-session (either we just produced a
+/// commit in `handle_invite_to_room`, or we just merged one in
+/// `refresh_room_roster_after_commit`). The subscribe is additive
+/// at the hub layer, so the next hub-routed room message at the new
+/// epoch lands in our connection.
+///
+/// Best-effort: a full hub-outbound queue or closed channel is
+/// logged and skipped — the next hub-session reconnect will pick
+/// up the new token via [`current_room_session_tokens`].
+pub(crate) async fn announce_room_subscribe(group_id: &[u8], state: &DaemonState) {
+    let Some(token) = ({
+        let party = state.mls_party.lock().await;
+        match party.load_group(group_id) {
+            Ok(Some(g)) => g
+                .export_routing_secret(&party)
+                .ok()
+                .map(|s| onyx_core::routing::session_token(&s, 0)),
+            _ => None,
+        }
+    }) else {
+        warn!(
+            group_id_b32 = %encode_b32(group_id),
+            "session-tokens: cannot derive token for incremental SUBSCRIBE; deferring to next reconnect"
+        );
+        return;
+    };
+    for (idx, hub_outbound) in state.hub_outbounds.iter().enumerate() {
+        if let Err(e) = hub_outbound.try_send(hub_client::HubOutbound::Subscribe(vec![token])) {
+            warn!(hub_idx = idx, error = %e, "session-tokens: incremental SUBSCRIBE push failed");
+        }
+    }
+}
+
+/// Derive the per-(room, current-epoch) session-token routing id
+/// for every room this daemon participates in (T6.3.g). The same
+/// derivation runs on every member at the same epoch, so the
+/// inviter publishing to `session_token(secret, 0)` lands in the
+/// same inbox each subscribing member fetches from. The hub sees
+/// one inbox per (room, epoch) rather than one per room-member,
+/// which is the unlinkability gain — passive hubs can no longer
+/// fingerprint room membership by correlating intro-inbox fetches
+/// across rooms.
+///
+/// Index `0` only; finer-grained intra-epoch rotation
+/// (`session_token(secret, n>0)`) is reserved for a future slice.
+/// Failures load_group/export_routing_secret on a single room are
+/// logged and skipped — that room just won't have a session token
+/// this connect cycle (recipient falls back to discovering the
+/// message only after the daemon retries the hub session).
+async fn current_room_session_tokens(
+    state: &Arc<DaemonState>,
+) -> Vec<onyx_core::routing::RoutingId> {
+    let rows = {
+        let vault = state.vault.lock().await;
+        match vault.list_rooms(state.identity_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "session-tokens: list_rooms failed; subscribing intro_inbox only");
+                return Vec::new();
+            }
+        }
+    };
+    let mut tokens = Vec::with_capacity(rows.len());
+    let party = state.mls_party.lock().await;
+    for row in &rows {
+        let Ok(Some(group)) = party.load_group(&row.group_id) else {
+            warn!(
+                group_id_b32 = %encode_b32(&row.group_id),
+                "session-tokens: load_group failed; skipping"
+            );
+            continue;
+        };
+        let Ok(secret) = group.export_routing_secret(&party) else {
+            warn!(
+                group_id_b32 = %encode_b32(&row.group_id),
+                "session-tokens: export_routing_secret failed; skipping"
+            );
+            continue;
+        };
+        tokens.push(onyx_core::routing::session_token(&secret, 0));
+    }
+    tokens
+}
+
 /// Post-commit roster refresh (T6.3.h). Called when
 /// [`handle_room_app_frame`] processes an MLS commit on a room —
 /// rebuilds `rooms.members_b32` from the post-merge group so
@@ -1323,6 +1425,10 @@ async fn refresh_room_roster_after_commit(
         mls_epoch = epoch,
         "room: commit merged; group epoch advanced"
     );
+    // T6.3.g: the per-epoch session token just changed. Push an
+    // incremental SUBSCRIBE so the next hub-routed room message at
+    // the new epoch lands in our connection without a reconnect.
+    announce_room_subscribe(group_id, state).await;
 }
 
 /// 8-char base32 prefix of a peer's X25519 pubkey — matches what the
@@ -1590,6 +1696,10 @@ async fn process_hub_mls_welcome(
             );
         }
         process_room_welcome(&group, &name, &sender_fingerprint, state).await;
+        // T6.3.g: subscribe to the new room's session-token inbox so
+        // we receive subsequent hub-routed room messages without
+        // waiting for the next hub reconnect.
+        announce_room_subscribe(&group.group_id_bytes(), state).await;
         return;
     }
 

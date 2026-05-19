@@ -450,6 +450,11 @@ async fn handle_create_room(name: &str, state: &DaemonState) -> ApiResponse {
         }
     }
 
+    // T6.3.g: subscribe to the new room's session-token inbox so
+    // any future invitee can hub-publish room messages to us
+    // before our next reconnect cycle.
+    crate::announce_room_subscribe(&group_id_bytes, state).await;
+
     ApiResponse::CreateRoomOk {
         group_id_b32: encode_b32(&group_id_bytes),
         name: name.to_string(),
@@ -863,6 +868,15 @@ async fn handle_invite_to_room(
         }
     }
 
+    // T6.3.g: our own epoch advanced (we just produced the commit).
+    // Push an incremental SUBSCRIBE so we receive room messages at
+    // the new epoch from any member who might publish before our
+    // next reconnect cycle. (CreateRoom doesn't do this because the
+    // initial group has no other members — nobody can publish to it
+    // yet — but InviteToRoom must, because the new member can start
+    // sending immediately after processing the Welcome.)
+    crate::announce_room_subscribe(&group_id_bytes, state).await;
+
     let members = refreshed_members_b32
         .split(',')
         .filter(|s| !s.is_empty())
@@ -872,6 +886,22 @@ async fn handle_invite_to_room(
         group_id_b32: encode_b32(&group_id_bytes),
         members,
     }
+}
+
+/// T6.3.g: derive the per-(room, current-epoch) session-token
+/// routing id from MLS group state. Returns `None` if the group
+/// isn't loadable or the exporter fails — the caller falls back
+/// to per-member introduction-inbox routing.
+async fn compute_room_session_token(
+    group_id_bytes: &[u8],
+    state: &DaemonState,
+) -> Option<onyx_core::routing::RoutingId> {
+    let party = state.mls_party.lock().await;
+    let Ok(Some(group)) = party.load_group(group_id_bytes) else {
+        return None;
+    };
+    let secret = group.export_routing_secret(&party).ok()?;
+    Some(onyx_core::routing::session_token(&secret, 0))
 }
 
 /// T6.3.h fan-out helper. Pushes a pre-built MLS message
@@ -894,6 +924,14 @@ async fn fanout_room_mls_bytes(
     let mut delivered_direct: u32 = 0;
     let mut delivered_hub: u32 = 0;
     let mut skipped_no_kem: u32 = 0;
+    // T6.3.g: compute the room's per-epoch session token ONCE — all
+    // hub-routed copies of this MLS payload go to the same inbox
+    // regardless of recipient. The hub sees one inbox per (room,
+    // epoch) rather than one per (room, member). On `None`
+    // (load/export failure), fall back to introduction-inbox-per-
+    // member routing so the message still flows — log it so an
+    // operator can investigate.
+    let room_target = compute_room_session_token(group_id_bytes, state).await;
     let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
         let reg = state.conversations.lock().await;
         members
@@ -929,9 +967,19 @@ async fn fanout_room_mls_bytes(
             skipped_no_kem += 1;
             continue;
         };
-        let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
-            skipped_no_kem += 1;
-            continue;
+        // T6.3.g: if we couldn't derive the session token (no MLS
+        // state for this room — should never happen because the
+        // caller already loaded it to encrypt, but defensive), fall
+        // back to per-member introduction_inbox so the message still
+        // routes. The recipient subscribes to both, so either lands.
+        let target = if let Some(t) = room_target {
+            t
+        } else {
+            let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
+                skipped_no_kem += 1;
+                continue;
+            };
+            onyx_core::routing::introduction_inbox(&target_fp_parsed)
         };
         let payload = onyx_core::routing::BootstrapPayload::MlsApp {
             group_id: serde_bytes::ByteBuf::from(group_id_bytes.to_vec()),
@@ -948,7 +996,6 @@ async fn fanout_room_mls_bytes(
         ) else {
             continue;
         };
-        let target = onyx_core::routing::introduction_inbox(&target_fp_parsed);
         let mut any_accepted = false;
         for hub_outbound in &state.hub_outbounds {
             if hub_outbound
@@ -1147,10 +1194,20 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             );
             continue;
         };
-        let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
-            skipped_no_kem += 1;
-            tracing::warn!(missing_member = %fp, "fingerprint did not parse");
-            continue;
+        // T6.3.g: route to the room's per-epoch session token so the
+        // hub sees one inbox per (room, epoch) rather than per
+        // (room, member). Fall back to per-member introduction_inbox
+        // if the session-token derivation fails — recipient subscribes
+        // to both, so either lands.
+        let target = if let Some(t) = compute_room_session_token(&group_id_bytes, state).await {
+            t
+        } else {
+            let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
+                skipped_no_kem += 1;
+                tracing::warn!(missing_member = %fp, "fingerprint did not parse");
+                continue;
+            };
+            onyx_core::routing::introduction_inbox(&target_fp_parsed)
         };
         let payload = onyx_core::routing::BootstrapPayload::MlsApp {
             group_id: serde_bytes::ByteBuf::from(group_id_bytes.clone()),
@@ -1169,7 +1226,6 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             tracing::warn!(missing_member = %fp, "seal_bootstrap failed; skipping");
             continue;
         };
-        let target = onyx_core::routing::introduction_inbox(&target_fp_parsed);
         let mut any_accepted = false;
         for hub_outbound in &state.hub_outbounds {
             if hub_outbound

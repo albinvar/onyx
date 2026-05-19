@@ -6,6 +6,37 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.g: per-(room, epoch) session-token routing for hub-relayed room messages
+
+Seventh T6.3 slice. Closes the routing-privacy gap noted in CHANNELS.md §4 Q4: pre-T6.3.g, every room member's hub-relayed traffic landed in `introduction_inbox(member_fingerprint)` — the same inbox every other piece of traffic to that member used. A hub watching the inbox could correlate "this member is talking in *some* room" without being able to distinguish rooms, but it could fingerprint cross-room membership by observing simultaneous fetches across multiple intro inboxes. T6.3.g routes each hub-relayed room message to `session_token(per_epoch_secret, 0)` instead — one inbox per (room, epoch) shared across all room members.
+
+What landed:
+
+  * **`HubOutbound::Subscribe(Vec<RoutingId>)`** — new variant. Carries a list of routing ids to additively subscribe to mid-session via an incremental `FRAME_SUBSCRIBE` (the hub layer's subscribe state was already additive — `onyx_hub::state::ConnState::subscribe`). Replaces the prior "reconnect to pick up new subscriptions" model with a no-reconnect path.
+  * **`write_incremental_subscribe`** helper in `hub_client.rs` — extracted from `serve_session`'s outbound match arm to keep `serve_session` under clippy's `too_many_lines` budget.
+  * **`current_room_session_tokens(state) -> Vec<RoutingId>`** in `onyx-daemon/lib.rs` — walks vault rooms, loads each MLS group state, exports the per-epoch routing secret, derives `session_token(secret, 0)`. Computed once per hub-(re)connect and concatenated with the introduction-inbox into the initial `FRAME_SUBSCRIBE`.
+  * **`announce_room_subscribe(group_id, state)`** — pushes `HubOutbound::Subscribe(vec![current_token])` to every configured hub channel. Called from three event points:
+    1. `handle_create_room` — newly-created room → subscribe.
+    2. `handle_invite_to_room` end — our own epoch just advanced → subscribe to the new token.
+    3. `refresh_room_roster_after_commit` (recipient side) — we just merged someone else's commit → subscribe to the new token.
+  * **`compute_room_session_token(group_id, state) -> Option<RoutingId>`** in `api_server.rs` — single-token version for the send-path. Used by `fanout_room_mls_bytes` (commits + KEM-ads) and `handle_send_room` (chat text) to route hub-fallback envelopes.
+  * **Send-path target change**: `fanout_room_mls_bytes` and `handle_send_room`'s hub-fallback branch now address envelopes to `session_token(secret, 0)` instead of `introduction_inbox(member_fingerprint)`. If the session-token derivation fails (no MLS group for this room — defensive, shouldn't normally happen), falls back to per-member introduction-inbox so the message still flows; the recipient subscribes to both, so either lands.
+  * **Receive-path**: the daemon now subscribes to its intro inbox AND every current room's per-epoch session token at every hub-(re)connect. Incremental subscribes are pushed mid-session for new rooms and epoch advances.
+
+Design notes:
+
+  * **Why the same token across all members**. MLS exports a per-epoch secret that's identical across all current members. Deriving `session_token(secret, 0)` therefore yields the same routing id for every member. Alice publishes one envelope per recipient (sealed under each recipient's KEM) but all land in the same inbox; every member fetches all envelopes; each tries to decrypt; only the one sealed for them succeeds. Net effect: hub can't tell which member an envelope is for, only that "some member of room X (at epoch N)" is talking.
+  * **Why fall back to intro_inbox on derivation failure**. The fallback is purely a robustness measure — if for any reason `load_group` or `export_routing_secret` returns an error, the message still needs to flow to keep the chat working. The recipient subscribes to both targets, so the fallback works as long as either side has the room loaded. Operator sees the warn log line if this fallback ever triggers.
+  * **Epoch advance ordering**. On invite, the sender produces a commit at epoch N→N+1. They announce_room_subscribe before returning; existing members process the commit (also advancing to N+1) and announce_room_subscribe in their refresh path. There's a brief window between "sender at N+1" and "recipient at N+1 + subscribed" — during this window, hub messages target session_token at N+1 (the new token), which the recipient hasn't subscribed to yet. Mitigation: the existing intro_inbox subscription stays valid; if the message arrives before re-subscribe completes, the hub queues it for the new token's first subscriber. The standard at-most-once delivery semantics handle the rest.
+  * **`HubOutbound::Subscribe` is fire-and-forget**. Failures (queue full, channel closed) warn but don't block the calling room operation. The next reconnect cycle picks up the token via `current_room_session_tokens` regardless.
+  * **No new wire format bumps**. The hub already accepted incremental `FRAME_SUBSCRIBE` mid-session — this slice just had to expose the daemon-side outbound channel for it.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **354 passed** (+2 new from 352: `session_token_matches_across_members_at_same_epoch` + `session_token_changes_after_commit`).
+
+Next: T6.3.f.2 (TUI room pane) is the remaining T6.3 item the user called out. After that the multi-party-room shape is end-to-end complete.
+
+---
+
 ## 2026-05-19 — T6.3.h: KEM-pub exchange + structured room plaintext + 3-party commit-distribution bugfix
 
 Sixth — and largest — T6.3 slice. Closes three issues left open by T6.3.b–e:
