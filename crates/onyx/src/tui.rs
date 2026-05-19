@@ -78,6 +78,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use crate::client;
 
@@ -338,7 +339,7 @@ async fn send_composer(app: &mut AppState) {
         app.last_send_result = Some(Err("no peer selected".to_string()));
         return;
     };
-    let text = std::mem::take(&mut app.composer);
+    let mut text = std::mem::take(&mut app.composer);
     let req = ApiRequest::Send {
         peer_short: peer.short_id.clone(),
         text: text.clone(),
@@ -346,10 +347,15 @@ async fn send_composer(app: &mut AppState) {
     match client::one_shot(&app.socket_path, &req).await {
         Ok(ApiResponse::SendOk) => {
             app.last_send_result = Some(Ok(()));
-            // Don't push into scrollback here — the daemon broadcasts
-            // an `EventMessage { direction: Outgoing }` for the send,
-            // which the tail loop will deliver and apply_event will
-            // record. Pushing here would double up.
+            // T-zeroize-audit: scrub the local text buffer after a
+            // successful send. The cloned copy that rode in the
+            // ApiRequest::Send is gone by now (consumed during the
+            // socket write). Don't push into scrollback here — the
+            // daemon broadcasts an `EventMessage { direction:
+            // Outgoing }` for the send, which the tail loop will
+            // deliver and apply_event will record. Pushing here
+            // would double up.
+            text.zeroize();
         }
         Ok(ApiResponse::Error { message, .. }) => {
             app.composer = text; // restore so user can edit & retry

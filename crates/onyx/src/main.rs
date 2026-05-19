@@ -301,7 +301,7 @@ fn build_daemon_config(
             .vault
             .clone()
             .unwrap_or_else(onyx_daemon::default_vault_path),
-        passphrase,
+        passphrase: zeroize::Zeroizing::new(passphrase),
         no_tor: args.listen_tcp.is_some() || args.dial_tcp.is_some(),
         tor_state_dir: None,
         dial_onion: None,

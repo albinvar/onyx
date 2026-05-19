@@ -3104,6 +3104,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -3159,6 +3160,7 @@ dependencies = [
  "serde_bytes",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -3187,6 +3189,7 @@ dependencies = [
  "onyx-daemon",
  "tokio",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

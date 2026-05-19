@@ -120,7 +120,7 @@ impl TryFrom<Args> for Config {
 
         Ok(Self {
             vault: a.vault.unwrap_or_else(onyx_daemon::default_vault_path),
-            passphrase: a.passphrase,
+            passphrase: zeroize::Zeroizing::new(a.passphrase),
             no_tor: a.no_tor,
             tor_state_dir: a.tor_state_dir,
             dial_onion: a.dial_onion,

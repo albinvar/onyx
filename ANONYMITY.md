@@ -126,12 +126,30 @@ A local snooper running `ps aux` sees `onyx` / `onyxd` in your process list. Rev
   * **What would close it:** prctl-rename on Linux, no equivalent on macOS that we'd trust. Document the limitation; rename if you care.
   * **Effort:** trivial documentation; harder if you want it actually invisible.
 
-### 3.8 Memory zeroization is partial
+### 3.8 Memory zeroization — partial, with the gaps explicitly mapped
 
-We use the `zeroize` crate on vault keys and KEM secrets (`crates/onyx-core/src/crypto.rs` — see the `ZeroizeOnDrop` derives). MLS state in `openmls` and decrypted plaintext in the conversation registry / TUI are **not** aggressively scrubbed. An attacker who can read the daemon's memory (root access, coredump, swap) can recover recently-decrypted plaintext.
+We use the `zeroize` crate on the items we **own and control**:
 
-  * **What would close it:** broader zeroization audit, locking memory to prevent swap, secure-enclave integration.
-  * **Effort:** ongoing — needs a dedicated pass through every crate.
+  * Vault key (`AeadKey`) — `ZeroizeOnDrop`.
+  * Argon2-derived intermediate (`vault_key: Zeroizing<[u8; 32]>`).
+  * X25519 identity secret (`IdentitySecret`) — `ZeroizeOnDrop`.
+  * Hybrid KEM secret (`HybridKemSecret`) — `Zeroize + ZeroizeOnDrop`.
+  * Identity-secret blob (`Identity::to_secret_bytes`) — `Zeroizing<Vec<u8>>`.
+  * MLS state snapshot (`MlsParty::snapshot_state`) — `Zeroizing<Vec<u8>>`.
+  * Daemon `Config.passphrase` — `Zeroizing<String>` (T-zeroize-audit).
+  * Hub-client per-task seed round-trips (`our_sk_bytes`, `our_kem_bytes`) — `Zeroizing` (T-zeroize-audit).
+  * TUI composer text after a successful send — `.zeroize()` called explicitly (T-zeroize-audit).
+
+What's **still not** scrubbed (gaps remain):
+
+  * **Decrypted plaintext in the daemon's conversation registry** — the `ChatLine` ring buffer holds decoded message text indefinitely (the user is reading it). Scrubbing on age-out is a follow-up that needs careful UX thought (when does "scroll history" become "old plaintext we can wipe"?).
+  * **`openmls` internal state** — the MLS group's working set lives in `openmls`'s `MemoryStorage`. We don't control the layout, can't add zeroize hooks without upstream changes. Worth tracking as an upstream contribution.
+  * **TUI composer per-keystroke** — between typing and send, the composer holds plaintext. We zeroize on successful send, not on per-keystroke edit/replace.
+  * **Brief intermediate `Vec<u8>` allocations** when handing key material to upstream libraries (e.g., `private_seed.to_vec()` in `mls::from_identity` before `openmls::SignatureKeyPair::from_raw` consumes it). The original `Zeroizing` wrapper scrubs; the intermediate doesn't. Documented inline as a known upstream-dependent gap.
+  * **mlock / memory-locking** — we don't mlock memory to prevent swap. An attacker with swap-file access could in principle recover state that was swapped out and not yet overwritten.
+
+  * **What would close it further:** zeroize-aware fork of `openmls` (or upstream contribution), `mlock` integration, secure-enclave-backed key storage on platforms that have one.
+  * **Effort:** the items we own took one slice (T-zeroize-audit, ~1 hr). The remaining items require upstream work or significant platform-specific code.
 
 ### 3.9 No anonymous-set cover (group membership)
 

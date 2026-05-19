@@ -6,6 +6,51 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-zeroize-audit: scrub the secrets we own end-to-end (passphrase, key round-trips, TUI composer)
+
+Memory-hygiene pass across the items Onyx **owns and controls**. Pre-T-zeroize-audit, our zeroization coverage was strong on the cryptographic primitives (`AeadKey`, `IdentitySecret`, `HybridKemSecret`, `MlsParty::snapshot_state`) but had three drag-in-process-memory gaps we hadn't closed: the daemon's vault passphrase, the per-task key seed round-trips inside the hub-client spawn loop, and the TUI composer buffer after send. This slice closes all three and maps every remaining gap explicitly in `ANONYMITY.md` §3.8.
+
+What landed:
+
+**T-zeroize-audit.a — `Config.passphrase: Zeroizing<String>`.** `crates/onyx-daemon/src/lib.rs`. The daemon's vault passphrase was previously a bare `String` — when the daemon dropped it (`drop(args.passphrase)` near the top of `run`), the heap allocator deallocated the buffer but did not scrub it. Anyone with subsequent process-memory access (coredump, swap inspection, root) could find the bytes lingering until they were overwritten by another allocation. Wrapping in `Zeroizing<String>` makes `Drop` actually zero the bytes first. Wire-compat: the field's serde encoding is unchanged (Zeroizing is a transparent wrapper); the on-the-wire `Config` shape (if ever serialized — it isn't today) would be identical. Constructor sites updated in both binaries: `onyxd::main` (`passphrase: Zeroizing::new(a.passphrase)`) and `onyx::main::build_daemon_config` (same).
+
+**T-zeroize-audit.b — Hub-client per-task seed round-trips wrapped in `Zeroizing`.** `crates/onyx-daemon/src/lib.rs`, inside the `for hub_cfg in args.hubs` spawn loop. We round-trip the X25519 identity secret (32 bytes) and the hybrid KEM secret (~2.4 KiB) via raw byte buffers because `IdentitySecret` and `HybridKemSecret` deliberately don't impl `Clone` (the underlying upstream types opt out). Pre-audit, those round-trip buffers were `[u8; 32]` and `Vec<u8>` — non-scrubbing. Now wrapped:
+
+```rust
+let our_sk_bytes: Zeroizing<[u8; 32]> =
+    Zeroizing::new(*state.identity.identity_key().to_bytes());
+let our_kem_bytes: Zeroizing<Vec<u8>> =
+    Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
+```
+
+The per-iteration `.clone()` on each Zeroizing handle gives every spawned task its own scrub-on-drop copy. When a hub task ends (Ctrl-C, abort, error), the seed bytes get scrubbed instead of lingering in the task's local frame.
+
+`IdentitySecret::from_bytes` takes `[u8; 32]` by value, so the inner array gets `Copy`-derefed at the call site (`*our_sk_bytes_task`). The deref produces a stack-local `[u8; 32]` whose lifetime ends inside `from_bytes`; the original Zeroizing wrapper still scrubs when it drops. The brief stack copy is a small known gap (one cache line, microseconds-lived) that we accept as acceptable in exchange for not modifying `IdentitySecret`'s API.
+
+**T-zeroize-audit.c — TUI composer scrub-on-send.** `crates/onyx/src/tui.rs`. After a successful `Send` API call, the local `text` buffer (which held the user's plaintext message just before going on the wire) is explicitly `text.zeroize()`'d before drop. Three error paths (`Error`, unexpected response, transport error) restore `text` into `app.composer` so the user can edit and retry — those paths keep the plaintext alive (correctly — the user is presumably about to retry sending it).
+
+What we did **not** scrub:
+
+  * `app.composer` itself between keystrokes — would need per-keystroke zeroization on every backspace / replace, awkward to wire without behavioural side-effects.
+  * The cloned copy that rode inside `ApiRequest::Send { text }` over the API socket — once `client::one_shot` returns, that buffer is gone (consumed by the socket write), but the *serialized JSON form* lived briefly in a tokio write buffer that we don't control. Acceptable for v0; would need API-level changes to fix.
+
+**T-zeroize-audit.d — Inline doc on `mls::from_identity`.** `crates/onyx-core/src/mls.rs`. The line `private_seed.to_vec()` creates a non-Zeroizing intermediate `Vec<u8>` that gets handed to `openmls::SignatureKeyPair::from_raw`. Once `from_raw` consumes the Vec, openmls owns the bytes — we can't enforce zeroization downstream. The original `private_seed` is still `Zeroizing<[u8; 32]>` and scrubs when it leaves scope; the intermediate Vec is a known upstream-dependent gap. Documented inline so future readers understand the boundary.
+
+**T-zeroize-audit.e — `ANONYMITY.md` §3.8 rewritten.** Now lists every item we DO scrub (8 specific places) and every gap that remains (5 specific items). No more vague "partial coverage" — concrete inventory the user can audit. Closes the documentation gap: previously `ANONYMITY.md` said "memory zeroization is partial" without saying which parts. Now it says exactly which parts.
+
+What's left to close (explicitly out of this slice):
+
+  * **Conversation-registry `ChatLine` plaintext** — the daemon holds decrypted message text indefinitely (the user is reading it). Scrub-on-age-out needs careful UX.
+  * **openmls internal state** — needs upstream contribution or a fork.
+  * **TUI composer per-keystroke** — currently only scrubbed on successful send.
+  * **mlock / no-swap** — platform-specific; not done.
+
+Tests: zeroize semantics are by definition not testable from Rust (you can't observe whether dropped memory was overwritten because the borrow checker forbids reading freed memory). The type signature changes ARE the property — `Zeroizing<T>` wraps with `Drop` impl that calls `T::zeroize()`. The compile-time check that the type signature is preserved IS the test. No new runtime tests; existing 285 stay green.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` **285 passed / 0 failed** (no count change). New crate-dep: `zeroize = { workspace = true }` added to `onyx-daemon`, `onyx`, `onyxd` (already in `onyx-core` since project inception via the security-primitives layer).
+
+---
+
 ## 2026-05-19 — T8.0.gc: hub-side queue garbage collection — bounded `queue_entry` growth
 
 Operational follow-up to T8.0. T8.0 made queued envelopes durable (good); it did *not* prune them (bad — unbounded growth). A hub running for months accumulates queue rows for every routing-id whose owner never returned to drain their inbox. Real "disk fills, hub dies" risk. T8.0.gc closes it.

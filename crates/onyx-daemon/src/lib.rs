@@ -67,6 +67,7 @@ use onyx_core::wire::{FRAME_MLS_APP, InnerFrame};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{Instrument, debug, error, info, info_span, warn};
+use zeroize::Zeroizing;
 
 const DEFAULT_IDENTITY_NICKNAME: &str = "default";
 const HS_NICKNAME: &str = "onyx";
@@ -136,7 +137,10 @@ pub struct HubConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vault: PathBuf,
-    pub passphrase: String,
+    /// Vault passphrase. Wrapped in [`Zeroizing`] so the bytes get
+    /// scrubbed when the Config (or any clone of it) is dropped —
+    /// not just deallocated. T-zeroize-audit.
+    pub passphrase: Zeroizing<String>,
     pub no_tor: bool,
     pub tor_state_dir: Option<PathBuf>,
     pub dial_onion: Option<String>,
@@ -441,9 +445,16 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         );
         // IdentitySecret + HybridKemSecret deliberately don't impl
         // Clone. Round-trip via bytes once here; each spawned task
-        // reconstructs them on the worker.
-        let our_sk_bytes: [u8; 32] = *state.identity.identity_key().to_bytes();
-        let our_kem_bytes: Vec<u8> = state.identity.kem_secret().to_bytes().to_vec();
+        // reconstructs them on the worker. Both buffers are wrapped
+        // in Zeroizing so the raw key material is scrubbed when the
+        // loop variable + per-task clones go out of scope —
+        // T-zeroize-audit. Without this wrap, the 32-byte X25519
+        // seed and ~2.4 KiB hybrid KEM seed would sit in process
+        // memory until the allocator happened to overwrite them.
+        let our_sk_bytes: Zeroizing<[u8; 32]> =
+            Zeroizing::new(*state.identity.identity_key().to_bytes());
+        let our_kem_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
 
         for (idx, hub_cfg) in args.hubs.iter().enumerate() {
             let (host, port) = hub_client::parse_host_port(&hub_cfg.onion, ONYX_HS_PORT)
@@ -454,15 +465,19 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
 
             let state_for_hub_task = state.clone();
             let tor_clone = tor.clone();
-            let our_kem_bytes = our_kem_bytes.clone();
+            // Per-iter Zeroizing clones — both buffers are no longer
+            // Copy (the Zeroizing wrapper opts out), so each spawned
+            // task gets its own scrub-on-drop copy of the seed bytes.
+            let our_sk_bytes_task = our_sk_bytes.clone();
+            let our_kem_bytes_task = our_kem_bytes.clone();
             let mut outbound_rx = hub_rx_holders.remove(0);
             let host = host.clone();
             let span = info_span!("hub", idx, host = %host, port);
 
             hub_tasks.push(tokio::spawn(async move {
-                let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(our_sk_bytes);
+                let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes_task);
                 let our_kem = std::sync::Arc::new(
-                    onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes)
+                    onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes_task)
                         .expect("our own KEM secret must round-trip"),
                 );
                 let state_for_hub_cb = state_for_hub_task.clone();

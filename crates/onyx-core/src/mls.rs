@@ -149,6 +149,13 @@ impl MlsParty {
         let signing = identity.signing();
         let private_seed = signing.to_bytes(); // Zeroizing<[u8; 32]>
         let public = signing.verifying_key().to_bytes();
+        // NOTE (T-zeroize-audit): `private_seed.to_vec()` allocates a
+        // fresh non-Zeroizing Vec<u8> that we hand to openmls. Once
+        // `from_raw` consumes the Vec, openmls owns the bytes — we
+        // can't enforce zeroization downstream of that handoff. The
+        // original `private_seed` is still Zeroizing and scrubs when
+        // it goes out of scope; the brief intermediate Vec is a known
+        // upstream-dependent gap, called out in MEMORY_HYGIENE.md.
         let signature_keys = SignatureKeyPair::from_raw(
             SignatureScheme::ED25519,
             private_seed.to_vec(),
