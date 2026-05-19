@@ -136,6 +136,7 @@ impl TryFrom<Args> for Config {
                 .api_socket
                 .unwrap_or_else(onyx_daemon::default_api_socket_path),
             hubs,
+            hub_tcp_addrs: Vec::new(),
             listen_tcp: a.listen_tcp,
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,

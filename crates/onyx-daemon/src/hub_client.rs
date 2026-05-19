@@ -169,6 +169,58 @@ where
     serve_session(&mut stream, &mut session, outbound_rx, on_deliver).await
 }
 
+/// **TEST-ONLY** parallel to [`run_hub_session`] that dials the
+/// hub over plain TCP instead of Tor. Used by the smoke harness in
+/// `crates/onyx-daemon/tests/rooms_smoke.rs` so the whole hub +
+/// daemon room flow can be exercised on localhost without paying
+/// Tor's bootstrap cost.
+///
+/// Everything after the dial is byte-identical to the Tor path —
+/// Noise XK over the same stream, same subscribe, same self-publish,
+/// same `serve_session` loop. Reuses the exact same `HubOutbound`
+/// channel and `on_deliver` callback.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_hub_session_tcp<F, Fut>(
+    addr: &str,
+    hub_pubkey: &IdentityPublic,
+    our_identity_sk: &IdentitySecret,
+    subscribe_to: &[RoutingId],
+    outbound_rx: &mut mpsc::Receiver<HubOutbound>,
+    on_deliver: F,
+    self_publish: Option<&SelfPublish>,
+) -> anyhow::Result<()>
+where
+    F: FnMut(RoutingId, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    info!(
+        addr = %addr,
+        subscriptions = subscribe_to.len(),
+        "hub-tcp: dialling"
+    );
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("hub-tcp dial failed: {e}"))?;
+    info!("hub-tcp: TCP connected, starting Noise XK handshake");
+
+    let mut session = handshake_initiator(&mut stream, our_identity_sk, hub_pubkey)
+        .await
+        .map_err(|e| anyhow::anyhow!("hub-tcp Noise handshake failed: {e}"))?;
+
+    write_subscribe(&mut stream, &mut session, subscribe_to)
+        .await
+        .map_err(|e| anyhow::anyhow!("hub-tcp SUBSCRIBE write failed: {e}"))?;
+
+    if let Some(sp) = self_publish {
+        write_kp_publish(&mut stream, &mut session, &sp.routing_id, &sp.kp_bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("hub-tcp KP_PUBLISH write failed: {e}"))?;
+    }
+
+    info!("hub-tcp: entering bidirectional loop");
+    serve_session(&mut stream, &mut session, outbound_rx, on_deliver).await
+}
+
 /// Write one `FRAME_KP_PUBLISH` carrying `routing_id ‖ kp_bytes`.
 /// Split out so the test harness + future re-publish triggers can
 /// call it without dragging in the full dial path.

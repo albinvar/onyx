@@ -6,6 +6,46 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-smoke: end-to-end room flow test harness (hub + 2 daemons over TCP) + XLARGE bucket bugfix
+
+Closes (mostly) post-T6.3 review's **issue #1** — "no real-Tor smoke yet." This isn't real Tor (TCP shortcut for speed), but it exercises every code path between the API surface and the wire encoding, including T6.3.h commit + KEM-ad fan-out, T6.3.i out-of-order retry buffer, and T6.3.g session-token routing. The remaining "differences from real Tor" are circuit-level (NAT, latency, packet loss, MTU) — out of scope for a CI test.
+
+**The smoke immediately found a real bug.** That's the entire point.
+
+What landed:
+
+  * **Hub `--listen-tcp` mode** (`onyx-hub/src/main.rs`): new flag that binds a plain TCP listener instead of publishing a hidden service. Mirrors the daemon's existing `--listen-tcp`. Loudly warned at startup; clap `conflicts_with_all = ["no_tor", "peer_hubs"]` so an operator can't accidentally combine it with federation. The whole listen + accept loop is in a new `run_listen_tcp_mode` helper.
+  * **Daemon `hub_tcp_addrs` config** (`onyx-daemon/src/lib.rs`): `Vec<HubConfig>` of (TCP-addr, b32-pubkey) pairs. Spawns one `run_hub_session_tcp` task per entry, sized into `hub_outbounds` alongside the Tor hubs. Two separate rx-holder Vecs (`hub_tor_rxs`, `hub_tcp_rxs`) so the spawn loops don't have an implicit ordering dependency.
+  * **`hub_client::run_hub_session_tcp`**: parallel to the Tor `run_hub_session`. Same `handshake_initiator` + `write_subscribe` + optional `write_kp_publish` + `serve_session` pipeline; only the initial dial differs (`TcpStream::connect` instead of `tor.dial`). Everything after the connect is byte-identical.
+  * **`spawn_tcp_hub_tasks` helper**: extracted so it runs BEFORE the `--listen-tcp` early-return in `run`. Otherwise the daemon would skip hub connectivity entirely in listen-tcp mode, which is exactly the smoke shape we need (the daemon must be both a TCP-listener for direct DMs AND a TCP-dialled-hub client).
+  * **`onyx-hub` exposed as a library** (`crates/onyx-hub/src/lib.rs`): re-exports `handler`, `peer_link`, `rate_limit`, `state`, `store` modules so the integration test can drive a `HubState` + `hub_handle_connection` in-process without spawning the binary. Existing `main.rs` keeps its own `mod` declarations — they compile to a separate root, by design. Added `#[must_use]` to `RateLimiter::tokens_now` and `HubState::with_rate_limit` which the lib-level pedantic gate caught (binary builds didn't surface these lints).
+  * **The smoke** (`crates/onyx-hub/tests/rooms_smoke.rs`): single `#[tokio::test(flavor = "multi_thread")]` that:
+    1. Spawns an in-process hub on a random TCP port.
+    2. Spawns alice + bob daemons configured with `hub_tcp_addrs = [hub]` and `listen_tcp = "127.0.0.1:0"`.
+    3. Polls each daemon's API socket via `Identity` until ready (synchronizes "daemon up + hub session connected + KP published").
+    4. alice creates a room → fetches bob's KP from the hub directory → invites bob → asserts bob's daemon persists the `rooms` row.
+    5. alice sends a room message → bob's `Tail` subscription receives the matching `EventMessage` with `peer_short = "room/<8-char>"`.
+  * **`bucket::XLARGE = 16384`** (`onyx-core/src/wire.rs`): NEW wire bucket above LARGE. **Discovered by the smoke** — pre-T-smoke, the LARGE bucket (4096 bytes max payload) was too small for room invites carrying the MLS Welcome (~2-3 KB for openmls 0.8 with the ratchet-tree extension) PLUS the T6.3.h `member_kems` roster (1216 bytes per current member). Even a 2-member room invite would error at `encode_padded` with "payload too large for any bucket — caller must chunk." Adding XLARGE = 16384 fits ~12-member room invites; beyond that needs chunking (future slice). Updated `smallest_bucket`, `InnerFrame::decode` length-validation, transport rustdoc, and the boundary round-trip test.
+
+Honest framing on what the smoke covers:
+
+  * **Covers**: API protocol, room create/invite/send/receive, Welcome wire encoding, MLS group lifecycle, hub directory KP fetch, hub-fallback send routing (T6.3.e), session-token derivation + subscription (T6.3.g), CBOR-tagged plaintext (T6.3.h), the XLARGE bucket bugfix above, and the entire daemon ↔ hub Noise XK channel.
+  * **Does NOT cover**: real Tor circuit characteristics (latency, NAT, packet loss, MTU), 3-party rooms (would catch the T6.3.h commit-distribution path on the wire, currently only pinned by the MLS-layer unit test `three_party_room_commit_distribution`), federation (T8.3.x), cover traffic on a real circuit (T-cover.2). Each is a separate follow-up.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **408 passed** (the jump from 359 is because the new `[lib]` target in onyx-hub now runs the existing handler/state/peer_link unit tests under both the lib and the bin build; +1 from the smoke test itself; old `inner_frame_payload_too_large` test updated for the new XLARGE bound).
+
+The smoke runs in ~4 seconds. Worth keeping in the default `cargo test` run.
+
+Issues resolved this session, updated:
+
+  * **#1 (real-Tor smoke)** → partially closed by this slice (TCP shortcut covers everything except circuit-level effects).
+  * **#2 (T6.3.h commit + KEM-ad ordering race)** → fixed by T6.3.i (`5c1bdb0`).
+  * **#3 (T6.3.g session-token subscribe race)** → confirmed non-issue.
+  * **#4 (cover traffic absence)** → partial mitigation via T-cover (1-3).
+  * **NEW (XLARGE bucket bugfix)** → fixed in this slice. Pre-T-smoke, room invites with the T6.3.h roster would have failed in real Tor too — just silently because nobody tried it.
+
+---
+
 ## 2026-05-19 — T-cover (1–3): opt-in client → hub cover traffic via `FRAME_PAD`
 
 Tackles the post-T6.3 review's issue #4: the timing-correlation gap documented in `ANONYMITY.md §3.1`. Pre-T-cover, a passive hub-watching adversary could fingerprint "alice is actively chatting" vs "alice is idle but online" purely from when frames arrived on her hub connection (real traffic only when she sends; nothing otherwise). T-cover adds an opt-in Poisson cover-traffic emitter that injects `FRAME_PAD` frames at exponentially-distributed intervals — same wire shape as a real small frame, indistinguishable to the hub.

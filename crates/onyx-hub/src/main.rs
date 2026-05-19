@@ -153,6 +153,20 @@ struct Args {
     /// Ignored when no `--peer-hub` is configured.
     #[arg(long, value_parser = ["lazy", "eager"], default_value = "lazy")]
     gossip_mode: String,
+
+    /// **TEST-ONLY** local-TCP listen mode. When set, the hub binds
+    /// a plain TCP listener at `addr` instead of standing up a
+    /// hidden service. Mirrors the daemon's `--listen-tcp`. No Tor,
+    /// no anonymity — strictly for the end-to-end smoke harness
+    /// (`crates/onyx-daemon/tests/rooms_smoke.rs`) and local dev.
+    /// Loudly warned at startup so an operator can't accidentally
+    /// run the hub in this mode publicly.
+    ///
+    /// Conflicts with `--peer-hub` (federation requires Tor).
+    /// Conflicts with `--no-tor` (which already bypasses bind).
+    #[arg(long, env = "ONYX_HUB_LISTEN_TCP",
+          conflicts_with_all = ["no_tor", "peer_hubs"])]
+    listen_tcp: Option<String>,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -193,6 +207,20 @@ async fn main() -> anyhow::Result<()> {
         warn!("--no-tor set: skipping Tor; hub will idle until Ctrl-C");
         wait_for_ctrl_c().await;
         return Ok(());
+    }
+
+    // TEST-ONLY: --listen-tcp bypasses Tor entirely and accepts
+    // plain TCP. Used by the smoke harness in
+    // `crates/onyx-daemon/tests/rooms_smoke.rs`. Loudly warned.
+    if let Some(addr) = args.listen_tcp.as_deref() {
+        return run_listen_tcp_mode(
+            addr,
+            identity,
+            args.state_db.clone(),
+            args.max_queue_age_days,
+            args.max_frames_per_minute,
+        )
+        .await;
     }
 
     let tor = if let Some(dir) = args.tor_state_dir.as_deref() {
@@ -425,6 +453,125 @@ async fn main() -> anyhow::Result<()> {
 
     drop(hs);
     drop(tor);
+    Ok(())
+}
+
+/// **TEST-ONLY** run-mode: bind a plain TCP listener instead of
+/// publishing a hidden service. Used by the smoke harness in
+/// `crates/onyx-daemon/tests/rooms_smoke.rs` to exercise the whole
+/// hub + daemon stack on localhost without paying Tor bootstrap.
+///
+/// Sets up the same `HubState` (durable store + rate limit) as the
+/// Tor path, just plumbed onto a `TcpListener::accept` loop. No
+/// federation (`--peer-hub` is forbidden in this mode by clap's
+/// `conflicts_with_all`).
+async fn run_listen_tcp_mode(
+    addr: &str,
+    identity: Identity,
+    state_db: String,
+    max_queue_age_days: u32,
+    max_frames_per_minute: u32,
+) -> anyhow::Result<()> {
+    warn!(
+        addr = %addr,
+        "HUB LISTEN-TCP MODE — NO TOR, NO ANONYMITY. Test/dev only. \
+         Anyone who can reach this address can speak Noise to this hub."
+    );
+
+    // Mirror the Tor path's HubState construction: durable store
+    // (unless --state-db ""), per-connection rate limit.
+    let state = if state_db.is_empty() {
+        warn!("--state-db is empty: running ephemeral.");
+        HubState::new()
+    } else {
+        let db_path = std::path::PathBuf::from(&state_db);
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating hub state-db parent directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let store = crate::store::Store::open(&db_path).context("opening hub state-db")?;
+        HubState::with_store(store).context("warming HubState from store")?
+    };
+    let state = if max_frames_per_minute == 0 {
+        state
+    } else {
+        state.with_rate_limit(max_frames_per_minute)
+    };
+    let state = Arc::new(Mutex::new(state));
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding hub TCP listener at {addr}"))?;
+    let local_addr = listener.local_addr().context("local_addr")?;
+    info!(
+        local_addr = %local_addr,
+        hub_pub_b32 = %encode_b32(&identity.identity_key().public().to_bytes()),
+        "hub TCP listener bound; share `--hub-tcp <addr>,<pubkey>` with daemons"
+    );
+
+    // Periodic queue GC (mirrors the Tor path).
+    if max_queue_age_days > 0 {
+        let gc_state = state.clone();
+        let age_days = max_queue_age_days;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| i64::try_from(d.as_millis()).ok())
+                    .unwrap_or(0);
+                let cutoff = now_ms - i64::from(age_days) * 24 * 60 * 60 * 1000;
+                let result = {
+                    let s = gc_state.lock().await;
+                    s.gc_queue_entries_older_than(cutoff)
+                };
+                if let Ok(n) = result
+                    && n > 0
+                {
+                    info!(deleted = n, "hub queue GC: dropped stale rows");
+                }
+            }
+        });
+    }
+
+    let hub_secret = Arc::new(IdentityHandle::new(identity));
+    let accept_loop = async {
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "hub TCP accept failed; continuing");
+                    continue;
+                }
+            };
+            let state = state.clone();
+            let hub_secret = hub_secret.clone();
+            let span = info_span!("hub-inbound-tcp", peer = %peer_addr);
+            tokio::spawn(
+                async move {
+                    if let Err(e) =
+                        hub_handle_connection(stream, hub_secret.identity_key(), state).await
+                    {
+                        warn!(error = %e, "hub TCP connection handler failed");
+                    }
+                }
+                .instrument(span),
+            );
+        }
+    };
+    tokio::select! {
+        () = accept_loop => {},
+        () = wait_for_ctrl_c() => info!("hub shutting down on Ctrl-C"),
+    }
     Ok(())
 }
 

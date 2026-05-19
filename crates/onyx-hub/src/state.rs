@@ -178,6 +178,7 @@ impl HubState {
     /// is `frames_per_minute / 60` per second, burst tolerance is
     /// the full bucket capacity. SUBSCRIBE frames are not limited
     /// (cheap; no heavy work).
+    #[must_use]
     pub fn with_rate_limit(mut self, frames_per_minute: u32) -> Self {
         self.rate_limiter = Some(RateLimiter::with_frames_per_minute(frames_per_minute));
         self

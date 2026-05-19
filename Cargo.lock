@@ -3172,11 +3172,14 @@ dependencies = [
  "clap",
  "futures",
  "onyx-core",
+ "onyx-daemon",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

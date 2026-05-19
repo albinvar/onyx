@@ -408,6 +408,11 @@ fn build_daemon_config(
         dial_pubkey: args.dial_pubkey.clone(),
         api_socket: socket.to_string_lossy().into_owned(),
         hubs,
+        // The user-facing `onyx` binary doesn't currently expose a
+        // `--hub-tcp` flag — the test-mode primitive is reserved
+        // for the integration smoke harness, which constructs
+        // Config directly without going through CLI parsing.
+        hub_tcp_addrs: Vec::new(),
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
         cover_traffic_mean_secs: args.cover_traffic_mean_secs,

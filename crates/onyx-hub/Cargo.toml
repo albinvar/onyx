@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[lib]
+name = "onyx_hub"
+path = "src/lib.rs"
+
 [[bin]]
 name = "onyx-hub"
 path = "src/main.rs"
@@ -25,6 +29,9 @@ rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+onyx-daemon = { workspace = true }
+zeroize = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

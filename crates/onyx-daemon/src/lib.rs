@@ -152,6 +152,12 @@ pub struct Config {
     /// mode (T8.1+). The recipient's `EnvelopeReplayGuard` handles
     /// the resulting duplicates transparently.
     pub hubs: Vec<HubConfig>,
+    /// **TEST-ONLY.** Same shape as `hubs` but the daemon dials the
+    /// hub over plain TCP instead of Tor. Used by the smoke harness
+    /// in `crates/onyx-daemon/tests/rooms_smoke.rs`. Each entry is
+    /// the (addr_with_port, base32_pubkey) of a hub running with
+    /// `--listen-tcp`. No Tor, no anonymity.
+    pub hub_tcp_addrs: Vec<HubConfig>,
     pub listen_tcp: Option<String>,
     pub dial_tcp: Option<String>,
     /// T-cover.3: mean interval (in seconds) between client → hub
@@ -336,20 +342,34 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // then fails cleanly with NotReady rather than queueing into a
     // void.
     let want_hubs = !args.hubs.is_empty() && !args.no_tor;
-    let (hub_outbounds, hub_rx_holders) = if want_hubs {
-        let mut txs = Vec::with_capacity(args.hubs.len());
-        let mut rxs = Vec::with_capacity(args.hubs.len());
-        for _ in &args.hubs {
+    // Tor-hub channels first, then TCP-hub channels. Build two
+    // separate rx Vecs so each spawn loop drains its own without
+    // an implicit ordering dependency (T-smoke: the TCP spawn now
+    // runs before the listen_tcp early-return, so it must not
+    // steal Tor's rxs).
+    let tor_hub_count = if want_hubs { args.hubs.len() } else { 0 };
+    let tcp_hub_count = args.hub_tcp_addrs.len();
+    let total_hubs = tor_hub_count + tcp_hub_count;
+    let (hub_outbounds, mut hub_tor_rxs, mut hub_tcp_rxs) = if total_hubs > 0 {
+        let mut txs = Vec::with_capacity(total_hubs);
+        let mut tor_rxs = Vec::with_capacity(tor_hub_count);
+        let mut tcp_rxs = Vec::with_capacity(tcp_hub_count);
+        for _ in 0..tor_hub_count {
             let (tx, rx) =
                 mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
             txs.push(tx);
-            rxs.push(rx);
+            tor_rxs.push(rx);
         }
-        (txs, rxs)
+        for _ in 0..tcp_hub_count {
+            let (tx, rx) =
+                mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+            txs.push(tx);
+            tcp_rxs.push(rx);
+        }
+        (txs, tor_rxs, tcp_rxs)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
-    let mut hub_rx_holders = hub_rx_holders;
 
     // Restore the envelope-replay seen-set from the vault if a
     // previous run persisted one (T7.3-sec.2-persist). Corrupt
@@ -405,6 +425,24 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     spawn_replay_snapshot_task(state.clone());
 
     let api_socket_path = PathBuf::from(&args.api_socket);
+
+    // **TEST-ONLY** spawn the TCP-hub client tasks BEFORE the
+    // listen_tcp early-return. Otherwise --listen-tcp would skip
+    // hub connectivity entirely, which defeats the smoke-harness
+    // shape (`crates/onyx-hub/tests/rooms_smoke.rs`) where the
+    // daemon needs both: a TCP listener for direct DM peers AND
+    // a TCP-dialled hub for room fan-out. Errors are non-fatal —
+    // a misconfigured `--hub-tcp` shouldn't refuse to start the
+    // whole daemon.
+    if let Err(e) = spawn_tcp_hub_tasks(
+        &state,
+        &args.hub_tcp_addrs,
+        tor_hub_count,
+        args.cover_traffic_mean_secs,
+        &mut hub_tcp_rxs,
+    ) {
+        warn!(error = %e, "failed to spawn TCP-hub tasks; continuing without them");
+    }
 
     // ── TEST-ONLY local-TCP modes (--listen-tcp / --dial-tcp) ───────────
     // Skip Tor entirely; useful for testing the chat path on localhost
@@ -514,7 +552,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             // task gets its own scrub-on-drop copy of the seed bytes.
             let our_sk_bytes_task = our_sk_bytes.clone();
             let our_kem_bytes_task = our_kem_bytes.clone();
-            let mut outbound_rx = hub_rx_holders.remove(0);
+            let mut outbound_rx = hub_tor_rxs.remove(0);
             let host = host.clone();
             let span = info_span!("hub", idx, host = %host, port);
 
@@ -1368,6 +1406,108 @@ async fn handle_room_app_frame(
     }
 }
 
+/// **TEST-ONLY** spawn the TCP-hub client tasks (and their
+/// per-hub cover-traffic emitters when enabled). Mirrors the
+/// Tor-hub spawn loop in `run` but uses
+/// [`hub_client::run_hub_session_tcp`] instead of the Tor dial.
+/// Tasks are spawned-and-forgotten — they live for the daemon's
+/// lifetime and die with the runtime.
+fn spawn_tcp_hub_tasks(
+    state: &Arc<DaemonState>,
+    hub_tcp_addrs: &[HubConfig],
+    tor_hub_count: usize,
+    cover_traffic_mean_secs: Option<u64>,
+    hub_tcp_rxs: &mut Vec<mpsc::Receiver<hub_client::HubOutbound>>,
+) -> anyhow::Result<()> {
+    if hub_tcp_addrs.is_empty() {
+        return Ok(());
+    }
+    warn!(
+        count = hub_tcp_addrs.len(),
+        "HUB-TCP MODE — no Tor on hub side; test/dev only"
+    );
+    let our_sk_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(*state.identity.identity_key().to_bytes());
+    let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
+    for (rel_idx, hub_cfg) in hub_tcp_addrs.iter().enumerate() {
+        let hub_pubkey_bytes = decode_b32_32(&hub_cfg.pubkey)
+            .with_context(|| format!("--hub-tcp pubkey: {}", hub_cfg.pubkey))?;
+        let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
+        let addr = hub_cfg.onion.clone();
+        let state_for_hub_task = state.clone();
+        let our_sk_bytes_task = our_sk_bytes.clone();
+        let mut outbound_rx = hub_tcp_rxs.remove(0);
+        let absolute_idx = tor_hub_count + rel_idx;
+        let span = info_span!("hub-tcp", idx = absolute_idx, addr = %addr);
+        tokio::spawn(
+            async move {
+                let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes_task);
+                let state_for_hub_cb = state_for_hub_task.clone();
+                let mut backoff = std::time::Duration::from_millis(500);
+                loop {
+                    let self_publish = {
+                        let party = state_for_hub_task.mls_party.lock().await;
+                        party
+                            .key_package_bytes()
+                            .ok()
+                            .map(|kp_bytes| hub_client::SelfPublish {
+                                routing_id: our_inbox,
+                                kp_bytes,
+                            })
+                    };
+                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> = vec![our_inbox];
+                    subscriptions.extend(current_room_session_tokens(&state_for_hub_task).await);
+                    let kem_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+                        state_for_hub_task.identity.kem_secret().to_bytes().to_vec(),
+                    );
+                    let our_kem = std::sync::Arc::new(
+                        onyx_core::crypto::HybridKemSecret::from_bytes(&kem_bytes)
+                            .expect("own KEM round-trip"),
+                    );
+                    let our_kem_for_cb = our_kem.clone();
+                    let result = hub_client::run_hub_session_tcp(
+                        &addr,
+                        &hub_pubkey,
+                        &our_sk,
+                        &subscriptions,
+                        &mut outbound_rx,
+                        |target, body| {
+                            let state = state_for_hub_cb.clone();
+                            let our_kem = our_kem_for_cb.clone();
+                            async move {
+                                handle_hub_delivery(target, body, &state, &our_kem).await;
+                            }
+                        },
+                        self_publish.as_ref(),
+                    )
+                    .await;
+                    match result {
+                        Ok(()) => info!("hub-tcp: session ended cleanly"),
+                        Err(e) => warn!(error = %e, "hub-tcp: session ended with error"),
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
+                }
+            }
+            .instrument(span),
+        );
+
+        if let Some(mean_secs) = cover_traffic_mean_secs
+            && mean_secs > 0
+        {
+            let hub_tx = state.hub_outbounds[absolute_idx].clone();
+            let cover_span = info_span!("cover-tcp", hub_idx = absolute_idx, mean_secs);
+            tokio::spawn(
+                async move {
+                    run_cover_traffic_loop(hub_tx, mean_secs).await;
+                }
+                .instrument(cover_span),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// T-cover.2: emit `HubOutbound::Pad` at exponentially-distributed
 /// intervals (Poisson process with mean `mean_secs`). Sender clone
 /// is consumed when the channel closes (daemon shutdown) — that's
@@ -2113,14 +2253,8 @@ mod cover_traffic_tests {
         let hi = std::time::Duration::from_secs(mean_secs * 10);
         for _ in 0..10_000 {
             let dt = next_exponential_interval(mean_secs);
-            assert!(
-                dt >= lo,
-                "interval {dt:?} below lower clamp {lo:?}"
-            );
-            assert!(
-                dt <= hi,
-                "interval {dt:?} above upper clamp {hi:?}"
-            );
+            assert!(dt >= lo, "interval {dt:?} below lower clamp {lo:?}");
+            assert!(dt <= hi, "interval {dt:?} above upper clamp {hi:?}");
         }
     }
 
@@ -2132,15 +2266,16 @@ mod cover_traffic_tests {
     /// generous ±50% band around `mean_secs` catches a bug where
     /// the sampler is constant or wildly skewed without flaking on
     /// CSPRNG randomness.
+    const COVER_SAMPLES_FOR_AVG: u32 = 10_000;
+
     #[test]
     fn next_exponential_interval_average_is_reasonable() {
         let mean_secs: u64 = 10;
-        const N: u32 = 10_000;
         let mut sum_ms: u128 = 0;
-        for _ in 0..N {
+        for _ in 0..COVER_SAMPLES_FOR_AVG {
             sum_ms += next_exponential_interval(mean_secs).as_millis();
         }
-        let avg_ms = sum_ms / u128::from(N);
+        let avg_ms = sum_ms / u128::from(COVER_SAMPLES_FOR_AVG);
         let target_ms = u128::from(mean_secs) * 1000;
         assert!(
             avg_ms >= target_ms / 2 && avg_ms <= target_ms * 3 / 2,

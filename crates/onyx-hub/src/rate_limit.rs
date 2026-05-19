@@ -122,6 +122,7 @@ impl TokenBucket {
     /// token). Returns the count rounded to one decimal for log
     /// readability.
     #[allow(dead_code)] // used by tests + future ops endpoints
+    #[must_use]
     pub fn tokens_now(&self) -> f64 {
         let elapsed_secs = Instant::now()
             .saturating_duration_since(self.last_refill)

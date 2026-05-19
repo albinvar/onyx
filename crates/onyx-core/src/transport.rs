@@ -299,8 +299,9 @@ impl std::fmt::Debug for Session {
 /// Prepend a 2-byte big-endian length to `body` for stream framing.
 ///
 /// Errors if `body` is larger than `u16::MAX` (65 535 bytes). The largest
-/// frame Onyx produces is `bucket::LARGE + AEAD_TAG_LEN = 4112` bytes, so
-/// this limit is not approached in practice.
+/// frame Onyx produces is `bucket::XLARGE + AEAD_TAG_LEN = 16400` bytes
+/// (room invites carrying a Welcome + member-KEM roster, T6.3.h);
+/// pre-T6.3.h was `bucket::LARGE + AEAD_TAG_LEN = 4112` bytes.
 pub fn frame_with_length(body: &[u8]) -> Result<Vec<u8>> {
     let len = u16::try_from(body.len())
         .map_err(|_| Error::InvalidEncoding("outer frame longer than u16::MAX"))?;

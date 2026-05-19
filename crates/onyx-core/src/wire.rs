@@ -164,6 +164,14 @@ pub mod bucket {
     pub const SMALL: usize = 256;
     pub const MEDIUM: usize = 1024;
     pub const LARGE: usize = 4096;
+    /// T-smoke / T6.3: room invites carry an MLS Welcome (~2–3 KB
+    /// for openmls 0.8 with the ratchet-tree extension) plus the
+    /// T6.3.h `member_kems` roster (1216 bytes per current member).
+    /// Even a 2-member room blows past `LARGE` once we add the
+    /// sealed-sender envelope overhead. `XLARGE = 16384` fits a
+    /// ~12-member room invite envelope. A future slice will need
+    /// chunking if room sizes routinely exceed that.
+    pub const XLARGE: usize = 16384;
 }
 
 /// Inner header size: 2-byte frame type + 2-byte payload length.
@@ -175,6 +183,7 @@ pub mod max_payload {
     pub const SMALL: usize = bucket::SMALL - INNER_HEADER_LEN; // 252
     pub const MEDIUM: usize = bucket::MEDIUM - INNER_HEADER_LEN; // 1020
     pub const LARGE: usize = bucket::LARGE - INNER_HEADER_LEN; // 4092
+    pub const XLARGE: usize = bucket::XLARGE - INNER_HEADER_LEN; // 16380
 }
 
 // ── InnerFrame ─────────────────────────────────────────────────────────────
@@ -204,7 +213,7 @@ pub struct InnerFrame {
 
 impl InnerFrame {
     /// Smallest bucket that fits `header + payload`. `None` if the payload
-    /// is larger than [`max_payload::LARGE`] — callers must chunk at that
+    /// is larger than [`max_payload::XLARGE`] — callers must chunk at that
     /// point (DESIGN.md §5.8).
     #[must_use]
     pub fn smallest_bucket(payload_len: usize) -> Option<usize> {
@@ -215,6 +224,8 @@ impl InnerFrame {
             Some(bucket::MEDIUM)
         } else if needed <= bucket::LARGE {
             Some(bucket::LARGE)
+        } else if needed <= bucket::XLARGE {
+            Some(bucket::XLARGE)
         } else {
             None
         }
@@ -272,6 +283,7 @@ impl InnerFrame {
         if bytes.len() != bucket::SMALL
             && bytes.len() != bucket::MEDIUM
             && bytes.len() != bucket::LARGE
+            && bytes.len() != bucket::XLARGE
         {
             return Err(Error::InvalidEncoding(
                 "InnerFrame: length is not a recognised bucket",
@@ -546,6 +558,8 @@ mod tests {
             max_payload::MEDIUM,
             max_payload::MEDIUM + 1,
             max_payload::LARGE,
+            max_payload::LARGE + 1,
+            max_payload::XLARGE,
         ] {
             let f = InnerFrame {
                 frame_type: FRAME_DELIVER,
@@ -555,7 +569,8 @@ mod tests {
             let expected_bucket = match size {
                 s if s <= max_payload::SMALL => bucket::SMALL,
                 s if s <= max_payload::MEDIUM => bucket::MEDIUM,
-                _ => bucket::LARGE,
+                s if s <= max_payload::LARGE => bucket::LARGE,
+                _ => bucket::XLARGE,
             };
             assert_eq!(bytes.len(), expected_bucket, "size {size}");
             assert_eq!(InnerFrame::decode(&bytes).unwrap(), f);
@@ -564,9 +579,11 @@ mod tests {
 
     #[test]
     fn inner_frame_payload_too_large() {
+        // T-smoke: XLARGE bucket is now the cap (was LARGE). A
+        // payload of XLARGE + 1 must error; LARGE + 1 fits.
         let f = InnerFrame {
             frame_type: FRAME_DELIVER,
-            payload: vec![0; max_payload::LARGE + 1],
+            payload: vec![0; max_payload::XLARGE + 1],
         };
         assert!(matches!(f.encode_padded(), Err(Error::InvalidEncoding(_))));
     }
