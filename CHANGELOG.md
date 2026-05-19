@@ -6,6 +6,59 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.x-ratelimit: per-connection token-bucket rate limiting on the hub
+
+Closes a real DoS vector that the relay-arc work today actively widened. Before this commit, the hub accepted DELIVER and KP_PUBLISH frames from any authenticated client as fast as the wire could carry them. A hostile (or buggy, or misconfigured) client could:
+
+  * Saturate the hub's CPU/IO with KeyPackage validation work — `handler.rs::FRAME_KP_PUBLISH` performs a TLS-deserialise + MLS leaf-node signature check per frame (T7.3-sec), neither cheap.
+  * Fill the `queue_entry` table at line rate, racing T8.0.gc's 30-day age cap.
+  * Starve other clients of hub attention via the shared `Mutex` on `HubState`.
+
+T8.x-ratelimit installs a standard token bucket per connection. Frames consume one token; empty bucket → silent drop. Defaults to 600 frames/minute (10/sec sustained, ~1 min of burst tolerance). Operator-configurable; `0` disables (loudly discouraged).
+
+What landed:
+
+**T8.x-ratelimit.a — new `onyx-hub::rate_limit` module.** `crates/onyx-hub/src/rate_limit.rs`, ~250 lines. Two types:
+
+  * `TokenBucket { capacity, refill_per_sec, tokens, last_refill }` — classic continuous-refill token bucket using `f64` tokens for sub-second precision. `try_consume()` lazily computes the refill since last call (`elapsed_secs * refill_per_sec`), caps at `capacity`, deducts one if available. Floor-clamps `capacity` and `refill_per_sec` to `0.001` so pathological zero-rate configs can't divide-by-zero.
+  * `RateLimiter { buckets: HashMap<ConnId, TokenBucket>, capacity, refill_per_sec }` — per-connection registry. Lazy bucket instantiation on first `check()` (avoids a default bucket per `register_conn` for subscribe-only clients). `forget(conn)` on disconnect prevents map-leak across reconnects.
+
+Seven new unit tests:
+  * `bucket_starts_full_and_drains_one_per_call` — base semantics.
+  * `bucket_refills_over_time` — uses `try_consume_at(Instant)` to drive deterministic time.
+  * `bucket_refill_capped_at_capacity` — wait 100 sec, can still only consume `capacity`.
+  * `rate_limiter_isolates_connections` — two `ConnId`s have independent buckets.
+  * `rate_limiter_forget_removes_bucket` — disconnect clears, reconnect gets fresh full bucket.
+  * `rate_limiter_zero_capacity_clamps` — pathological config doesn't panic.
+  * `tokens_now_reflects_lazy_refill` — observability without burning a token.
+
+**T8.x-ratelimit.b — `HubState::with_rate_limit(u32)` + `check_rate(conn) -> bool`.** `crates/onyx-hub/src/state.rs`. Adds `rate_limiter: Option<RateLimiter>` to the struct — `None` means "no limit" (preserves the existing `HubState::new()` ephemeral semantics for tests). `with_rate_limit` is the builder for the production path. `check_rate(conn)` returns `true` when no limiter is installed (defensive default — better to accept than to drop unexpectedly), or delegates to the limiter when one is present. `unregister_conn` was extended to also `rl.forget(conn)` so disconnected conn ids don't accumulate in the limiter's map.
+
+**T8.x-ratelimit.c — `handler.rs` checks before processing DELIVER + KP_PUBLISH.** Both frame branches now `state.lock().await.check_rate(conn_id)` at the top of the arm; on `false`, log a `warn!` and `continue` the loop (silent drop to the client — matches the hub's existing posture for malformed-frame handling so attackers can't probe by counting error responses). SUBSCRIBE is **not** rate-limited because it doesn't trigger heavy work (just a HashSet insert).
+
+**T8.x-ratelimit.d — `--max-frames-per-minute` flag.** `crates/onyx-hub/src/main.rs`. New clap arg (env `ONYX_HUB_MAX_FRAMES_PER_MINUTE`), default 600. `--max-frames-per-minute 0` disables with a loud `warn!` at startup so it can't be invoked silently. Documentation in the flag's rustdoc explains: typical chat = single-digit frames/min, so 600 is comfortable; the cap exists for the *misbehaving* case.
+
+Security and operational analysis:
+
+  * **Defends against**: single-connection flood. A hostile client running flat-out can do at most `max_frames_per_minute` of CPU/disk work per minute, instead of "as fast as the wire allows" (which on Tor is still meaningful — gigabits theoretically).
+  * **Does NOT defend against** (documented in module rustdoc):
+    - **Coordinated attack from many connections.** Each connection gets its own bucket. N attackers = N × rate. A follow-up per-identity limit (keyed on the Noise XK authenticated pubkey) would close this; out of scope here.
+    - **Slow-loris-style drip.** This caps *peak* rate, not aggregate work. A connection that sends 1 DELIVER/sec forever still adds 86 400 rows/day to `queue_entry`. The T8.0.gc 30-day cap bounds that; the two defences compose.
+  * **No new attack surface.** The bucket lives in process memory, keyed by a u64 we already generate. No new wire format, no new auth surface.
+  * **Backward compat.** Existing `HubState::new()` callers (every existing test) get `rate_limiter: None` and the limiter is a no-op — none of the 21 existing hub tests need to change. The 7 new tests cover the limiter itself.
+  * **Operator default**: 600/min is permissive enough that no legitimate use case approaches it. Operators running dedicated bots / bridges that legitimately need higher throughput can bump it via the flag.
+
+What this did NOT do:
+
+  * Did not add per-identity (Noise-pubkey-keyed) rate limiting — follow-up, would require lifting the Noise pubkey out of the handshake and into `HubState`.
+  * Did not add SUBSCRIBE rate limiting — SUBSCRIBE is a hash-set insert, doesn't justify the protection cost.
+  * Did not add a hub-status / metrics endpoint that surfaces per-connection bucket state for operators. `RateLimiter::known_connections()` exists for that future use.
+  * Did not add a "rejected with backoff hint" wire frame to tell the client "slow down for X seconds." Silent drop is consistent with the hub's other posture and avoids leaking the bucket-state observable to attackers.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` **292 passed / 0 failed** (was 285; +7 rate_limit module tests). All 21 pre-existing hub tests still pass — the new `Option<RateLimiter>` field defaults to `None` for `HubState::new()` callers, so no test had to change.
+
+---
+
 ## 2026-05-19 — T-zeroize-audit: scrub the secrets we own end-to-end (passphrase, key round-trips, TUI composer)
 
 Memory-hygiene pass across the items Onyx **owns and controls**. Pre-T-zeroize-audit, our zeroization coverage was strong on the cryptographic primitives (`AeadKey`, `IdentitySecret`, `HybridKemSecret`, `MlsParty::snapshot_state`) but had three drag-in-process-memory gaps we hadn't closed: the daemon's vault passphrase, the per-task key seed round-trips inside the hub-client spawn loop, and the TUI composer buffer after send. This slice closes all three and maps every remaining gap explicitly in `ANONYMITY.md` §3.8.

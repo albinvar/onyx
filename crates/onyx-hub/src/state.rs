@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::rate_limit::RateLimiter;
 use crate::store::Store;
 
 /// Routing identifier — 16 bytes from `BLAKE2b-128` per DESIGN §5.5.
@@ -71,6 +72,11 @@ pub struct HubState {
     /// hub is running ephemeral — fine for tests and short-lived
     /// dev runs. Production uses `Self::with_store`.
     durable_store: Option<Store>,
+    /// Per-connection rate limiter (T8.x-ratelimit). Optional so
+    /// existing tests + ephemeral hubs don't pay the cost; `None`
+    /// means "no limit, accept everything." Bound on first frame
+    /// per connection (lazy); cleared on unregister_conn.
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl HubState {
@@ -98,6 +104,29 @@ impl HubState {
         }
         me.durable_store = Some(store);
         Ok(me)
+    }
+
+    /// Install a per-connection rate limiter (T8.x-ratelimit). Each
+    /// connection lazily gets a token bucket capped at
+    /// `frames_per_minute` for DELIVER + KP_PUBLISH; sustained rate
+    /// is `frames_per_minute / 60` per second, burst tolerance is
+    /// the full bucket capacity. SUBSCRIBE frames are not limited
+    /// (cheap; no heavy work).
+    pub fn with_rate_limit(mut self, frames_per_minute: u32) -> Self {
+        self.rate_limiter = Some(RateLimiter::with_frames_per_minute(frames_per_minute));
+        self
+    }
+
+    /// Check + consume one token for `conn`. Returns `true` if the
+    /// caller should process the frame, `false` if the connection
+    /// has exceeded its rate quota and the frame should be silently
+    /// dropped. When no rate limiter is installed, always returns
+    /// `true` (limiter is opt-in).
+    pub fn check_rate(&mut self, conn: ConnId) -> bool {
+        match &mut self.rate_limiter {
+            Some(rl) => rl.check(conn),
+            None => true,
+        }
     }
 
     /// Register a fresh connection. Returns the [`ConnId`] the
@@ -201,6 +230,11 @@ impl HubState {
         }
         // Reclaim empty-set entries so subscribers doesn't grow without bound.
         self.subscribers.retain(|_, subs| !subs.is_empty());
+        // T8.x-ratelimit: drop the rate bucket too — otherwise the
+        // map slowly leaks one entry per disconnected conn id.
+        if let Some(rl) = &mut self.rate_limiter {
+            rl.forget(conn);
+        }
     }
 
     // ── KeyPackage directory (T6.1) ────────────────────────────────────────

@@ -106,6 +106,17 @@ where
                         }
                     }
                     FRAME_DELIVER => {
+                        // T8.x-ratelimit: per-connection token bucket.
+                        // Drop silently on empty bucket (matches our
+                        // "fail closed, log loudly" posture for other
+                        // misbehaving-client signals).
+                        if !state.lock().await.check_rate(conn_id) {
+                            warn!(
+                                conn = conn_id,
+                                "hub: DELIVER rate-limited (bucket empty); dropping frame"
+                            );
+                            continue;
+                        }
                         // The hub reads the 16-byte target prefix to decide
                         // *where* to route, but forwards the entire payload
                         // (prefix included) to subscribers so they can tell
@@ -123,6 +134,20 @@ where
                         );
                     }
                     FRAME_KP_PUBLISH => {
+                        // T8.x-ratelimit: KP_PUBLISH triggers MLS
+                        // validation work (TLS deserialise + leaf-
+                        // node signature check), so the bucket
+                        // matters here too. Same shared bucket as
+                        // DELIVER — one connection's DELIVER spam
+                        // and KP_PUBLISH spam compete for the same
+                        // budget.
+                        if !state.lock().await.check_rate(conn_id) {
+                            warn!(
+                                conn = conn_id,
+                                "hub: KP_PUBLISH rate-limited (bucket empty); dropping frame"
+                            );
+                            continue;
+                        }
                         // Latest-wins on accept. The publisher must
                         // prove ownership of the routing id by shipping
                         // a KP whose embedded Ed25519 signing key

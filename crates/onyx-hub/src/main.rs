@@ -42,6 +42,7 @@ use crate::handler::hub_handle_connection;
 use crate::state::HubState;
 
 mod handler;
+mod rate_limit;
 mod state;
 mod store;
 
@@ -101,6 +102,22 @@ struct Args {
     /// disk or are running ephemeral via `--state-db ""`).
     #[arg(long, env = "ONYX_HUB_MAX_QUEUE_AGE_DAYS", default_value_t = 30)]
     max_queue_age_days: u32,
+
+    /// Per-connection rate limit for DELIVER + KP_PUBLISH frames
+    /// (T8.x-ratelimit). Each connection gets a token bucket capped
+    /// at this many frames; sustained refill rate is the same value
+    /// per minute. A normal client never approaches this limit
+    /// (typical chat = single-digit frames/min); the cap exists to
+    /// prevent a single hostile or misbehaving client from
+    /// monopolising the hub's CPU/disk by spamming DELIVERs or
+    /// KP_PUBLISHes (the latter triggers MLS validation work per
+    /// frame).
+    ///
+    /// SUBSCRIBE frames are NOT limited (cheap). Set to 0 to
+    /// disable the limiter entirely (NOT recommended for any
+    /// production hub).
+    #[arg(long, env = "ONYX_HUB_MAX_FRAMES_PER_MINUTE", default_value_t = 600)]
+    max_frames_per_minute: u32,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -187,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
             "--state-db is empty: running ephemeral. Queued envelopes \
              and published KPs will NOT survive a hub restart."
         );
-        Arc::new(Mutex::new(HubState::new()))
+        HubState::new()
     } else {
         let db_path = std::path::PathBuf::from(&args.state_db);
         if let Some(parent) = db_path.parent()
@@ -202,8 +219,26 @@ async fn main() -> anyhow::Result<()> {
         }
         info!(state_db = %db_path.display(), "opening hub durable state-db");
         let store = crate::store::Store::open(&db_path).context("opening hub state-db")?;
-        let warm = HubState::with_store(store).context("warming HubState from store")?;
-        Arc::new(Mutex::new(warm))
+        HubState::with_store(store).context("warming HubState from store")?
+    };
+    // T8.x-ratelimit: install the per-connection rate limiter.
+    // Operator can opt out with `--max-frames-per-minute 0` (loudly
+    // discouraged for production hubs).
+    let state = if args.max_frames_per_minute == 0 {
+        warn!(
+            "--max-frames-per-minute 0: rate limiting is DISABLED. \
+             Any single connection can spam DELIVER / KP_PUBLISH \
+             frames as fast as the wire allows."
+        );
+        Arc::new(Mutex::new(state))
+    } else {
+        info!(
+            max_frames_per_minute = args.max_frames_per_minute,
+            "per-connection rate limit installed (DELIVER + KP_PUBLISH; SUBSCRIBE unlimited)"
+        );
+        Arc::new(Mutex::new(
+            state.with_rate_limit(args.max_frames_per_minute),
+        ))
     };
 
     // T8.0.gc: spawn the periodic queue-GC task. Runs hourly,
