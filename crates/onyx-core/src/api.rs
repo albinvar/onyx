@@ -246,6 +246,34 @@ pub enum ApiRequest {
         group_id_b32: String,
         new_name: String,
     },
+    /// Send a file to every member of a room (T-files.d). The
+    /// daemon reads `path`, sanitizes it per `FILES.md §3`
+    /// (strips metadata + computes content_hash), chunks the
+    /// cleaned bytes (12 KB each by default), and fans out a
+    /// `FileMeta` followed by N `FileChunk` MLS messages via
+    /// the existing room channel.
+    ///
+    /// `keep_filename`: false (default) renames to a hash-prefixed
+    /// sanitized name; true preserves the original name (sanitized).
+    /// `keep_metadata`: false (default) refuses to send formats
+    /// Onyx can't safely strip; true bypasses the strip and
+    /// passes raw bytes through with the leak documented at
+    /// `FILES.md §3.2`.
+    ///
+    /// Per-file size cap enforced from `FilesConfig.max_send_size_bytes`
+    /// (default 50 MB). Exceeded → `ApiResponse::Error`.
+    SendFileToRoom {
+        group_id_b32: String,
+        path: String,
+        #[serde(default)]
+        keep_filename: bool,
+        #[serde(default)]
+        keep_metadata: bool,
+    },
+    /// List files received from peers / in rooms (T-files.d). Returns
+    /// most-recent-first. `conversation` is `peer-<short>` for DMs
+    /// (when DM file support lands) or `room/<short_b32>` for rooms.
+    ListReceivedFiles { conversation: String, limit: u32 },
     /// Fetch the persisted scrollback for a room (T-polish.3).
     /// Returns up to `limit` most recent messages oldest → newest
     /// — same shape as [`Self::History`] for DMs. Empty Vec when
@@ -380,6 +408,30 @@ pub enum ApiResponse {
     InviteToRoomOk {
         group_id_b32: String,
         members: Vec<String>,
+    },
+    /// Reply to [`ApiRequest::SendFileToRoom`] (T-files.d). The file
+    /// was sanitized + chunked + fanned out. Per-call delivery stats
+    /// mirror the [`Self::SendRoomOk`] shape; `file_id_b32` is the
+    /// 16-byte random transfer id from the FileMeta (useful for
+    /// correlating later events).
+    SendFileToRoomOk {
+        group_id_b32: String,
+        file_id_b32: String,
+        size: u64,
+        mime: String,
+        stripped_metadata: bool,
+        chunks: u32,
+        delivered_to_direct: u32,
+        #[serde(default)]
+        delivered_to_hub: u32,
+        #[serde(default)]
+        skipped_no_kem: u32,
+        total_members: u32,
+    },
+    /// Reply to [`ApiRequest::ListReceivedFiles`] (T-files.d).
+    ListReceivedFilesOk {
+        conversation: String,
+        files: Vec<ReceivedFileInfo>,
     },
     /// Reply to [`ApiRequest::RoomHistory`] (T-polish.3). Messages
     /// are oldest → newest. May be shorter than `limit` if fewer
@@ -529,6 +581,21 @@ pub struct RoomHistoryEntry {
     pub sender_fp: String,
     pub text: String,
     pub ts_unix_ms: u64,
+}
+
+/// One row in [`ApiResponse::ListReceivedFilesOk`] (T-files.d).
+/// Projection of the vault's `received_files` row to the API
+/// surface; `path` is the absolute filesystem path the receiver
+/// can shell-`cat` / `open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceivedFileInfo {
+    pub sender_fp: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub content_hash_b32: String,
+    pub path: String,
+    pub received_at_ms: u64,
 }
 
 /// Direction of an [`ApiResponse::EventMessage`].

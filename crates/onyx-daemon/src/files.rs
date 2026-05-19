@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use onyx_core::room::RoomAppMessage;
 use serde_bytes::ByteBuf;
@@ -67,7 +66,7 @@ const QUOTA_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 /// state for an incoming `FileMeta`. Returns the accept decision;
 /// caller does the logging + tail-event emission.
 pub async fn accept_file_meta(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     sender_fp: &str,
     conversation: &str,
     meta_id: &[u8],
@@ -147,7 +146,7 @@ pub async fn accept_file_meta(
 /// chunk was rejected (logged at debug). All-or-nothing: a verify
 /// failure drops the in-flight state and returns None.
 pub async fn accept_file_chunk(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     sender_fp: &str,
     chunk_id: &[u8],
     index: u32,
@@ -253,7 +252,7 @@ pub async fn accept_file_chunk(
 /// failure (verify fail, disk write fail, vault record fail).
 #[allow(clippy::too_many_arguments)]
 async fn finalize_file(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     sender_fp: &str,
     conversation: &str,
     name: &str,

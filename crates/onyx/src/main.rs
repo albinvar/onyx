@@ -298,6 +298,13 @@ enum Command {
         #[command(subcommand)]
         cmd: RoomCommand,
     },
+    /// File-management subcommands (T-files.d). `onyx files list
+    /// --conversation room/<short>` enumerates received files in
+    /// a room; sending uses `onyx room send-file`.
+    Files {
+        #[command(subcommand)]
+        cmd: FilesCommand,
+    },
 }
 
 /// Subcommands under `onyx room`. Each maps directly to one
@@ -388,6 +395,41 @@ enum RoomCommand {
     Leave {
         #[arg(long)]
         group_id: String,
+    },
+    /// Send a file to every member of a room (T-files.d). The
+    /// daemon sanitizes metadata by default (raster images get
+    /// decoded + re-encoded; PDF/Office/video/audio are refused
+    /// unless `--keep-metadata` is set). Filename is replaced
+    /// with a hash-prefixed sanitized name unless `--keep-filename`
+    /// is set. See `FILES.md §3` for the per-format strategy.
+    SendFile {
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        path: String,
+        /// Preserve the original filename (still sanitized for
+        /// safe disk storage). Default: replace with `file.<ext>`.
+        #[arg(long)]
+        keep_filename: bool,
+        /// Bypass metadata stripping. Required for formats Onyx
+        /// can't safely strip (PDF, DOCX, video, audio, archives,
+        /// HEIC). Documented leak — see `FILES.md §3.2`.
+        #[arg(long)]
+        keep_metadata: bool,
+    },
+}
+
+/// `onyx files …` subcommands (T-files.d).
+#[derive(Subcommand, Debug)]
+enum FilesCommand {
+    /// List files received from peers / in rooms.
+    /// `conversation` is `peer-<short>` for DMs (when DM file
+    /// support lands) or `room/<short_b32>` for rooms.
+    List {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
     },
 }
 
@@ -554,6 +596,7 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
         }
         Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
         Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
+        Some(Command::Files { cmd }) => dispatch_files(&socket, cmd).await,
     }
 }
 
@@ -618,6 +661,43 @@ async fn dispatch_room(socket: &std::path::Path, cmd: RoomCommand) -> anyhow::Re
                 socket,
                 ApiRequest::LeaveRoom {
                     group_id_b32: group_id,
+                },
+            )
+            .await
+        }
+        RoomCommand::SendFile {
+            group_id,
+            path,
+            keep_filename,
+            keep_metadata,
+        } => {
+            one_shot_print(
+                socket,
+                ApiRequest::SendFileToRoom {
+                    group_id_b32: group_id,
+                    path,
+                    keep_filename,
+                    keep_metadata,
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// T-files.d: dispatch `onyx files …` subcommands. Each maps
+/// 1:1 to an ApiRequest variant.
+async fn dispatch_files(socket: &std::path::Path, cmd: FilesCommand) -> anyhow::Result<ExitCode> {
+    match cmd {
+        FilesCommand::List {
+            conversation,
+            limit,
+        } => {
+            one_shot_print(
+                socket,
+                ApiRequest::ListReceivedFiles {
+                    conversation,
+                    limit,
                 },
             )
             .await

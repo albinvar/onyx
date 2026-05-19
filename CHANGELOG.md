@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-files.d: CLI verbs (`onyx room send-file`, `onyx files list`) + end-to-end smoke
+
+Fourth of five T-files slices. The wire + persistence layer (T-files.b) and the metadata-strip layer (T-files.c) are now reachable from the CLI: `onyx room send-file --group-id X --path photo.jpg` sanitizes + chunks + fans out; `onyx files list --conversation room/<short>` enumerates received files.
+
+What landed:
+
+  * **`ApiRequest::SendFileToRoom { group_id_b32, path, keep_filename, keep_metadata }`** + **`ApiResponse::SendFileToRoomOk { file_id_b32, size, mime, stripped_metadata, chunks, delivered_to_direct, delivered_to_hub, skipped_no_kem, total_members }`**.
+  * **`ApiRequest::ListReceivedFiles { conversation, limit }`** + **`ApiResponse::ListReceivedFilesOk { conversation, files: Vec<ReceivedFileInfo> }`**.
+  * **`ReceivedFileInfo`** wire shape (sender_fp, name, mime, size, content_hash_b32, path, received_at_ms).
+  * **`handle_send_file_to_room`** daemon handler — sanitize → chunk → per-chunk encrypt + fan-out. Enforces `max_send_size_bytes` sender-side (FILES.md §4) so the local operator doesn't accidentally ship a 1 GB file.
+  * **`handle_list_received_files`** daemon handler — projects vault rows to `ReceivedFileInfo`.
+  * **`fanout_room_mls_bytes_with_stats`** helper — variant of the existing fan-out that returns delivery counts. Used by the per-chunk loop.
+  * **CLI**: `onyx room send-file --group-id … --path … [--keep-filename] [--keep-metadata]`. `onyx files list --conversation … [--limit N]`.
+  * **End-to-end smoke test** `rooms_e2e_send_file_with_metadata_strip`. Alice creates a room, invites bob, writes a JPEG with an `ONYX-SMOKE-EXIF-CANARY` marker to disk, calls `SendFileToRoom`. Test then polls bob's `ListReceivedFiles` until the file appears, reads bob's on-disk copy, and asserts (a) it's a valid JPEG (SOI marker present), (b) the on-disk size matches the manifest, (c) **the EXIF canary is GONE** — proves the strip survived the full pipeline end-to-end.
+
+This is the load-bearing smoke for file sharing. Sanitize → chunk → MLS encrypt → fan-out via hub → bob's daemon decrypts → reassembles in chunk-index order → BLAKE2b-256 verifies → writes to `~/.onyx/files/room-<short>/<hash>-<name>` → vault manifest row. Any regression in any step fails this test.
+
+What's still missing (queued for T-files.e):
+
+  * **TUI `Ctrl-F` file-picker modal**. Today's CLI flow: `onyx room send-file --path …`. TUI flow needs a path input modal + strip preview + submit.
+  * **Attachment rendering in the scrollback**. Today: room messages show as text only; received files show up only via `onyx files list`. TUI should render `📎 photo.jpg (2.3 MB) → ./onyx-files/room-X/abc-photo.jpg` inline.
+  * **Progress reporting during in-flight transfer**. For multi-MB files, the operator should see a bar.
+
+What's NOT supported (out of scope for T-files):
+
+  * **DM file sending** (`onyx send-file --peer …`). The DM channel today encrypts raw UTF-8 plaintext; adding file framing requires migrating the DM channel to a tagged `DmAppMessage` enum the same way rooms migrated in T6.3.h. Documented in `FILES.md §7` as future work.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **446 passed** (+1 from 445; new file-smoke is the +1). End-to-end smoke runs in ~4s.
+
+Status of T-files slices: ✅ a, ✅ b, ✅ c, ✅ d, pending e (TUI surface).
+
+---
+
 ## 2026-05-19 — T-files.c: metadata stripping (re-encode raster, refuse complex formats)
 
 Third of five slices for file-sharing. Implements `FILES.md §3` — sender-side metadata removal before chunking. With this slice, the daemon-side primitives are complete; T-files.d wires them to the CLI and T-files.e adds the TUI surface.

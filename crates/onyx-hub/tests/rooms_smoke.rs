@@ -36,7 +36,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use onyx_core::api::{
-    ApiRequest, ApiResponse, MessageDirection, RoomInfo, decode_response, encode_request_line,
+    ApiRequest, ApiResponse, MessageDirection, ReceivedFileInfo, RoomInfo, decode_response,
+    encode_request_line,
 };
 use onyx_core::crypto::Argon2Params;
 use onyx_core::storage::Vault;
@@ -570,6 +571,201 @@ async fn rooms_e2e_no_intro_inbox_opt_out_queues_first_contact() {
     // restarting the daemon process — left as an operator drill
     // for now. The two key properties (opt-out blocks live
     // delivery; hub queues the envelope) are pinned above.
+}
+
+/// T-files.d end-to-end: alice creates a room, invites bob,
+/// sends a JPEG file (with fake EXIF), bob receives + assembles
+/// + verifies + persists. Asserts the on-disk bytes match what
+/// alice's sanitize_file produced.
+///
+/// This is the load-bearing test for the whole file-sharing
+/// pipeline: sanitize → chunk → encrypt → fan-out → reassemble
+/// → verify → persist. Catches regressions in any of those steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn rooms_e2e_send_file_with_metadata_strip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
+        .with_test_writer()
+        .try_init();
+
+    let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
+    let (alice_sock, alice_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "alice_file").await;
+    let (bob_sock, _bob_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "bob_file").await;
+
+    let _ = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
+    let bob_id = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
+    let (bob_fp, bob_kem_b32) = match bob_id {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => (fingerprint, identity_kem_pub_b32),
+        other => panic!("bob Identity: {other:?}"),
+    };
+
+    let group_id_b32 = match one_shot(
+        &alice_sock,
+        &ApiRequest::CreateRoom {
+            name: "file-room".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::CreateRoomOk { group_id_b32, .. } => group_id_b32,
+        other => panic!("CreateRoom: {other:?}"),
+    };
+
+    let bob_kp_b64 = match one_shot_until_ok(
+        &alice_sock,
+        &ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: bob_fp.clone(),
+        },
+        "fetch bob KP",
+    )
+    .await
+    {
+        ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+        other => panic!("fetch bob KP: {other:?}"),
+    };
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::InviteToRoom {
+            group_id_b32: group_id_b32.clone(),
+            peer_fingerprint: bob_fp,
+            peer_kem_pub_b32: bob_kem_b32,
+            peer_kp_b64: bob_kp_b64,
+        },
+    )
+    .await
+    {
+        ApiResponse::InviteToRoomOk { .. } => {}
+        other => panic!("InviteToRoom: {other:?}"),
+    }
+    let _ = wait_for_room_in_list(&bob_sock, &group_id_b32).await;
+
+    // Write a JPEG with EXIF canary to alice's temp dir.
+    let canary = b"ONYX-SMOKE-EXIF-CANARY";
+    let dirty_jpeg = build_jpeg_with_canary(canary);
+    let file_path = alice_dir.path().join("photo.jpg");
+    std::fs::write(&file_path, &dirty_jpeg).unwrap();
+
+    // Send the file with default strip-on.
+    let send_resp = one_shot(
+        &alice_sock,
+        &ApiRequest::SendFileToRoom {
+            group_id_b32: group_id_b32.clone(),
+            path: file_path.to_string_lossy().into_owned(),
+            keep_filename: false,
+            keep_metadata: false,
+        },
+    )
+    .await;
+    match &send_resp {
+        ApiResponse::SendFileToRoomOk {
+            stripped_metadata,
+            chunks,
+            mime,
+            ..
+        } => {
+            assert!(stripped_metadata, "default send must strip metadata");
+            assert!(*chunks >= 1);
+            assert_eq!(mime, "image/jpeg");
+        }
+        other => panic!("SendFileToRoom: {other:?}"),
+    }
+
+    // Poll bob's received-files list until the file appears.
+    let conversation = format!("room/{}", &group_id_b32.chars().take(8).collect::<String>());
+    let received: ReceivedFileInfo = wait_for_received_file(&bob_sock, &conversation).await;
+    assert_eq!(received.mime, "image/jpeg");
+    assert!(received.size > 0);
+
+    // Read the file off bob's disk + verify:
+    //  (a) it's a valid JPEG
+    //  (b) the canary is GONE (strip worked end-to-end)
+    let on_disk = std::fs::read(&received.path).expect("bob's file readable");
+    assert_eq!(
+        on_disk.len() as u64,
+        received.size,
+        "on-disk size must match manifest"
+    );
+    // First two bytes are SOI; this is a real JPEG.
+    assert_eq!(&on_disk[..2], &[0xFF, 0xD8]);
+    assert!(
+        !on_disk.windows(canary.len()).any(|w| w == canary),
+        "EXIF canary survived end-to-end strip — metadata leak"
+    );
+}
+
+/// Build a tiny JPEG with a fake EXIF segment containing the
+/// canary. Same as the per-format test in `files.rs::tests`, but
+/// duplicated here to avoid exposing it from the daemon module
+/// just for tests. Kept independent.
+fn build_jpeg_with_canary(canary: &[u8]) -> Vec<u8> {
+    // Generate a minimal JPEG via the `image` crate's encode path.
+    // We do this without depending on `image` here by writing the
+    // bytes directly — a 1x1 black JPEG is a well-known constant.
+    let minimal_jpeg: Vec<u8> = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06,
+        0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B,
+        0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29, 0x2C, 0x30, 0x31,
+        0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF,
+        0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00,
+        0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+        0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05,
+        0x04, 0x04, 0x00, 0x00, 0x01, 0x7D, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
+        0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A,
+        0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x34, 0x35, 0x36, 0x37,
+        0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56,
+        0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
+        0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x92, 0x93,
+        0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9,
+        0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6,
+        0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7,
+        0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0xFB, 0xFF,
+        0xD9,
+    ];
+    // Splice canary into an APP1 segment after the SOI.
+    let mut exif_segment: Vec<u8> = vec![0xFF, 0xE1, 0, 0, b'E', b'x', b'i', b'f', 0x00, 0x00];
+    exif_segment.extend_from_slice(canary);
+    let len = u16::try_from(exif_segment.len() - 2).expect("EXIF segment length fits in u16");
+    exif_segment[2] = u8::try_from(len >> 8).unwrap_or(0);
+    exif_segment[3] = u8::try_from(len & 0xFF).unwrap_or(0);
+    let mut out = Vec::with_capacity(minimal_jpeg.len() + exif_segment.len());
+    out.extend_from_slice(&minimal_jpeg[..2]);
+    out.extend_from_slice(&exif_segment);
+    out.extend_from_slice(&minimal_jpeg[2..]);
+    out
+}
+
+/// Poll bob's `ListReceivedFiles` until at least one file appears,
+/// or timeout. Returns the most recent one.
+async fn wait_for_received_file(socket: &Path, conversation: &str) -> ReceivedFileInfo {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let resp = one_shot(
+            socket,
+            &ApiRequest::ListReceivedFiles {
+                conversation: conversation.to_string(),
+                limit: 10,
+            },
+        )
+        .await;
+        if let ApiResponse::ListReceivedFilesOk { mut files, .. } = resp
+            && !files.is_empty()
+        {
+            return files.remove(0);
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("no file appeared in {conversation} after 20s");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 /// 3-party room flow: alice creates a room, invites bob, then

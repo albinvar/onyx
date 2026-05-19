@@ -340,6 +340,19 @@ async fn dispatch_one_shot(
             group_id_b32,
             limit,
         } => handle_room_history(group_id_b32, *limit, state).await,
+        ApiRequest::SendFileToRoom {
+            group_id_b32,
+            path,
+            keep_filename,
+            keep_metadata,
+        } => {
+            handle_send_file_to_room(group_id_b32, path, *keep_filename, *keep_metadata, state)
+                .await
+        }
+        ApiRequest::ListReceivedFiles {
+            conversation,
+            limit,
+        } => handle_list_received_files(conversation, *limit, state).await,
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
     }
 }
@@ -1184,6 +1197,341 @@ async fn handle_leave_room(group_id_b32: &str, state: &DaemonState) -> ApiRespon
         group_id_b32: group_id_b32.to_string(),
         members: members_count,
     }
+}
+
+/// T-files.d: read + sanitize + chunk a file and fan out the
+/// resulting `FileMeta` + `FileChunk` MLS messages to every room
+/// member. Caps enforced sender-side too (size cap), not just on
+/// the receivers — defends against the local operator accidentally
+/// shipping a 1 GB file across Tor.
+#[allow(clippy::too_many_lines)]
+async fn handle_send_file_to_room(
+    group_id_b32: &str,
+    path: &str,
+    keep_filename: bool,
+    keep_metadata: bool,
+    state: &DaemonState,
+) -> ApiResponse {
+    use crate::files::{SanitizeOpts, chunk_file_for_send, sanitize_file, sanitize_filename};
+
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+
+    // 1. Sanitize the file (strip metadata + sniff MIME).
+    let cleaned = match sanitize_file(std::path::Path::new(path), SanitizeOpts { keep_metadata }) {
+        Ok(c) => c,
+        Err(e) => {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: format!("sanitize_file: {e}"),
+            };
+        }
+    };
+
+    // 2. Cap-list §2.5: per-file send size.
+    let size = cleaned.bytes.len() as u64;
+    if size > state.files_config.max_send_size_bytes {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: format!(
+                "file size {} exceeds max_send_size_bytes {}",
+                size, state.files_config.max_send_size_bytes
+            ),
+        };
+    }
+
+    // 3. Compute file_id (random) + content_hash.
+    let mut file_id = [0u8; 16];
+    onyx_core::crypto::fill_random(&mut file_id);
+    let content_hash = onyx_core::crypto::blake2b_256(&[&cleaned.bytes]);
+
+    // 4. Compute the sanitized name to put on the wire.
+    let raw_name = std::path::Path::new(path).file_name().map_or_else(
+        || "unnamed".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let wire_name = if keep_filename {
+        sanitize_filename(&raw_name)
+    } else {
+        // Strip name to just the extension; receiver will use the
+        // hash prefix as the on-disk filename anyway.
+        let ext = std::path::Path::new(&raw_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin");
+        format!("file.{ext}")
+    };
+
+    // 5. Look up the room + load MLS group + verify membership.
+    let room_row = {
+        let vault = state.vault.lock().await;
+        match vault.list_rooms(state.identity_id) {
+            Ok(rows) => rows.into_iter().find(|r| r.group_id == group_id_bytes),
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list_rooms: {e}"),
+                };
+            }
+        }
+    };
+    let Some(room) = room_row else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "no room with that group_id".into(),
+        };
+    };
+
+    // 6. Chunk + encrypt + fan out. Same shape as handle_send_room
+    //    but iterates over the FileMeta + N FileChunk messages.
+    let messages = chunk_file_for_send(
+        file_id,
+        &wire_name,
+        &cleaned.mime,
+        &cleaned.bytes,
+        state.files_config.chunk_size_bytes,
+        &content_hash,
+    );
+    let chunks_count = u32::try_from(messages.len() - 1).unwrap_or(u32::MAX);
+
+    let our_fp = state.identity.fingerprint().to_string();
+    let members: Vec<String> = room
+        .members_b32
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != our_fp)
+        .map(str::to_owned)
+        .collect();
+    let total_members = u32::try_from(members.len()).unwrap_or(u32::MAX);
+
+    // Encrypt each plaintext message through the room's MLS group
+    // and fan out to members. We track delivery stats from the
+    // first chunk's fanout only — the per-chunk stats would just
+    // repeat for each chunk in the absence of mid-transfer failures.
+    let mut total_direct: u32 = 0;
+    let mut total_hub: u32 = 0;
+    let mut total_skipped: u32 = 0;
+    for msg in &messages {
+        let Ok(plaintext) = msg.to_cbor() else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "RoomAppMessage CBOR encode failed".into(),
+            };
+        };
+        let ciphertext_opt = {
+            let party = state.mls_party.lock().await;
+            match party.load_group(&group_id_bytes) {
+                Ok(Some(mut g)) => g.encrypt_application(&party, &plaintext).ok(),
+                _ => None,
+            }
+        };
+        let Some(ciphertext) = ciphertext_opt else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "encrypt_application failed mid-transfer".into(),
+            };
+        };
+        // Snapshot the freshly-advanced MLS state (each encrypt
+        // advances the ratchet; lose it = de-sync).
+        let snap_opt = {
+            let party = state.mls_party.lock().await;
+            party.snapshot_state().ok()
+        };
+        if let Some(snap) = snap_opt {
+            let vault = state.vault.lock().await;
+            let _ = vault.save_mls_state(state.identity_id, &snap);
+        }
+        // Per-chunk fanout. Returns no stats from the helper, so
+        // we only use the LAST chunk's stats as the "delivery
+        // count" reported to the caller. v0 limitation: if some
+        // members lose their channel mid-transfer the user won't
+        // see that; they'll see "delivered to N" for the last
+        // chunk's destination.
+        let (direct, hub, skipped) = fanout_room_mls_bytes_with_stats(
+            &group_id_bytes,
+            &ciphertext,
+            &members,
+            state,
+            "file",
+            None,
+        )
+        .await;
+        total_direct = direct;
+        total_hub = hub;
+        total_skipped = skipped;
+    }
+
+    let file_id_b32 = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &file_id);
+    tracing::info!(
+        op = "send_file_to_room",
+        group_id_b32,
+        file_id_b32 = %file_id_b32,
+        size,
+        mime = %cleaned.mime,
+        chunks = chunks_count,
+        stripped = cleaned.stripped,
+        "file sent"
+    );
+    ApiResponse::SendFileToRoomOk {
+        group_id_b32: group_id_b32.to_string(),
+        file_id_b32,
+        size,
+        mime: cleaned.mime,
+        stripped_metadata: cleaned.stripped,
+        chunks: chunks_count,
+        delivered_to_direct: total_direct,
+        delivered_to_hub: total_hub,
+        skipped_no_kem: total_skipped,
+        total_members,
+    }
+}
+
+/// T-files.d: list files received in a conversation.
+async fn handle_list_received_files(
+    conversation: &str,
+    limit: u32,
+    state: &DaemonState,
+) -> ApiResponse {
+    let rows = {
+        let vault = state.vault.lock().await;
+        match vault.list_received_files(state.identity_id, conversation, limit as usize) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list_received_files: {e}"),
+                };
+            }
+        }
+    };
+    let files = rows
+        .into_iter()
+        .map(|r| onyx_core::api::ReceivedFileInfo {
+            sender_fp: r.sender_fp,
+            name: r.name,
+            mime: r.mime,
+            size: r.size,
+            content_hash_b32: base32::encode(
+                base32::Alphabet::Rfc4648Lower { padding: false },
+                &r.content_hash,
+            ),
+            path: r.path,
+            received_at_ms: u64::try_from(r.received_at_ms).unwrap_or(0),
+        })
+        .collect();
+    ApiResponse::ListReceivedFilesOk {
+        conversation: conversation.to_string(),
+        files,
+    }
+}
+
+/// T-files.d: variant of [`fanout_room_mls_bytes`] that returns
+/// the delivery stats so `handle_send_file_to_room` can report
+/// per-call counts. The original doesn't return stats because the
+/// commit / KEM-ad broadcasts didn't care.
+async fn fanout_room_mls_bytes_with_stats(
+    group_id_bytes: &[u8],
+    mls_bytes: &[u8],
+    members: &[String],
+    state: &DaemonState,
+    op_label: &'static str,
+    routing_target_override: Option<onyx_core::routing::RoutingId>,
+) -> (u32, u32, u32) {
+    let mut delivered_direct: u32 = 0;
+    let mut delivered_hub: u32 = 0;
+    let mut skipped_no_kem: u32 = 0;
+    let room_target = match routing_target_override {
+        Some(t) => Some(t),
+        None => compute_room_session_token(group_id_bytes, state).await,
+    };
+    let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
+        let reg = state.conversations.lock().await;
+        members
+            .iter()
+            .map(|fp| (fp.clone(), reg.handle_for_fingerprint(fp)))
+            .collect()
+    };
+    for (fp, maybe_handle) in direct_targets {
+        if let Some(handle) = maybe_handle
+            && handle
+                .outbound_tx
+                .try_send(crate::conversations::PeerOutbound::RoomFrame(
+                    mls_bytes.to_vec(),
+                ))
+                .is_ok()
+        {
+            delivered_direct += 1;
+            continue;
+        }
+        let kem_bytes_opt = {
+            let vault = state.vault.lock().await;
+            vault
+                .lookup_room_member_kem(state.identity_id, group_id_bytes, &fp)
+                .unwrap_or(None)
+        };
+        let Some(kem_bytes) = kem_bytes_opt else {
+            skipped_no_kem += 1;
+            continue;
+        };
+        let Ok(kem_pub) = onyx_core::crypto::HybridKemPublic::from_bytes(&kem_bytes) else {
+            skipped_no_kem += 1;
+            continue;
+        };
+        let target = if let Some(t) = room_target {
+            t
+        } else {
+            let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
+                skipped_no_kem += 1;
+                continue;
+            };
+            onyx_core::routing::introduction_inbox(&target_fp_parsed)
+        };
+        let payload = onyx_core::routing::BootstrapPayload::MlsApp {
+            group_id: serde_bytes::ByteBuf::from(group_id_bytes.to_vec()),
+            ciphertext: serde_bytes::ByteBuf::from(mls_bytes.to_vec()),
+        };
+        let Ok(payload_bytes) = payload.to_cbor() else {
+            continue;
+        };
+        let Ok(sealed) = onyx_core::routing::seal_bootstrap(
+            state.identity.signing(),
+            state.identity.identity_key(),
+            &payload_bytes,
+            &kem_pub,
+        ) else {
+            continue;
+        };
+        let mut any_accepted = false;
+        for hub_outbound in &state.hub_outbounds {
+            if hub_outbound
+                .try_send(crate::hub_client::HubOutbound::deliver(
+                    target,
+                    sealed.clone(),
+                ))
+                .is_ok()
+            {
+                any_accepted = true;
+            }
+        }
+        if any_accepted {
+            delivered_hub += 1;
+        }
+    }
+    tracing::trace!(
+        op_label,
+        delivered_direct,
+        delivered_hub,
+        skipped_no_kem,
+        "file-chunk fanout"
+    );
+    (delivered_direct, delivered_hub, skipped_no_kem)
 }
 
 /// T6.3.h fan-out helper. Pushes a pre-built MLS message
