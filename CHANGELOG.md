@@ -6,6 +6,37 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.a: `CHANNELS.md` design doc — multi-party rooms
+
+Documentation-only. T6.3 (channels / multi-party rooms — the headline IRC feature) is genuinely complex enough that doing it inline at slice cadence would skip the design step. Same FEDERATION.md / DISCOVERY.md pattern: write the design first, capture open questions, plan the implementation slices.
+
+Structure (10 sections, mirrors `FEDERATION.md`):
+
+  * **§0 honest framing**. The cryptographic substrate is **already there** — `MlsParty` supports N-member groups natively per RFC 9420. T6.3 is "wire up the application surface": Room concept, vault persistence, CLI verbs, TUI pane, send/receive routing. The crypto is solved; the application layer needs to learn it.
+  * **§1 adversary model**. T6.3 does NOT introduce new adversary classes. Two design properties worth noting: member-list visibility within a room (MLS property, not a leak — every member sees every other member's fingerprint), and DM↔room disambiguation depending on a forward-compatible wire-format field.
+  * **§2 data model**. `Room { name, group_id, members, created_at_ms }` keyed by group_id at the cryptographic layer + by name at the UI layer. New additive vault table `rooms` (same `CREATE TABLE IF NOT EXISTS` pattern as T7.3-sec.2-persist's `replay_state` — no schema-version bump). Conversation registry gains `ConversationKey::{Peer, Room}` parallel index.
+  * **§3 lifecycle**. Create (fresh MLS group with us alone), Invite (`MlsGroup::invite` + Welcome via existing T7.2-mls hub path), Send (encrypt via MLS, route to each member direct-or-hub), Receive (find group by group_id, emit `EventMessage` tagged `Room(group_id)`), Leave (`MlsGroup::remove` + Commit, fire-and-forget, local state gone immediately).
+  * **§4 wire considerations**. `BootstrapPayload::MlsWelcome` gains optional `room_name: Option<String>` field with `#[serde(default)]` for back-compat (pre-T6.3 daemons treat the Welcome as a 2-party MLS bootstrap, which it functionally was anyway). Per-epoch session tokens (`routing::session_token`) noted as the right primitive for hub-routed in-group messages — deferred to T6.3.g follow-up so the bulk slices can land first.
+  * **§5 five open questions**. Q1 inviter-name handling; Q2 invite-with-or-without explicit KP; Q3 new `BootstrapPayload::MlsApp` variant vs reuse MlsWelcome (recommendation: new variant); Q4 per-epoch session tokens vs per-member inboxes for hub-routing (recommendation: per-member first, session tokens later); Q5 leave-room confirmation (recommendation: fire-and-forget). Each with my recommendation and the reasoning.
+  * **§6 slice plan**. Six slices T6.3.b–T6.3.f covering ~7.5 hours of focused work + T6.3.g per-epoch follow-up. NOT a one-shot.
+  * **§7 threat-model deltas**. Two design properties to add to THREAT_MODEL.md when T6.3.b lands. No new §8.2 carry-forwards — T6.3 is additive feature work that composes safely with existing defenses.
+  * **§8 deferred**. Role-based moderation, cryptographic history backfill for new joiners (MLS forbids it by construction; Onyx will not invent a back door), public room discovery (same DISCOVERY.md posture as for hubs), federation across hub boundaries beyond T8.3 (rooms with members across federated hubs compose for free), persistent message history on the hub (the existing offline-queue model handles it).
+  * **§9 cross-references** + **§10 decision log**.
+
+README §12 doc index updated to feature `CHANNELS.md` below `DISCOVERY.md`.
+
+What this commit deliberately does NOT do:
+
+  * No code. Not even an empty `crates/onyx-daemon/src/rooms.rs`.
+  * No API verb additions, no CLI subcommand, no vault table.
+  * No commitment to a slice cadence — T6.3.b through T6.3.f land when they land.
+
+**Next concrete step**: review CHANNELS.md §5 open questions. If the recommendations hold (especially Q3 new BootstrapPayload variant and Q4 per-member inboxes first), T6.3.b (data model + create-room) is a clean ~1.5 hour slice.
+
+Verification: documentation-only. `cargo fmt --check` / `cargo clippy -D warnings` / `cargo test --workspace` (317) all unchanged from `e14e91a`.
+
+---
+
 ## 2026-05-19 — Docs: `DISCOVERY.md` — why public hub discovery (T8.4) is deferred
 
 Documentation-only. The user asked "what about public discovery hubs?" The honest answer is that T8.4 is mostly a *governance* problem, not a technical one, and shipping a discovery mechanism without a community of public hubs to populate it would be theatre. This commit captures that reasoning as a permanent repo artifact so the next reader who asks the same question gets a real answer instead of "I forgot."
