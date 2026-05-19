@@ -124,6 +124,29 @@ CREATE TABLE IF NOT EXISTS replay_state (
 );
 ";
 
+/// Additive extension for T6.3.b — multi-party rooms. Same pattern
+/// as [`SCHEMA_REPLAY_STATE_ADD`]: applied via
+/// `CREATE TABLE IF NOT EXISTS` on every `open`/`initialize`,
+/// **no** schema-version bump. Existing vaults pick up the table on
+/// next open with no migration runner required.
+///
+/// One row per (our identity, MLS group_id) pair. `name` is local-
+/// only — each member can call the same MLS group whatever they
+/// like (FEDERATION-style member metadata is not propagated over
+/// the wire). `members_b32` is a comma-separated list of member
+/// fingerprints in base32; a cache of what we'd otherwise have to
+/// walk the MLS tree to recover, refreshed on every commit.
+const SCHEMA_ROOMS_ADD: &str = "
+CREATE TABLE IF NOT EXISTS rooms (
+  identity_id     INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  group_id        BLOB NOT NULL,
+  name            TEXT NOT NULL,
+  members_b32     TEXT NOT NULL,
+  created_at_ms   INTEGER NOT NULL,
+  PRIMARY KEY (identity_id, group_id)
+);
+";
+
 /// Known plaintext used to detect a wrong passphrase. Encrypted under
 /// the vault key at creation; failure to decrypt at open means the
 /// passphrase doesn't match (or the file is corrupted — we don't
@@ -255,6 +278,7 @@ impl Vault {
         // SCHEMA_REPLAY_STATE_ADD rustdoc).
         conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOMS_ADD).map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -264,6 +288,7 @@ impl Vault {
         conn.execute_batch(SCHEMA_V3).map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOMS_ADD).map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -461,6 +486,96 @@ impl Vault {
         }
     }
 
+    // ── T6.3.b: Rooms (multi-party MLS groups) ─────────────────────
+
+    /// UPSERT a room for `identity_id`. Idempotent on
+    /// `(identity_id, group_id)`. Updates `name`, `members_b32`,
+    /// `created_at_ms` to the supplied values on conflict.
+    ///
+    /// `members_b32` is a comma-separated list of fingerprints in
+    /// base32 (the same form `Fingerprint::to_base32()` produces).
+    /// Empty string is permitted (a freshly-created room before
+    /// invite has only the creator, but [`Self::save_room`] takes
+    /// the caller's word for what's in members_b32 — typically the
+    /// daemon includes its own fingerprint).
+    pub fn save_room(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        name: &str,
+        members_b32: &str,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO rooms (identity_id, group_id, name, members_b32, created_at_ms) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(identity_id, group_id) DO UPDATE SET \
+                   name = excluded.name, \
+                   members_b32 = excluded.members_b32, \
+                   created_at_ms = excluded.created_at_ms",
+                params![identity_id, group_id, name, members_b32, created_at_ms],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// List every room for `identity_id`, ordered by `created_at_ms`
+    /// ascending (older first). Returns the rows verbatim — the
+    /// daemon decides how to project them into API responses.
+    pub fn list_rooms(&self, identity_id: i64) -> Result<Vec<RoomRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT group_id, name, members_b32, created_at_ms \
+                 FROM rooms WHERE identity_id = ? \
+                 ORDER BY created_at_ms ASC",
+            )
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id], |r| {
+                Ok(RoomRow {
+                    group_id: r.get(0)?,
+                    name: r.get(1)?,
+                    members_b32: r.get(2)?,
+                    created_at_ms: r.get(3)?,
+                })
+            })
+            .map_err(map_db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_db_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a room by `(identity_id, group_id)`. Idempotent — no
+    /// error if the row didn't exist. Note: this does NOT drop the
+    /// underlying MLS state (that's `mls_state`); a future `leave-
+    /// room` flow may want to forget both.
+    pub fn delete_room(&self, identity_id: i64, group_id: &[u8]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM rooms WHERE identity_id = ? AND group_id = ?",
+                params![identity_id, group_id],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+}
+
+/// One row of [`Vault::list_rooms`]. Plain data; the daemon
+/// translates this into the API-level `RoomInfo` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomRow {
+    pub group_id: Vec<u8>,
+    pub name: String,
+    /// Comma-separated base32 fingerprints; see [`Vault::save_room`].
+    pub members_b32: String,
+    pub created_at_ms: i64,
+}
+
+impl Vault {
     /// Read-only access to the underlying SQLite connection for
     /// implementing per-entity repos (identity, contacts, …). Repos
     /// MUST NOT bypass [`Self::encrypt_blob`]/[`Self::decrypt_blob`]
@@ -590,6 +705,95 @@ mod tests {
         let snap2 = b"replacement snapshot";
         v.save_replay_state(id, snap2).unwrap();
         assert_eq!(v.load_replay_state(id).unwrap().unwrap(), snap2);
+    }
+
+    // ── T6.3.b: rooms ───────────────────────────────────────────────
+
+    #[test]
+    fn room_save_list_round_trip() {
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("alice").unwrap();
+
+        // Empty to start.
+        assert!(v.list_rooms(id).unwrap().is_empty());
+
+        // Insert one room.
+        let gid_1 = vec![0x01, 0x02, 0x03];
+        v.save_room(id, &gid_1, "alpha", "fp_alice,fp_bob", 1_000)
+            .unwrap();
+        let rooms = v.list_rooms(id).unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].group_id, gid_1);
+        assert_eq!(rooms[0].name, "alpha");
+        assert_eq!(rooms[0].members_b32, "fp_alice,fp_bob");
+        assert_eq!(rooms[0].created_at_ms, 1_000);
+
+        // Insert a second room — list now sorted by created_at ASC.
+        let gid_2 = vec![0x10, 0x20, 0x30];
+        v.save_room(id, &gid_2, "beta", "fp_alice", 2_000).unwrap();
+        let rooms = v.list_rooms(id).unwrap();
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].name, "alpha"); // older
+        assert_eq!(rooms[1].name, "beta"); // newer
+    }
+
+    #[test]
+    fn room_save_is_upsert_on_group_id() {
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("alice").unwrap();
+
+        let gid = vec![0xAA, 0xBB];
+        v.save_room(id, &gid, "alpha", "fp_alice", 1_000).unwrap();
+        // Same group_id, updated name + members.
+        v.save_room(id, &gid, "alpha-renamed", "fp_alice,fp_bob", 1_500)
+            .unwrap();
+
+        let rooms = v.list_rooms(id).unwrap();
+        assert_eq!(rooms.len(), 1, "UPSERT must not duplicate");
+        assert_eq!(rooms[0].name, "alpha-renamed");
+        assert_eq!(rooms[0].members_b32, "fp_alice,fp_bob");
+        assert_eq!(rooms[0].created_at_ms, 1_500);
+    }
+
+    #[test]
+    fn room_delete_is_idempotent() {
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("alice").unwrap();
+        let gid = vec![0x42; 32];
+
+        // Deleting a never-inserted room is a no-op.
+        v.delete_room(id, &gid).unwrap();
+        assert!(v.list_rooms(id).unwrap().is_empty());
+
+        // Insert + delete + verify gone.
+        v.save_room(id, &gid, "alpha", "fp_alice", 1).unwrap();
+        assert_eq!(v.list_rooms(id).unwrap().len(), 1);
+        v.delete_room(id, &gid).unwrap();
+        assert!(v.list_rooms(id).unwrap().is_empty());
+
+        // Double-delete still fine.
+        v.delete_room(id, &gid).unwrap();
+    }
+
+    #[test]
+    fn rooms_isolated_across_identities() {
+        // FK to identities means each identity has its own room set.
+        let mut v = fresh_vault();
+        let (alice, _) = v.create_identity("alice").unwrap();
+        let (bob, _) = v.create_identity("bob").unwrap();
+
+        v.save_room(alice, &[0xA1], "alice-room", "fp_alice", 100)
+            .unwrap();
+        v.save_room(bob, &[0xB1], "bob-room", "fp_bob", 200)
+            .unwrap();
+
+        let alice_rooms = v.list_rooms(alice).unwrap();
+        assert_eq!(alice_rooms.len(), 1);
+        assert_eq!(alice_rooms[0].name, "alice-room");
+
+        let bob_rooms = v.list_rooms(bob).unwrap();
+        assert_eq!(bob_rooms.len(), 1);
+        assert_eq!(bob_rooms[0].name, "bob-room");
     }
 
     #[test]

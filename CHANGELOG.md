@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.b: vault `rooms` table + `CreateRoom` / `ListRooms` API
+
+First code slice of T6.3 (multi-party rooms). Establishes the data model and the daemon plumbing to create + enumerate rooms. **No invite, no send, no receive yet** — those are T6.3.c–e. Sized deliberately small so the foundations can be reviewed and exercised before the routing surface lands on top.
+
+What landed:
+
+  * **Vault `rooms` table** (`crates/onyx-core/src/storage.rs`). Additive `CREATE TABLE IF NOT EXISTS` via new `SCHEMA_ROOMS_ADD` constant — same pattern as `replay_state` from T7.3-sec.2-persist, **no `SCHEMA_VERSION` bump**. One row per (`identity_id`, `group_id`) pair; columns are `name TEXT`, `members_b32 TEXT` (comma-separated fingerprint list, cached so we don't have to walk the MLS tree), `created_at_ms INTEGER`. `PRIMARY KEY (identity_id, group_id)` makes save an upsert by design, isolates rooms per identity (`ON DELETE CASCADE`), and prevents cross-identity leakage.
+  * **Vault methods** (same file): `save_room`, `list_rooms` returning `Vec<RoomRow>`, `delete_room`. 4 new tests — `room_save_list_round_trip`, `room_save_is_upsert_on_group_id`, `room_delete_is_idempotent`, `rooms_isolated_across_identities`.
+  * **API types** (`crates/onyx-core/src/api.rs`): `ApiRequest::CreateRoom { name }`, `ApiRequest::ListRooms`, `ApiResponse::CreateRoomOk { group_id_b32, name }`, `ApiResponse::ListRoomsOk { rooms: Vec<RoomInfo> }`, new struct `RoomInfo { name, group_id_b32, members: Vec<String>, created_at_ms: u64 }`. 5 round-trip serde tests.
+  * **Daemon handlers** (`crates/onyx-daemon/src/api_server.rs`): `handle_create_room` calls `MlsParty::create_group` → snapshots MLS state → persists via `save_mls_state` → records the room row with our own fingerprint as the sole member. `handle_list_rooms` projects each `RoomRow` to `RoomInfo`, splitting `members_b32` on `,`. Both wired into the request dispatch arm.
+
+Design notes:
+
+  * **Why `members_b32` is a cached comma-list, not a join table**. T6.3.c will refresh it on every Welcome/Commit, so the cache is always at most one commit out of date. A members table would be the "correct" relational shape but adds a join on every `list_rooms` call for negligible gain; the room member-count is bounded by MLS group size, so a 4KB TEXT column is plenty.
+  * **No wire-format changes in this slice**. `BootstrapPayload::MlsWelcome` keeps its T6.x shape — the `room_name` optional field will land with T6.3.c when there's a recipient to render it.
+  * **No CLI verbs / TUI surface**. `onyx createroom` / room pane land in T6.3.f. T6.3.b is daemon-only so the API can be exercised over the raw socket (`nc -U ./onyxd.sock` + JSON) for early validation.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **326 passed** (was 317; +9 new tests = 4 vault + 5 API). Manual smoke deferred to T6.3.c once there's something interesting to look at.
+
+Next: T6.3.c (invite-to-room via existing T7.2-mls path; extends `BootstrapPayload::MlsWelcome` with optional `room_name`).
+
+---
+
 ## 2026-05-19 — T6.3.a: `CHANNELS.md` design doc — multi-party rooms
 
 Documentation-only. T6.3 (channels / multi-party rooms — the headline IRC feature) is genuinely complex enough that doing it inline at slice cadence would skip the design step. Same FEDERATION.md / DISCOVERY.md pattern: write the design first, capture open questions, plan the implementation slices.

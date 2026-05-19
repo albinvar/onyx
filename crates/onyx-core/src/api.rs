@@ -187,6 +187,21 @@ pub enum ApiRequest {
     /// want to share an invite URL out-of-band (Signal, in person)
     /// without exposing your KP via the hub directory.
     ExportKeyPackage,
+    /// Create a new multi-party room with just us as the sole member
+    /// (T6.3.b). Subsequent `InviteToRoom` calls add members via the
+    /// existing T7.2-mls hub path. `name` is a local-only display
+    /// label; it does not propagate over the wire. Returns
+    /// [`ApiResponse::CreateRoomOk`] with the new room's MLS
+    /// `group_id` in base32 — the cryptographic identity of the
+    /// room (the name is just a label).
+    ///
+    /// Two rooms can share a name locally — the daemon disambiguates
+    /// by `group_id` everywhere; the name is for the TUI's benefit.
+    CreateRoom { name: String },
+    /// List every room this daemon participates in (T6.3.b). Returns
+    /// [`ApiResponse::ListRoomsOk`] with one [`RoomInfo`] per room,
+    /// ordered by `created_at_ms` ascending (older first).
+    ListRooms,
 }
 
 /// One response line on the wire (daemon → client).
@@ -269,6 +284,14 @@ pub enum ApiResponse {
     /// invite URL's `kp` query parameter to enable MLS-tier first
     /// contact.
     ExportKeyPackageOk { kp_b64: String },
+    /// Reply to [`ApiRequest::CreateRoom`]. `group_id_b32` is the
+    /// MLS group's stable identifier in base32 — this IS the
+    /// room's cryptographic identity (the name is just a local
+    /// label). `name` echoes back what the caller passed.
+    CreateRoomOk { group_id_b32: String, name: String },
+    /// Reply to [`ApiRequest::ListRooms`]. `rooms` is ordered by
+    /// `created_at_ms` ascending (older first).
+    ListRoomsOk { rooms: Vec<RoomInfo> },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
     /// Initial ack of [`ApiRequest::Tail`]. Tells the client the
@@ -346,6 +369,27 @@ pub struct HistoryEntry {
     pub ts_unix_ms: u64,
     #[serde(default)]
     pub via_hub: bool,
+}
+
+/// One row in [`ApiResponse::ListRoomsOk`]. The daemon's
+/// projection of its internal `Room` state into the API-level
+/// shape clients consume (T6.3.b).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomInfo {
+    /// User-supplied display label. Local-only — each member can
+    /// call the same MLS group whatever they like; the name does
+    /// NOT propagate over the wire.
+    pub name: String,
+    /// Stable MLS GroupId, base32. This IS the room's
+    /// cryptographic identity; the name is just a label.
+    pub group_id_b32: String,
+    /// Current members' fingerprints, base32-grouped (the same
+    /// shape `onyx identity` prints). Includes us. Refreshed on
+    /// every successful MLS commit (invite/remove).
+    pub members: Vec<String>,
+    /// Daemon wall-clock at room creation. Used by clients to
+    /// sort the room list; not authoritative across members.
+    pub created_at_ms: u64,
 }
 
 /// Direction of an [`ApiResponse::EventMessage`].
@@ -478,6 +522,66 @@ mod tests {
             }
             other => panic!("expected IdentityOk, got {other:?}"),
         }
+    }
+
+    // ── T6.3.b: rooms ─────────────────────────────────────────────
+
+    #[test]
+    fn request_round_trip_create_room() {
+        let r = ApiRequest::CreateRoom {
+            name: "my-room".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn request_round_trip_list_rooms() {
+        let r = ApiRequest::ListRooms;
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_create_room_ok() {
+        let r = ApiResponse::CreateRoomOk {
+            group_id_b32: "abcd".into(),
+            name: "my-room".into(),
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_list_rooms_ok() {
+        let r = ApiResponse::ListRoomsOk {
+            rooms: vec![
+                RoomInfo {
+                    name: "alpha".into(),
+                    group_id_b32: "g1".into(),
+                    members: vec!["fp_alice".into(), "fp_bob".into()],
+                    created_at_ms: 1000,
+                },
+                RoomInfo {
+                    name: "beta".into(),
+                    group_id_b32: "g2".into(),
+                    members: vec!["fp_alice".into()],
+                    created_at_ms: 2000,
+                },
+            ],
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn create_room_wire_shape() {
+        let r = ApiRequest::CreateRoom { name: "x".into() };
+        let line = encode_request_line(&r).unwrap();
+        assert!(
+            line.contains("\"kind\":\"CreateRoom\""),
+            "wire must carry kind=CreateRoom; got {line:?}"
+        );
     }
 
     #[test]

@@ -307,6 +307,8 @@ async fn dispatch_one_shot(
             handle_fetch_peer_keypackage(peer_fingerprint, state).await
         }
         ApiRequest::ExportKeyPackage => handle_export_key_package(state).await,
+        ApiRequest::CreateRoom { name } => handle_create_room(name, state).await,
+        ApiRequest::ListRooms => handle_list_rooms(state).await,
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
     }
 }
@@ -353,6 +355,117 @@ async fn handle_export_key_package(state: &DaemonState) -> ApiResponse {
     ApiResponse::ExportKeyPackageOk {
         kp_b64: base64_encode(&kp_bytes),
     }
+}
+
+/// Create a new multi-party MLS room with us as the sole member
+/// (T6.3.b). The group_id of the resulting MLS group becomes the
+/// room's cryptographic identity; `name` is a local-only display
+/// label that does not propagate over the wire.
+///
+/// Side effects:
+///   * `MlsParty::create_group` mints a fresh MLS group.
+///   * MLS state is snapshotted + persisted to vault.
+///   * A row is upserted into the `rooms` table with our own
+///     fingerprint as the sole `members_b32` entry.
+///
+/// Failure of either persistence step surfaces as
+/// `ApiErrorCode::Internal` — the in-memory MLS state may already
+/// hold the group, but the caller should not assume so.
+async fn handle_create_room(name: &str, state: &DaemonState) -> ApiResponse {
+    // Create the MLS group + snapshot state.
+    let (group_id_bytes, snapshot) = {
+        let party = state.mls_party.lock().await;
+        let group = match party.create_group() {
+            Ok(g) => g,
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("create_group failed: {e}"),
+                };
+            }
+        };
+        let group_id = group.group_id_bytes();
+        let Ok(snap) = party.snapshot_state() else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "snapshot_state failed".into(),
+            };
+        };
+        (group_id, snap)
+    };
+
+    // Persist MLS state.
+    {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_mls_state(state.identity_id, &snapshot) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_mls_state: {e}"),
+            };
+        }
+    }
+
+    // Insert the rooms-table row. Sole member at creation is us.
+    let our_fp = state.identity.fingerprint().to_string();
+    let created_at_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(0);
+    {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_room(
+            state.identity_id,
+            &group_id_bytes,
+            name,
+            &our_fp,
+            created_at_ms,
+        ) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_room: {e}"),
+            };
+        }
+    }
+
+    ApiResponse::CreateRoomOk {
+        group_id_b32: encode_b32(&group_id_bytes),
+        name: name.to_string(),
+    }
+}
+
+/// List every room this daemon participates in (T6.3.b). Reads
+/// from the vault's `rooms` table; projects each row into a
+/// [`RoomInfo`] for the wire.
+async fn handle_list_rooms(state: &DaemonState) -> ApiResponse {
+    let rows = {
+        let vault = state.vault.lock().await;
+        match vault.list_rooms(state.identity_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list_rooms: {e}"),
+                };
+            }
+        }
+    };
+    let rooms = rows
+        .into_iter()
+        .map(|row| onyx_core::api::RoomInfo {
+            name: row.name,
+            group_id_b32: encode_b32(&row.group_id),
+            members: row
+                .members_b32
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            created_at_ms: u64::try_from(row.created_at_ms).unwrap_or(0),
+        })
+        .collect();
+    ApiResponse::ListRoomsOk { rooms }
 }
 
 /// Fetch a peer's MLS KeyPackage from the hub's T6.1 directory.
