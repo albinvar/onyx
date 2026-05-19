@@ -246,6 +246,40 @@ impl MlsParty {
 /// hub creates an ephemeral [`OpenMlsRustCrypto`] provider per call;
 /// it carries no persistent state because we're only using its
 /// crypto trait impls for the [`KeyPackageIn::validate`] step.
+/// Peek the `group_id` from a serialised MLS application message
+/// without decrypting it (T6.3.d).
+///
+/// Used by the per-peer recipient task to decide whether an incoming
+/// `FRAME_MLS_APP` belongs to this peer's DM group or to a multi-
+/// party room both sides are members of. The cleartext MLS header
+/// carries the group_id in both `PrivateMessage` and `PublicMessage`
+/// framings (RFC 9420 §6) so we can extract it before holding the
+/// MLS state lock.
+///
+/// **Privacy note.** The group_id is *already on the wire in
+/// cleartext as part of the MLS framing* — peeking here does not
+/// leak any information that a passive observer of the Tor stream
+/// couldn't already see at the MLS layer. The local lookup keeps
+/// the MlsParty / vault locks brief.
+///
+/// Returns `Error::InvalidEncoding` on non-MLS bytes,
+/// `Error::InvalidEncoding` on a framing kind we don't handle
+/// (Welcome, KeyPackage, GroupInfo).
+pub fn peek_group_id(ciphertext: &[u8]) -> Result<Vec<u8>> {
+    let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
+        .map_err(|_| Error::InvalidEncoding("mls: peek_group_id: not MLS-encoded"))?;
+    let pm: ProtocolMessage = match mls_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(pm) => pm.into(),
+        MlsMessageBodyIn::PublicMessage(pm) => pm.into(),
+        _ => {
+            return Err(Error::InvalidEncoding(
+                "mls: peek_group_id: not a Private/PublicMessage",
+            ));
+        }
+    };
+    Ok(pm.group_id().as_slice().to_vec())
+}
+
 pub fn signing_key_from_kp_bytes(kp_bytes: &[u8]) -> Result<[u8; 32]> {
     let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(kp_bytes)
         .map_err(|_| Error::InvalidEncoding("mls: peer KeyPackage not TLS-encoded"))?;
@@ -846,6 +880,26 @@ mod tests {
                 .peer_signing_pk_from_kp_bytes(b"definitely not a TLS-encoded KeyPackage")
                 .is_err()
         );
+    }
+
+    // ── T6.3.d: peek_group_id ─────────────────────────────────────
+
+    #[test]
+    fn peek_group_id_round_trip_against_encrypted_application() {
+        // Encrypting through a real 2-party group must produce a
+        // ciphertext whose peeked group_id == the group's own
+        // group_id_bytes. That's the contract the per-peer recipient
+        // task relies on for room/DM disambiguation.
+        let (alice, _bob, mut alice_group, _bob_group) = established_2party();
+        let ct = alice_group.encrypt_application(&alice, b"hi").unwrap();
+        let peeked = peek_group_id(&ct).expect("peek_group_id");
+        assert_eq!(peeked, alice_group.group_id_bytes());
+    }
+
+    #[test]
+    fn peek_group_id_rejects_garbage() {
+        assert!(peek_group_id(&[]).is_err());
+        assert!(peek_group_id(b"not MLS-encoded bytes").is_err());
     }
 
     #[test]

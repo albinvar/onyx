@@ -29,6 +29,34 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 /// error rather than blocking.
 pub const OUTBOUND_MAILBOX: usize = 32;
 
+/// What gets pushed into a peer's outbound channel. Two variants —
+///
+///   * `Dm(text)` — plaintext for the DM with this peer. The per-
+///     peer session task MLS-encrypts this against the DM group
+///     state it owns, then sends as `FRAME_MLS_APP`. The original
+///     T2.x / T6.x shape.
+///   * `RoomFrame(ciphertext)` — *already-encrypted* MLS ciphertext
+///     belonging to a multi-party room (T6.3.d). The room sender
+///     encrypts **once** in the room's group state, then pushes the
+///     same ciphertext into every member's direct-session outbound
+///     queue. The per-peer task forwards it as a `FRAME_MLS_APP`
+///     frame without touching it.
+///
+/// Receiver-side disambiguation lives in the per-peer session task:
+/// it peeks the `group_id` from every incoming `FRAME_MLS_APP` and
+/// routes to either the DM group state (existing) or a room group
+/// state (T6.3.d) before decrypting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerOutbound {
+    /// DM plaintext — the peer-session task encrypts in this peer's
+    /// DM group before sending.
+    Dm(String),
+    /// Already-MLS-encrypted room ciphertext — the peer-session
+    /// task sends as-is; the room sender already encrypted in the
+    /// room's group state.
+    RoomFrame(Vec<u8>),
+}
+
 /// How many of the most recent messages we keep in memory per peer
 /// for preview / scrollback rendering.
 pub const RING_CAPACITY: usize = 200;
@@ -50,8 +78,10 @@ pub struct ConversationHandle {
     pub short_id: String,
     pub pubkey_b32: String,
     pub fingerprint: String,
-    /// Push to this to have the peer session task encrypt + send.
-    pub outbound_tx: mpsc::Sender<String>,
+    /// Push to this to have the peer session task either encrypt-
+    /// and-send (DM) or just-send (room ciphertext) — see
+    /// [`PeerOutbound`].
+    pub outbound_tx: mpsc::Sender<PeerOutbound>,
 }
 
 /// Mutable per-peer state. Held inside the registry behind its own
@@ -119,7 +149,7 @@ impl ConversationRegistry {
         peer_pub: [u8; 32],
         pubkey_b32: &str,
         fingerprint: String,
-    ) -> (ConversationHandle, mpsc::Receiver<String>) {
+    ) -> (ConversationHandle, mpsc::Receiver<PeerOutbound>) {
         let short_id = short_id_of(pubkey_b32);
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_MAILBOX);
         let handle = ConversationHandle {
@@ -287,6 +317,52 @@ impl ConversationRegistry {
         true
     }
 
+    /// T6.3.d: surface a freshly-decoded room application message
+    /// as an `EventMessage` whose `peer_short` is the room's
+    /// `group_id` short prefix. The TUI room pane (T6.3.f) will
+    /// distinguish room events from DM events by inspecting whether
+    /// `peer_short` matches a known room. For now this is logging-
+    /// adjacent — the live broadcast surfaces the message to any
+    /// `Tail` subscriber, and a future T6.3.f will route to the
+    /// right pane.
+    ///
+    /// Room messages are **not** added to any per-peer ring buffer
+    /// — `History` is DM-scoped today. Persistent room scrollback
+    /// is its own follow-up (CHANNELS.md §8 deferred bullet).
+    pub fn push_room_message(
+        &mut self,
+        group_id: &[u8],
+        _sender_peer_pub: [u8; 32],
+        text: String,
+    ) -> bool {
+        let ts_unix_ms = now_unix_ms();
+        let peer_short = format!("room/{}", short_id_of_group(group_id));
+        let _ = self.events_tx.send(ApiResponse::EventMessage {
+            peer_short,
+            direction: MessageDirection::Incoming,
+            text,
+            ts_unix_ms,
+            via_hub: false,
+        });
+        true
+    }
+
+    /// Look up a live-session handle by the peer's fingerprint
+    /// (T6.3.d: used by `handle_send_room` to find every room
+    /// member's direct channel). Returns `None` if no live peer
+    /// matches or the peer's session has ended — same semantics as
+    /// [`Self::handle_for_short`]. Linear over `by_peer`, which is
+    /// fine at v0 scale (single user, a handful of peers).
+    #[must_use]
+    pub fn handle_for_fingerprint(&self, fingerprint: &str) -> Option<ConversationHandle> {
+        for state in self.by_peer.values() {
+            if state.connected && state.handle.fingerprint == fingerprint {
+                return Some(state.handle.clone());
+            }
+        }
+        None
+    }
+
     /// Look up a handle by the user-facing short_id (e.g. typed into
     /// `onyx send <short> <text>`). Returns `None` if no live peer
     /// matches or the peer's session has ended.
@@ -368,6 +444,20 @@ fn info_of(state: &ConversationState) -> PeerInfo {
 #[must_use]
 pub fn short_id_of(pubkey_b32: &str) -> String {
     pubkey_b32.chars().take(8).collect()
+}
+
+/// User-facing 8-char prefix of an MLS `group_id`, used to label
+/// room-tagged events (T6.3.d). `peer_short = "room/<8-char-b32>"`
+/// keeps the wire shape backwards-compatible with `EventMessage`'s
+/// existing `peer_short` field; clients that don't know about
+/// rooms (pre-T6.3.d TUI) render the short id as an unknown peer
+/// rather than misrendering it as a DM.
+#[must_use]
+pub fn short_id_of_group(group_id: &[u8]) -> String {
+    base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, group_id)
+        .chars()
+        .take(8)
+        .collect()
 }
 
 fn now_unix_ms() -> u64 {
@@ -495,8 +585,12 @@ mod tests {
     async fn outbound_send_round_trip_via_mpsc() {
         let mut reg = ConversationRegistry::new();
         let (handle, mut rx) = reg.register([6u8; 32], &b32(), "fpr".into());
-        handle.outbound_tx.send("hi peer".into()).await.unwrap();
-        assert_eq!(rx.recv().await.unwrap(), "hi peer");
+        handle
+            .outbound_tx
+            .send(PeerOutbound::Dm("hi peer".into()))
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap(), PeerOutbound::Dm("hi peer".into()));
     }
 
     #[tokio::test]
@@ -618,8 +712,8 @@ mod tests {
         // The Receiver was dropped inside register_hub_only; any
         // try_send should hit Closed almost immediately. (It might
         // succeed once before the channel notices.)
-        let first = h.outbound_tx.try_send("msg".into());
-        let second = h.outbound_tx.try_send("msg".into());
+        let first = h.outbound_tx.try_send(PeerOutbound::Dm("msg".into()));
+        let second = h.outbound_tx.try_send(PeerOutbound::Dm("msg".into()));
         // At least one of the two attempts must be Closed — a future
         // refactor that silently absorbs all messages into a dropped
         // channel would defeat the whole point of `register_hub_only`.

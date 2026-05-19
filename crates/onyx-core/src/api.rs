@@ -227,6 +227,26 @@ pub enum ApiRequest {
         peer_kem_pub_b32: String,
         peer_kp_b64: String,
     },
+    /// Send `text` to every current member of the room identified
+    /// by `group_id_b32` (T6.3.d, direct path only). The daemon
+    /// encrypts the plaintext **once** in the room's MLS group
+    /// state, then pushes the resulting ciphertext into every room
+    /// member's live direct Noise session.
+    ///
+    /// Members without a live direct session are skipped on this
+    /// path — T6.3.e adds the hub-fallback path so offline / hub-
+    /// only members still receive the message. The response
+    /// reports how many members were reached vs total so the
+    /// caller can warn that some members will only get the message
+    /// via T6.3.e once it ships.
+    ///
+    /// Returns [`ApiResponse::SendRoomOk`] on success even when
+    /// `delivered_to_direct == 0` — encrypting succeeded and the
+    /// sender's own MLS ratchet has advanced; the message exists
+    /// cryptographically even if nobody picked it up on the wire.
+    /// (Re-sending wastes a ratchet step; caller is expected to
+    /// surface the count and let the user decide.)
+    SendRoom { group_id_b32: String, text: String },
 }
 
 /// One response line on the wire (daemon → client).
@@ -326,6 +346,17 @@ pub enum ApiResponse {
     InviteToRoomOk {
         group_id_b32: String,
         members: Vec<String>,
+    },
+    /// Reply to [`ApiRequest::SendRoom`]. `delivered_to_direct` is
+    /// the count of room members the daemon successfully pushed
+    /// the ciphertext to over their live direct Noise session;
+    /// `total_members` is the room's full member count *after*
+    /// excluding ourselves. Their difference is the hub-fallback
+    /// gap that T6.3.e will fill in.
+    SendRoomOk {
+        group_id_b32: String,
+        delivered_to_direct: u32,
+        total_members: u32,
     },
 
     // ── streaming-mode ack + events (Tail only) ─────────────────────
@@ -655,6 +686,42 @@ mod tests {
         assert!(
             line.contains("\"kind\":\"InviteToRoom\""),
             "wire must carry kind=InviteToRoom; got {line:?}"
+        );
+    }
+
+    // ── T6.3.d: send-to-room (direct path) ────────────────────────
+
+    #[test]
+    fn request_round_trip_send_room() {
+        let r = ApiRequest::SendRoom {
+            group_id_b32: "groupabc".into(),
+            text: "hello room".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert_eq!(decode_request(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn response_round_trip_send_room_ok() {
+        let r = ApiResponse::SendRoomOk {
+            group_id_b32: "groupabc".into(),
+            delivered_to_direct: 2,
+            total_members: 3,
+        };
+        let line = encode_response_line(&r).unwrap();
+        assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);
+    }
+
+    #[test]
+    fn send_room_wire_shape() {
+        let r = ApiRequest::SendRoom {
+            group_id_b32: "g".into(),
+            text: "t".into(),
+        };
+        let line = encode_request_line(&r).unwrap();
+        assert!(
+            line.contains("\"kind\":\"SendRoom\""),
+            "wire must carry kind=SendRoom; got {line:?}"
         );
     }
 

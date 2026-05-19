@@ -1047,7 +1047,7 @@ async fn drive_peer_session<S>(
     group: &mut MlsGroupState,
     peer_pub: &[u8; 32],
     state: &Arc<DaemonState>,
-    outbound_rx: &mut mpsc::Receiver<String>,
+    outbound_rx: &mut mpsc::Receiver<conversations::PeerOutbound>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -1065,15 +1065,51 @@ where
                             );
                             continue;
                         }
-                        let plaintext = {
-                            let party = state.mls_party.lock().await;
-                            group
-                                .decrypt_application(&party, &frame.payload)
-                                .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
+                        // T6.3.d: an MLS app frame can belong to either
+                        // this peer's DM group OR a multi-party room
+                        // both sides are members of. Peek the group_id
+                        // before decrypting so we route to the correct
+                        // MlsGroupState — using the wrong group's
+                        // ratchet would just fail to decrypt, but
+                        // distinguishing here lets us surface the
+                        // message under the right conversation.
+                        let incoming_gid = match
+                            onyx_core::mls::peek_group_id(&frame.payload) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                debug!(
+                                    error = %e,
+                                    "MLS frame: cannot peek group_id, dropping"
+                                );
+                                continue;
+                            }
                         };
-                        let text = String::from_utf8_lossy(&plaintext).into_owned();
-                        let mut reg = state.conversations.lock().await;
-                        reg.push_message(peer_pub, MessageDirection::Incoming, text);
+                        if incoming_gid == group.group_id_bytes() {
+                            // DM-tier: decrypt against this peer's DM group.
+                            let plaintext = {
+                                let party = state.mls_party.lock().await;
+                                group
+                                    .decrypt_application(&party, &frame.payload)
+                                    .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
+                            };
+                            let text = String::from_utf8_lossy(&plaintext).into_owned();
+                            let mut reg = state.conversations.lock().await;
+                            reg.push_message(peer_pub, MessageDirection::Incoming, text);
+                        } else {
+                            // Room-tier (T6.3.d): load the matching room
+                            // group, decrypt against it, emit a room-
+                            // tagged event. Silent debug-level drop if
+                            // the group_id doesn't match any group we
+                            // know — could be a peer mis-routing a frame
+                            // intended for someone else, or a room we
+                            // haven't joined yet.
+                            handle_room_app_frame(
+                                &incoming_gid,
+                                &frame.payload,
+                                peer_pub,
+                                state,
+                            ).await;
+                        }
                     }
                     Err(e) => {
                         info!(error = %e, "peer side closed; ending session");
@@ -1085,30 +1121,119 @@ where
             // (It also already pushed an `Outgoing` event into the
             // registry's ring buffer + broadcast, so don't double-push.)
             msg = outbound_rx.recv() => {
-                let Some(text) = msg else {
+                let Some(outbound) = msg else {
                     debug!("outbound channel closed; ending session");
                     return Ok(());
                 };
-                let ct = {
-                    let party = state.mls_party.lock().await;
-                    group
-                        .encrypt_application(&party, text.as_bytes())
-                        .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
+                let (frame_payload, log_text) = match outbound {
+                    conversations::PeerOutbound::Dm(text) => {
+                        let ct = {
+                            let party = state.mls_party.lock().await;
+                            group
+                                .encrypt_application(&party, text.as_bytes())
+                                .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
+                        };
+                        (ct, text)
+                    }
+                    conversations::PeerOutbound::RoomFrame(ct) => {
+                        // Pre-encrypted in the room's MLS group state
+                        // by handle_send_room (T6.3.d). Forward as-is;
+                        // never decrypt-and-re-encrypt — that would
+                        // burn an extra MLS ratchet step per
+                        // recipient and break the "one ciphertext for
+                        // the whole group" property MLS gives us.
+                        let bytes = ct.len();
+                        (ct, format!("[room ciphertext, {bytes} B]"))
+                    }
                 };
                 write_frame(
                     stream,
                     session,
                     &InnerFrame {
                         frame_type: FRAME_MLS_APP,
-                        payload: ct,
+                        payload: frame_payload,
                     },
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
-                info!(text = %text, "chat message sent");
+                info!(text = %log_text, "chat message sent");
             }
         }
     }
+}
+
+/// Decrypt an MLS app frame whose group_id is *not* this peer's DM
+/// group — i.e. it belongs to a multi-party room (T6.3.d). Looks up
+/// the matching `MlsGroupState` via `MlsParty::load_group`, decrypts,
+/// and emits the message as a room-tagged event. Failures are debug-
+/// level only (a peer could route a frame to us that we don't have
+/// the group for — likely lag, not an attack).
+async fn handle_room_app_frame(
+    group_id: &[u8],
+    payload: &[u8],
+    sender_peer_pub: &[u8; 32],
+    state: &Arc<DaemonState>,
+) {
+    let plaintext_result = {
+        let party = state.mls_party.lock().await;
+        match party.load_group(group_id) {
+            Ok(Some(mut room_group)) => room_group
+                .decrypt_application(&party, payload)
+                .map(|pt| (pt, room_group.epoch())),
+            Ok(None) => {
+                debug!(
+                    group_id_b32 = %encode_b32(group_id),
+                    "MLS room frame: no matching group; dropping"
+                );
+                return;
+            }
+            Err(e) => {
+                debug!(error = %e, "MLS room frame: load_group failed; dropping");
+                return;
+            }
+        }
+    };
+    let Ok((plaintext, epoch)) = plaintext_result else {
+        debug!(
+            group_id_b32 = %encode_b32(group_id),
+            "MLS room frame: decrypt failed; dropping"
+        );
+        return;
+    };
+    let text = String::from_utf8_lossy(&plaintext).into_owned();
+    // Persist the new MLS state — a successful decrypt mutates the
+    // group's ratchet, and losing it on restart would desync us from
+    // the room. Best-effort; warn but keep going on failure.
+    let snap_result = {
+        let party = state.mls_party.lock().await;
+        party.snapshot_state()
+    };
+    if let Ok(snap) = snap_result {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_mls_state(state.identity_id, &snap) {
+            warn!(error = %e, "room frame: snapshot save failed");
+        }
+    }
+    info!(
+        group_id_b32 = %encode_b32(group_id),
+        from_peer_short = %short_id_of_peer_pub(sender_peer_pub),
+        mls_epoch = epoch,
+        text_bytes = text.len(),
+        "room: incoming app message decrypted"
+    );
+    let _ = state
+        .conversations
+        .lock()
+        .await
+        .push_room_message(group_id, *sender_peer_pub, text);
+}
+
+/// 8-char base32 prefix of a peer's X25519 pubkey — matches what the
+/// conversation registry uses as `short_id`. Helper kept tiny on
+/// purpose so the room-frame log line above doesn't pull in the
+/// whole registry just for a debug field.
+fn short_id_of_peer_pub(peer_pub: &[u8; 32]) -> String {
+    encode_b32(peer_pub).chars().take(8).collect()
 }
 
 async fn persist_final_state(state: &Arc<DaemonState>) -> anyhow::Result<()> {

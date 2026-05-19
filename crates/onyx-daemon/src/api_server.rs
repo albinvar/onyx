@@ -257,7 +257,10 @@ async fn dispatch_one_shot(
                     message: format!("no live conversation with peer {peer_short}"),
                 };
             };
-            match handle.outbound_tx.try_send(text.clone()) {
+            match handle
+                .outbound_tx
+                .try_send(crate::conversations::PeerOutbound::Dm(text.clone()))
+            {
                 Ok(()) => {
                     state.conversations.lock().await.push_message(
                         &handle.peer_pub,
@@ -323,6 +326,9 @@ async fn dispatch_one_shot(
                 state,
             )
             .await
+        }
+        ApiRequest::SendRoom { group_id_b32, text } => {
+            handle_send_room(group_id_b32, text, state).await
         }
         ApiRequest::Tail => unreachable!("Tail handled by serve_tail"),
     }
@@ -735,6 +741,142 @@ async fn handle_invite_to_room(
             code: ApiErrorCode::NotReady,
             message: last_err.unwrap_or_else(|| "no hub accepted the Welcome envelope".into()),
         }
+    }
+}
+
+/// Send a plaintext message to every member of a room over their
+/// **direct** Noise sessions (T6.3.d, "direct path only"). Hub
+/// fan-out for offline / hub-only members lands in T6.3.e.
+///
+/// Encrypts **once** in the room's MLS group state — that's the
+/// "one ciphertext for the whole group" property MLS gives us —
+/// then pushes the same ciphertext into every member's per-peer
+/// outbound queue as a `PeerOutbound::RoomFrame`. The per-peer
+/// task forwards it as a `FRAME_MLS_APP` frame on the wire.
+///
+/// Returns the count of members successfully reached vs the total
+/// (excluding ourselves) so the caller can warn that some members
+/// won't receive the message until T6.3.e ships.
+//
+// Same shape as handle_invite_to_room / handle_send_bootstrap_mls
+// — one linear parse → validate → load → encrypt → snapshot →
+// fan-out path with several short-circuit error branches; per-step
+// extraction would yield helpers that each carry their own typed
+// error response with no net readability win.
+#[allow(clippy::too_many_lines)]
+async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -> ApiResponse {
+    // 1. Parse + look up room row + own fingerprint.
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    let our_fp = state.identity.fingerprint().to_string();
+    let room_row = {
+        let vault = state.vault.lock().await;
+        match vault.list_rooms(state.identity_id) {
+            Ok(rows) => rows.into_iter().find(|r| r.group_id == group_id_bytes),
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list_rooms: {e}"),
+                };
+            }
+        }
+    };
+    let Some(room) = room_row else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "no room with that group_id".into(),
+        };
+    };
+    let members: Vec<String> = room
+        .members_b32
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // 2. Encrypt once in the room's MLS group, snapshot.
+    let (ciphertext, snapshot) = {
+        let party = state.mls_party.lock().await;
+        let mut group = match party.load_group(&group_id_bytes) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "MLS state has no group with that group_id (vault drift?)".into(),
+                };
+            }
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("load_group: {e}"),
+                };
+            }
+        };
+        let Ok(ct) = group.encrypt_application(&party, text.as_bytes()) else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "encrypt_application failed".into(),
+            };
+        };
+        let Ok(snap) = party.snapshot_state() else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "snapshot_state failed".into(),
+            };
+        };
+        (ct, snap)
+    };
+    {
+        let vault = state.vault.lock().await;
+        if let Err(e) = vault.save_mls_state(state.identity_id, &snapshot) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!("save_mls_state: {e}"),
+            };
+        }
+    }
+    // 3. Walk room members (excluding ourselves), push ciphertext to
+    //    each live direct session. Skipped silently when a member has
+    //    no live session — T6.3.e fills that gap via the hub.
+    let mut delivered: u32 = 0;
+    let mut total: u32 = 0;
+    let reg = state.conversations.lock().await;
+    for fp in &members {
+        if fp == &our_fp {
+            continue;
+        }
+        total += 1;
+        let Some(handle) = reg.handle_for_fingerprint(fp) else {
+            continue;
+        };
+        if handle
+            .outbound_tx
+            .try_send(crate::conversations::PeerOutbound::RoomFrame(
+                ciphertext.clone(),
+            ))
+            .is_ok()
+        {
+            delivered += 1;
+        }
+    }
+    drop(reg);
+    tracing::info!(
+        op = "send_room",
+        group_id_b32,
+        delivered_to_direct = delivered,
+        total_members = total,
+        "room: direct-path fan-out"
+    );
+    ApiResponse::SendRoomOk {
+        group_id_b32: group_id_b32.to_string(),
+        delivered_to_direct: delivered,
+        total_members: total,
     }
 }
 

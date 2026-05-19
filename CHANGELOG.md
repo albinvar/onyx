@@ -6,6 +6,44 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T6.3.d: send-to-room (direct path) + group_id-routed receive
+
+Third code slice of T6.3 (multi-party rooms). Lets a sender encrypt **once** in the room's MLS group and fan the same ciphertext out to every room member who has a live direct Noise session. Hub-fallback for offline / hub-only members is T6.3.e. With this slice, end-to-end direct-path multi-party messaging works: alice → invite bob → invite carol → send-to-room delivers one MLS ciphertext to both bob and carol over their respective DM Noise tunnels, and each decrypts it against the *room* group state rather than the DM group state.
+
+What landed:
+
+  * **MLS API** (`crates/onyx-core/src/mls.rs`):
+    * `MlsGroupState::member_signing_keys()` already in from T6.3.c.
+    * `peek_group_id(ciphertext) -> Result<Vec<u8>>` — parses the MLS framing header without consuming the message; returns the group_id so the recipient can decide which group to decrypt against. Privacy: the group_id is already on the wire in cleartext as part of MLS framing — peeking here leaks nothing a passive observer of the Tor stream couldn't already see at the MLS layer. 2 new tests: round-trip-against-real-ciphertext + reject-garbage.
+  * **Channel-shape refactor** (`crates/onyx-daemon/src/conversations.rs`): per-peer outbound channel goes from `Sender<String>` → `Sender<PeerOutbound>` where `PeerOutbound::Dm(String) | PeerOutbound::RoomFrame(Vec<u8>)`. `Dm` keeps the existing T2.x DM behaviour (per-peer task encrypts against the DM group then sends as `FRAME_MLS_APP`); `RoomFrame` carries an already-encrypted MLS ciphertext that the per-peer task forwards as-is. New helper `handle_for_fingerprint` for the room fan-out lookup. New `push_room_message` that emits a room-tagged `EventMessage` whose `peer_short = "room/<group_id_short>"` (T6.3.f will surface this in the TUI). New `short_id_of_group` helper.
+  * **API** (`crates/onyx-core/src/api.rs`): `ApiRequest::SendRoom { group_id_b32, text }` and `ApiResponse::SendRoomOk { group_id_b32, delivered_to_direct, total_members }` reporting per-call delivery stats so the caller can warn that some members will only get the message via the hub once T6.3.e ships. 3 new round-trip + wire-shape tests.
+  * **Daemon — sender side** (`handle_send_room` in `api_server.rs`):
+    1. Parses `group_id_b32`, looks up the room row, refuses if missing.
+    2. Loads the room's MLS group via `load_group`, encrypts the plaintext **once**, snapshots updated MLS state, persists to vault.
+    3. Walks `room.members_b32`, skips ourselves, finds each member's live direct-session handle via `handle_for_fingerprint`, pushes `PeerOutbound::RoomFrame(ciphertext.clone())` into each. The same ciphertext goes to every member — that's the "one ciphertext per send for the whole group" property MLS gives us.
+    4. Returns `delivered_to_direct` / `total_members` counts; never decrypts-and-re-encrypts per recipient (would burn an extra ratchet step per member and break that property).
+  * **Daemon — recipient side** (per-peer session loop in `lib.rs`): on every incoming `FRAME_MLS_APP`, peek the group_id before decrypting. If it matches the DM group, decrypt against that (existing T2.x behaviour). Otherwise call new `handle_room_app_frame` helper which `load_group`s the matching room group, decrypts against it, snapshots MLS state, and emits a room-tagged event via `push_room_message`. Silent debug-level drop if the group_id matches no known group (could be a peer mis-routing, or a room we haven't joined yet — neither is operator-actionable).
+
+Design notes:
+
+  * **Why same-ciphertext fan-out**. MLS application messages are deterministic in the group's ratchet state — every member at the same epoch shares the same key schedule, so the *same* ciphertext decrypts for everyone. Encrypting once and broadcasting bytes is correct + efficient. Encrypting separately per recipient would advance the ratchet N times for one logical message and break the property that all members observe a consistent sequence.
+  * **Why peek_group_id over add-a-new-frame-type**. We considered adding `FRAME_ROOM_APP` distinct from `FRAME_MLS_APP`. Rejected: the MLS framing already carries the group_id in cleartext, and adding a new frame type would expose to a passive observer of the Tor stream "this peer is in at least one room" — strictly more metadata than today. Reusing `FRAME_MLS_APP` keeps the wire shape opaque between DM and room.
+  * **Why `peer_short = "room/<short>"` on `EventMessage`**. Forward-compat: existing TUIs that don't know about rooms render the short id as an unknown peer (visibly wrong but not a crash); future T6.3.f TUI inspects the `room/` prefix to route to a room pane. Same wire shape, no enum variant bump on `ApiResponse`.
+  * **Persist-on-decrypt for room frames**. Same reason as the existing DM path: a successful decrypt advances the room's MLS ratchet, and losing it on restart would desync us from the room. Best-effort save — warn but keep going if the vault save fails (the in-memory state is still consistent and the next mutation will retry).
+  * **`#[allow(clippy::too_many_lines)]` on `handle_send_room`**. Same justification as `handle_invite_to_room` / `handle_send_bootstrap_mls` — one linear parse→load→encrypt→snapshot→fan-out path with several short-circuit error branches; per-step extraction would yield helpers each carrying a typed error response with no net readability win.
+
+What this slice deliberately does NOT do:
+
+  * No hub-fallback path. Members without a live direct session are skipped; T6.3.e adds the `BootstrapPayload::MlsApp` envelope + hub fan-out.
+  * No room pane in the TUI. Room events surface as `EventMessage` with `peer_short = "room/<short>"`; T6.3.f adds the dedicated room pane + `onyx room` CLI verbs.
+  * No persistent room scrollback. Room messages broadcast live but don't land in any ring buffer (CHANNELS.md §8 deferred bullet).
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **336 passed** (+5 new from 331).
+
+Next: T6.3.e — hub-fallback path. New `BootstrapPayload::MlsApp` variant carrying the room ciphertext; the daemon sends the same envelope to every offline / hub-only member's introduction inbox so they pick it up when next online.
+
+---
+
 ## 2026-05-19 — T6.3.c: invite-to-room via existing T7.2-mls hub path
 
 Second code slice of T6.3 (multi-party rooms). Adds the only verb that has to traverse the wire: invite an existing peer (whose KeyPackage we have) into a room we've already created. The recipient sees the room appear in their vault on next decode of the Welcome. Send-to-room (T6.3.d–e) and TUI surfacing (T6.3.f) still pending.
