@@ -6,6 +6,31 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.3.a: hub-federation design doc — `FEDERATION.md`
+
+Documentation-only. T8.3 (hub-to-hub gossip — real federation in the Matrix/XMPP sense) is genuinely complex enough that doing it inline at today's slice cadence would skip the design step and produce something fragile. This commit is the design step: a written specification of wire protocol, gossip semantics, loop prevention, threat-model deltas, and a 4-slice implementation plan, with open questions flagged for review before code begins.
+
+Structure (10 sections):
+
+  * **§0 honest framing**. T8.1 already gave us client-side multi-hub redundancy; T8.3 adds *server-side* cross-hub delivery (publishing to hub A reaches subscribers on hub B even when A and B are separate operator domains). Explicit goals + non-goals so reviewers can sanity-check scope.
+  * **§1 adversary model**. Two new adversaries: F1 (hostile peer hub) and F2 (gossip-loop amplification). F1 is defended by reusing the T7.3-sec ownership check on every gossiped KP — gossip authentication = same standard as client publish. F2 needs TTL + seen-by set.
+  * **§2 wire protocol**. Reuse Noise XK (already implemented, already audited-by-staring). New gossip frame types `FRAME_GOSSIP_PUBLISH (0x80)` and `FRAME_GOSSIP_DELIVER (0x81)` wrap the existing payload with a `ttl: u8 + seen_by: u128` header. Single-direction sessions (hub A→B and B→A as separate Noise sessions, mirrors how clients already work).
+  * **§3 gossip semantics**. KP gossip is idempotent (UPSERT). Queue gossip has two modes: lazy (only forward when no local subscriber, default — minimal bandwidth) and eager (always forward, stronger eventual consistency, opt-in via flag). Critical realisation: gossiped envelope bytes are byte-identical to the original DELIVER, so the **existing T7.3-sec.2 replay guard catches duplicates with zero new dedup logic**. Same elegant property that made T8.1 multi-hub work for free.
+  * **§4 operator surface**. New `--peer-hub onion:port,b32pubkey` flag (repeatable). Default zero peer hubs = no federation = byte-identical pre-T8.3 behaviour. Federation is opt-in per hub operator. Peer-hub vs client role distinguished by authenticated Noise-XK pubkey matching the operator's allowlist.
+  * **§5 threat-model deltas**. Two new §8.2 carry-forwards to add when T8.3.b lands. Federation introduces a connectivity property, not a trust transfer.
+  * **§6 slice plan**. Four slices (T8.3.b through T8.3.e) totaling ~9 hours of focused implementation. Each slice is independently committable and testable. Explicitly **not** a one-shot.
+  * **§7 open questions**. Five Q-numbered design decisions with my recommendations, flagged as "block T8.3.b until resolved." Single-direction vs bidirectional sessions; new frames vs extending existing; single seen_by vs full path; replay-guard handles gossip duplicates (yes); inbound role distinction.
+  * **§8 deferred**. Auto-discovery, strong consistency, cross-org trust delegation — explicitly out of scope.
+  * **§9 cross-references** + **§10 decision log**.
+
+`README.md §12` doc index updated: `FEDERATION.md` listed below `ANONYMITY.md` with explicit "in design, review open questions first" note so casual readers don't mistake the doc for already-shipped capability.
+
+Verification: documentation-only — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` (292) all unchanged from `a9949af`.
+
+**Next concrete step**: review FEDERATION.md §7 open questions. If the recommendations hold, T8.3.b (minimum viable peer-hub link with KP gossip only) becomes a clean ~3-hour implementation slice.
+
+---
+
 ## 2026-05-19 — T8.x-ratelimit: per-connection token-bucket rate limiting on the hub
 
 Closes a real DoS vector that the relay-arc work today actively widened. Before this commit, the hub accepted DELIVER and KP_PUBLISH frames from any authenticated client as fast as the wire could carry them. A hostile (or buggy, or misconfigured) client could:
