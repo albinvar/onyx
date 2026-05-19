@@ -173,6 +173,38 @@ CREATE TABLE IF NOT EXISTS room_member_kems (
 );
 ";
 
+/// Additive extension for T-files.b — manifest of received files.
+/// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
+/// tables; no `SCHEMA_VERSION` bump.
+///
+/// One row per fully-received file. `conversation` is `peer-<short>`
+/// or `room-<short>`. `path` is the absolute on-disk path under
+/// the operator's `file_storage_dir`. `content_hash` is the
+/// BLAKE2b-256 the receiver verified against. `quota_window_ms`
+/// is the wall-clock timestamp used for the per-peer per-day
+/// quota check (rolling 24h window).
+///
+/// Indexed by `(identity_id, sender_fp, quota_window_ms)` for the
+/// quota lookup hot path.
+const SCHEMA_RECEIVED_FILES_ADD: &str = "
+CREATE TABLE IF NOT EXISTS received_files (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  identity_id     INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  conversation    TEXT NOT NULL,
+  sender_fp       TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  mime            TEXT NOT NULL,
+  size            INTEGER NOT NULL,
+  content_hash    BLOB NOT NULL,
+  path            TEXT NOT NULL,
+  received_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS received_files_by_conversation
+  ON received_files (identity_id, conversation, id);
+CREATE INDEX IF NOT EXISTS received_files_by_quota
+  ON received_files (identity_id, sender_fp, received_at_ms);
+";
+
 /// Additive extension for T-polish.3 — persistent room scrollback.
 /// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
 /// tables; no `SCHEMA_VERSION` bump.
@@ -347,6 +379,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOM_MESSAGES_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_RECEIVED_FILES_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -360,6 +394,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_ROOM_MEMBER_KEMS_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOM_MESSAGES_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_RECEIVED_FILES_ADD)
             .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
@@ -650,6 +686,101 @@ impl Vault {
         Ok(changed)
     }
 
+    /// T-files.b: record a fully-received file in the manifest.
+    /// The file bytes themselves live on disk at `path`; this row
+    /// is the index entry for `list_received_files` / quota
+    /// accounting. `content_hash` is what the receiver verified
+    /// against the chunked bytes (cap-list §2.8). `received_at_ms`
+    /// drives the per-peer per-day quota (cap-list §2.6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_received_file(
+        &self,
+        identity_id: i64,
+        conversation: &str,
+        sender_fp: &str,
+        name: &str,
+        mime: &str,
+        size: u64,
+        content_hash: &[u8],
+        path: &str,
+        received_at_ms: i64,
+    ) -> Result<()> {
+        let size_i64 = i64::try_from(size).map_err(|_| {
+            Error::InvalidEncoding("received_files: size exceeds i64")
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO received_files \
+                 (identity_id, conversation, sender_fp, name, mime, size, \
+                  content_hash, path, received_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    identity_id, conversation, sender_fp, name, mime, size_i64,
+                    content_hash, path, received_at_ms
+                ],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// T-files.b: list received files for one conversation, newest
+    /// first. Empty Vec for unknown / empty conversation.
+    pub fn list_received_files(
+        &self,
+        identity_id: i64,
+        conversation: &str,
+        limit: usize,
+    ) -> Result<Vec<ReceivedFileRow>> {
+        let i64_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_fp, name, mime, size, content_hash, path, received_at_ms \
+                 FROM received_files \
+                 WHERE identity_id = ? AND conversation = ? \
+                 ORDER BY id DESC LIMIT ?",
+            )
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id, conversation, i64_limit], |r| {
+                let size_i64: i64 = r.get(3)?;
+                Ok(ReceivedFileRow {
+                    sender_fp: r.get(0)?,
+                    name: r.get(1)?,
+                    mime: r.get(2)?,
+                    size: u64::try_from(size_i64).unwrap_or(0),
+                    content_hash: r.get(4)?,
+                    path: r.get(5)?,
+                    received_at_ms: r.get(6)?,
+                })
+            })
+            .map_err(map_db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_db_err)
+    }
+
+    /// T-files.b cap-list §2.6: per-peer per-day quota. Returns
+    /// the total bytes received from `sender_fp` in the last 24h
+    /// (`window_start_ms` = now - 86_400_000). Caller enforces the
+    /// quota before accepting a new transfer.
+    pub fn received_bytes_since(
+        &self,
+        identity_id: i64,
+        sender_fp: &str,
+        window_start_ms: i64,
+    ) -> Result<u64> {
+        let total: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM received_files \
+                 WHERE identity_id = ? AND sender_fp = ? AND received_at_ms >= ?",
+                params![identity_id, sender_fp, window_start_ms],
+                |r| r.get(0),
+            )
+            .map_err(map_db_err)?;
+        Ok(u64::try_from(total.unwrap_or(0)).unwrap_or(0))
+    }
+
     /// T-polish.3: append one room message to the persistent
     /// scrollback. `direction_outgoing = false` for incoming
     /// (decoded `RoomAppMessage::Text`), `true` for outgoing
@@ -809,6 +940,19 @@ pub struct RoomMessageRow {
     pub sender_fp: String,
     pub text: String,
     pub created_at_ms: i64,
+}
+
+/// One row of [`Vault::list_received_files`] (T-files.b). Plain
+/// data; the daemon translates this to the API-level shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedFileRow {
+    pub sender_fp: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub content_hash: Vec<u8>,
+    pub path: String,
+    pub received_at_ms: i64,
 }
 
 impl Vault {
@@ -1033,6 +1177,72 @@ mod tests {
     }
 
     // ── T6.3.e: room_member_kems ─────────────────────────────────
+
+    // ── T-files.b: received_files manifest + quota accounting ─────
+
+    #[test]
+    fn received_file_record_and_list_round_trip() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let hash = vec![0xAAu8; 32];
+        v.record_received_file(
+            id,
+            "peer-bobshort",
+            "fp_bob",
+            "photo.jpg",
+            "image/jpeg",
+            1234,
+            &hash,
+            "/tmp/photo.jpg",
+            1000,
+        )
+        .unwrap();
+        v.record_received_file(
+            id,
+            "peer-bobshort",
+            "fp_bob",
+            "second.png",
+            "image/png",
+            5678,
+            &[0xBBu8; 32],
+            "/tmp/second.png",
+            2000,
+        )
+        .unwrap();
+        let rows = v.list_received_files(id, "peer-bobshort", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first
+        assert_eq!(rows[0].name, "second.png");
+        assert_eq!(rows[1].name, "photo.jpg");
+        assert_eq!(rows[1].size, 1234);
+        assert_eq!(rows[1].content_hash, hash);
+    }
+
+    #[test]
+    fn received_files_quota_sums_recent_only() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.record_received_file(id, "peer-x", "fp_bob", "a", "x/y", 1_000, &[0; 32], "/a", 500)
+            .unwrap();
+        v.record_received_file(id, "peer-x", "fp_bob", "b", "x/y", 2_000, &[0; 32], "/b", 1_500)
+            .unwrap();
+        v.record_received_file(id, "peer-x", "fp_bob", "c", "x/y", 4_000, &[0; 32], "/c", 3_000)
+            .unwrap();
+        // Window starts at 1_500; only b + c count.
+        let bytes = v.received_bytes_since(id, "fp_bob", 1_500).unwrap();
+        assert_eq!(bytes, 6_000);
+        // Different sender → 0.
+        let bytes = v.received_bytes_since(id, "fp_other", 0).unwrap();
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn received_files_quota_empty_for_unknown_peer() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let bytes = v.received_bytes_since(id, "fp_nobody", 0).unwrap();
+        assert_eq!(bytes, 0);
+    }
 
     // ── T-polish.3: persistent room scrollback ────────────────────
 

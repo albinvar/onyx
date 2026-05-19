@@ -17,7 +17,7 @@ use std::fmt;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::Digest;
-use blake2::digest::consts::U16;
+use blake2::digest::consts::{U16, U32};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as AeadRawKey, Nonce as AeadRawNonce};
 use ed25519_dalek::{Signer, Verifier};
@@ -433,6 +433,24 @@ pub fn blake2b_128(inputs: &[&[u8]]) -> [u8; 16] {
     }
     let out = hasher.finalize();
     let mut result = [0u8; 16];
+    result.copy_from_slice(&out);
+    result
+}
+
+/// Compute BLAKE2b with a 32-byte (256-bit) output over the
+/// concatenation of all `inputs`. Used for file content-hash
+/// verification (`FILES.md §2.8`); 256-bit is the standard collision
+/// resistance for an integrity hash and matches what most modern
+/// HASH-of-file workflows expect.
+#[must_use]
+pub fn blake2b_256(inputs: &[&[u8]]) -> [u8; 32] {
+    type Blake2b256 = blake2::Blake2b<U32>;
+    let mut hasher = Blake2b256::new();
+    for chunk in inputs {
+        hasher.update(chunk);
+    }
+    let out = hasher.finalize();
+    let mut result = [0u8; 32];
     result.copy_from_slice(&out);
     result
 }

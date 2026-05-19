@@ -44,6 +44,7 @@
 
 pub mod api_server;
 pub mod conversations;
+pub mod files;
 pub mod hub_client;
 pub mod replay_guard;
 
@@ -269,6 +270,16 @@ pub struct DaemonState {
     /// frame (FIFO) — losing a single undecryptable retry is the
     /// cheapest failure mode here.
     pub pending_room_frames: PendingRoomFrames,
+    /// T-files.b: in-flight file-transfer reassembly state. Map
+    /// from sender fingerprint to that peer's in-flight transfers
+    /// (keyed by 16-byte file_id from `FileMeta`). Bounded per
+    /// sender by `FILES_MAX_INFLIGHT_PER_PEER`; oldest transfer
+    /// dropped on overflow. See `FILES.md §4` for the cap-list.
+    pub inflight_files: InflightFiles,
+    /// T-files.b: file-transfer config (size caps + storage dir +
+    /// quota). Defaults from `Config::default_files()` honor the
+    /// `FILES.md §4` defaults; operator overrides via CLI.
+    pub files_config: FilesConfig,
 }
 
 /// T6.3.i: per-group out-of-order room-frame retry buffer. Map
@@ -284,6 +295,73 @@ pub type PendingRoomFrames =
 /// app messages that were already in flight). Anything beyond that
 /// is almost certainly garbage / hostile probing.
 pub const PENDING_ROOM_FRAMES_PER_GROUP_MAX: usize = 64;
+
+/// T-files.b: per-peer in-flight file-transfer reassembly state.
+/// Outer map keyed by sender fingerprint (so per-peer caps fire
+/// correctly); inner map keyed by 16-byte `file_id` from
+/// `FileMeta`. Each entry holds the manifest + a sparse chunk
+/// buffer. Bounded entries per peer by
+/// `FILES_MAX_INFLIGHT_PER_PEER`; bounded bytes per transfer by
+/// `FilesConfig::max_recv_size_bytes`.
+pub type InflightFiles =
+    Arc<Mutex<std::collections::HashMap<String, std::collections::HashMap<[u8; 16], InflightFile>>>>;
+
+/// T-files.b: state per in-flight transfer. See
+/// [`crate::files::buffer_chunk`] for the reassembly path and
+/// `FILES.md §2.7 + §2.11 + §2.12` for the caps this enforces.
+#[derive(Debug)]
+pub struct InflightFile {
+    pub conversation: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub chunks: u32,
+    pub chunk_size: u32,
+    pub content_hash: Vec<u8>,
+    /// Sparse buffer: chunk_index → chunk bytes. Once all chunks
+    /// are present, the receiver assembles + verifies + persists.
+    pub received: std::collections::HashMap<u32, Vec<u8>>,
+    pub started_at_ms: i64,
+}
+
+/// T-files.b cap-list §2.7: max simultaneously in-flight
+/// transfers per peer. The 11th gets rejected.
+pub const FILES_MAX_INFLIGHT_PER_PEER: usize = 10;
+
+/// T-files.b: file-transfer configuration. Defaults per
+/// `FILES.md §4`. Operator overrides via CLI / env vars at
+/// daemon startup.
+#[derive(Debug, Clone)]
+pub struct FilesConfig {
+    /// Per-file send size cap (§4 row 1).
+    pub max_send_size_bytes: u64,
+    /// Per-file receive size cap (§4 row 2). Sender's `FileMeta.size`
+    /// over this = reject.
+    pub max_recv_size_bytes: u64,
+    /// Per-peer per-day receive quota (§4 row 3). Rolling 24h.
+    pub max_recv_per_day_bytes: u64,
+    /// Chunk size (§4 row 5). Bigger = fewer messages but bumps
+    /// the wire frame to XLARGE more often. Defaults to 12 KB
+    /// (fits inside XLARGE with margin for CBOR + MLS framing).
+    pub chunk_size_bytes: u32,
+    /// Where received files land on disk (§4 row 6). Default
+    /// `<data_dir>/files/`.
+    pub storage_dir: PathBuf,
+}
+
+impl FilesConfig {
+    /// T-files.b: defaults per `FILES.md §4`.
+    #[must_use]
+    pub fn defaults(data_dir: &std::path::Path) -> Self {
+        Self {
+            max_send_size_bytes: 50 * 1024 * 1024,
+            max_recv_size_bytes: 50 * 1024 * 1024,
+            max_recv_per_day_bytes: 500 * 1024 * 1024,
+            chunk_size_bytes: 12 * 1024,
+            storage_dir: data_dir.join("files"),
+        }
+    }
+}
 
 /// Run the Onyx daemon to completion. Returns when the daemon exits
 /// normally (Ctrl-C, peer disconnect in dial mode) or with an error
@@ -436,6 +514,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         seen_envelopes: Arc::new(Mutex::new(initial_guard)),
         configured_hubs: args.hubs.clone(),
         pending_room_frames: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        inflight_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        files_config: FilesConfig::defaults(args.vault.parent().unwrap_or_else(|| std::path::Path::new("."))),
     });
 
     drop(args.passphrase);
@@ -1466,7 +1546,57 @@ async fn handle_room_app_frame(
                 ),
             }
         }
+        onyx_core::room::RoomAppMessage::FileMeta {
+            id,
+            name,
+            mime,
+            size,
+            chunks,
+            chunk_size,
+            content_hash,
+        } => {
+            // T-files.b: handshake-side of a file transfer. Run
+            // the receive caps + allocate the in-flight buffer.
+            // sender_fp here is a placeholder — see same note in
+            // the Text arm. Conversation = "room/<gid_short>".
+            let sender_fp = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
+            let conversation = format!("room/{}", crate::conversations::short_id_of_group(group_id));
+            let now_ms = now_unix_ms_i64();
+            let decision = files::accept_file_meta(
+                state, &sender_fp, &conversation, id.as_ref(), &name, &mime,
+                size, chunks, chunk_size, content_hash.as_ref(), now_ms,
+            ).await;
+            match decision {
+                files::AcceptDecision::Accepted => info!(
+                    sender_fp = %sender_fp,
+                    size, chunks, mime = %mime,
+                    "file transfer accepted; waiting for chunks"
+                ),
+                other => warn!(?other, sender_fp = %sender_fp, "file transfer rejected"),
+            }
+        }
+        onyx_core::room::RoomAppMessage::FileChunk { id, index, bytes } => {
+            // T-files.b: chunk-side. accept_file_chunk dedups,
+            // appends, and triggers finalize when complete.
+            let sender_fp = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
+            let now_ms = now_unix_ms_i64();
+            if let Some(path) = files::accept_file_chunk(
+                state, &sender_fp, id.as_ref(), index, bytes.as_ref(), now_ms,
+            ).await {
+                info!(path = %path.display(), "file received + persisted");
+            }
+        }
     }
+}
+
+/// T-files.b: i64 wall-clock helper. Used by the file handler.
+fn now_unix_ms_i64() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(0)
 }
 
 /// **TEST-ONLY** spawn the TCP-hub client tasks (and their

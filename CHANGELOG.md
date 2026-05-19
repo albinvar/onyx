@@ -6,6 +6,55 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-files.a + b: design doc + chunk wire + reassembly + persistence
+
+First two of five slices for file-sharing. T-files.a is the design doc (FILES.md); T-files.b is the wire format + receiver-side reassembly + content-hash verification + vault manifest. T-files.c (metadata stripping), .d (CLI), .e (TUI) follow.
+
+### T-files.a: FILES.md design doc
+
+`FILES.md` captures the threat model + slice plan:
+
+  * **§0 honest framing**: four ways files leak identity (embedded metadata, filename, content itself, traffic shape). What we mitigate in v0 vs what we don't. Read this before reading the rest.
+  * **§1 adversary additions** to ANONYMITY.md: A5 (sender-device metadata leak via EXIF/document fields), A6 (malicious sender DoS + path traversal + executable disguise).
+  * **§2 12-item cap-list** — every receive path enforces these; numbered for cross-reference from code.
+  * **§3 metadata strip strategy**: decode-and-re-encode for raster images (provably complete — drops the source format's metadata structures entirely); REFUSE-with-warning for formats we can't safely strip (PDF, DOCX, video).
+  * **§4 size + quota table** with defaults (50 MB per-file, 500 MB/day per-peer, 10 inflight per peer, 12 KB chunk size).
+  * **§5 path + filename sanitization** spec.
+  * **§6 traffic-shape leak** — the biggest residual gap, honestly documented. `--constant-rate` opt-in for partial mitigation.
+  * **§7 wire format** — new `RoomAppMessage::{FileMeta, FileChunk}` variants.
+  * **§8 slice plan**.
+  * **§9 threat-model deltas** to fold into THREAT_MODEL.md.
+
+### T-files.b: wire chunks + reassembly + content-hash verify + persistence
+
+  * **`RoomAppMessage::FileMeta`** carries `id` (16-byte random transfer label), `name`, `mime`, `size`, `chunks`, `chunk_size`, `content_hash` (BLAKE2b-256 of the cleaned bytes).
+  * **`RoomAppMessage::FileChunk`** carries `id` (matches FileMeta.id), `index` (0-based), `bytes`. Receiver dedups by `(file_id, chunk_index)` so multi-hub fan-out duplicates silently drop.
+  * **`onyx_core::crypto::blake2b_256`** added (alongside the existing `blake2b_128`) for content-hash verification.
+  * **`InflightFiles`** state on `DaemonState`: `HashMap<sender_fp, HashMap<file_id, InflightFile>>` with sparse chunk buffer. Bounded by `FILES_MAX_INFLIGHT_PER_PEER = 10` per peer.
+  * **`FilesConfig`** with the §4 defaults: `max_send_size_bytes = 50 MB`, `max_recv_size_bytes = 50 MB`, `max_recv_per_day_bytes = 500 MB`, `chunk_size_bytes = 12 KB`, `storage_dir = <data_dir>/files/`.
+  * **`onyx_daemon::files`** module: `accept_file_meta` runs the receive-side caps (size, quota, in-flight limit, executable refuse, malformed-meta check); `accept_file_chunk` inserts + dedups + triggers `finalize_file` on completion; `finalize_file` assembles in chunk-index order → verifies BLAKE2b-256 → writes to `<storage_dir>/<conversation>/<hash_prefix>-<sanitized_name>` → records the vault manifest row.
+  * **`Vault::record_received_file`** + **`list_received_files`** + **`received_bytes_since`** for the manifest + quota accounting. New `received_files` table (additive; no SCHEMA_VERSION bump). Indexed by both `(identity_id, conversation, id)` for listing and `(identity_id, sender_fp, received_at_ms)` for the quota lookup hot path.
+  * **`sanitize_filename`** — replaces path separators + non-portable chars with `_`; truncates to 64 chars; falls back to `"unnamed"` only when fully empty or all-dots.
+  * **`is_executable_mime`** — hard-coded list of obvious executable types (`.exe`, `.dmg`, `.deb`, ELF, Mach-O, etc.). Refused by default.
+  * **Receive path wiring**: `handle_room_app_frame` gets two new arms (`FileMeta` and `FileChunk`) that route to `files::accept_*`. Sender_fp is a placeholder (same caveat as T-polish.3 — MLS-credential extraction is a separate follow-up).
+  * **Send-side chunking** via `chunk_file_for_send` returns the `FileMeta + N FileChunk` Vec the caller fans out via the existing room channel.
+
+### Tests + verification
+
+  * 3 new `RoomAppMessage` round-trip tests (FileMeta, FileChunk, kind-tag preservation).
+  * 3 new vault tests (`received_file_record_and_list_round_trip`, `received_files_quota_sums_recent_only`, `received_files_quota_empty_for_unknown_peer`).
+  * 6 new `files` module tests (filename sanitization edge cases, executable MIME rejection, chunk_file_for_send shape).
+  * Gate: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **439 passed** (+12 from 427).
+
+### What this slice does NOT do (queued for T-files.c–e)
+
+  * **Metadata stripping** — the wire/persistence layer is ready, but the sender currently doesn't sanitize before chunking. T-files.c adds the `image` crate dependency and the strip implementation.
+  * **CLI verbs** — `onyx send-file` / `onyx room send-file` / `onyx files list / open` are pending T-files.d.
+  * **TUI** — Ctrl-F file-picker modal + attachment rendering + progress bar are pending T-files.e.
+  * **End-to-end smoke test** sending a real file through the TCP harness is pending T-files.d (needs the CLI hookup).
+
+---
+
 ## 2026-05-19 — Infra (1–4): CI advisories + cargo-deny split + release workflow + sigstore signing + N-member room benchmarks
 
 Four supply-chain / observability slices shipped together. Closes the "infra hygiene" items from the medium-term inventory; sets up the foundation for releasing actual binaries that downstream users can verify.

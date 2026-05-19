@@ -80,6 +80,41 @@ pub enum RoomAppMessage {
         fingerprint: String,
         kem_pub: ByteBuf,
     },
+    /// File-transfer manifest (T-files.b). Carries everything the
+    /// receiver needs to allocate buffer state, validate incoming
+    /// chunks, and verify the assembled file. See `FILES.md §7`
+    /// for the field semantics and `§2` for the security cap-list
+    /// enforced by the receiver.
+    ///
+    /// `id` is a 16-byte random identifier the sender mints fresh
+    /// per transfer; it's NOT cryptographic in itself (chunk
+    /// authenticity comes from the MLS ratchet), just a routing
+    /// label so chunks can be matched to their manifest in the
+    /// presence of interleaved transfers.
+    ///
+    /// `content_hash` is BLAKE2b-256 of the cleaned-and-ready-to-
+    /// send file bytes. Receiver assembles all chunks, hashes,
+    /// compares — mismatch = drop the transfer + warn. This is
+    /// the load-bearing integrity check (`FILES.md §2.8`).
+    FileMeta {
+        id: ByteBuf,
+        name: String,
+        mime: String,
+        size: u64,
+        chunks: u32,
+        chunk_size: u32,
+        content_hash: ByteBuf,
+    },
+    /// One chunk of an in-flight file transfer (T-files.b). `id`
+    /// matches a prior `FileMeta::id`; `index` is the 0-based
+    /// chunk number; `bytes` is `chunk_size` bytes (or smaller for
+    /// the final chunk). Receiver dedups by `(id, index)` so
+    /// multi-hub fan-out duplicates collapse silently.
+    FileChunk {
+        id: ByteBuf,
+        index: u32,
+        bytes: ByteBuf,
+    },
 }
 
 impl RoomAppMessage {
@@ -146,6 +181,59 @@ mod tests {
             s.contains("KemAdvertisement"),
             "KemAdvertisement variant must carry its kind tag; got {bytes:?}"
         );
+    }
+
+    // ── T-files.b: FileMeta + FileChunk ───────────────────────────
+
+    #[test]
+    fn file_meta_round_trip() {
+        let m = RoomAppMessage::FileMeta {
+            id: ByteBuf::from(vec![0x42u8; 16]),
+            name: "photo.jpg".into(),
+            mime: "image/jpeg".into(),
+            size: 1_234_567,
+            chunks: 103,
+            chunk_size: 12 * 1024,
+            content_hash: ByteBuf::from(vec![0xCDu8; 32]),
+        };
+        let bytes = m.to_cbor().unwrap();
+        assert_eq!(RoomAppMessage::from_cbor(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn file_chunk_round_trip() {
+        let c = RoomAppMessage::FileChunk {
+            id: ByteBuf::from(vec![0x42u8; 16]),
+            index: 7,
+            bytes: ByteBuf::from(vec![0xEEu8; 12 * 1024]),
+        };
+        let bytes = c.to_cbor().unwrap();
+        assert_eq!(RoomAppMessage::from_cbor(&bytes).unwrap(), c);
+    }
+
+    #[test]
+    fn file_meta_and_chunk_carry_kind_tags() {
+        let m = RoomAppMessage::FileMeta {
+            id: ByteBuf::from(vec![0; 16]),
+            name: "x".into(),
+            mime: "a/b".into(),
+            size: 0,
+            chunks: 0,
+            chunk_size: 0,
+            content_hash: ByteBuf::from(vec![0; 32]),
+        };
+        let bytes = m.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("FileMeta"));
+
+        let c = RoomAppMessage::FileChunk {
+            id: ByteBuf::from(vec![0; 16]),
+            index: 0,
+            bytes: ByteBuf::from(vec![1u8; 4]),
+        };
+        let bytes = c.to_cbor().unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("FileChunk"));
     }
 
     #[test]
