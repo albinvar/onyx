@@ -97,11 +97,13 @@ When your daemon connects to the hub and subscribes to your inbox routing id, th
 
 Even without cover traffic, the hub can count "inbox X received 14 envelopes today." Over time this is a statistical fingerprint of how busy a user is. **Cover traffic (§3.1) defeats this** as a side effect; documented separately because it's a distinct observable.
 
-### 3.4 Hub durability — partially closed
+### 3.4 Hub durability — closed end-to-end
 
-Before T8.0 the hub kept queued envelopes and the KP directory in *in-memory* HashMaps. A hub restart (deploy, OOM-kill, machine reboot) silently lost every queued envelope and every published KP. T8.0 closes that for the single-hub case by SQLite-backing the two non-ephemeral state pieces. A hub now survives its own restart.
+Before T8.0 the hub kept queued envelopes and the KP directory in *in-memory* HashMaps. A hub restart (deploy, OOM-kill, machine reboot) silently lost every queued envelope and every published KP. T8.0 closed that for the single-hub case by SQLite-backing the two non-ephemeral state pieces — a hub now survives its own restart.
 
-What remains: **a hub permanently dying** (disk destroyed) still loses everything stored there. The fix is **multi-hub publish/subscribe** (T8.1, next slice): daemon publishes its KP to N hubs and subscribes on N hubs; recipient dedups duplicates via the existing T7.3-sec.2 replay guard. Pure sender-side redundancy, no inter-hub coordination needed.
+T8.1 closes the remaining gap (**hub permanently dying**) at the *client* layer. The daemon now accepts a repeatable `--hub onion:port,b32pubkey` flag and spawns one client task per configured hub. Sealed envelopes are **fanned out to every hub in parallel**; subscriptions run on **every hub** simultaneously. If hub A's disk is destroyed, hubs B and C still hold the recipient's KP and any in-flight envelopes — delivery continues uninterrupted. The recipient's existing T7.3-sec.2 replay guard dedups the resulting duplicate deliveries silently, so the user sees exactly one message regardless of how many hubs forwarded it.
+
+What this is **not**: full hub-to-hub federation (T8.3+, long-term). Hubs don't yet talk to each other; durability comes from **user-controlled redundancy** — pick N hubs you trust, publish to all of them. Strictly simpler than Matrix-style server-to-server federation, surprisingly effective.
 
 ### 3.5 No reproducible builds, no signed releases
 

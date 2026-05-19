@@ -94,6 +94,15 @@ struct Args {
     #[arg(long, global = true)]
     dial_pubkey: Option<String>,
 
+    /// Repeatable: each `--hub onion:port,b32pubkey` adds one hub
+    /// the embedded daemon should publish to and subscribe on.
+    /// Multi-hub mode (T8.1+) gives N-fold redundancy — if any one
+    /// hub goes down, deliveries continue via the others. The
+    /// recipient's replay guard silently dedups duplicate envelopes
+    /// arriving from multiple hubs.
+    #[arg(long = "hub", action = clap::ArgAction::Append, global = true)]
+    hubs: Vec<String>,
+
     #[command(subcommand)]
     cmd: Option<Command>,
 }
@@ -258,6 +267,22 @@ fn build_daemon_config(
              show up in `ps`."
         );
     };
+    // Parse repeatable --hub "onion:port,b32pubkey" args into a
+    // Vec<HubConfig>. Each --hub is one hub; the embedded daemon
+    // publishes/subscribes to all of them in parallel (T8.1+).
+    let mut hubs: Vec<onyx_daemon::HubConfig> = Vec::new();
+    for raw in &args.hubs {
+        let (onion, pubkey) = raw.split_once(',').ok_or_else(|| {
+            anyhow::anyhow!("--hub value must be `onion:port,b32pubkey` (missing comma): {raw}")
+        })?;
+        if onion.is_empty() || pubkey.is_empty() {
+            anyhow::bail!("--hub value has empty field: {raw}");
+        }
+        hubs.push(onyx_daemon::HubConfig {
+            onion: onion.to_string(),
+            pubkey: pubkey.to_string(),
+        });
+    }
     Ok(onyx_daemon::Config {
         vault: args
             .vault
@@ -269,8 +294,7 @@ fn build_daemon_config(
         dial_onion: None,
         dial_pubkey: args.dial_pubkey.clone(),
         api_socket: socket.to_string_lossy().into_owned(),
-        hub_onion: None,
-        hub_pubkey: None,
+        hubs,
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
     })
@@ -619,5 +643,39 @@ mod tests {
         // surface it as a clap parse error instead, same discipline
         // as send-bootstrap.
         assert!(Args::try_parse_from(["onyx", "accept", "onyx://invite/v1?fp=x&kem=y"]).is_err());
+    }
+
+    #[test]
+    fn no_hub_flag_parses_to_empty_vec() {
+        let args = Args::try_parse_from(["onyx"]).expect("parses");
+        assert!(args.hubs.is_empty(), "no --hub args → empty Vec");
+    }
+
+    #[test]
+    fn single_hub_flag_parses() {
+        let args = Args::try_parse_from(["onyx", "--hub", "abc.onion:1,KEYBYTES"]).expect("parses");
+        assert_eq!(args.hubs, vec!["abc.onion:1,KEYBYTES".to_string()]);
+    }
+
+    #[test]
+    fn multiple_hub_flags_accumulate() {
+        let args = Args::try_parse_from([
+            "onyx",
+            "--hub",
+            "a.onion:1,KEYA",
+            "--hub",
+            "b.onion:1,KEYB",
+            "--hub",
+            "c.onion:1,KEYC",
+        ])
+        .expect("parses");
+        assert_eq!(
+            args.hubs,
+            vec![
+                "a.onion:1,KEYA".to_string(),
+                "b.onion:1,KEYB".to_string(),
+                "c.onion:1,KEYC".to_string(),
+            ]
+        );
     }
 }

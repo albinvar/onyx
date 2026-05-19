@@ -6,6 +6,58 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T8.1: multi-hub publish/subscribe — daemon talks to N hubs in parallel; one hub dying loses nothing
+
+Second step in the "build up the relay setup" architecture. T8.0 made a single hub survive its own restart; T8.1 closes the remaining gap — **hub permanently dying** — at the client layer. Daemons now accept a repeatable `--hub onion:port,b32pubkey` flag and connect to as many hubs as the operator wants in parallel. Fan-out on send, fan-in on receive, dedup on the recipient via the existing replay guard. Strictly simpler than Matrix-style server-to-server federation, real durability + redundancy in ~one slice of work.
+
+What landed:
+
+**T8.1.a — `HubConfig` type, `Config.hubs: Vec<HubConfig>`.** `crates/onyx-daemon/src/lib.rs`. The single `hub_onion: Option<String>` + `hub_pubkey: Option<String>` pair becomes a `Vec<HubConfig { onion, pubkey }>`. Empty vec == no hub-relayed messaging (unchanged semantics for `--no-tor` / direct-only). Single-element vec == identical behaviour to pre-T8.1 single-hub mode. Multi-element vec == the new mode.
+
+**T8.1.b — `DaemonState.hub_outbounds: Vec<mpsc::Sender>`.** Replaces the single `Option<Sender>`. Constructed up-front in `run`: one mpsc channel per configured hub, with the Receivers parked in a Vec for the spawn-loop to consume. Empty in `--no-tor` mode or when no hubs are configured.
+
+**T8.1.c — `spawn_replay_snapshot_task` loop becomes spawn-per-hub.** `crates/onyx-daemon/src/lib.rs`. The single hub-client `tokio::spawn` block becomes a `for (idx, hub_cfg) in args.hubs.iter().enumerate()` loop. Each spawned task gets:
+  * Its own clone of the daemon state, the Tor runtime, the identity secrets (round-tripped via bytes, same trick as before).
+  * Its own mpsc receiver (drained via `remove(0)` from the parked Vec).
+  * An independent exponential-backoff reconnect loop (per-hub backoff so one flaky hub doesn't perturb the others).
+  * A per-task tracing span (`info_span!("hub", idx, host, port)`) so log output stays attributable.
+  * The existing `run_hub_session` self-publish path runs unchanged — each task publishes our fresh KP to its hub on every reconnect, so **multi-hub KP publication is free**.
+
+**T8.1.d — `handle_send_bootstrap` fan-out.** `crates/onyx-daemon/src/api_server.rs`. The single `hub_outbound.try_send(...)` becomes a `for hub_outbound in hub_outbounds` loop pushing the same sealed envelope into every channel. New helper `fan_out_deliver(hub_outbounds, target, sealed, op)` factors out the fan-out + accounting logic for reuse from the MLS path. **Success on any one hub counts as overall success** — partial failures (some channels full / closed) log `info!` with the accepted/total counts but still return `SendBootstrapOk`. Only when *every* hub queue is full or closed does the API return `NotReady`.
+
+**T8.1.e — `handle_send_bootstrap_mls` fan-out.** Same pattern as msg/v1 but inline (couldn't reuse `fan_out_deliver` directly because the MLS path returns `SendBootstrapMlsOk { group_id_b32 }` not `SendBootstrapOk` — different shape). Same any-hub-accepts semantics.
+
+**T8.1.f — `handle_fetch_peer_keypackage` serial try.** Different semantics for fetch: we don't want to ask every hub in parallel (the FIFO matching invariant in `hub_client` is per-hub, but we never have more than one fetch in flight thanks to `hub_fetch_lock`). Instead, hold the existing `hub_fetch_lock` across the *entire* multi-hub fan, try each hub in configured order, **return the first success**. If all hubs return "not found", surface `NotReady` with a clean "no configured hub has this peer's KeyPackage published" message. If a hub's outbound is dead (full/closed) or its responder dropped (`Err`), skip and try the next; only fail overall if *every* hub fails.
+
+**T8.1.g — `EnvelopeReplayGuard` does the dedup for free.** Multi-hub send means the recipient gets the same sealed envelope N times (one per hub). The T7.3-sec.2 replay guard already keys on a BLAKE2b-128 hash of the body bytes, so duplicates are silently dropped before `open_bootstrap` is even called. **Zero new dedup logic needed** — this is the elegant part. T7.3-sec.2 was originally added to defend against hostile-hub replay; it now also pays for itself as the multi-hub correctness primitive. Same code, two wins.
+
+**T8.1.h — backward-compatible CLI.** `crates/onyxd/src/main.rs` + `crates/onyx/src/main.rs`:
+  * Old `--hub-onion` + `--hub-pubkey` flags still parse (legacy single-hub form, kept for backward compat — clap `requires` ensures they appear together).
+  * New `--hub onion:port,b32pubkey` flag is repeatable (`action = clap::ArgAction::Append`) and `conflicts_with_all = ["hub_onion", "hub_pubkey"]` — pick one form, never both.
+  * `TryFrom<Args> for Config` merges either form into `Vec<HubConfig>`. Comma split for the new form errors out cleanly on `"missing comma"` or empty fields.
+  * Three new CLI parser tests in `onyx::main::tests`: `no_hub_flag_parses_to_empty_vec`, `single_hub_flag_parses`, `multiple_hub_flags_accumulate`.
+
+Security and anonymity analysis:
+
+  * **No new trust assumption per hub.** Each hub still sees only routing-ids + opaque ciphertext + timing — same posture as single-hub. Adding *more* hubs spreads the metadata-correlation across more independent observers, which is strictly better for anonymity (no single hub sees your full message count).
+  * **Does NOT prevent timing correlation across hubs.** A coalition of N hubs (or a passive observer of all N) can still correlate "this routing-id received an envelope at time T on every hub" — the fan-out by definition makes the same envelope visible to every hub at nearly the same wall-clock time. Cover traffic (separate slice) is what would defend against this; multi-hub is purely a **durability + censorship-resistance** play, not a new anonymity property.
+  * **No wire-format change.** Hubs don't even know they're in a multi-hub setup. From a single hub's perspective, the client just behaves identically to single-hub. This is what makes T8.1 deployable without coordinating with hub operators.
+  * **Replay safety preserved.** Same BLAKE2b-128 envelope dedup as T7.3-sec.2. Multi-hub *increases* the rate at which duplicates land on the recipient, and the guard handles them transparently.
+  * **Censorship resistance.** A single malicious hub that *drops* messages addressed to bob can no longer fully censor bob — as long as bob is also subscribed to a non-malicious hub, his daemon receives the envelope. Real defence-in-depth against hub-level censorship.
+
+`ANONYMITY.md §3.4` updated: "Hub durability — partially closed" → "Hub durability — closed end-to-end." Explicit note that this is *not* federation (hubs don't talk to each other; T8.3+ later) and that this is the simpler-than-Matrix shape.
+
+What this did NOT do:
+
+  * Did not add hub-to-hub gossip (T8.3, real federation, separate design doc).
+  * Did not add multi-hub-aware invite URLs (T8.2 — invite URL would carry recipient's hub list so the sender knows where to fan out). T8.2 is the natural follow-up.
+  * Did not parallelise `handle_fetch_peer_keypackage` across hubs (kept sequential under the existing lock). Correctness over throughput; multi-fetch is a small follow-up if measured needed.
+  * Did not break the single-hub path. Operators with one `--hub-onion`+`--hub-pubkey` flag pair get *exactly* single-hub behaviour, byte-identical to pre-T8.1.
+
+Verification: `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean (four cleanups: two redundant `continue;` statements in the FetchKp loop, one `items_after_statements` from a misplaced `use TrySendError` that I hoisted to file-top, one `redundant_locals` from a leftover `let our_sk_bytes = our_sk_bytes;` line from the spawn refactor), `cargo test --workspace` **271 passed / 0 failed** (was 268; +3 CLI parser tests).
+
+---
+
 ## 2026-05-19 — T8.0: hub durability — SQLite-back the queue + KP-directory so they survive hub restart
 
 First step in the "build up the relay setup" architectural slice. Before today, the hub kept its two non-ephemeral state pieces (offline-delivery queues, MLS KeyPackage directory) in *pure in-memory `HashMap`s*. A hub restart — `kill -HUP`, a deploy, an OOM, a machine reboot — silently lost every queued envelope and every published KP. Senders got no signal; recipients silently lost first-contact attempts. T8.0 makes the hub survive its own restart.

@@ -41,6 +41,7 @@ use onyx_core::api::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::DaemonState;
@@ -280,7 +281,7 @@ async fn dispatch_one_shot(
             text,
             state.identity.signing(),
             state.identity.identity_key(),
-            state.hub_outbound.as_ref(),
+            &state.hub_outbounds,
         ),
         ApiRequest::SendBootstrapMls {
             peer_fingerprint,
@@ -362,12 +363,12 @@ async fn handle_export_key_package(state: &DaemonState) -> ApiResponse {
 /// `SendBootstrapMls` and unknowingly invite the attacker.
 /// `THREAT_MODEL.md` §8.2 #15.
 async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonState) -> ApiResponse {
-    let Some(hub_outbound) = state.hub_outbound.as_ref() else {
+    if state.hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "hub client is not enabled; relaunch with --hub-onion --hub-pubkey".into(),
+            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
         };
-    };
+    }
     let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
         return ApiResponse::Error {
             code: ApiErrorCode::Malformed,
@@ -377,60 +378,82 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
     let target = onyx_core::routing::introduction_inbox(&fp);
 
     // Hold the hub_fetch_lock across the whole request/response cycle
-    // so the hub-client's FIFO can't get out of order.
+    // so each hub-client's FIFO can't get out of order. T8.1: we
+    // serialise across ALL hubs under the same lock — try each in
+    // configured order, return the first success. The FIFO matching
+    // invariant in `hub_client` is per-hub, but since we never have
+    // more than one fetch in flight at a time (lock guarantees), the
+    // invariant holds across the multi-hub fan.
     let _guard = state.hub_fetch_lock.lock().await;
 
-    let (responder_tx, responder_rx) = tokio::sync::oneshot::channel();
-    if let Err(e) = hub_outbound.try_send(crate::hub_client::HubOutbound::FetchKp {
-        routing_id: target,
-        responder: responder_tx,
-    }) {
-        return ApiResponse::Error {
-            code: ApiErrorCode::NotReady,
-            message: format!("hub outbound queue: {e}"),
-        };
-    }
-
-    match responder_rx.await {
-        Ok(Some(kp_bytes)) => {
-            // SECURITY: validate the returned KP's signing key matches
-            // peer_fingerprint before surfacing.
-            let extracted = {
-                let party = state.mls_party.lock().await;
-                party.peer_signing_pk_from_kp_bytes(&kp_bytes)
-            };
-            let Ok(signing_bytes) = extracted else {
-                return ApiResponse::Error {
-                    code: ApiErrorCode::Malformed,
-                    message: "fetched KP did not validate as a KeyPackage".into(),
+    let mut last_send_err: Option<String> = None;
+    let mut last_recv_err: bool = false;
+    for (idx, hub_outbound) in state.hub_outbounds.iter().enumerate() {
+        let (responder_tx, responder_rx) = tokio::sync::oneshot::channel();
+        if let Err(e) = hub_outbound.try_send(crate::hub_client::HubOutbound::FetchKp {
+            routing_id: target,
+            responder: responder_tx,
+        }) {
+            last_send_err = Some(format!("hub #{idx} outbound queue: {e}"));
+            continue;
+        }
+        match responder_rx.await {
+            Ok(Some(kp_bytes)) => {
+                // SECURITY: validate the returned KP's signing key
+                // matches peer_fingerprint before surfacing. Same
+                // T7.3-sec / THREAT_MODEL §8.2 #15 mitigation as
+                // single-hub — applied to whichever hub answered.
+                let extracted = {
+                    let party = state.mls_party.lock().await;
+                    party.peer_signing_pk_from_kp_bytes(&kp_bytes)
                 };
-            };
-            let Ok(vk) = onyx_core::crypto::VerifyingKey::from_bytes(signing_bytes) else {
-                return ApiResponse::Error {
-                    code: ApiErrorCode::Malformed,
-                    message: "fetched KP signing key is not a valid Ed25519 point".into(),
+                let Ok(signing_bytes) = extracted else {
+                    return ApiResponse::Error {
+                        code: ApiErrorCode::Malformed,
+                        message: "fetched KP did not validate as a KeyPackage".into(),
+                    };
                 };
-            };
-            if vk.fingerprint() != fp {
-                return ApiResponse::Error {
-                    code: ApiErrorCode::Malformed,
-                    message: "fetched KP signing key does not match peer_fingerprint \
-                              — refusing (potential hub-directory tampering)"
-                        .into(),
+                let Ok(vk) = onyx_core::crypto::VerifyingKey::from_bytes(signing_bytes) else {
+                    return ApiResponse::Error {
+                        code: ApiErrorCode::Malformed,
+                        message: "fetched KP signing key is not a valid Ed25519 point".into(),
+                    };
+                };
+                if vk.fingerprint() != fp {
+                    return ApiResponse::Error {
+                        code: ApiErrorCode::Malformed,
+                        message: "fetched KP signing key does not match peer_fingerprint \
+                                  — refusing (potential hub-directory tampering)"
+                            .into(),
+                    };
+                }
+                return ApiResponse::FetchPeerKeyPackageOk {
+                    kp_b64: base64_encode(&kp_bytes),
                 };
             }
-            ApiResponse::FetchPeerKeyPackageOk {
-                kp_b64: base64_encode(&kp_bytes),
+            Ok(None) => {
+                // This hub doesn't have the KP — try the next one.
+            }
+            Err(_) => {
+                last_recv_err = true;
             }
         }
-        Ok(None) => ApiResponse::Error {
+    }
+    if let Some(msg) = last_send_err {
+        ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "peer has not published a KeyPackage to this hub".into(),
-        },
-        Err(_) => ApiResponse::Error {
+            message: msg,
+        }
+    } else if last_recv_err {
+        ApiResponse::Error {
             code: ApiErrorCode::Internal,
-            message: "hub session ended before responding".into(),
-        },
+            message: "every hub session ended before responding".into(),
+        }
+    } else {
+        ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: "no configured hub has this peer's KeyPackage published".into(),
+        }
     }
 }
 
@@ -452,18 +475,18 @@ fn handle_send_bootstrap(
     text: &str,
     our_signing: &onyx_core::crypto::SigningKey,
     our_identity_sk: &onyx_core::crypto::IdentitySecret,
-    hub_outbound: Option<&tokio::sync::mpsc::Sender<crate::hub_client::HubOutbound>>,
+    hub_outbounds: &[tokio::sync::mpsc::Sender<crate::hub_client::HubOutbound>],
 ) -> ApiResponse {
-    // Require the hub-client to be active. If `--hub-onion` wasn't
-    // set at launch, `hub_outbound` is None and we can't relay
+    // Require at least one hub-client to be active. If `--hub` wasn't
+    // set at launch, `hub_outbounds` is empty and we can't relay
     // anything; surface that as NotReady (operator config issue, not
     // a malformed request).
-    let Some(hub_outbound) = hub_outbound else {
+    if hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "hub client is not enabled; relaunch with --hub-onion --hub-pubkey".into(),
+            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
         };
-    };
+    }
 
     // Parse + validate the peer identifiers up front so a bad input
     // never reaches the crypto helpers.
@@ -508,19 +531,52 @@ fn handle_send_bootstrap(
         };
     };
 
-    // Push to the hub-client's outbound queue. `try_send` so we
-    // never block the API handler; full mailbox → NotReady.
+    // T8.1 fan-out: push the same sealed envelope to every configured
+    // hub. The recipient's `EnvelopeReplayGuard` (T7.3-sec.2) drops
+    // duplicates silently, so the recipient sees exactly one
+    // EventMessage regardless of how many hubs forwarded it. A
+    // success on any one hub counts as overall success — partial
+    // failures (some hubs full / closed) log a warn but still report
+    // SendBootstrapOk.
     let target = onyx_core::routing::introduction_inbox(&fp);
-    match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(target, sealed)) {
-        Ok(()) => ApiResponse::SendBootstrapOk,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ApiResponse::Error {
+    fan_out_deliver(hub_outbounds, target, &sealed, "send_bootstrap")
+}
+
+/// Push the same DELIVER envelope into every hub outbound queue.
+/// Returns `SendBootstrapOk` if **any** hub accepted the envelope
+/// (duplicates on the recipient side are dedup'd by the replay
+/// guard). Returns `NotReady` only when **every** hub queue was full
+/// or closed.
+fn fan_out_deliver(
+    hub_outbounds: &[tokio::sync::mpsc::Sender<crate::hub_client::HubOutbound>],
+    target: onyx_core::routing::RoutingId,
+    sealed: &[u8],
+    op: &str,
+) -> ApiResponse {
+    let mut accepted = 0;
+    let mut last_err: Option<String> = None;
+    for (idx, hub_outbound) in hub_outbounds.iter().enumerate() {
+        match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(
+            target,
+            sealed.to_vec(),
+        )) {
+            Ok(()) => accepted += 1,
+            Err(TrySendError::Full(_)) => {
+                last_err = Some(format!("hub #{idx} outbound queue is full"));
+            }
+            Err(TrySendError::Closed(_)) => {
+                last_err = Some(format!("hub #{idx} client task has ended"));
+            }
+        }
+    }
+    if accepted > 0 {
+        tracing::info!(op, accepted, total = hub_outbounds.len(), "hub fan-out");
+        ApiResponse::SendBootstrapOk
+    } else {
+        ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "hub outbound queue is full; try again shortly".into(),
-        },
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ApiResponse::Error {
-            code: ApiErrorCode::NotReady,
-            message: "hub client task has ended; relaunch the daemon".into(),
-        },
+            message: last_err.unwrap_or_else(|| "no hub accepted the delivery".into()),
+        }
     }
 }
 
@@ -572,12 +628,12 @@ async fn handle_send_bootstrap_mls(
         }
     }
 
-    let Some(hub_outbound) = state.hub_outbound.as_ref() else {
+    if state.hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "hub client is not enabled; relaunch with --hub-onion --hub-pubkey".into(),
+            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
         };
-    };
+    }
 
     let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
         return ApiResponse::Error {
@@ -717,19 +773,43 @@ async fn handle_send_bootstrap_mls(
         }
     }
 
+    // T8.1 fan-out across all configured hubs. The recipient's
+    // EnvelopeReplayGuard drops duplicates. Success on any one hub
+    // is overall success — but we override the response type to
+    // include the new group_id_b32 (fan_out_deliver returns the
+    // bootstrap-OK shape, which doesn't carry that field).
     let target = onyx_core::routing::introduction_inbox(&fp);
-    match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(target, sealed)) {
-        Ok(()) => ApiResponse::SendBootstrapMlsOk {
+    let mut accepted = 0;
+    let mut last_err: Option<String> = None;
+    for (idx, hub_outbound) in state.hub_outbounds.iter().enumerate() {
+        match hub_outbound.try_send(crate::hub_client::HubOutbound::deliver(
+            target,
+            sealed.clone(),
+        )) {
+            Ok(()) => accepted += 1,
+            Err(TrySendError::Full(_)) => {
+                last_err = Some(format!("hub #{idx} outbound queue is full"));
+            }
+            Err(TrySendError::Closed(_)) => {
+                last_err = Some(format!("hub #{idx} client task has ended"));
+            }
+        }
+    }
+    if accepted > 0 {
+        tracing::info!(
+            op = "send_bootstrap_mls",
+            accepted,
+            total = state.hub_outbounds.len(),
+            "hub fan-out"
+        );
+        ApiResponse::SendBootstrapMlsOk {
             group_id_b32: encode_b32(&group_id_bytes),
-        },
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ApiResponse::Error {
+        }
+    } else {
+        ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "hub outbound queue is full; try again shortly".into(),
-        },
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ApiResponse::Error {
-            code: ApiErrorCode::NotReady,
-            message: "hub client task has ended; relaunch the daemon".into(),
-        },
+            message: last_err.unwrap_or_else(|| "no hub accepted the Welcome envelope".into()),
+        }
     }
 }
 
@@ -790,7 +870,7 @@ mod tests {
         (SigningKey::generate(), IdentitySecret::generate())
     }
 
-    /// `--hub-onion` not set ⇒ `hub_outbound: None` ⇒ NotReady.
+    /// `--hub` not set ⇒ `hub_outbounds` empty ⇒ NotReady.
     /// Operator config error, not a malformed request.
     #[test]
     fn send_bootstrap_without_hub_is_not_ready() {
@@ -802,7 +882,7 @@ mod tests {
             .fingerprint()
             .to_string();
 
-        let resp = handle_send_bootstrap(&fp, &bob_kem_b32, "hi bob", &sign, &id, None);
+        let resp = handle_send_bootstrap(&fp, &bob_kem_b32, "hi bob", &sign, &id, &[]);
         match resp {
             ApiResponse::Error { code, .. } => assert_eq!(code, ApiErrorCode::NotReady),
             other => panic!("expected NotReady, got {other:?}"),
@@ -823,7 +903,7 @@ mod tests {
             "x",
             &sign,
             &id,
-            Some(&tx),
+            std::slice::from_ref(&tx),
         );
         match resp {
             ApiResponse::Error { code, .. } => assert_eq!(code, ApiErrorCode::Malformed),
@@ -841,7 +921,14 @@ mod tests {
             .to_string();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
-        let resp = handle_send_bootstrap(&fp, "not-base32!@#$", "x", &sign, &id, Some(&tx));
+        let resp = handle_send_bootstrap(
+            &fp,
+            "not-base32!@#$",
+            "x",
+            &sign,
+            &id,
+            std::slice::from_ref(&tx),
+        );
         match resp {
             ApiResponse::Error { code, .. } => assert_eq!(code, ApiErrorCode::Malformed),
             other => panic!("expected Malformed, got {other:?}"),
@@ -859,7 +946,14 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
 
         // Valid base32 of an obviously-wrong length (8 bytes, not 1216).
-        let resp = handle_send_bootstrap(&fp, "aaaaaaaaaaaa", "x", &sign, &id, Some(&tx));
+        let resp = handle_send_bootstrap(
+            &fp,
+            "aaaaaaaaaaaa",
+            "x",
+            &sign,
+            &id,
+            std::slice::from_ref(&tx),
+        );
         match resp {
             ApiResponse::Error { code, .. } => assert_eq!(code, ApiErrorCode::Malformed),
             other => panic!("expected Malformed, got {other:?}"),
@@ -887,7 +981,7 @@ mod tests {
             "first hub-relayed hello",
             &sign,
             &id,
-            Some(&tx),
+            std::slice::from_ref(&tx),
         );
         assert!(matches!(resp, ApiResponse::SendBootstrapOk));
 
@@ -974,8 +1068,22 @@ mod tests {
 
         // Capacity-1 channel; don't drain it, so the second send fills it.
         let (tx, _rx_held_open) = tokio::sync::mpsc::channel(1);
-        let _ = handle_send_bootstrap(&bob_fp, &bob_kem_b32, "1", &sign, &id, Some(&tx));
-        let resp = handle_send_bootstrap(&bob_fp, &bob_kem_b32, "2", &sign, &id, Some(&tx));
+        let _ = handle_send_bootstrap(
+            &bob_fp,
+            &bob_kem_b32,
+            "1",
+            &sign,
+            &id,
+            std::slice::from_ref(&tx),
+        );
+        let resp = handle_send_bootstrap(
+            &bob_fp,
+            &bob_kem_b32,
+            "2",
+            &sign,
+            &id,
+            std::slice::from_ref(&tx),
+        );
         match resp {
             ApiResponse::Error { code, .. } => assert_eq!(code, ApiErrorCode::NotReady),
             other => panic!("expected NotReady, got {other:?}"),

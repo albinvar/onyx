@@ -119,6 +119,16 @@ pub fn ensure_data_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A single configured hub. The daemon spawns one hub-client task
+/// per entry of [`Config::hubs`] (T8.1+).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubConfig {
+    /// `onion:port` or just `onion` (port defaults to [`ONYX_HS_PORT`]).
+    pub onion: String,
+    /// X25519 identity public key of the hub, base32.
+    pub pubkey: String,
+}
+
 /// Configuration for [`run`]. Mirrors the fields the original `onyxd`
 /// `Args` clap struct used to carry, minus the clap conflicts/requires
 /// constraints — those are enforced by whichever binary is parsing
@@ -132,8 +142,12 @@ pub struct Config {
     pub dial_onion: Option<String>,
     pub dial_pubkey: Option<String>,
     pub api_socket: String,
-    pub hub_onion: Option<String>,
-    pub hub_pubkey: Option<String>,
+    /// Zero or more hubs the daemon should connect to. Empty list ==
+    /// no hub-relayed messaging (only direct peer-to-peer dials).
+    /// Multiple entries == publish-to-all-subscribe-to-all multi-hub
+    /// mode (T8.1+). The recipient's `EnvelopeReplayGuard` handles
+    /// the resulting duplicates transparently.
+    pub hubs: Vec<HubConfig>,
     pub listen_tcp: Option<String>,
     pub dial_tcp: Option<String>,
 }
@@ -153,11 +167,23 @@ pub struct DaemonState {
     pub mls_party: Arc<Mutex<MlsParty>>,
     pub vault: Arc<Mutex<Vault>>,
     pub conversations: conversations::SharedRegistry,
-    /// `Some` only when the daemon was launched with `--hub-onion`.
-    /// Push [`hub_client::HubOutbound`] here to relay a delivery (or
-    /// to issue a KP fetch) via the hub. Bounded; full-mailbox
-    /// surfaces as `NotReady`. Drained by the hub-client task.
-    pub hub_outbound: Option<mpsc::Sender<hub_client::HubOutbound>>,
+    /// One outbound channel per configured hub (T8.1+). Empty when
+    /// no hubs are configured. Each sender drains into a dedicated
+    /// `hub_client::run_hub_session` task. Senders are bounded;
+    /// full-mailbox surfaces as `NotReady`.
+    ///
+    /// Hub deliveries (`HubOutbound::Deliver`) are **fanned out** —
+    /// the sender pushes into every channel — so the recipient gets
+    /// the envelope from whichever hub it picks up first. The
+    /// recipient's `EnvelopeReplayGuard` drops duplicates silently.
+    ///
+    /// KP fetches (`HubOutbound::FetchKp`) are tried in
+    /// configured order, holding [`Self::hub_fetch_lock`] for the
+    /// duration so the per-hub FIFO matching invariant in
+    /// `hub_client` stays sound. First hub that returns "found"
+    /// wins; if all return "not found", the caller surfaces
+    /// `NotReady`.
+    pub hub_outbounds: Vec<mpsc::Sender<hub_client::HubOutbound>>,
     /// Serialises concurrent `FetchPeerKeyPackage` API calls. The
     /// `FRAME_KP_RESPONSE` wire format has no request id, so the
     /// hub-client's FIFO queue is correct only if we never have more
@@ -247,20 +273,29 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("MLS party create failed: {e}"))?
     };
 
-    // Construct the hub outbound channel up front so the API server
-    // can hold the Sender alongside the rest of DaemonState. The
-    // Receiver is parked here and handed to the hub task below if
-    // --hub-onion is set; in --no-tor mode it's dropped immediately,
-    // leaving `hub_outbound: None` so any Send-via-hub attempt fails
-    // cleanly with NotReady rather than queueing into a void.
-    let want_hub = args.hub_onion.is_some() && args.hub_pubkey.is_some() && !args.no_tor;
-    let (hub_tx, mut hub_rx_holder) = if want_hub {
-        let (tx, rx) =
-            mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
-        (Some(tx), Some(rx))
+    // Construct one outbound mpsc channel per configured hub up
+    // front so the API server can hold the Senders alongside the
+    // rest of DaemonState (T8.1+). The Receivers are parked here in
+    // a Vec and consumed by the spawn-loop below; in --no-tor mode
+    // (or when no hubs are configured) the Receivers are dropped
+    // and `hub_outbounds` ends up empty — any Send-via-hub attempt
+    // then fails cleanly with NotReady rather than queueing into a
+    // void.
+    let want_hubs = !args.hubs.is_empty() && !args.no_tor;
+    let (hub_outbounds, hub_rx_holders) = if want_hubs {
+        let mut txs = Vec::with_capacity(args.hubs.len());
+        let mut rxs = Vec::with_capacity(args.hubs.len());
+        for _ in &args.hubs {
+            let (tx, rx) =
+                mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+            txs.push(tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
     } else {
-        (None, None)
+        (Vec::new(), Vec::new())
     };
+    let mut hub_rx_holders = hub_rx_holders;
 
     // Restore the envelope-replay seen-set from the vault if a
     // previous run persisted one (T7.3-sec.2-persist). Corrupt
@@ -298,7 +333,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         mls_party: Arc::new(Mutex::new(mls_party)),
         vault: Arc::new(Mutex::new(vault)),
         conversations: conversations::new_shared(),
-        hub_outbound: hub_tx,
+        hub_outbounds,
         hub_fetch_lock: Arc::new(Mutex::new(())),
         seen_envelopes: Arc::new(Mutex::new(initial_guard)),
     });
@@ -377,103 +412,97 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         TorState::Ready,
     ));
 
-    // Optional hub-client task: dial the hub, subscribe to our own
-    // inbox routing id, log every DELIVER we receive. Reconnects on
-    // disconnect with exponential backoff. Runs concurrently with the
-    // accept/dial mode below.
-    let hub_task = if let (Some(host_port), Some(pubkey_b32)) =
-        (args.hub_onion.as_ref(), args.hub_pubkey.as_ref())
-    {
-        let (host, port) =
-            hub_client::parse_host_port(host_port, ONYX_HS_PORT).context("--hub-onion")?;
-        let hub_pubkey_bytes = decode_b32_32(pubkey_b32).context("--hub-pubkey")?;
-        let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
+    // Spawn one hub-client task per configured hub (T8.1+). Each
+    // task: dial its hub, subscribe to our own inbox routing id,
+    // self-publish a fresh KP per reconnect, drain its dedicated
+    // outbound mpsc, decode any DELIVER frames via handle_hub_delivery.
+    // Independent backoff per hub so a single flaky hub doesn't
+    // perturb the others.
+    //
+    // All tasks share the same state.seen_envelopes guard so duplicate
+    // deliveries (the recipient subscribed on N hubs, sender published
+    // to N hubs → N copies of the same envelope) are silently dropped
+    // by `EnvelopeReplayGuard` before they surface as events.
+    let mut hub_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(args.hubs.len());
+    if want_hubs {
         let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
         info!(
             our_inbox_b32 = %encode_b32(&our_inbox),
-            "hub: our introduction-inbox routing id derived"
+            hub_count = args.hubs.len(),
+            "hub: our introduction-inbox routing id derived; spawning one client task per hub"
         );
-        // IdentitySecret deliberately doesn't impl Clone; round-trip
-        // via bytes to hand a copy to the spawned task without
-        // exposing the StaticSecret type.
+        // IdentitySecret + HybridKemSecret deliberately don't impl
+        // Clone. Round-trip via bytes once here; each spawned task
+        // reconstructs them on the worker.
         let our_sk_bytes: [u8; 32] = *state.identity.identity_key().to_bytes();
-        // Same trick for the hybrid KEM secret — it doesn't impl Clone
-        // (StaticSecret + ml-kem's DecapsulationKey are both
-        // deliberately non-Clone). Round-trip through bytes once here;
-        // the spawned task reconstructs it inside an Arc so the
-        // per-delivery callback can cheaply hand a reference into
-        // handle_hub_delivery without re-decoding 2.4 KiB every time.
         let our_kem_bytes: Vec<u8> = state.identity.kem_secret().to_bytes().to_vec();
-        let state_for_hub_task = state.clone();
-        let tor_clone = tor.clone();
-        // Take the parked receiver. `want_hub == true` implies
-        // hub_rx_holder is Some, so this unwrap is sound — but we
-        // express it defensively to avoid a panic if the invariant
-        // ever drifts.
-        let mut outbound_rx = hub_rx_holder
-            .take()
-            .expect("hub_rx_holder is Some when hub_onion+hub_pubkey are both set");
-        Some(tokio::spawn(async move {
-            let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(our_sk_bytes);
-            // Reconstruct + Arc the KEM secret once per spawned task.
-            // Wrapping in Arc so the per-delivery closure clones the
-            // Arc (cheap) instead of the underlying 2.4 KiB key bytes.
-            let our_kem = std::sync::Arc::new(
-                onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes)
-                    .expect("our own KEM secret must round-trip"),
-            );
-            let state_for_hub_cb = state_for_hub_task.clone();
-            let our_kem_for_cb = our_kem.clone();
-            let mut backoff = std::time::Duration::from_millis(500);
-            loop {
-                // Build a fresh KeyPackage per reconnect attempt so the
-                // hub's directory reflects our current MLS state. The
-                // generation is cheap (MLS just emits the current
-                // signing key + a fresh init key); doing it inside the
-                // loop keeps the surface minimal.
-                let self_publish = {
-                    let party = state_for_hub_task.mls_party.lock().await;
-                    match party.key_package_bytes() {
-                        Ok(kp_bytes) => Some(hub_client::SelfPublish {
-                            routing_id: our_inbox,
-                            kp_bytes,
-                        }),
-                        Err(e) => {
-                            warn!(error = %e, "hub: KeyPackage generation failed; skipping publish this cycle");
-                            None
+
+        for (idx, hub_cfg) in args.hubs.iter().enumerate() {
+            let (host, port) = hub_client::parse_host_port(&hub_cfg.onion, ONYX_HS_PORT)
+                .with_context(|| format!("--hub onion #{idx}: {}", hub_cfg.onion))?;
+            let hub_pubkey_bytes = decode_b32_32(&hub_cfg.pubkey)
+                .with_context(|| format!("--hub pubkey #{idx}: {}", hub_cfg.pubkey))?;
+            let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
+
+            let state_for_hub_task = state.clone();
+            let tor_clone = tor.clone();
+            let our_kem_bytes = our_kem_bytes.clone();
+            let mut outbound_rx = hub_rx_holders.remove(0);
+            let host = host.clone();
+            let span = info_span!("hub", idx, host = %host, port);
+
+            hub_tasks.push(tokio::spawn(async move {
+                let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(our_sk_bytes);
+                let our_kem = std::sync::Arc::new(
+                    onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes)
+                        .expect("our own KEM secret must round-trip"),
+                );
+                let state_for_hub_cb = state_for_hub_task.clone();
+                let our_kem_for_cb = our_kem.clone();
+                let mut backoff = std::time::Duration::from_millis(500);
+                loop {
+                    let self_publish = {
+                        let party = state_for_hub_task.mls_party.lock().await;
+                        match party.key_package_bytes() {
+                            Ok(kp_bytes) => Some(hub_client::SelfPublish {
+                                routing_id: our_inbox,
+                                kp_bytes,
+                            }),
+                            Err(e) => {
+                                warn!(error = %e, "hub: KeyPackage generation failed; skipping publish this cycle");
+                                None
+                            }
                         }
+                    };
+                    let result = hub_client::run_hub_session(
+                        &tor_clone,
+                        &host,
+                        port,
+                        &hub_pubkey,
+                        &our_sk,
+                        &[our_inbox],
+                        &mut outbound_rx,
+                        |target, body| {
+                            let state = state_for_hub_cb.clone();
+                            let our_kem = our_kem_for_cb.clone();
+                            async move {
+                                handle_hub_delivery(target, body, &state, &our_kem).await;
+                            }
+                        },
+                        self_publish.as_ref(),
+                    )
+                    .await;
+                    match result {
+                        Ok(()) => info!("hub: session ended cleanly"),
+                        Err(e) => warn!(error = %e, "hub: session ended with error"),
                     }
-                };
-                let result = hub_client::run_hub_session(
-                    &tor_clone,
-                    &host,
-                    port,
-                    &hub_pubkey,
-                    &our_sk,
-                    &[our_inbox],
-                    &mut outbound_rx,
-                    |target, body| {
-                        let state = state_for_hub_cb.clone();
-                        let our_kem = our_kem_for_cb.clone();
-                        async move {
-                            handle_hub_delivery(target, body, &state, &our_kem).await;
-                        }
-                    },
-                    self_publish.as_ref(),
-                )
-                .await;
-                match result {
-                    Ok(()) => info!("hub: session ended cleanly"),
-                    Err(e) => warn!(error = %e, "hub: session ended with error"),
+                    info!(?backoff, "hub: backing off before reconnect");
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
                 }
-                info!(?backoff, "hub: backing off before reconnect");
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
-            }
-        }))
-    } else {
-        None
-    };
+            }.instrument(span)));
+        }
+    }
 
     let mode_result = if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey)
     {
@@ -488,7 +517,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
 
     // Stop the API server so its socket file gets unlinked promptly.
     api_task.abort();
-    if let Some(h) = hub_task {
+    for h in hub_tasks {
         h.abort();
     }
     // Surface any mode error after API cleanup so it isn't lost.
