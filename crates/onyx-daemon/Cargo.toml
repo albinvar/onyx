@@ -21,6 +21,10 @@ base32 = { workspace = true }
 base64 = { workspace = true }
 serde_bytes = { workspace = true }
 zeroize = { workspace = true }
+# T-files.c: image decode + re-encode for metadata stripping.
+image = { workspace = true }
+# T-files.c: content-based MIME sniffing (FILES.md §3.3).
+infer = { workspace = true }
 
 [lints]
 workspace = true

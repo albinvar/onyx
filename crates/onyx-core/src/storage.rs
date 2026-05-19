@@ -705,9 +705,8 @@ impl Vault {
         path: &str,
         received_at_ms: i64,
     ) -> Result<()> {
-        let size_i64 = i64::try_from(size).map_err(|_| {
-            Error::InvalidEncoding("received_files: size exceeds i64")
-        })?;
+        let size_i64 = i64::try_from(size)
+            .map_err(|_| Error::InvalidEncoding("received_files: size exceeds i64"))?;
         self.conn
             .execute(
                 "INSERT INTO received_files \
@@ -715,8 +714,15 @@ impl Vault {
                   content_hash, path, received_at_ms) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
-                    identity_id, conversation, sender_fp, name, mime, size_i64,
-                    content_hash, path, received_at_ms
+                    identity_id,
+                    conversation,
+                    sender_fp,
+                    name,
+                    mime,
+                    size_i64,
+                    content_hash,
+                    path,
+                    received_at_ms
                 ],
             )
             .map_err(map_db_err)?;
@@ -1222,12 +1228,18 @@ mod tests {
     fn received_files_quota_sums_recent_only() {
         let mut v = fresh_vault();
         let (id, _) = v.create_identity("alice").unwrap();
-        v.record_received_file(id, "peer-x", "fp_bob", "a", "x/y", 1_000, &[0; 32], "/a", 500)
-            .unwrap();
-        v.record_received_file(id, "peer-x", "fp_bob", "b", "x/y", 2_000, &[0; 32], "/b", 1_500)
-            .unwrap();
-        v.record_received_file(id, "peer-x", "fp_bob", "c", "x/y", 4_000, &[0; 32], "/c", 3_000)
-            .unwrap();
+        v.record_received_file(
+            id, "peer-x", "fp_bob", "a", "x/y", 1_000, &[0; 32], "/a", 500,
+        )
+        .unwrap();
+        v.record_received_file(
+            id, "peer-x", "fp_bob", "b", "x/y", 2_000, &[0; 32], "/b", 1_500,
+        )
+        .unwrap();
+        v.record_received_file(
+            id, "peer-x", "fp_bob", "c", "x/y", 4_000, &[0; 32], "/c", 3_000,
+        )
+        .unwrap();
         // Window starts at 1_500; only b + c count.
         let bytes = v.received_bytes_since(id, "fp_bob", 1_500).unwrap();
         assert_eq!(bytes, 6_000);

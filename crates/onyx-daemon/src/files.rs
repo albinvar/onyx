@@ -173,7 +173,11 @@ pub async fn accept_file_chunk(
             return None;
         };
         if index >= entry.chunks {
-            debug!(index, total = entry.chunks, "file chunk: index out of range");
+            debug!(
+                index,
+                total = entry.chunks,
+                "file chunk: index out of range"
+            );
             return None;
         }
         // §2.12 dedup: duplicate (id, index) → silent drop.
@@ -386,8 +390,190 @@ pub fn is_executable_mime(mime: &str) -> bool {
         | "application/x-rpm"
         | "application/vnd.microsoft.portable-executable" // .exe (registered)
         | "application/x-bat"                 // .bat
-        | "application/x-sh"                  // shell scripts
+        | "application/x-sh" // shell scripts
     )
+}
+
+/// T-files.c: result of [`sanitize_file`]. Carries the cleaned
+/// bytes ready for chunking + the sanitized metadata to put on
+/// `FileMeta`.
+#[derive(Debug)]
+pub struct CleanedFile {
+    /// The bytes to chunk + send. For re-encoded raster images
+    /// this is the post-encode output (metadata-free); for raw
+    /// pass-through (with `--no-strip-metadata`) this is the
+    /// original bytes.
+    pub bytes: Vec<u8>,
+    /// MIME sniffed from the cleaned bytes. May differ from the
+    /// claimed MIME of the source if it had a misleading extension.
+    pub mime: String,
+    /// Whether metadata was actually stripped (for the operator's
+    /// log line / TUI display).
+    pub stripped: bool,
+}
+
+/// T-files.c: outcome when the requested format is one we refuse
+/// to strip safely. Caller (CLI / TUI) decides whether to surface
+/// as an error or to bypass with explicit `keep_metadata = true`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SanitizeError {
+    /// MIME identifies a format with metadata we can't safely
+    /// strip without shipping a format-specific parser (PDF,
+    /// DOCX, video). Operator can bypass with
+    /// `SanitizeOpts.keep_metadata = true`.
+    UnsupportedFormat(&'static str),
+    /// Bytes don't look like any format `infer` recognises.
+    /// Strip can't run. Same bypass.
+    UnknownFormat,
+    /// Bytes failed to decode as the sniffed image format.
+    /// Likely a corrupt or truncated file.
+    DecodeFailed(String),
+    /// Re-encode failed. Should never happen for a successfully-
+    /// decoded image but we surface it rather than panic.
+    EncodeFailed(String),
+    /// I/O error reading the path.
+    IoError(String),
+}
+
+impl std::fmt::Display for SanitizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedFormat(name) => write!(
+                f,
+                "format `{name}` has metadata Onyx can't safely strip; \
+                 pass --no-strip-metadata to send anyway with the leak \
+                 documented in FILES.md §3.2"
+            ),
+            Self::UnknownFormat => write!(
+                f,
+                "could not identify the file format from content; \
+                 pass --no-strip-metadata to send as application/octet-stream"
+            ),
+            Self::DecodeFailed(detail) => write!(f, "image decode failed: {detail}"),
+            Self::EncodeFailed(detail) => write!(f, "image re-encode failed: {detail}"),
+            Self::IoError(detail) => write!(f, "I/O error: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for SanitizeError {}
+
+/// T-files.c: caller options for [`sanitize_file`]. `keep_metadata`
+/// defaults to `false` — strip aggressively per `FILES.md §3.1`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SanitizeOpts {
+    /// `false` (default): strip metadata aggressively per
+    /// `FILES.md §3.1`. `true`: pass through; refused-format
+    /// errors don't fire.
+    pub keep_metadata: bool,
+}
+
+/// T-files.c: read `path`, sniff the MIME, and either strip
+/// metadata (raster formats) or refuse (formats we can't safely
+/// strip). See `FILES.md §3` for the per-format strategy table.
+///
+/// Returns the cleaned bytes + sniffed MIME ready for
+/// [`chunk_file_for_send`]. The caller computes
+/// `blake2b_256(cleaned.bytes)` for the FileMeta content_hash.
+pub fn sanitize_file(
+    path: &std::path::Path,
+    opts: SanitizeOpts,
+) -> Result<CleanedFile, SanitizeError> {
+    let raw = std::fs::read(path).map_err(|e| SanitizeError::IoError(format!("{e}")))?;
+    sanitize_bytes(&raw, opts)
+}
+
+/// T-files.c: same as [`sanitize_file`] but operates on bytes
+/// already loaded into memory. Used directly by tests + when the
+/// caller (TUI) already has the bytes.
+pub fn sanitize_bytes(raw: &[u8], opts: SanitizeOpts) -> Result<CleanedFile, SanitizeError> {
+    let sniffed_mime = infer::get(raw).map_or_else(
+        || "application/octet-stream".to_string(),
+        |t| t.mime_type().to_string(),
+    );
+
+    // Pass-through path: operator opted out of stripping. Return
+    // raw bytes + sniffed MIME (still better than the sender's
+    // claim per FILES.md §3.3).
+    if opts.keep_metadata {
+        return Ok(CleanedFile {
+            bytes: raw.to_vec(),
+            mime: sniffed_mime,
+            stripped: false,
+        });
+    }
+
+    // Strip path. Branch on sniffed MIME.
+    match sniffed_mime.as_str() {
+        // Raster formats: decode + re-encode without metadata.
+        "image/jpeg" => reencode_raster(raw, image::ImageFormat::Jpeg, "image/jpeg"),
+        "image/png" => reencode_raster(raw, image::ImageFormat::Png, "image/png"),
+        "image/webp" => reencode_raster(raw, image::ImageFormat::WebP, "image/webp"),
+        "image/tiff" => {
+            // TIFF → PNG (lossless, no TIFF EXIF carry-through).
+            reencode_raster(raw, image::ImageFormat::Png, "image/png")
+        }
+        "image/bmp" => {
+            // BMP has minimal metadata; still re-encode to PNG
+            // for consistency + future-proofing if BMP gains
+            // metadata extensions.
+            reencode_raster(raw, image::ImageFormat::Png, "image/png")
+        }
+        "image/gif" => {
+            // Animated GIFs lose frames in a naive decode-encode;
+            // for a still GIF this is fine, but to be safe we
+            // refuse (matches the "refuse what we can't safely
+            // strip" policy).
+            Err(SanitizeError::UnsupportedFormat("image/gif"))
+        }
+        // Formats with metadata we can't safely strip without
+        // shipping a format-specific parser. FILES.md §3.2.
+        "image/heic" | "image/heif" => Err(SanitizeError::UnsupportedFormat("image/heic")),
+        "application/pdf" => Err(SanitizeError::UnsupportedFormat("application/pdf")),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        | "application/vnd.oasis.opendocument.text"
+        | "application/msword" => Err(SanitizeError::UnsupportedFormat("office document")),
+        m if m.starts_with("video/") => Err(SanitizeError::UnsupportedFormat("video")),
+        m if m.starts_with("audio/") => Err(SanitizeError::UnsupportedFormat("audio")),
+        m if m.starts_with("application/zip")
+            || m.starts_with("application/x-tar")
+            || m.starts_with("application/x-7z-compressed")
+            || m.starts_with("application/x-rar") =>
+        {
+            Err(SanitizeError::UnsupportedFormat("archive"))
+        }
+        "application/octet-stream" => Err(SanitizeError::UnknownFormat),
+        // Anything else: refuse. The operator either passes
+        // --no-strip-metadata to accept the leak, or converts
+        // first.
+        other => Err(SanitizeError::UnsupportedFormat(match other {
+            "text/plain" => "text/plain",
+            _ => "unknown",
+        })),
+    }
+}
+
+/// T-files.c §3.1: decode raster bytes via `image` crate, then
+/// re-encode in `target_format` with no metadata fields. The
+/// `image` crate's encoders don't carry forward any source-format
+/// metadata structures, so a successful round-trip strips everything.
+fn reencode_raster(
+    raw: &[u8],
+    target_format: image::ImageFormat,
+    target_mime: &str,
+) -> Result<CleanedFile, SanitizeError> {
+    let img =
+        image::load_from_memory(raw).map_err(|e| SanitizeError::DecodeFailed(format!("{e}")))?;
+    let mut out = Vec::with_capacity(raw.len());
+    img.write_to(&mut std::io::Cursor::new(&mut out), target_format)
+        .map_err(|e| SanitizeError::EncodeFailed(format!("{e}")))?;
+    Ok(CleanedFile {
+        bytes: out,
+        mime: target_mime.to_string(),
+        stripped: true,
+    })
 }
 
 /// T-files.b: send-side chunking. Splits `bytes` into
@@ -445,12 +631,18 @@ mod tests {
         // "漢字" is 2 chars → 2 underscores. Plus 3 spaces in
         // "with spaces and " → 3 more underscores. Total trailing
         // run is 3 (one per space + one per CJK char interspersed).
-        assert_eq!(sanitize_filename("with spaces and 漢字"), "with_spaces_and___");
+        assert_eq!(
+            sanitize_filename("with spaces and 漢字"),
+            "with_spaces_and___"
+        );
     }
 
     #[test]
     fn sanitize_preserves_safe_chars() {
-        assert_eq!(sanitize_filename("photo_2026-01-12.jpg"), "photo_2026-01-12.jpg");
+        assert_eq!(
+            sanitize_filename("photo_2026-01-12.jpg"),
+            "photo_2026-01-12.jpg"
+        );
         assert_eq!(sanitize_filename("a.b.c"), "a.b.c");
     }
 
@@ -483,16 +675,141 @@ mod tests {
         assert!(!is_executable_mime("application/pdf"));
     }
 
+    // ── T-files.c: sanitize_file ──────────────────────────────────
+
+    /// Build a tiny JPEG with EXIF metadata embedded. We build the
+    /// JPEG via `image` (no EXIF), then SPLICE in a synthetic EXIF
+    /// APP1 segment so we have a known marker to grep for after
+    /// stripping. This is hacky but deterministic + dep-free.
+    fn jpeg_with_fake_exif() -> Vec<u8> {
+        // Build a 4x4 red JPEG via image crate.
+        let img = image::DynamicImage::new_rgb8(4, 4);
+        let mut buf = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        // Splice a synthetic EXIF APP1 segment right after the SOI
+        // marker (FF D8). Segment shape: FF E1 [len_hi][len_lo]
+        // "Exif\0\0" <tiff-style payload>. We use a recognisable
+        // payload "ONYX-EXIF-CANARY-12345" so the test can verify
+        // it's GONE after sanitize.
+        let canary = b"ONYX-EXIF-CANARY-12345";
+        let mut exif_segment: Vec<u8> = vec![
+            0xFF, 0xE1, // APP1 marker
+            0, 0, // length placeholder
+            b'E', b'x', b'i', b'f', 0x00, 0x00, // EXIF header
+        ];
+        exif_segment.extend_from_slice(canary);
+        // Length = bytes from the size field onward = exif_segment.len() - 2
+        let len = (exif_segment.len() - 2) as u16;
+        exif_segment[2] = (len >> 8) as u8;
+        exif_segment[3] = len as u8;
+        // Splice in after the SOI (bytes 0..2 = FF D8).
+        let mut out = Vec::with_capacity(buf.len() + exif_segment.len());
+        out.extend_from_slice(&buf[..2]);
+        out.extend_from_slice(&exif_segment);
+        out.extend_from_slice(&buf[2..]);
+        out
+    }
+
+    #[test]
+    fn sanitize_strips_jpeg_exif_canary() {
+        let dirty = jpeg_with_fake_exif();
+        // Sanity: dirty JPEG contains the canary.
+        let canary = b"ONYX-EXIF-CANARY-12345";
+        assert!(dirty.windows(canary.len()).any(|w| w == canary));
+        let cleaned = sanitize_bytes(&dirty, SanitizeOpts::default()).unwrap();
+        assert_eq!(cleaned.mime, "image/jpeg");
+        assert!(cleaned.stripped);
+        // Cleaned output must NOT contain the canary anymore.
+        assert!(
+            !cleaned.bytes.windows(canary.len()).any(|w| w == canary),
+            "EXIF canary survived the strip — metadata leak"
+        );
+        // Result must still be a valid JPEG.
+        let _re = image::load_from_memory(&cleaned.bytes).expect("cleaned output decodes");
+    }
+
+    #[test]
+    fn sanitize_keep_metadata_passes_canary_through() {
+        let dirty = jpeg_with_fake_exif();
+        let canary = b"ONYX-EXIF-CANARY-12345";
+        let cleaned = sanitize_bytes(
+            &dirty,
+            SanitizeOpts {
+                keep_metadata: true,
+            },
+        )
+        .unwrap();
+        assert!(!cleaned.stripped);
+        assert!(
+            cleaned.bytes.windows(canary.len()).any(|w| w == canary),
+            "keep_metadata=true should preserve metadata (it didn't)"
+        );
+    }
+
+    #[test]
+    fn sanitize_refuses_pdf() {
+        // PDF magic: %PDF-1.x
+        let fake_pdf = b"%PDF-1.4\n%fake content for sniff test\n%%EOF";
+        let err = sanitize_bytes(fake_pdf, SanitizeOpts::default()).unwrap_err();
+        assert!(matches!(err, SanitizeError::UnsupportedFormat(_)));
+    }
+
+    #[test]
+    fn sanitize_refuses_zip() {
+        // ZIP magic: PK\x03\x04
+        let fake_zip = b"PK\x03\x04fake-zip-bytes";
+        let err = sanitize_bytes(fake_zip, SanitizeOpts::default()).unwrap_err();
+        assert!(matches!(err, SanitizeError::UnsupportedFormat(_)));
+    }
+
+    #[test]
+    fn sanitize_unknown_format_errors() {
+        let random = b"not any recognizable format magic bytes";
+        let err = sanitize_bytes(random, SanitizeOpts::default()).unwrap_err();
+        assert!(matches!(err, SanitizeError::UnknownFormat));
+    }
+
+    #[test]
+    fn sanitize_keep_metadata_accepts_unknown_format() {
+        let random = b"not any recognizable format magic bytes";
+        let cleaned = sanitize_bytes(
+            random,
+            SanitizeOpts {
+                keep_metadata: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(cleaned.mime, "application/octet-stream");
+        assert!(!cleaned.stripped);
+        assert_eq!(cleaned.bytes, random);
+    }
+
     #[test]
     fn chunk_file_roundtrip_shape() {
         // 30 KB file, 12 KB chunks → 3 chunks (last is 6 KB).
         let bytes = vec![0xABu8; 30 * 1024];
         let hash = onyx_core::crypto::blake2b_256(&[&bytes]);
         let id = [0x11u8; 16];
-        let msgs = chunk_file_for_send(id, "test.bin", "application/octet-stream", &bytes, 12 * 1024, &hash);
+        let msgs = chunk_file_for_send(
+            id,
+            "test.bin",
+            "application/octet-stream",
+            &bytes,
+            12 * 1024,
+            &hash,
+        );
         assert_eq!(msgs.len(), 4); // 1 FileMeta + 3 FileChunk
         match &msgs[0] {
-            RoomAppMessage::FileMeta { chunks, chunk_size, size, .. } => {
+            RoomAppMessage::FileMeta {
+                chunks,
+                chunk_size,
+                size,
+                ..
+            } => {
                 assert_eq!(*chunks, 3);
                 assert_eq!(*chunk_size, 12 * 1024);
                 assert_eq!(*size, 30 * 1024);

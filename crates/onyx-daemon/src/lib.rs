@@ -303,8 +303,9 @@ pub const PENDING_ROOM_FRAMES_PER_GROUP_MAX: usize = 64;
 /// buffer. Bounded entries per peer by
 /// `FILES_MAX_INFLIGHT_PER_PEER`; bounded bytes per transfer by
 /// `FilesConfig::max_recv_size_bytes`.
-pub type InflightFiles =
-    Arc<Mutex<std::collections::HashMap<String, std::collections::HashMap<[u8; 16], InflightFile>>>>;
+pub type InflightFiles = Arc<
+    Mutex<std::collections::HashMap<String, std::collections::HashMap<[u8; 16], InflightFile>>>,
+>;
 
 /// T-files.b: state per in-flight transfer. See
 /// [`crate::files::buffer_chunk`] for the reassembly path and
@@ -515,7 +516,11 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         configured_hubs: args.hubs.clone(),
         pending_room_frames: Arc::new(Mutex::new(std::collections::HashMap::new())),
         inflight_files: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        files_config: FilesConfig::defaults(args.vault.parent().unwrap_or_else(|| std::path::Path::new("."))),
+        files_config: FilesConfig::defaults(
+            args.vault
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        ),
     });
 
     drop(args.passphrase);
@@ -1560,12 +1565,23 @@ async fn handle_room_app_frame(
             // sender_fp here is a placeholder — see same note in
             // the Text arm. Conversation = "room/<gid_short>".
             let sender_fp = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
-            let conversation = format!("room/{}", crate::conversations::short_id_of_group(group_id));
+            let conversation =
+                format!("room/{}", crate::conversations::short_id_of_group(group_id));
             let now_ms = now_unix_ms_i64();
             let decision = files::accept_file_meta(
-                state, &sender_fp, &conversation, id.as_ref(), &name, &mime,
-                size, chunks, chunk_size, content_hash.as_ref(), now_ms,
-            ).await;
+                state,
+                &sender_fp,
+                &conversation,
+                id.as_ref(),
+                &name,
+                &mime,
+                size,
+                chunks,
+                chunk_size,
+                content_hash.as_ref(),
+                now_ms,
+            )
+            .await;
             match decision {
                 files::AcceptDecision::Accepted => info!(
                     sender_fp = %sender_fp,
@@ -1581,8 +1597,15 @@ async fn handle_room_app_frame(
             let sender_fp = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
             let now_ms = now_unix_ms_i64();
             if let Some(path) = files::accept_file_chunk(
-                state, &sender_fp, id.as_ref(), index, bytes.as_ref(), now_ms,
-            ).await {
+                state,
+                &sender_fp,
+                id.as_ref(),
+                index,
+                bytes.as_ref(),
+                now_ms,
+            )
+            .await
+            {
                 info!(path = %path.display(), "file received + persisted");
             }
         }

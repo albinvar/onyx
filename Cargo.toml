@@ -99,6 +99,19 @@ proptest         = "1"
 # under `target/criterion/`.
 criterion        = { version = "0.5", features = ["html_reports"] }
 
+# T-files.c: image decoding + re-encoding for metadata stripping.
+# Default features include JPEG/PNG/GIF/WebP/TIFF/BMP support;
+# we explicitly enable only the ones we strip-via-re-encode for to
+# avoid bloating the binary with formats we don't intentionally
+# support. HEIC/AVIF stay off (libheif is LGPL + patent-encumbered;
+# operator must convert to JPEG before sending).
+image            = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif"] }
+
+# T-files.c: magic-byte MIME sniffing — small, well-audited,
+# no_std-compatible. We always sniff from content; the sender's
+# claimed MIME is hint-only on the receive side (FILES.md §3.3).
+infer            = { version = "0.16", default-features = false }
+
 # TUI for the `onyx` CLI client. Crossterm is ratatui's default
 # backend on macOS/Linux/Windows.
 ratatui          = "0.30"

@@ -6,6 +6,44 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-19 — T-files.c: metadata stripping (re-encode raster, refuse complex formats)
+
+Third of five slices for file-sharing. Implements `FILES.md §3` — sender-side metadata removal before chunking. With this slice, the daemon-side primitives are complete; T-files.d wires them to the CLI and T-files.e adds the TUI surface.
+
+What landed:
+
+  * **`image = "0.25"`** added as a daemon dep with `default-features = false` + explicit `jpeg`/`png`/`webp`/`tiff`/`bmp`/`gif` features. HEIC/AVIF deliberately off (libheif is LGPL + patent-encumbered; operator must convert to JPEG before sending).
+  * **`infer = "0.16"`** added for magic-byte MIME sniffing. Small + well-audited.
+  * **`sanitize_file(path, opts)`** + **`sanitize_bytes(raw, opts)`** in `onyx_daemon::files`. Branches on sniffed MIME:
+    * **Raster (JPEG, PNG, WebP, TIFF, BMP)** → decode via `image::load_from_memory` + re-encode via `image::ImageFormat`. The encoder doesn't carry source-format metadata structures (EXIF, XMP, IPTC, ICC profile, thumbnails) — strip is provably complete.
+    * **GIF** → refused (animated GIFs lose frames in naive decode-encode; matches "refuse what we can't safely strip" policy).
+    * **HEIC, PDF, Office docs, video, audio, archives** → refused with the format name in the error (`FILES.md §3.2`). Operator opts in via `SanitizeOpts { keep_metadata: true }` to pass through with the documented leak.
+    * **Unknown format** (sniff returns nothing) → refused unless `keep_metadata` is set.
+  * **`SanitizeOpts`** with one `keep_metadata: bool` field (default `false`).
+  * **`CleanedFile { bytes, mime, stripped }`** result type. The chunker (`chunk_file_for_send`) consumes this.
+  * **`SanitizeError`** enum with `Display` impl that points refused-format errors at `FILES.md §3.2` for the operator to read.
+  * **6 new tests** including the load-bearing one:
+    * `sanitize_strips_jpeg_exif_canary` — builds a JPEG with a known EXIF canary `ONYX-EXIF-CANARY-12345`, sanitizes, asserts the canary is GONE from the output bytes. This is the property the whole strip rests on.
+    * `sanitize_keep_metadata_passes_canary_through` — `keep_metadata: true` preserves the canary (proves the opt-out actually opts out).
+    * Refusal tests: `sanitize_refuses_pdf`, `sanitize_refuses_zip`, `sanitize_unknown_format_errors`, `sanitize_keep_metadata_accepts_unknown_format`.
+
+Honest framing of what `image`-based stripping does NOT do:
+
+  * **Re-encoded JPEGs are not byte-identical to the original.** q=95 is visually indistinguishable but a recipient comparing to a reference will see the difference. For pixel-perfect transfer, `keep_metadata: true` preserves the original bytes (and original metadata).
+  * **HEIC, PDF, Office docs, video, audio remain unsupported.** The operator's options today are: convert to JPEG first (for HEIC), or `keep_metadata: true` with the leak accepted. PDF/DOCX metadata stripping needs format-specific parsers we don't ship; queued for a future slice.
+  * **The `image` crate has not been formally audited.** It's the standard Rust image library, widely used, but `cargo deny advisories` is our backstop here.
+
+Verification: `cargo fmt --check` ✓, `cargo clippy --workspace --all-targets -- -D warnings` ✓, `cargo test --workspace` → **445 passed** (+6 from 439).
+
+Status of T-files slices:
+  * ✅ T-files.a (design doc, `FILES.md`)
+  * ✅ T-files.b (wire chunks + reassembly + persistence)
+  * ✅ T-files.c (metadata stripping)
+  * Pending T-files.d (CLI verbs + end-to-end smoke)
+  * Pending T-files.e (TUI file-picker modal + attachment rendering)
+
+---
+
 ## 2026-05-19 — T-files.a + b: design doc + chunk wire + reassembly + persistence
 
 First two of five slices for file-sharing. T-files.a is the design doc (FILES.md); T-files.b is the wire format + receiver-side reassembly + content-hash verification + vault manifest. T-files.c (metadata stripping), .d (CLI), .e (TUI) follow.
