@@ -357,9 +357,60 @@ where
                 let Ok(frame) = read_result else { return Ok(()) };
                 match frame.frame_type {
                     FRAME_SUBSCRIBE => {
-                        let ids = parse_routing_ids(&frame.payload)?;
-                        if ids.is_empty() {
+                        // HIGH-1: SUBSCRIBE is now signed. Verify the
+                        // Ed25519 proof against this connection's Noise
+                        // handshake hash (replay-binds the proof to
+                        // this connection), then enforce ownership for
+                        // any requested id that is a KNOWN introduction
+                        // inbox: the subscriber must hold the signing
+                        // key whose fingerprint derives that inbox.
+                        // Session tokens (not in the KP directory) are
+                        // high-entropy and allowed without proof.
+                        let hh = session.handshake_hash();
+                        let (signer, requested) =
+                            match onyx_core::routing::decode_signed_subscribe(&frame.payload, &hh) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(
+                                        conn = conn_id,
+                                        error = %e,
+                                        "hub: SUBSCRIBE proof invalid; ignoring frame"
+                                    );
+                                    continue;
+                                }
+                            };
+                        if requested.is_empty() {
                             warn!(conn = conn_id, "hub: empty SUBSCRIBE frame; ignoring");
+                            continue;
+                        }
+                        let signer_inbox = onyx_core::routing::introduction_inbox(
+                            &onyx_core::crypto::Fingerprint::from_bytes(signer.to_bytes()),
+                        );
+                        let ids: Vec<RoutingId> = {
+                            let s = state.lock().await;
+                            requested
+                                .into_iter()
+                                .filter(|id| {
+                                    // Reject a subscription to a KNOWN intro
+                                    // inbox that isn't the signer's own.
+                                    if s.is_known_intro_inbox(id) && *id != signer_inbox {
+                                        warn!(
+                                            conn = conn_id,
+                                            "hub: SUBSCRIBE to a known intro inbox not owned by \
+                                             the signer; rejecting that id"
+                                        );
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                })
+                                .collect()
+                        };
+                        if ids.is_empty() {
+                            warn!(
+                                conn = conn_id,
+                                "hub: SUBSCRIBE had no admissible ids after ownership check"
+                            );
                             continue;
                         }
                         let drained = {
@@ -634,26 +685,6 @@ fn sample_exponential_interval(mean_secs: u64) -> std::time::Duration {
     std::time::Duration::from_millis(millis)
 }
 
-/// SUBSCRIBE payload is concatenated 16-byte routing IDs.
-fn parse_routing_ids(payload: &[u8]) -> anyhow::Result<Vec<RoutingId>> {
-    // (Not `is_multiple_of` — that's only stable in Rust 1.87 and
-    // our workspace MSRV is 1.85.)
-    if payload.len() % 16 != 0 {
-        anyhow::bail!(
-            "hub: SUBSCRIBE payload length {} is not a multiple of 16",
-            payload.len()
-        );
-    }
-    Ok(payload
-        .chunks_exact(16)
-        .map(|chunk| {
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(chunk);
-            arr
-        })
-        .collect())
-}
-
 /// Peek the 16-byte target prefix from a DELIVER payload without
 /// allocating a separate body buffer.
 fn parse_target_prefix(payload: &[u8]) -> anyhow::Result<RoutingId> {
@@ -724,12 +755,19 @@ mod tests {
             let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk_for_alice)
                 .await
                 .expect("alice handshake");
+            // HIGH-1: SUBSCRIBE must be signed over the handshake hash.
+            let alice_signing = onyx_core::crypto::SigningKey::generate();
+            let hh = session.handshake_hash();
             write_frame(
                 &mut stream,
                 &mut session,
                 &InnerFrame {
                     frame_type: FRAME_SUBSCRIBE,
-                    payload: alice_inbox.to_vec(),
+                    payload: onyx_core::routing::encode_signed_subscribe(
+                        &alice_signing,
+                        &hh,
+                        &[alice_inbox],
+                    ),
                 },
             )
             .await
@@ -835,12 +873,19 @@ mod tests {
             let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk_for_alice)
                 .await
                 .expect("alice handshake");
+            // HIGH-1: signed SUBSCRIBE over the handshake hash.
+            let alice_signing = onyx_core::crypto::SigningKey::generate();
+            let hh = session.handshake_hash();
             write_frame(
                 &mut stream,
                 &mut session,
                 &InnerFrame {
                     frame_type: FRAME_SUBSCRIBE,
-                    payload: alice_inbox.to_vec(),
+                    payload: onyx_core::routing::encode_signed_subscribe(
+                        &alice_signing,
+                        &hh,
+                        &[alice_inbox],
+                    ),
                 },
             )
             .await

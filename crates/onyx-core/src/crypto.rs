@@ -669,7 +669,9 @@ impl HybridKemSecret {
         let mut pq_ss_bytes = [0u8; 32];
         pq_ss_bytes.copy_from_slice(pq_ss.as_ref());
 
-        let combined = combine_hybrid_secrets(&x_ss.to_bytes(), &pq_ss_bytes, ct)?;
+        // Derive our own public key to bind into the combiner, matching
+        // what the encapsulator did with the same recipient pubkey.
+        let combined = combine_hybrid_secrets(&x_ss.to_bytes(), &pq_ss_bytes, ct, &self.public())?;
 
         // Zeroize the borrowed-by-value PQ secret bytes; X25519 SharedSecret
         // zeroizes itself on drop via the dalek zeroize feature.
@@ -720,7 +722,8 @@ impl HybridKemPublic {
 
         let mut pq_ss_bytes = [0u8; 32];
         pq_ss_bytes.copy_from_slice(pq_ss.as_ref());
-        let combined = combine_hybrid_secrets(&x_ss.to_bytes(), &pq_ss_bytes, &ct)?;
+        // `self` IS the recipient public key for an encapsulation.
+        let combined = combine_hybrid_secrets(&x_ss.to_bytes(), &pq_ss_bytes, &ct, self)?;
         pq_ss_bytes.zeroize();
 
         Ok((ct, combined))
@@ -831,21 +834,45 @@ impl fmt::Debug for HybridSharedSecret {
 }
 
 /// Combine the classical and post-quantum shared secrets through HKDF-SHA256.
-/// The entire ciphertext bytes go into `info` so any tampering of either
-/// half of the ciphertext changes the combined output — this is what makes
-/// the hybrid resistant to an attacker substituting one component.
+///
+/// Audit hardening (X-Wing / PQXDH-style binding): the KDF `info` binds
+/// the full transcript of the encapsulation —
+///
+/// ```text
+///   info = ct.classical (eph X25519 pub)
+///        ‖ ct.post_quantum (ML-KEM ciphertext)
+///        ‖ recipient X25519 static pub
+///        ‖ recipient ML-KEM encapsulation key
+/// ```
+///
+/// Previously only the ciphertext halves were bound. Binding the
+/// recipient's *static public keys* as well makes this a robust
+/// combiner in the sense of Giacon–Heuer–Poettering / the X-Wing
+/// construction: the combined secret commits to which recipient the
+/// encapsulation was for, so the output stays secure as long as
+/// *either* X25519 *or* ML-KEM-768 is unbroken, and a ciphertext can't
+/// be silently re-pointed at a different recipient public key. Both
+/// `encapsulate` (has the recipient pubkey as `self`) and
+/// `decapsulate` (derives it via `self.public()`) feed the identical
+/// bytes, so the two sides agree.
 fn combine_hybrid_secrets(
     x_ss: &[u8; 32],
     pq_ss: &[u8; 32],
     ct: &HybridCiphertext,
+    recipient_pub: &HybridKemPublic,
 ) -> Result<HybridSharedSecret> {
     let mut ikm = Zeroizing::new([0u8; 64]);
     ikm[..32].copy_from_slice(x_ss);
     ikm[32..].copy_from_slice(pq_ss);
 
-    let mut info = Vec::with_capacity(HYBRID_CIPHERTEXT_LEN);
+    let recipient_pq_ek = recipient_pub.post_quantum.as_bytes();
+    let mut info = Vec::with_capacity(
+        HYBRID_CIPHERTEXT_LEN + HYBRID_CLASSICAL_LEN + recipient_pq_ek.as_slice().len(),
+    );
     info.extend_from_slice(&ct.classical);
     info.extend_from_slice(&ct.post_quantum);
+    info.extend_from_slice(&recipient_pub.classical);
+    info.extend_from_slice(recipient_pq_ek.as_slice());
 
     let mut out = [0u8; 32];
     hkdf_sha256(&ikm[..], HYBRID_HKDF_SALT, &info, &mut out)?;

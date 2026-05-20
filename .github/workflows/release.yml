@@ -63,7 +63,15 @@ jobs:
             runner: macos-latest
             ext: ''
           - target: x86_64-apple-darwin
-            runner: macos-13
+            # Cross-compile the Intel-Mac binary on the Apple-Silicon
+            # runner. The macos-13 (Intel) runner is deprecated and so
+            # scarce that jobs sat queued for hours, wedging the whole
+            # release (sign-and-release needs every target). macos-latest
+            # ships the universal Apple SDK, so `cargo build --target
+            # x86_64-apple-darwin` cross-compiles cleanly from arm64
+            # with no extra toolchain — ring/aws-lc support the Apple
+            # cross target out of the box.
+            runner: macos-latest
             ext: ''
     steps:
       - uses: actions/checkout@v4

@@ -139,8 +139,14 @@ impl Initiator {
     /// Promote the completed handshake to a transport [`Session`]. Errors
     /// if the handshake is not yet finished.
     pub fn into_session(self) -> Result<Session> {
+        // Capture the handshake hash BEFORE consuming the handshake
+        // state (snow 0.9's TransportState doesn't re-expose it).
+        let hh = capture_handshake_hash(&self.state);
         let ts = self.state.into_transport_mode().map_err(map_noise_err)?;
-        Ok(Session { state: ts })
+        Ok(Session {
+            state: ts,
+            handshake_hash: hh,
+        })
     }
 }
 
@@ -207,9 +213,23 @@ impl Responder {
     }
 
     pub fn into_session(self) -> Result<Session> {
+        let hh = capture_handshake_hash(&self.state);
         let ts = self.state.into_transport_mode().map_err(map_noise_err)?;
-        Ok(Session { state: ts })
+        Ok(Session {
+            state: ts,
+            handshake_hash: hh,
+        })
     }
+}
+
+/// Snapshot the 32-byte Noise handshake hash from a finished
+/// `HandshakeState`, before it is consumed by `into_transport_mode`.
+/// Our ciphersuite's hash is 32 bytes.
+fn capture_handshake_hash(state: &HandshakeState) -> [u8; 32] {
+    let raw = state.get_handshake_hash();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw[..32]);
+    out
 }
 
 impl std::fmt::Debug for Responder {
@@ -227,6 +247,9 @@ impl std::fmt::Debug for Responder {
 /// per-direction counters); the application never sees them.
 pub struct Session {
     state: TransportState,
+    /// Noise handshake hash, snapshotted at handshake completion.
+    /// Stable for the session's lifetime. See [`Self::handshake_hash`].
+    handshake_hash: [u8; 32],
 }
 
 impl Session {
@@ -285,6 +308,19 @@ impl Session {
         let mut out = [0u8; 32];
         out.copy_from_slice(raw);
         out
+    }
+
+    /// The Noise handshake hash for this session. Both peers compute
+    /// the identical value at the end of the handshake, and it is
+    /// unique per session (it commits to both statics, the ephemeral
+    /// keys, and the full transcript). Used as a replay-binding nonce
+    /// for application-layer proofs (e.g. the signed SUBSCRIBE, HIGH-1):
+    /// a proof signed over this hash on one connection cannot be
+    /// replayed on another, because the other connection has a
+    /// different hash.
+    #[must_use]
+    pub fn handshake_hash(&self) -> [u8; 32] {
+        self.handshake_hash
     }
 }
 

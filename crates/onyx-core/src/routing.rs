@@ -103,6 +103,104 @@ pub fn session_token(group_secret: &[u8; 32], index: u64) -> RoutingId {
     blake2b_128(&[group_secret.as_slice(), &index.to_be_bytes()])
 }
 
+// ── Signed SUBSCRIBE (HIGH-1) ───────────────────────────────────────────────
+//
+// A hub SUBSCRIBE frame used to be a bare concatenation of 16-byte
+// routing ids with zero authentication: any client could subscribe to
+// any id and destructively drain its offline queue. The introduction
+// inbox is a deterministic hash of a *public* fingerprint, so a
+// victim's first-contact queue was trivially targetable.
+//
+// The fix binds a subscription to proof that the subscriber holds the
+// Ed25519 key whose fingerprint derives the claimed introduction
+// inbox. The SUBSCRIBE payload becomes:
+//
+// ```text
+//   signer_pk (32)  ‖  signature (64)  ‖  routing_ids (16·N)
+// ```
+//
+// where the signature is Ed25519 over
+// `"onyx/v1/subscribe" ‖ noise_handshake_hash(32) ‖ routing_ids`.
+// The handshake hash is unique per connection, so a captured
+// SUBSCRIBE frame can't be replayed onto a different connection.
+//
+// The hub verifies the signature, then for any requested id that it
+// knows to be an introduction inbox (i.e. present in its KeyPackage
+// directory) it requires `id == introduction_inbox(signer_fp)`.
+// Session tokens — high-entropy, derived from a group-private MLS
+// exporter secret the hub never sees — are not in the directory and
+// remain unauthenticated by necessity (authenticating them would
+// require the hub to link tokens to identities, which is exactly the
+// unlinkability the two-tier routing scheme is designed to provide).
+
+/// Domain separator for the signed SUBSCRIBE proof (HIGH-1).
+pub const SUBSCRIBE_SIG_CONTEXT: &[u8] = b"onyx/v1/subscribe";
+
+/// Bytes signed in a SUBSCRIBE proof: context ‖ handshake hash ‖ ids.
+fn subscribe_signing_bytes(handshake_hash: &[u8; 32], ids: &[RoutingId]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SUBSCRIBE_SIG_CONTEXT.len() + 32 + ids.len() * 16);
+    out.extend_from_slice(SUBSCRIBE_SIG_CONTEXT);
+    out.extend_from_slice(handshake_hash);
+    for id in ids {
+        out.extend_from_slice(id);
+    }
+    out
+}
+
+/// Build a signed SUBSCRIBE payload (HIGH-1). Layout:
+/// `signer_pk(32) ‖ sig(64) ‖ ids(16·N)`.
+#[must_use]
+pub fn encode_signed_subscribe(
+    signing: &SigningKey,
+    handshake_hash: &[u8; 32],
+    ids: &[RoutingId],
+) -> Vec<u8> {
+    let sig = signing.sign(&subscribe_signing_bytes(handshake_hash, ids));
+    let mut out = Vec::with_capacity(32 + 64 + ids.len() * 16);
+    out.extend_from_slice(&signing.verifying_key().to_bytes());
+    out.extend_from_slice(&sig.to_bytes());
+    for id in ids {
+        out.extend_from_slice(id);
+    }
+    out
+}
+
+/// Parse + verify a signed SUBSCRIBE payload against the connection's
+/// `handshake_hash` (HIGH-1). Returns the authenticated signer key and
+/// the routing ids. Fails on a short payload, a non-16-aligned id
+/// section, or an invalid signature.
+pub fn decode_signed_subscribe(
+    payload: &[u8],
+    handshake_hash: &[u8; 32],
+) -> Result<(VerifyingKey, Vec<RoutingId>)> {
+    if payload.len() < 32 + 64 {
+        return Err(Error::InvalidEncoding(
+            "subscribe: payload shorter than signer_pk + signature",
+        ));
+    }
+    let (signer_bytes, rest) = payload.split_at(32);
+    let (sig_bytes, ids_bytes) = rest.split_at(64);
+    if ids_bytes.len() % 16 != 0 {
+        return Err(Error::InvalidEncoding(
+            "subscribe: routing-id section not a multiple of 16",
+        ));
+    }
+    let signer = parse_ed25519_pk(signer_bytes)?;
+    let signature = parse_signature(sig_bytes)?;
+
+    let ids: Vec<RoutingId> = ids_bytes
+        .chunks_exact(16)
+        .map(|c| {
+            let mut id = [0u8; 16];
+            id.copy_from_slice(c);
+            id
+        })
+        .collect();
+
+    signer.verify(&subscribe_signing_bytes(handshake_hash, &ids), &signature)?;
+    Ok((signer, ids))
+}
+
 // ── Sealed-sender inner payload (T5.2.c) ──────────────────────────────────
 //
 // The sealed-sender envelope is the **envelope layer** — opaque bytes
@@ -517,6 +615,46 @@ mod tests {
     use proptest::prelude::*;
 
     // ── Tier 1: inbox ──────────────────────────────────────────────────────
+
+    // ── Signed SUBSCRIBE (HIGH-1) ──────────────────────────────────────────
+
+    #[test]
+    fn signed_subscribe_round_trips() {
+        let signing = SigningKey::generate();
+        let hh = [7u8; 32];
+        let ids = vec![[1u8; 16], [2u8; 16], [3u8; 16]];
+        let payload = encode_signed_subscribe(&signing, &hh, &ids);
+        let (signer, decoded) = decode_signed_subscribe(&payload, &hh).unwrap();
+        assert_eq!(signer, signing.verifying_key());
+        assert_eq!(decoded, ids);
+    }
+
+    #[test]
+    fn signed_subscribe_rejected_under_different_handshake_hash() {
+        // Replay binding: a SUBSCRIBE proof captured on one connection
+        // (handshake hash A) must not verify on another (hash B).
+        let signing = SigningKey::generate();
+        let ids = vec![[9u8; 16]];
+        let payload = encode_signed_subscribe(&signing, &[0xAAu8; 32], &ids);
+        assert!(decode_signed_subscribe(&payload, &[0xBBu8; 32]).is_err());
+    }
+
+    #[test]
+    fn signed_subscribe_rejects_tampered_ids() {
+        let signing = SigningKey::generate();
+        let hh = [5u8; 32];
+        let ids = vec![[1u8; 16]];
+        let mut payload = encode_signed_subscribe(&signing, &hh, &ids);
+        // Flip a byte in the routing-id section (after pk(32)+sig(64)).
+        let last = payload.len() - 1;
+        payload[last] ^= 0x01;
+        assert!(decode_signed_subscribe(&payload, &hh).is_err());
+    }
+
+    #[test]
+    fn signed_subscribe_short_payload_rejected() {
+        assert!(decode_signed_subscribe(&[0u8; 10], &[0u8; 32]).is_err());
+    }
 
     #[test]
     fn inbox_is_deterministic() {

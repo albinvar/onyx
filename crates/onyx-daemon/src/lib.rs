@@ -663,6 +663,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             Zeroizing::new(*state.identity.identity_key().to_bytes());
         let our_kem_bytes: Zeroizing<Vec<u8>> =
             Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
+        // HIGH-1: the Ed25519 signing seed, threaded into each hub task
+        // so it can sign SUBSCRIBE proofs. Same Zeroizing round-trip.
+        let our_signing_bytes: Zeroizing<[u8; 32]> =
+            Zeroizing::new(*state.identity.signing().to_bytes());
 
         for (idx, hub_cfg) in args.hubs.iter().enumerate() {
             let (host, port) = hub_client::parse_host_port(&hub_cfg.onion, ONYX_HS_PORT)
@@ -678,6 +682,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             // task gets its own scrub-on-drop copy of the seed bytes.
             let our_sk_bytes_task = our_sk_bytes.clone();
             let our_kem_bytes_task = our_kem_bytes.clone();
+            let our_signing_bytes_task = our_signing_bytes.clone();
             let mut outbound_rx = hub_tor_rxs.remove(0);
             let host = host.clone();
             let subscribe_intro_inbox_task = args.subscribe_intro_inbox;
@@ -685,6 +690,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
 
             hub_tasks.push(tokio::spawn(async move {
                 let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes_task);
+                let our_signing =
+                    onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes_task);
                 let our_kem = std::sync::Arc::new(
                     onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes_task)
                         .expect("our own KEM secret must round-trip"),
@@ -734,6 +741,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                         port,
                         &hub_pubkey,
                         &our_sk,
+                        &our_signing,
                         &subscriptions,
                         &mut outbound_rx,
                         |target, body| {
@@ -1661,6 +1669,8 @@ fn spawn_tcp_hub_tasks(
     );
     let our_sk_bytes: Zeroizing<[u8; 32]> =
         Zeroizing::new(*state.identity.identity_key().to_bytes());
+    let our_signing_bytes: Zeroizing<[u8; 32]> =
+        Zeroizing::new(*state.identity.signing().to_bytes());
     let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
     for (rel_idx, hub_cfg) in hub_tcp_addrs.iter().enumerate() {
         let hub_pubkey_bytes = decode_b32_32(&hub_cfg.pubkey)
@@ -1669,12 +1679,15 @@ fn spawn_tcp_hub_tasks(
         let addr = hub_cfg.onion.clone();
         let state_for_hub_task = state.clone();
         let our_sk_bytes_task = our_sk_bytes.clone();
+        let our_signing_bytes_task = our_signing_bytes.clone();
         let mut outbound_rx = hub_tcp_rxs.remove(0);
         let absolute_idx = tor_hub_count + rel_idx;
         let span = info_span!("hub-tcp", idx = absolute_idx, addr = %addr);
         tokio::spawn(
             async move {
                 let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes_task);
+                let our_signing =
+                    onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes_task);
                 let state_for_hub_cb = state_for_hub_task.clone();
                 let mut backoff = std::time::Duration::from_millis(500);
                 loop {
@@ -1705,6 +1718,7 @@ fn spawn_tcp_hub_tasks(
                         &addr,
                         &hub_pubkey,
                         &our_sk,
+                        &our_signing,
                         &subscriptions,
                         &mut outbound_rx,
                         |target, body| {
@@ -2227,6 +2241,35 @@ async fn process_hub_mls_welcome(
         );
         return;
     };
+
+    // MEDIUM (audit): inviter authorization. The sealed-sender
+    // envelope is authenticated to `sender_fingerprint` (HIGH-2 binds
+    // it to us as recipient and the inner Ed25519 signature proves the
+    // sender). Require that this authenticated sender is ACTUALLY a
+    // member of the group it just added us to. Without this, anyone
+    // who learns our intro inbox + KEM key could seal us a Welcome to
+    // a group we have no relationship with (unsolicited group-add);
+    // we'd persist state + emit per-epoch tokens for it. Cross-
+    // checking the signer against the freshly-joined roster closes
+    // that: a Welcome whose signer isn't in the group is dropped
+    // before any state is persisted.
+    let signer_in_roster = group.member_signing_keys().iter().any(|pk_bytes| {
+        <[u8; 32]>::try_from(pk_bytes.as_slice()).is_ok_and(|arr| {
+            onyx_core::crypto::Fingerprint::from_bytes(arr).to_string() == sender_fingerprint
+        })
+    });
+    if !signer_in_roster {
+        warn!(
+            sender_fp = %sender_fingerprint,
+            "hub: mls/v1 Welcome signer is not a member of the group it invited us to; \
+             dropping (possible unsolicited group-add)"
+        );
+        // Drop the just-joined group state so it doesn't linger in the
+        // MLS provider's in-memory store (it was never persisted).
+        let party = state.mls_party.lock().await;
+        let _ = party.forget_group(&group.group_id_bytes());
+        return;
+    }
 
     // Persist the post-join MLS state so the group survives a daemon
     // restart.

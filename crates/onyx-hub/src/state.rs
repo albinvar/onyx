@@ -645,6 +645,21 @@ impl HubState {
         self.keypackages.get(routing_id).cloned()
     }
 
+    /// HIGH-1: is `routing_id` a known introduction inbox? True iff a
+    /// KeyPackage has been published there. The KP-publish path
+    /// (`handler.rs::FRAME_KP_PUBLISH`) only accepts a publish whose
+    /// claimed routing id equals `introduction_inbox(fingerprint)` of
+    /// the KP's own signing key, so every entry in the directory is a
+    /// validated introduction inbox. The SUBSCRIBE handler uses this
+    /// to require ownership proof before letting a connection
+    /// subscribe to (and drain) a *known* inbox — closing the
+    /// queue-theft / metadata-leak vector. Ids absent here are treated
+    /// as (high-entropy) session tokens and allowed without proof.
+    #[must_use]
+    pub fn is_known_intro_inbox(&self, routing_id: &RoutingId) -> bool {
+        self.keypackages.contains_key(routing_id)
+    }
+
     /// Diagnostic: number of routing ids that currently hold a
     /// published KeyPackage. Used by tests + future status reporting.
     #[allow(dead_code)]

@@ -24,7 +24,7 @@
 //! as `ApiErrorCode::NotReady`.
 
 use anyhow::Context;
-use onyx_core::crypto::{IdentityPublic, IdentitySecret};
+use onyx_core::crypto::{IdentityPublic, IdentitySecret, SigningKey};
 use onyx_core::routing::RoutingId;
 use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{Session, handshake_initiator, read_frame, write_frame};
@@ -124,6 +124,7 @@ pub async fn run_hub_session<F, Fut>(
     port: u16,
     hub_pubkey: &IdentityPublic,
     our_identity_sk: &IdentitySecret,
+    our_signing: &SigningKey,
     subscribe_to: &[RoutingId],
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     on_deliver: F,
@@ -148,6 +149,8 @@ where
     let mut session = handshake_initiator(&mut stream, our_identity_sk, hub_pubkey)
         .await
         .map_err(|e| anyhow::anyhow!("hub Noise handshake failed: {e}"))?;
+    // HIGH-1: replay-binds the signed SUBSCRIBE proof to this connection.
+    let handshake_hash = session.handshake_hash();
     info!("hub: Noise XK complete; sending SUBSCRIBE");
 
     // T-rotation.a: skip the SUBSCRIBE frame entirely when the
@@ -160,9 +163,15 @@ where
     if subscribe_to.is_empty() {
         info!("hub: nothing to subscribe to (opt-out + no rooms); skipping SUBSCRIBE");
     } else {
-        write_subscribe(&mut stream, &mut session, subscribe_to)
-            .await
-            .map_err(|e| anyhow::anyhow!("hub SUBSCRIBE write failed: {e}"))?;
+        write_subscribe(
+            &mut stream,
+            &mut session,
+            our_signing,
+            &handshake_hash,
+            subscribe_to,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("hub SUBSCRIBE write failed: {e}"))?;
         info!("hub: subscription registered");
     }
 
@@ -177,7 +186,15 @@ where
     }
 
     info!("hub: entering bidirectional loop");
-    serve_session(&mut stream, &mut session, outbound_rx, on_deliver).await
+    serve_session(
+        &mut stream,
+        &mut session,
+        our_signing,
+        &handshake_hash,
+        outbound_rx,
+        on_deliver,
+    )
+    .await
 }
 
 /// **TEST-ONLY** parallel to [`run_hub_session`] that dials the
@@ -195,6 +212,7 @@ pub async fn run_hub_session_tcp<F, Fut>(
     addr: &str,
     hub_pubkey: &IdentityPublic,
     our_identity_sk: &IdentitySecret,
+    our_signing: &SigningKey,
     subscribe_to: &[RoutingId],
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     on_deliver: F,
@@ -217,11 +235,18 @@ where
     let mut session = handshake_initiator(&mut stream, our_identity_sk, hub_pubkey)
         .await
         .map_err(|e| anyhow::anyhow!("hub-tcp Noise handshake failed: {e}"))?;
+    let handshake_hash = session.handshake_hash();
 
     if !subscribe_to.is_empty() {
-        write_subscribe(&mut stream, &mut session, subscribe_to)
-            .await
-            .map_err(|e| anyhow::anyhow!("hub-tcp SUBSCRIBE write failed: {e}"))?;
+        write_subscribe(
+            &mut stream,
+            &mut session,
+            our_signing,
+            &handshake_hash,
+            subscribe_to,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("hub-tcp SUBSCRIBE write failed: {e}"))?;
     }
 
     if let Some(sp) = self_publish {
@@ -231,7 +256,15 @@ where
     }
 
     info!("hub-tcp: entering bidirectional loop");
-    serve_session(&mut stream, &mut session, outbound_rx, on_deliver).await
+    serve_session(
+        &mut stream,
+        &mut session,
+        our_signing,
+        &handshake_hash,
+        outbound_rx,
+        on_deliver,
+    )
+    .await
 }
 
 /// Write one `FRAME_KP_PUBLISH` carrying `routing_id ‖ kp_bytes`.
@@ -293,6 +326,8 @@ where
 async fn write_incremental_subscribe<S>(
     stream: &mut S,
     session: &mut Session,
+    our_signing: &SigningKey,
+    handshake_hash: &[u8; 32],
     ids: &[RoutingId],
 ) -> anyhow::Result<()>
 where
@@ -302,7 +337,7 @@ where
         return Ok(());
     }
     let id_count = ids.len();
-    write_subscribe(stream, session, ids)
+    write_subscribe(stream, session, our_signing, handshake_hash, ids)
         .await
         .map_err(|e| anyhow::anyhow!("hub: incremental SUBSCRIBE write failed: {e}"))?;
     debug!(
@@ -318,15 +353,19 @@ where
 async fn write_subscribe<S>(
     stream: &mut S,
     session: &mut Session,
+    our_signing: &SigningKey,
+    handshake_hash: &[u8; 32],
     subscribe_to: &[RoutingId],
 ) -> onyx_core::error::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut payload = Vec::with_capacity(subscribe_to.len() * 16);
-    for id in subscribe_to {
-        payload.extend_from_slice(id);
-    }
+    // HIGH-1: SUBSCRIBE is signed (signer_pk ‖ sig ‖ ids) with the
+    // signature bound to this connection's Noise handshake hash so the
+    // hub can verify the subscriber owns any introduction inbox it
+    // asks for, and a captured frame can't be replayed elsewhere.
+    let payload =
+        onyx_core::routing::encode_signed_subscribe(our_signing, handshake_hash, subscribe_to);
     write_frame(
         stream,
         session,
@@ -348,9 +387,15 @@ where
 /// are serialised at the API-handler level (see
 /// `handle_fetch_peer_keypackage` in `api_server.rs`) so this loop
 /// only ever has at most one outstanding fetch.
+// One linear select!-loop dispatching every outbound/inbound frame
+// kind inline; the body is just over the 100-line budget. Splitting
+// per-frame helpers would scatter the loop without aiding readability.
+#[allow(clippy::too_many_lines)]
 async fn serve_session<S, F, Fut>(
     stream: &mut S,
     session: &mut Session,
+    our_signing: &SigningKey,
+    handshake_hash: &[u8; 32],
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     mut on_deliver: F,
 ) -> anyhow::Result<()>
@@ -458,7 +503,14 @@ where
                         debug!("hub: outbound KP_FETCH sent");
                     }
                     HubOutbound::Subscribe(ids) => {
-                        write_incremental_subscribe(stream, session, &ids).await?;
+                        write_incremental_subscribe(
+                            stream,
+                            session,
+                            our_signing,
+                            handshake_hash,
+                            &ids,
+                        )
+                        .await?;
                     }
                     HubOutbound::Pad => write_cover_pad(stream, session).await?,
                 }
@@ -544,12 +596,17 @@ mod tests {
                 .await
                 .expect("hub-side handshake");
 
-            // Read SUBSCRIBE.
+            // Read SUBSCRIBE. HIGH-1: the payload is now a signed
+            // envelope (signer_pk ‖ sig ‖ ids); verify it against this
+            // connection's handshake hash and check the decoded ids.
             let sub = read_frame(&mut stream, &mut session)
                 .await
                 .expect("read sub");
             assert_eq!(sub.frame_type, FRAME_SUBSCRIBE);
-            assert_eq!(sub.payload, our_inbox.to_vec());
+            let hub_hh = session.handshake_hash();
+            let (_signer, ids) = onyx_core::routing::decode_signed_subscribe(&sub.payload, &hub_hh)
+                .expect("SUBSCRIBE proof must verify");
+            assert_eq!(ids, vec![our_inbox]);
 
             // Push an inbound DELIVER to the client.
             let mut deliver_payload = Vec::new();
@@ -581,9 +638,17 @@ mod tests {
             onyx_core::transport::handshake_initiator(&mut client_stream, &client_sk, &hub_pk)
                 .await
                 .expect("client handshake");
-        write_subscribe(&mut client_stream, &mut client_session, &[our_inbox])
-            .await
-            .expect("client write subscribe");
+        let client_signing = onyx_core::crypto::SigningKey::generate();
+        let client_hh = client_session.handshake_hash();
+        write_subscribe(
+            &mut client_stream,
+            &mut client_session,
+            &client_signing,
+            &client_hh,
+            &[our_inbox],
+        )
+        .await
+        .expect("client write subscribe");
 
         // Outbound channel pre-populated with one delivery; the
         // session loop will pick it up after handling the inbound one.
@@ -608,6 +673,8 @@ mod tests {
         let session_result = serve_session(
             &mut client_stream,
             &mut client_session,
+            &client_signing,
+            &client_hh,
             &mut out_rx,
             move |target, body| {
                 let observed = observed_clone.clone();

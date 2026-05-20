@@ -6,6 +6,41 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-20 — Security audit fixes (batch 2/2): HIGH-1, Welcome-auth, hybrid combiner + release-pipeline fix
+
+Second batch from the internal multi-agent security review (batch 1 was the same-day commits `0ff2cd5`/`90bbf49`/`bccadad`). These are the larger changes that needed careful, isolated work.
+
+### HIGH-1 — signed SUBSCRIBE with ownership proof (the anonymity-defeating one)
+
+Before: a hub SUBSCRIBE was a bare list of 16-byte routing ids with **zero authentication**. Anyone connected to the hub could subscribe to any id and *destructively drain* its offline queue. The introduction inbox is a deterministic hash of a *public* fingerprint, so a victim's first-contact queue was trivially targetable — message theft + traffic-analysis metadata, defeating the whole point of an anonymity relay.
+
+Fix:
+  * **SUBSCRIBE is now signed**: payload is `signer_pk(32) ‖ Ed25519-sig(64) ‖ ids`, where the signature covers `"onyx/v1/subscribe" ‖ noise_handshake_hash ‖ ids`. Codec lives in `routing.rs` (`encode_signed_subscribe` / `decode_signed_subscribe`).
+  * **Replay-bound to the connection**: the Noise handshake hash (snapshotted into `Session` at handshake completion, exposed via `Session::handshake_hash()`) is unique per connection, so a captured SUBSCRIBE can't be replayed onto another connection.
+  * **Ownership enforced against the KP directory**: the hub rejects a subscription to any routing id it *knows* to be an introduction inbox (`HubState::is_known_intro_inbox` → present in the validated KeyPackage directory) unless `id == introduction_inbox(signer_fingerprint)`. The signing key is threaded through both `run_hub_session` / `run_hub_session_tcp` and the incremental-subscribe path from the daemon's Ed25519 identity.
+
+**Documented residual**: session tokens (Tier-2, per-epoch) are derived from a group-private MLS exporter secret the hub never sees, so the hub *cannot* authenticate them without breaking the unlinkability the two-tier scheme exists to provide. They stay unauthenticated by necessity and rely on 128-bit unguessability. Likewise, an introduction inbox that has *not* had a KeyPackage published is not yet in the directory, so it's treated as a session token until publish (most flows auto-publish on connect, so this is covered in practice).
+
+### MEDIUM — Welcome inviter authorization
+
+A forged sealed-sender Welcome could add a victim to an attacker-controlled group (unsolicited group-add); the victim would persist room state and start emitting per-epoch tokens for it. Fix: after `join_from_welcome`, cross-check the **authenticated sealed-sender signer** (now bound to us as recipient by HIGH-2) against the freshly-joined group's member roster (`MlsGroupState::member_signing_keys`). If the signer isn't actually a member of the group it invited us to, drop it and `forget_group` before any state is persisted.
+
+### MEDIUM — hybrid KEM combiner hardening (defense-in-depth)
+
+`combine_hybrid_secrets` previously bound only the ciphertext halves into the HKDF `info`. Now it also binds the recipient's **static public keys** (X25519 static + ML-KEM encapsulation key) — an X-Wing / PQXDH-style robust combiner, so the combined secret commits to which recipient the encapsulation was for. Not a live exploit (X25519 holds), but it closes the gap between the code and the stated "secure as long as either component is unbroken" goal. Both `encapsulate` (recipient pubkey = `self`) and `decapsulate` (`self.public()`) feed identical bytes.
+
+### Release pipeline fix (why the install one-liner didn't work yet)
+
+The real reason `curl …/releases/latest/…` failed: **no release had ever published.** rc.1 died on the ARM64-Linux cross-compile (fixed earlier); rc.2 then got 3/4 targets built but **sat 8.5 h waiting for a deprecated, scarce `macos-13` Intel runner** — and `sign-and-release` needs every target, so nothing published. Fix: the `x86_64-apple-darwin` build moves to `macos-latest` (Apple-Silicon), cross-compiling via the universal Apple SDK — no dependency on the dead Intel runner.
+
+### Verification
+
+`cargo clippy --workspace --all-targets -D warnings` ✓. `cargo test --workspace` → **465 passed, 0 failed** (+ new tests: signed-SUBSCRIBE codec round-trip / wrong-handshake-rejection / tampered-ids; the two over-the-wire hub SUBSCRIBE tests updated to the signed format — they *hung* under the old unsigned frames, which is exactly the regression the gate caught before push).
+
+Carry-forward still open: cover traffic on idle Tor circuits (biggest remaining anonymity gap), in-memory-only replay guard (resets on restart), and — above all — an **external** security audit. Nothing here is "audited safe"; it's "the code-level findings we could self-identify, fixed."
+
+---
+
 ## 2026-05-19 — T-install (a–c): one-liner installer + Linux ARM64 builds + INSTALL.md
 
 The install path before this change was either `cargo build --release` (assumes a Rust toolchain) or *"download the binary from the GitHub release page, verify it with cosign, drop it on your PATH, deal with the macOS quarantine xattr yourself."* Neither is a "non-developer can install this in 30 seconds" experience.
