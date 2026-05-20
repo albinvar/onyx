@@ -45,9 +45,12 @@
 //!   * `PgUp` / `PgDn`      — scroll the messages pane up / down by 10 lines (T-polish.4).
 //!   * `Home`               — jump to oldest scrollback (T-polish.4).
 //!   * `End`                — snap back to live (T-polish.4).
+//!   * `F1`                 — keyboard help overlay (every binding).
+//!   * `Ctrl-K`             — command palette: fuzzy-run any action.
 //!   * `Ctrl-N`             — open the Create Room modal (T-polish.6).
 //!   * `Ctrl-I`             — open the Invite Peer modal (requires a room selected; T-polish.6).
 //!   * `Ctrl-F`             — open the Send File modal (requires a room selected; T-files.e).
+//!   * `Ctrl-E`             — build + copy (OSC52) this identity's invite link.
 //!   * `Tab` (in modal)     — cycle between input fields.
 //!   * `Space` (in modal)   — toggle the focused checkbox (Send File only).
 //!   * `Enter`              — send composer text / submit active modal.
@@ -100,6 +103,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
+
+use base64::Engine as _;
 
 use crate::client;
 
@@ -175,6 +180,11 @@ struct AppState {
     /// (BLAKE2b-256 content hash truncated to 32 bytes / 52 b32
     /// chars), so no per-conversation namespacing needed.
     seen_files: HashSet<String>,
+    /// UX overhaul: set by the command palette's "Quit" action so the
+    /// modal handler can request app exit without rewiring every
+    /// modal-key return into a quit signal. Checked by `handle_key`
+    /// right after the modal handler runs.
+    quit_requested: bool,
 }
 
 /// T-polish.6: TUI modals for room operations that can't easily
@@ -218,6 +228,73 @@ enum ModalState {
         /// 2 = keep_metadata toggle.
         focus: usize,
     },
+    /// UX overhaul: full keybinding cheat-sheet overlay. Opens on
+    /// `F1`. Any key closes it.
+    Help,
+    /// UX overhaul: fuzzy command palette. Opens on `Ctrl-K`. Type to
+    /// filter the action list; `↑/↓` move the selection; `Enter` runs
+    /// the highlighted action; `Esc` closes.
+    CommandPalette {
+        query: String,
+        selected: usize,
+    },
+    /// UX overhaul: shows this identity's invite URL (built from
+    /// Identity + KeyPackage + configured hubs) and whether it was
+    /// copied to the clipboard via OSC52. Opens on `Ctrl-E`. The URL
+    /// is fetched async when the modal opens.
+    Invite {
+        url: String,
+        copied: bool,
+    },
+}
+
+/// UX overhaul: actions runnable from the command palette (`Ctrl-K`).
+/// Kept as a small enum so the palette list, the fuzzy filter, and the
+/// dispatch all stay in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteAction {
+    CreateRoom,
+    InvitePeer,
+    SendFile,
+    CopyInvite,
+    Help,
+    Quit,
+}
+
+impl PaletteAction {
+    /// All actions, in palette display order.
+    const ALL: [PaletteAction; 6] = [
+        PaletteAction::CreateRoom,
+        PaletteAction::InvitePeer,
+        PaletteAction::SendFile,
+        PaletteAction::CopyInvite,
+        PaletteAction::Help,
+        PaletteAction::Quit,
+    ];
+
+    /// Human label shown in the palette.
+    fn label(self) -> &'static str {
+        match self {
+            PaletteAction::CreateRoom => "Create room",
+            PaletteAction::InvitePeer => "Invite peer to room",
+            PaletteAction::SendFile => "Send file to room",
+            PaletteAction::CopyInvite => "Copy my invite link",
+            PaletteAction::Help => "Show keyboard help",
+            PaletteAction::Quit => "Quit Onyx",
+        }
+    }
+
+    /// The keybinding hint shown on the right of the palette row.
+    fn key_hint(self) -> &'static str {
+        match self {
+            PaletteAction::CreateRoom => "^N",
+            PaletteAction::InvitePeer => "^I",
+            PaletteAction::SendFile => "^F",
+            PaletteAction::CopyInvite => "^E",
+            PaletteAction::Help => "F1",
+            PaletteAction::Quit => "^C",
+        }
+    }
 }
 
 /// What the current selection refers to (T6.3.f.2). `Peer` drives
@@ -281,6 +358,7 @@ impl AppState {
             last_activity_ms: HashMap::new(),
             modal: None,
             seen_files: HashSet::new(),
+            quit_requested: false,
         }
     }
 
@@ -558,7 +636,9 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
     // the active field).
     if app.modal.is_some() {
         handle_modal_key(app, key).await;
-        return false;
+        // The command palette's Quit action sets this; everything
+        // else leaves it false.
+        return app.quit_requested;
     }
 
     match (key.code, key.modifiers) {
@@ -604,6 +684,24 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             } else {
                 app.last_send_result = Some(Err("send-file needs a room selected".to_string()));
             }
+            return false;
+        }
+        // UX overhaul: F1 opens the keybinding help overlay.
+        (KeyCode::F(1), _) => {
+            app.modal = Some(ModalState::Help);
+            return false;
+        }
+        // UX overhaul: Ctrl-K opens the fuzzy command palette.
+        (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(ModalState::CommandPalette {
+                query: String::new(),
+                selected: 0,
+            });
+            return false;
+        }
+        // UX overhaul: Ctrl-E builds + shows + copies the invite link.
+        (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+            open_invite_modal(app).await;
             return false;
         }
         (KeyCode::Esc, _) => return true,
@@ -663,8 +761,45 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
     };
     let submit_intent: Option<ModalState>;
     match (&mut modal, key.code) {
-        (_, KeyCode::Esc) => {
-            // Close without submitting.
+        // Esc closes any modal without submitting. Help + Invite are
+        // read-only overlays, so ANY key dismisses them too.
+        (_, KeyCode::Esc) | (ModalState::Help | ModalState::Invite { .. }, _) => {
+            return;
+        }
+        // UX overhaul: command palette navigation + filtering.
+        (ModalState::CommandPalette { selected, .. }, KeyCode::Up) => {
+            *selected = selected.saturating_sub(1);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::CommandPalette { query, selected }, KeyCode::Down) => {
+            let n = palette_filter(query).len();
+            if n > 0 {
+                *selected = (*selected + 1).min(n - 1);
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::CommandPalette { query, selected }, KeyCode::Backspace) => {
+            query.pop();
+            *selected = 0;
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::CommandPalette { query, selected }, KeyCode::Enter) => {
+            let action = palette_filter(query).get(*selected).copied();
+            // Modal consumed (not put back). Running the action either
+            // opens the relevant modal, performs the action, or (Quit)
+            // sets app.quit_requested.
+            if let Some(a) = action {
+                run_palette_action(app, a).await;
+            }
+            return;
+        }
+        (ModalState::CommandPalette { query, selected }, KeyCode::Char(c)) => {
+            query.push(c);
+            *selected = 0;
+            app.modal = Some(modal);
             return;
         }
         (ModalState::CreateRoom { name }, KeyCode::Enter) => {
@@ -824,6 +959,11 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 keep_filename,
                 keep_metadata,
             }),
+            // Help / CommandPalette / Invite never set submit_intent
+            // (they're handled inline above), so they can't reach here.
+            ModalState::Help | ModalState::CommandPalette { .. } | ModalState::Invite { .. } => {
+                None
+            }
         };
         if let Some(req) = req {
             match client::one_shot(&app.socket_path, &req).await {
@@ -894,6 +1034,117 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             }
         }
     }
+}
+
+/// UX overhaul: filter the palette actions by a case-insensitive
+/// substring of the action label. Empty query → all actions.
+fn palette_filter(query: &str) -> Vec<PaletteAction> {
+    let q = query.trim().to_lowercase();
+    PaletteAction::ALL
+        .into_iter()
+        .filter(|a| q.is_empty() || a.label().to_lowercase().contains(&q))
+        .collect()
+}
+
+/// UX overhaul: run a command-palette action. Opens the relevant
+/// modal, performs the action, or (Quit) sets `app.quit_requested`.
+async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
+    match action {
+        PaletteAction::CreateRoom => {
+            app.modal = Some(ModalState::CreateRoom {
+                name: String::new(),
+            });
+        }
+        PaletteAction::InvitePeer => {
+            if let Some(SelectedEntry::Room(r)) = app.selected_entry() {
+                app.modal = Some(ModalState::InvitePeer {
+                    group_id_b32: r.group_id_b32.clone(),
+                    fingerprint: String::new(),
+                    kem_pub_b32: String::new(),
+                    kp_b64: String::new(),
+                    focus: 0,
+                });
+            } else {
+                app.last_send_result = Some(Err("invite-peer needs a room selected".to_string()));
+            }
+        }
+        PaletteAction::SendFile => {
+            if let Some(SelectedEntry::Room(r)) = app.selected_entry() {
+                app.modal = Some(ModalState::SendFile {
+                    group_id_b32: r.group_id_b32.clone(),
+                    path: String::new(),
+                    keep_filename: false,
+                    keep_metadata: false,
+                    focus: 0,
+                });
+            } else {
+                app.last_send_result = Some(Err("send-file needs a room selected".to_string()));
+            }
+        }
+        PaletteAction::CopyInvite => open_invite_modal(app).await,
+        PaletteAction::Help => app.modal = Some(ModalState::Help),
+        PaletteAction::Quit => app.quit_requested = true,
+    }
+}
+
+/// UX overhaul: build this identity's invite URL, copy it to the
+/// system clipboard (OSC52), and open the Invite modal showing the
+/// URL + whether the copy succeeded.
+async fn open_invite_modal(app: &mut AppState) {
+    match build_invite_url(&app.socket_path).await {
+        Ok(url) => {
+            let copied = osc52_copy(&url).is_ok();
+            app.modal = Some(ModalState::Invite { url, copied });
+        }
+        Err(e) => {
+            app.last_send_result = Some(Err(format!("invite: {e:#}")));
+        }
+    }
+}
+
+/// UX overhaul: assemble an `onyx://invite/v1?…` URL from the daemon's
+/// Identity + a fresh KeyPackage + the configured hub list — the same
+/// bundle `onyx invite --with-kp --with-hubs` produces on the CLI.
+async fn build_invite_url(socket: &Path) -> anyhow::Result<String> {
+    let id = client::one_shot(socket, &ApiRequest::Identity).await?;
+    let (fingerprint, kem, hubs) = match id {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            hubs,
+            ..
+        } => (fingerprint, identity_kem_pub_b32, hubs),
+        other => anyhow::bail!("unexpected Identity response: {other:?}"),
+    };
+    let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
+    let kp = client::one_shot(socket, &ApiRequest::ExportKeyPackage).await?;
+    let mut invite = match kp {
+        ApiResponse::ExportKeyPackageOk { kp_b64 } => {
+            let kp_bytes = base64::engine::general_purpose::STANDARD.decode(kp_b64)?;
+            onyx_core::invite::Invite::with_key_package(fp, kem, kp_bytes)
+        }
+        // No KP available → fall back to a PFS-only (msg/v1) invite.
+        _ => onyx_core::invite::Invite::new(fp, kem),
+    };
+    if !hubs.is_empty() {
+        invite = invite.with_hubs(hubs);
+    }
+    Ok(invite.to_url())
+}
+
+/// UX overhaul: copy `text` to the terminal's clipboard via the OSC52
+/// escape sequence. Works over SSH and inside the alternate screen on
+/// terminals that support it (iTerm2, kitty, wezterm, modern xterm,
+/// tmux with `set -g set-clipboard on`). On terminals that don't, the
+/// sequence is silently ignored — the Invite modal still shows the URL
+/// for manual selection, so this is best-effort.
+fn osc52_copy(text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{b64}\x07");
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())?;
+    out.flush()
 }
 
 async fn send_composer(app: &mut AppState) {
@@ -1313,6 +1564,11 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::CreateRoom { .. } => 7,
         ModalState::InvitePeer { .. } => 17,
         ModalState::SendFile { .. } => 13,
+        ModalState::Help => 18,
+        ModalState::CommandPalette { .. } => {
+            u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
+        }
+        ModalState::Invite { .. } => 11,
     };
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -1481,7 +1737,162 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             .block(block);
             frame.render_widget(body, rect);
         }
+        ModalState::Help => render_help_modal(frame, rect),
+        ModalState::CommandPalette { query, selected } => {
+            render_palette_modal(frame, rect, query, *selected);
+        }
+        ModalState::Invite { url, copied } => render_invite_modal(frame, rect, url, *copied),
     }
+}
+
+/// UX overhaul: keybinding cheat-sheet overlay (F1). Two columns of
+/// `key — action` rows, grouped.
+fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Keyboard Help  (any key to close) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let key = |k: &str, d: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(
+                format!("  {k:<10}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(d.to_string(), Style::default().fg(Color::White)),
+        ])
+    };
+    let head = |t: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            format!(" {t}"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let body = Paragraph::new(vec![
+        head("Navigation"),
+        key("↑ / ↓", "move between conversations"),
+        key("PgUp/PgDn", "scroll messages · Home/End jump"),
+        key("Enter", "send the composed message"),
+        Line::from(""),
+        head("Actions"),
+        key("Ctrl-K", "command palette (run anything)"),
+        key("Ctrl-N", "create a room / channel"),
+        key("Ctrl-I", "invite a peer to the selected room"),
+        key("Ctrl-F", "send a file to the selected room"),
+        key("Ctrl-E", "copy my invite link to clipboard"),
+        Line::from(""),
+        head("General"),
+        key("F1", "this help · Esc/any key closes overlays"),
+        key("Ctrl-C / Esc", "quit Onyx"),
+    ])
+    .block(block);
+    frame.render_widget(body, rect);
+}
+
+/// UX overhaul: fuzzy command palette (Ctrl-K).
+fn render_palette_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, query: &str, selected: usize) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Command Palette  (type to filter · ↑↓ · Enter · Esc) ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let matches = palette_filter(query);
+    let mut lines: Vec<Line> = Vec::with_capacity(matches.len() + 2);
+    lines.push(Line::from(vec![
+        Span::styled(" ▸ ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            query.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+    ]));
+    lines.push(Line::from(""));
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no matching command)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (i, action) in matches.iter().enumerate() {
+        let sel = i == selected;
+        let marker = if sel { "▶ " } else { "  " };
+        let row_style = if sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}{:<28}", action.label()), row_style),
+            Span::styled(
+                action.key_hint().to_string(),
+                Style::default().fg(if sel { Color::Black } else { Color::DarkGray }),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// UX overhaul: invite-link overlay (Ctrl-E). Shows the URL and
+/// whether it was copied to the clipboard.
+fn render_invite_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, url: &str, copied: bool) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(
+            " Your Invite Link  (any key to close) ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let status = if copied {
+        Line::from(Span::styled(
+            " ✓ copied to clipboard (OSC52)",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            " ⚠ clipboard copy unavailable — select the text below to copy",
+            Style::default().fg(Color::Yellow),
+        ))
+    };
+    let body = Paragraph::new(vec![
+        Line::from(""),
+        status,
+        Line::from(""),
+        Line::from(Span::styled(
+            url.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Share this with a friend; they run `onyx accept <url>`.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .block(block)
+    .wrap(Wrap { trim: false });
+    frame.render_widget(body, rect);
 }
 
 /// Truncate `s` for display in the modal — long base32/base64 fields
@@ -1766,14 +2177,33 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     format!("v{}", s.daemon_version),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(
-                    "  ·  ↑↓ peer · Enter send · Esc quit",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::raw("   "),
+                // UX overhaul: colored, always-visible keybind hints.
+                kb("F1"),
+                Span::styled("help ", Style::default().fg(Color::Gray)),
+                kb("^K"),
+                Span::styled("palette ", Style::default().fg(Color::Gray)),
+                kb("^N"),
+                Span::styled("room ", Style::default().fg(Color::Gray)),
+                kb("^F"),
+                Span::styled("file ", Style::default().fg(Color::Gray)),
+                kb("^E"),
+                Span::styled("invite", Style::default().fg(Color::Gray)),
             ])
         }
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// UX overhaul: render a keybinding chip for the footer (bold yellow
+/// key + trailing space).
+fn kb(key: &str) -> Span<'static> {
+    Span::styled(
+        format!("{key} "),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn short_id(s: &str) -> String {
