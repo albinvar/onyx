@@ -83,6 +83,23 @@ pub type ConnId = u64;
 /// the hub buffer unbounded data on their behalf.
 pub const PER_CONN_MAILBOX: usize = 64;
 
+/// Max number of queued envelopes the hub will hold for a single
+/// routing id (offline queue depth). A client delivering to an id
+/// with no live subscriber accumulates here; without a cap a hostile
+/// client could push unbounded entries to one id. Beyond this depth,
+/// further envelopes for that id are dropped (the recipient still
+/// gets the first `MAX_QUEUE_DEPTH_PER_ID`).
+pub const MAX_QUEUE_DEPTH_PER_ID: usize = 1024;
+
+/// Global cap on total bytes the hub will hold across ALL in-memory
+/// offline queues. The real DoS vector (audit MEDIUM) is a client
+/// delivering to many DISTINCT routing ids, each below the per-id
+/// depth cap but together unbounded. This ceiling bounds aggregate
+/// memory regardless of how the entries are spread across ids. At the
+/// ceiling, new enqueues are dropped until drains (subscribe) free
+/// space. 256 MiB is generous for a relay and still bounded.
+pub const MAX_TOTAL_QUEUED_BYTES: usize = 256 * 1024 * 1024;
+
 /// All the mutable state the hub keeps.
 ///
 /// **Persistence (T8.0):** `queues` and `keypackages` are write-through-
@@ -143,6 +160,12 @@ pub struct HubState {
     /// Queue-gossip policy (T8.3.c). Default `Lazy`. See
     /// [`GossipMode`] for the tradeoff.
     gossip_mode: GossipMode,
+    /// Running total of bytes held across all in-memory offline
+    /// queues (audit MEDIUM: bound aggregate queue memory). Maintained
+    /// at every site that mutates `queues`: incremented on enqueue,
+    /// decremented on drain, seeded on store-warming. Enforced against
+    /// [`MAX_TOTAL_QUEUED_BYTES`] in [`Self::enqueue_in_memory`].
+    queued_bytes: usize,
 }
 
 impl HubState {
@@ -164,8 +187,10 @@ impl HubState {
         for (rid, kp) in store.load_all_keypackages()? {
             me.keypackages.insert(rid, kp);
         }
-        // Warm the queue cache.
+        // Warm the queue cache, seeding the byte accounting so the
+        // global cap stays accurate across restarts.
         for (rid, payloads) in store.load_all_queues()? {
+            me.queued_bytes += payloads.iter().map(Vec::len).sum::<usize>();
             me.queues.insert(rid, payloads);
         }
         me.durable_store = Some(store);
@@ -375,6 +400,9 @@ impl HubState {
         for id in ids {
             self.subscribers.entry(*id).or_default().insert(conn);
             if let Some(q) = self.queues.remove(id) {
+                // Draining frees the bytes from the global accounting.
+                let freed: usize = q.iter().map(Vec::len).sum();
+                self.queued_bytes = self.queued_bytes.saturating_sub(freed);
                 drained.extend(q);
                 if let Some(store) = &mut self.durable_store {
                     // Best-effort: if the disk write fails, the
@@ -403,8 +431,7 @@ impl HubState {
         let subs = match self.subscribers.get(&target) {
             Some(s) if !s.is_empty() => s.clone(),
             _ => {
-                self.enqueue_durable(target, &payload);
-                self.queues.entry(target).or_default().push(payload);
+                self.enqueue_offline(target, payload);
                 return 0;
             }
         };
@@ -425,10 +452,48 @@ impl HubState {
         // full or closed), queue it instead. This keeps the
         // promise that a slow client doesn't lose messages.
         if delivered == 0 {
-            self.enqueue_durable(target, &payload);
-            self.queues.entry(target).or_default().push(payload);
+            self.enqueue_offline(target, payload);
         }
         delivered
+    }
+
+    /// Enqueue `payload` to the offline queue for `target`, enforcing
+    /// the depth + global-bytes caps (audit MEDIUM). Writes through to
+    /// the durable store only when the in-memory enqueue is accepted,
+    /// so the two stay consistent. Dropped (over-cap) envelopes are
+    /// logged at `warn!` and silently lost — same delivery contract as
+    /// the existing "every subscriber was full" path, just bounded.
+    fn enqueue_offline(&mut self, target: RoutingId, payload: Vec<u8>) {
+        if !self.can_enqueue(target, payload.len()) {
+            return;
+        }
+        // Write through to disk first (borrow), then take ownership
+        // into the in-memory queue and update the byte accounting.
+        self.enqueue_durable(target, &payload);
+        self.queued_bytes += payload.len();
+        self.queues.entry(target).or_default().push(payload);
+    }
+
+    /// Whether an envelope of `len` bytes may be queued for `target`
+    /// without breaching the per-id depth cap or the global byte cap
+    /// (audit MEDIUM). Logs the reason at `warn!` on refusal.
+    fn can_enqueue(&self, target: RoutingId, len: usize) -> bool {
+        let depth = self.queues.get(&target).map_or(0, Vec::len);
+        if depth >= MAX_QUEUE_DEPTH_PER_ID {
+            warn!(
+                target_prefix = format!("{:02x}{:02x}", target[0], target[1]),
+                depth, "hub: offline queue at per-id depth cap; dropping envelope"
+            );
+            return false;
+        }
+        if self.queued_bytes.saturating_add(len) > MAX_TOTAL_QUEUED_BYTES {
+            warn!(
+                queued_bytes = self.queued_bytes,
+                "hub: total offline-queue byte cap reached; dropping envelope"
+            );
+            return false;
+        }
+        true
     }
 
     /// Best-effort write-through enqueue to the durable store, if
@@ -657,6 +722,40 @@ mod tests {
         // drained items; the handler is responsible for flushing them
         // to the wire. (No live delivery while we subscribed.)
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn offline_queue_enforces_per_id_depth_cap() {
+        // audit MEDIUM: a client delivering to an unsubscribed id must
+        // not grow the queue without bound.
+        let mut state = HubState::new();
+        let id: RoutingId = [2u8; 16];
+        for _ in 0..(MAX_QUEUE_DEPTH_PER_ID + 50) {
+            state.deliver(id, b"x".to_vec());
+        }
+        assert_eq!(
+            state.queue_len(&id),
+            MAX_QUEUE_DEPTH_PER_ID,
+            "queue depth must be clamped at the per-id cap"
+        );
+    }
+
+    #[test]
+    fn offline_queue_byte_accounting_frees_on_drain() {
+        // The global byte counter must go back down when a subscriber
+        // drains a queue, so a long-running hub doesn't leak its
+        // budget and wrongly start dropping.
+        let mut state = HubState::new();
+        let id: RoutingId = [3u8; 16];
+        for _ in 0..10 {
+            state.deliver(id, vec![0u8; 1000]);
+        }
+        assert_eq!(state.queued_bytes, 10_000);
+        let (tx, _rx) = mpsc::channel(8);
+        let conn = state.register_conn(tx);
+        let drained = state.subscribe(conn, &[id]);
+        assert_eq!(drained.len(), 10);
+        assert_eq!(state.queued_bytes, 0, "draining must free the byte budget");
     }
 
     #[tokio::test]

@@ -348,6 +348,20 @@ pub struct FilesConfig {
     /// Where received files land on disk (§4 row 6). Default
     /// `<data_dir>/files/`.
     pub storage_dir: PathBuf,
+    /// Audit MEDIUM: global cap on bytes reserved across ALL in-flight
+    /// receive transfers (every peer, every file). The per-peer
+    /// inflight count cap and per-file size cap together still allow
+    /// `N_peers × 10 × 50 MB`, which is unbounded in the number of
+    /// distinct sender identities. This ceiling bounds aggregate
+    /// reassembly memory regardless of identity count: a new FileMeta
+    /// whose declared size would push total reserved over this is
+    /// rejected. Default 256 MiB.
+    pub max_inflight_total_bytes: u64,
+    /// Audit MEDIUM: a transfer that hasn't completed within this many
+    /// milliseconds of its first `FileMeta` is reaped (its buffered
+    /// chunks dropped, its budget freed). Closes the "send all-but-one
+    /// chunk and stall forever" memory-pin. Default 10 minutes.
+    pub inflight_deadline_ms: i64,
 }
 
 impl FilesConfig {
@@ -360,6 +374,8 @@ impl FilesConfig {
             max_recv_per_day_bytes: 500 * 1024 * 1024,
             chunk_size_bytes: 12 * 1024,
             storage_dir: data_dir.join("files"),
+            max_inflight_total_bytes: 256 * 1024 * 1024,
+            inflight_deadline_ms: 10 * 60 * 1000,
         }
     }
 }

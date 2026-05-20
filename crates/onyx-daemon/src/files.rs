@@ -57,6 +57,10 @@ pub enum AcceptDecision {
     /// FileMeta is internally inconsistent (e.g. chunks * chunk_size
     /// doesn't bracket size, or fields beyond u32 bounds). Drop.
     RejectMalformed,
+    /// Accepting this transfer would push total reserved in-flight
+    /// bytes (across ALL peers) over `max_inflight_total_bytes`
+    /// (audit MEDIUM global memory budget).
+    RejectInflightBudget,
 }
 
 /// T-files.b: 24h window for the per-peer per-day quota.
@@ -118,6 +122,22 @@ pub async fn accept_file_meta(
     id_arr.copy_from_slice(meta_id);
     {
         let mut inflight = state.inflight_files.lock().await;
+
+        // Audit MEDIUM: reap stalled transfers, then enforce the
+        // global byte budget. Extracted into a pure helper so the
+        // accounting is unit-testable without a full DaemonState.
+        if !reap_and_check_budget(
+            &mut inflight,
+            sender_fp,
+            &id_arr,
+            size,
+            now_ms,
+            cfg.inflight_deadline_ms,
+            cfg.max_inflight_total_bytes,
+        ) {
+            return AcceptDecision::RejectInflightBudget;
+        }
+
         let per_peer = inflight.entry(sender_fp.to_string()).or_default();
         if per_peer.len() >= FILES_MAX_INFLIGHT_PER_PEER && !per_peer.contains_key(&id_arr) {
             return AcceptDecision::RejectInflightCap;
@@ -138,6 +158,54 @@ pub async fn accept_file_meta(
         );
     }
     AcceptDecision::Accepted
+}
+
+/// Audit MEDIUM: reap stalled in-flight transfers, then decide
+/// whether a new transfer of `size` bytes may be admitted under the
+/// global byte budget. Pure function over the in-flight map so it can
+/// be unit-tested without a `DaemonState`.
+///
+/// 1. Drops every transfer whose first `FileMeta` is older than
+///    `deadline_ms` (frees the memory + budget a stalled "send all
+///    chunks but the last, forever" attacker would otherwise pin),
+///    then prunes now-empty per-peer maps.
+/// 2. Reserves by declared `size`: since buffered bytes never exceed
+///    the sum of reserved sizes, capping the reserved sum bounds total
+///    reassembly memory regardless of how many distinct sender
+///    identities appear. Re-sent `FileMeta` for an already-tracked
+///    `(sender_fp, new_id)` is admitted without re-charging budget.
+///
+/// Returns `true` if the transfer may be admitted, `false` if it
+/// would breach `max_total_bytes`.
+fn reap_and_check_budget(
+    inflight: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<[u8; 16], InflightFile>,
+    >,
+    sender_fp: &str,
+    new_id: &[u8; 16],
+    size: u64,
+    now_ms: i64,
+    deadline_ms: i64,
+    max_total_bytes: u64,
+) -> bool {
+    for per_peer in inflight.values_mut() {
+        per_peer.retain(|_, f| now_ms.saturating_sub(f.started_at_ms) < deadline_ms);
+    }
+    inflight.retain(|_, per_peer| !per_peer.is_empty());
+
+    let already_present = inflight
+        .get(sender_fp)
+        .is_some_and(|p| p.contains_key(new_id));
+    if already_present {
+        return true;
+    }
+    let reserved: u64 = inflight
+        .values()
+        .flat_map(std::collections::HashMap::values)
+        .map(|f| f.size)
+        .sum();
+    reserved.saturating_add(size) <= max_total_bytes
 }
 
 /// T-files.b: insert a `FileChunk` into the in-flight buffer.
@@ -694,6 +762,106 @@ mod tests {
             sanitize_filename("with spaces and 漢字"),
             "with_spaces_and___"
         );
+    }
+
+    fn inflight_entry(size: u64, started_at_ms: i64) -> InflightFile {
+        InflightFile {
+            conversation: "room/abcdefgh".into(),
+            name: "f".into(),
+            mime: "application/octet-stream".into(),
+            size,
+            chunks: 1,
+            chunk_size: size.max(1) as u32,
+            content_hash: vec![0u8; 32],
+            received: HashMap::new(),
+            started_at_ms,
+        }
+    }
+
+    #[test]
+    fn budget_admits_under_cap_and_rejects_over() {
+        let mut inflight: std::collections::HashMap<
+            String,
+            std::collections::HashMap<[u8; 16], InflightFile>,
+        > = std::collections::HashMap::new();
+        // One existing 100-byte transfer.
+        inflight
+            .entry("peerA".into())
+            .or_default()
+            .insert([1u8; 16], inflight_entry(100, 1000));
+
+        // A new 50-byte transfer fits under a 200-byte cap.
+        assert!(reap_and_check_budget(
+            &mut inflight,
+            "peerB",
+            &[2u8; 16],
+            50,
+            2000,
+            60_000,
+            200
+        ));
+        // A new 150-byte transfer would push reserved (100+150) over 200.
+        assert!(!reap_and_check_budget(
+            &mut inflight,
+            "peerB",
+            &[3u8; 16],
+            150,
+            2000,
+            60_000,
+            200
+        ));
+    }
+
+    #[test]
+    fn reaper_frees_budget_from_stalled_transfers() {
+        let mut inflight: std::collections::HashMap<
+            String,
+            std::collections::HashMap<[u8; 16], InflightFile>,
+        > = std::collections::HashMap::new();
+        // A 200-byte transfer started long ago (stalled).
+        inflight
+            .entry("peerA".into())
+            .or_default()
+            .insert([1u8; 16], inflight_entry(200, 0));
+
+        // now = 100_000, deadline = 60_000 → the stalled transfer is
+        // reaped, freeing its 200 bytes, so a new 200-byte transfer
+        // fits under a 200-byte cap.
+        assert!(reap_and_check_budget(
+            &mut inflight,
+            "peerB",
+            &[2u8; 16],
+            200,
+            100_000,
+            60_000,
+            200
+        ));
+        // The stalled entry's peer map was pruned.
+        assert!(!inflight.contains_key("peerA"));
+    }
+
+    #[test]
+    fn resent_meta_for_tracked_id_is_admitted_without_recharge() {
+        let mut inflight: std::collections::HashMap<
+            String,
+            std::collections::HashMap<[u8; 16], InflightFile>,
+        > = std::collections::HashMap::new();
+        // Reserve right up to the cap.
+        inflight
+            .entry("peerA".into())
+            .or_default()
+            .insert([9u8; 16], inflight_entry(200, 1000));
+        // A re-sent FileMeta for the SAME (peer,id) is admitted even
+        // though reserved == cap (no double-charge).
+        assert!(reap_and_check_budget(
+            &mut inflight,
+            "peerA",
+            &[9u8; 16],
+            200,
+            2000,
+            60_000,
+            200
+        ));
     }
 
     #[test]
