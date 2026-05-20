@@ -152,15 +152,25 @@ resolve_version() {
     esac
     return
   fi
+  # Resolve the latest release tag from the GitHub API's
+  # `releases/latest` endpoint, which returns the most recent
+  # published (non-prerelease, non-draft) release. We parse
+  # `"tag_name": "vX.Y.Z"` with grep+sed (no jq dependency).
+  #
+  # An earlier version parsed the `/releases/latest` *browser*
+  # redirect for `/tag/<v>`, but GitHub doesn't always redirect there
+  # (it fell back to the releases-list page, yielding a garbage
+  # "version" = the whole URL and a broken download path). The API's
+  # tag_name is the reliable source.
   local tag
-  # GitHub redirects the /releases/latest browser URL to /releases/tag/<tag>;
-  # follow the redirect and pluck the tag from the final URL, since this
-  # avoids needing jq.
-  tag="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
-        "https://github.com/${ONYX_REPO}/releases/latest" 2>/dev/null \
-        | sed -E 's|.*/tag/(.+)$|\1|')"
-  if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
-    die "could not resolve latest release for ${ONYX_REPO} — has v0.1.0+ been tagged? Pin a version: ONYX_VERSION=v0.1.0 $0"
+  tag="$(curl -fsSL "https://api.github.com/repos/${ONYX_REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+  # Sanity-check the shape: a real tag starts with a digit or `v`.
+  # Anything else (empty, an HTML error body, a stray URL) is a
+  # resolution failure, not a usable version.
+  if ! printf '%s' "$tag" | grep -qE '^v?[0-9]'; then
+    die "could not resolve latest release for ${ONYX_REPO} — has a non-prerelease vX.Y.Z been published? Pin a version: ONYX_VERSION=v0.1.0 $0"
   fi
   echo "$tag"
 }
