@@ -48,31 +48,29 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             ext: ''
-            cross: false
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            # Build natively on an ARM runner instead of cross-compiling.
+            # The Arti dep stack pulls in ring / aws-lc-sys, whose build
+            # scripts compile target C code; cross-compiling needs a full
+            # cross C toolchain (CC_<target>, AR_<target>, sysroot), not
+            # just the linker. A native aarch64 runner sidesteps the whole
+            # class of cross-compile breakage — ring/aws-lc compile with
+            # the host toolchain because the host IS the target.
+            # ubuntu-24.04-arm is free for public repositories.
+            runner: ubuntu-24.04-arm
             ext: ''
-            cross: true   # cross-compile via gcc-aarch64-linux-gnu
           - target: aarch64-apple-darwin
             runner: macos-latest
             ext: ''
-            cross: false
           - target: x86_64-apple-darwin
             runner: macos-13
             ext: ''
-            cross: false
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         run: |
           rustup target add ${{ matrix.target }}
-
-      - name: Install cross-compile toolchain (Linux aarch64)
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
 
@@ -87,12 +85,11 @@ jobs:
             --remap-path-prefix ${{ github.workspace }}=/onyx
             --remap-path-prefix ${HOME}/.cargo=/cargo
             -C link-arg=-s
-          # Cross-compile linker for aarch64-unknown-linux-gnu. Cargo
-          # reads CARGO_TARGET_<TARGET>_LINKER for the per-target linker.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           # --locked: refuse to update Cargo.lock; same dep set as
-          # committed. --release: optimized + stripped.
+          # committed. --release: optimized + stripped. Every target
+          # builds natively on its own runner (no cross-compilation),
+          # so no per-target linker/CC env is needed.
           cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip + rename binaries
