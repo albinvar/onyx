@@ -217,6 +217,15 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          # Any tag with a SemVer pre-release suffix (a hyphen — e.g.
+          # v0.1.0-rc.1, v0.1.0-beta) is marked as a GitHub pre-release.
+          # CRITICAL: pre-releases are excluded from `/releases/latest`,
+          # so the live install one-liner
+          # (`.../releases/latest/download/install.sh`) keeps pointing at
+          # the last STABLE release and never auto-upgrades users onto an
+          # untested RC. A clean `vX.Y.Z` tag (no hyphen) is a full
+          # release and does become `latest`.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/onyx-*
             dist/onyxd-*
