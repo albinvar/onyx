@@ -113,6 +113,14 @@ struct Args {
     #[arg(long = "hub", action = clap::ArgAction::Append, global = true)]
     hubs: Vec<String>,
 
+    /// **TEST-ONLY** local-TCP hub, mirroring `--hub` but over plain
+    /// TCP instead of Tor (pairs with `onyx-hub --listen-tcp`). No
+    /// Tor, no anonymity — for local rooms/files testing without
+    /// standing up onion services. Format: `--hub-tcp 127.0.0.1:7100,b32pubkey`.
+    /// Repeatable. Loudly warned by the daemon at startup.
+    #[arg(long = "hub-tcp", action = clap::ArgAction::Append, global = true)]
+    hub_tcp: Vec<String>,
+
     /// **Opt-in.** Mean interval (in seconds) between cover-traffic
     /// PAD frames on each configured hub. When set, the embedded
     /// daemon publishes a sealed-sender-indistinguishable FRAME_PAD
@@ -466,7 +474,10 @@ async fn main() -> ExitCode {
                 .open(&log_path)
             {
                 Ok(file) => {
-                    eprintln!("onyx: logs → {} (TUI owns the terminal)", log_path.display());
+                    eprintln!(
+                        "onyx: logs → {} (TUI owns the terminal)",
+                        log_path.display()
+                    );
                     tracing_subscriber::fmt()
                         .with_env_filter(env_filter)
                         .with_ansi(false)
@@ -474,7 +485,10 @@ async fn main() -> ExitCode {
                         .init();
                 }
                 Err(e) => {
-                    eprintln!("onyx: could not open log file {} ({e}); logging to stderr", log_path.display());
+                    eprintln!(
+                        "onyx: could not open log file {} ({e}); logging to stderr",
+                        log_path.display()
+                    );
                     tracing_subscriber::fmt()
                         .with_env_filter(env_filter)
                         .with_writer(std::io::stderr)
@@ -524,23 +538,39 @@ fn build_daemon_config(
             pubkey: pubkey.to_string(),
         });
     }
+    // TEST-ONLY: parse repeatable --hub-tcp "addr,b32pubkey" the same
+    // way, into hub_tcp_addrs. Mirrors --hub but the daemon dials it
+    // over plain TCP (no Tor). Pairs with `onyx-hub --listen-tcp`.
+    let mut hub_tcp_addrs: Vec<onyx_daemon::HubConfig> = Vec::new();
+    for raw in &args.hub_tcp {
+        let (addr, pubkey) = raw.split_once(',').ok_or_else(|| {
+            anyhow::anyhow!("--hub-tcp value must be `addr,b32pubkey` (missing comma): {raw}")
+        })?;
+        if addr.is_empty() || pubkey.is_empty() {
+            anyhow::bail!("--hub-tcp value has empty field: {raw}");
+        }
+        hub_tcp_addrs.push(onyx_daemon::HubConfig {
+            onion: addr.to_string(),
+            pubkey: pubkey.to_string(),
+        });
+    }
     Ok(onyx_daemon::Config {
         vault: args
             .vault
             .clone()
             .unwrap_or_else(onyx_daemon::default_vault_path),
         passphrase: zeroize::Zeroizing::new(passphrase),
-        no_tor: args.listen_tcp.is_some() || args.dial_tcp.is_some(),
+        // TCP hub mode is also a no-Tor path: when only --hub-tcp is
+        // given (no Tor dial/listen), skip the Tor bootstrap.
+        no_tor: args.listen_tcp.is_some()
+            || args.dial_tcp.is_some()
+            || (!args.hub_tcp.is_empty() && args.hubs.is_empty()),
         tor_state_dir: None,
         dial_onion: None,
         dial_pubkey: args.dial_pubkey.clone(),
         api_socket: socket.to_string_lossy().into_owned(),
         hubs,
-        // The user-facing `onyx` binary doesn't currently expose a
-        // `--hub-tcp` flag — the test-mode primitive is reserved
-        // for the integration smoke harness, which constructs
-        // Config directly without going through CLI parsing.
-        hub_tcp_addrs: Vec::new(),
+        hub_tcp_addrs,
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
         cover_traffic_mean_secs: args.cover_traffic_mean_secs,
