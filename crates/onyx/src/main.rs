@@ -438,15 +438,52 @@ async fn main() -> ExitCode {
     let args = Args::parse();
     // Initialise tracing for any mode that runs the daemon or the TUI;
     // pure one-shot CLI commands keep stdout clean so they pipe into `jq`.
-    let needs_logging = matches!(args.cmd, Some(Command::Tui | Command::Daemon) | None);
-    if needs_logging {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_writer(std::io::stderr)
-            .init();
+    //
+    // Critical: the TUI owns the terminal, so any mode that renders it
+    // (`onyx` combined mode = `None`, and `onyx tui`) MUST send logs to
+    // a FILE, not stderr — otherwise the daemon's tracing output writes
+    // straight over the ratatui frame and shreds the display. Only the
+    // headless `onyx daemon` keeps logging to stderr (no TUI there).
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    match args.cmd {
+        Some(Command::Daemon) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::io::stderr)
+                .init();
+        }
+        Some(Command::Tui) | None => {
+            // Log to ~/.onyx/onyx.log (next to the vault). Falls back to
+            // stderr only if the file can't be opened.
+            let log_path = onyx_daemon::default_data_dir().join("onyx.log");
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(file) => {
+                    eprintln!("onyx: logs → {} (TUI owns the terminal)", log_path.display());
+                    tracing_subscriber::fmt()
+                        .with_env_filter(env_filter)
+                        .with_ansi(false)
+                        .with_writer(move || file.try_clone().expect("clone log file handle"))
+                        .init();
+                }
+                Err(e) => {
+                    eprintln!("onyx: could not open log file {} ({e}); logging to stderr", log_path.display());
+                    tracing_subscriber::fmt()
+                        .with_env_filter(env_filter)
+                        .with_writer(std::io::stderr)
+                        .init();
+                }
+            }
+        }
+        // Pure one-shot CLI commands: no tracing init (keep stdout clean).
+        _ => {}
     }
 
     match dispatch(args).await {
