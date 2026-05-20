@@ -315,20 +315,36 @@ pub struct OpenedBootstrap {
 /// "onyx/v1/bootstrap"
 ///   ‖ sender_signing_pk (32)
 ///   ‖ sender_identity_pk (32)
-///   ‖ u32_BE(mls_welcome_len)
-///   ‖ mls_welcome
+///   ‖ u32_BE(recipient_kem_pub_len) ‖ recipient_kem_pub
+///   ‖ u32_BE(mls_welcome_len)       ‖ mls_welcome
 /// ```
+///
+/// HIGH-2 fix: `recipient_kem_pub` (the intended recipient's hybrid
+/// KEM public key) is bound into the signature. Without it the signed
+/// payload was recipient-independent — a malicious *legitimate*
+/// recipient could re-seal the identical signed bytes to a different
+/// victim, who would accept a Welcome/message "from Alice" that Alice
+/// never sent *them*. With the binding, re-sealing to a new recipient
+/// fails verification: the opener recomputes these bytes using *its
+/// own* KEM pubkey, which won't match the one the sender signed over.
 fn bootstrap_signing_bytes(
     sender_signing_pk: &VerifyingKey,
     sender_identity_pk: &IdentityPublic,
+    recipient_kem_pub: &[u8],
     mls_welcome: &[u8],
 ) -> Result<Vec<u8>> {
+    let kem_len = u32::try_from(recipient_kem_pub.len())
+        .map_err(|_| Error::InvalidEncoding("bootstrap: recipient_kem_pub longer than u32::MAX"))?;
     let mls_len = u32::try_from(mls_welcome.len())
         .map_err(|_| Error::InvalidEncoding("bootstrap: mls_welcome longer than u32::MAX"))?;
-    let mut out = Vec::with_capacity(BOOTSTRAP_SIG_CONTEXT.len() + 32 + 32 + 4 + mls_welcome.len());
+    let mut out = Vec::with_capacity(
+        BOOTSTRAP_SIG_CONTEXT.len() + 32 + 32 + 4 + recipient_kem_pub.len() + 4 + mls_welcome.len(),
+    );
     out.extend_from_slice(BOOTSTRAP_SIG_CONTEXT);
     out.extend_from_slice(&sender_signing_pk.to_bytes());
     out.extend_from_slice(&sender_identity_pk.to_bytes());
+    out.extend_from_slice(&kem_len.to_be_bytes());
+    out.extend_from_slice(recipient_kem_pub);
     out.extend_from_slice(&mls_len.to_be_bytes());
     out.extend_from_slice(mls_welcome);
     Ok(out)
@@ -340,13 +356,16 @@ fn derive_aead_key(shared: &HybridSharedSecret) -> Result<AeadKey> {
     Ok(AeadKey::from_bytes(key_bytes))
 }
 
-fn seal_with_hybrid(plaintext: &[u8], pub_key: &HybridKemPublic) -> Result<Vec<u8>> {
+fn seal_with_hybrid(plaintext: &[u8], pub_key: &HybridKemPublic, aad: &[u8]) -> Result<Vec<u8>> {
     let (ciphertext, shared) = pub_key.encapsulate()?;
     let aead_key = derive_aead_key(&shared)?;
     // One-shot key: fresh shared secret per encapsulation means nonce
     // reuse is impossible, so all-zero nonce is fine.
     let nonce = Nonce::from_bytes([0u8; 12]);
-    let aead_ct = aead_key.encrypt(&nonce, b"", plaintext)?;
+    // HIGH-2: `aad` carries the recipient KEM pubkey, binding the
+    // ciphertext layer to the intended recipient (defense-in-depth
+    // alongside the signature binding).
+    let aead_ct = aead_key.encrypt(&nonce, aad, plaintext)?;
 
     let ct_bytes = ciphertext.to_bytes();
     let mut out = Vec::with_capacity(ct_bytes.len() + aead_ct.len());
@@ -355,7 +374,7 @@ fn seal_with_hybrid(plaintext: &[u8], pub_key: &HybridKemPublic) -> Result<Vec<u
     Ok(out)
 }
 
-fn open_with_hybrid(sealed: &[u8], secret: &HybridKemSecret) -> Result<Vec<u8>> {
+fn open_with_hybrid(sealed: &[u8], secret: &HybridKemSecret, aad: &[u8]) -> Result<Vec<u8>> {
     use crate::crypto::HYBRID_CIPHERTEXT_LEN;
 
     if sealed.len() < HYBRID_CIPHERTEXT_LEN {
@@ -368,7 +387,7 @@ fn open_with_hybrid(sealed: &[u8], secret: &HybridKemSecret) -> Result<Vec<u8>> 
     let shared = secret.decapsulate(&hybrid_ct)?;
     let aead_key = derive_aead_key(&shared)?;
     let nonce = Nonce::from_bytes([0u8; 12]);
-    aead_key.decrypt(&nonce, b"", aead_ct)
+    aead_key.decrypt(&nonce, aad, aead_ct)
 }
 
 /// Seal a bootstrap envelope for `recipient_kem_pub`.
@@ -395,7 +414,17 @@ pub fn seal_bootstrap(
     let sender_signing_pk = sender_signing.verifying_key();
     let sender_identity_pk = sender_identity.public();
 
-    let sig_input = bootstrap_signing_bytes(&sender_signing_pk, &sender_identity_pk, mls_welcome)?;
+    // HIGH-2: bind the recipient's KEM pubkey into both the signature
+    // and the AEAD aad so the envelope is cryptographically addressed
+    // to exactly this recipient and can't be reflected to another.
+    let recipient_kem_bytes = recipient_kem_pub.to_bytes();
+
+    let sig_input = bootstrap_signing_bytes(
+        &sender_signing_pk,
+        &sender_identity_pk,
+        &recipient_kem_bytes,
+        mls_welcome,
+    )?;
     let signature = sender_signing.sign(&sig_input);
 
     let wire = BootstrapWire {
@@ -409,7 +438,7 @@ pub fn seal_bootstrap(
     ciborium::into_writer(&wire, &mut cbor)
         .map_err(|_| Error::Internal("bootstrap: CBOR encode failed"))?;
 
-    seal_with_hybrid(&cbor, recipient_kem_pub)
+    seal_with_hybrid(&cbor, recipient_kem_pub, &recipient_kem_bytes)
 }
 
 /// Open a sealed-sender bootstrap envelope.
@@ -427,7 +456,13 @@ pub fn open_bootstrap(
     sealed: &[u8],
     recipient_kem_secret: &HybridKemSecret,
 ) -> Result<OpenedBootstrap> {
-    let cbor = open_with_hybrid(sealed, recipient_kem_secret)?;
+    // HIGH-2: recompute our own KEM pubkey to use as the AEAD aad and
+    // signature binding. An envelope sealed for a different recipient
+    // (reflection attack) will fail the AEAD open and/or the signature
+    // verify because these bytes won't match what the sender bound.
+    let recipient_kem_bytes = recipient_kem_secret.public().to_bytes();
+
+    let cbor = open_with_hybrid(sealed, recipient_kem_secret, &recipient_kem_bytes)?;
 
     let wire: BootstrapWire = ciborium::from_reader(cbor.as_slice())
         .map_err(|_| Error::InvalidEncoding("sealed bootstrap: CBOR decode"))?;
@@ -436,7 +471,12 @@ pub fn open_bootstrap(
     let identity_pk = parse_x25519_pk(wire.sender_identity_pk.as_ref())?;
     let signature = parse_signature(wire.signature.as_ref())?;
 
-    let sig_input = bootstrap_signing_bytes(&signing_pk, &identity_pk, &wire.mls_welcome)?;
+    let sig_input = bootstrap_signing_bytes(
+        &signing_pk,
+        &identity_pk,
+        &recipient_kem_bytes,
+        &wire.mls_welcome,
+    )?;
     signing_pk.verify(&sig_input, &signature)?;
 
     Ok(OpenedBootstrap {
@@ -908,12 +948,66 @@ mod tests {
         };
         let mut cbor = Vec::new();
         ciborium::into_writer(&wire, &mut cbor).unwrap();
-        let sealed = seal_with_hybrid(&cbor, &bob_kem.public()).unwrap();
+        // Seal to bob with the correct aad so the AEAD layer opens
+        // (we want the INNER signature verification to be what fails,
+        // not the AEAD tag).
+        let sealed =
+            seal_with_hybrid(&cbor, &bob_kem.public(), &bob_kem.public().to_bytes()).unwrap();
 
         assert!(matches!(
             open_bootstrap(&sealed, &bob_kem),
             Err(Error::VerificationFailed)
         ));
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn bootstrap_reflection_to_other_recipient_fails() {
+        // HIGH-2: a malicious legitimate recipient (bob) who holds the
+        // inner signed payload tries to reflect it to a different
+        // victim (carol) by re-sealing the *same* signed BootstrapWire
+        // to carol's KEM key. Carol must reject it: the signature was
+        // bound to bob's KEM pubkey, but carol recomputes the signing
+        // bytes with HER OWN pubkey, so verification fails.
+        let (alice_sign, alice_id, bob_kem, mls) = alice_to_bob_setup();
+        let carol_kem = HybridKemSecret::generate();
+
+        // Alice seals legitimately to bob; bob opens to recover the
+        // genuine signed inner wire.
+        let sealed_for_bob =
+            seal_bootstrap(&alice_sign, &alice_id, &mls, &bob_kem.public()).unwrap();
+        let opened_by_bob = open_bootstrap(&sealed_for_bob, &bob_kem).unwrap();
+
+        // Bob reconstructs the exact signed BootstrapWire he received
+        // (he has all four fields, including alice's genuine signature)
+        // and re-seals it to carol's KEM key.
+        let reflected_wire = BootstrapWire {
+            sender_signing_pk: ByteBuf::from(opened_by_bob.sender_signing_pk.to_bytes().to_vec()),
+            sender_identity_pk: ByteBuf::from(opened_by_bob.sender_identity_pk.to_bytes().to_vec()),
+            mls_welcome: ByteBuf::from(opened_by_bob.mls_welcome.clone()),
+            // The genuine signature alice produced — but it was bound
+            // to BOB's kem pubkey, not carol's.
+            signature: ByteBuf::from(extract_signature(&sealed_for_bob, &bob_kem)),
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&reflected_wire, &mut cbor).unwrap();
+        let reflected =
+            seal_with_hybrid(&cbor, &carol_kem.public(), &carol_kem.public().to_bytes()).unwrap();
+
+        // Carol opens: AEAD succeeds (bob sealed to her correctly), but
+        // the inner signature, recomputed against carol's pubkey, fails.
+        assert!(matches!(
+            open_bootstrap(&reflected, &carol_kem),
+            Err(Error::VerificationFailed)
+        ));
+    }
+
+    // Test helper: pull alice's genuine signature back out of an
+    // envelope by opening it as the intended recipient.
+    fn extract_signature(sealed: &[u8], recipient: &HybridKemSecret) -> Vec<u8> {
+        let cbor = open_with_hybrid(sealed, recipient, &recipient.public().to_bytes()).unwrap();
+        let wire: BootstrapWire = ciborium::from_reader(cbor.as_slice()).unwrap();
+        wire.signature.into_vec()
     }
 
     #[test]
