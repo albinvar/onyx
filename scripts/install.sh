@@ -55,6 +55,14 @@ ONYX_BINS="${ONYX_BINS:-onyx}"
 ONYX_NO_VERIFY="${ONYX_NO_VERIFY:-0}"
 ONYX_SKIP_PATH_HINT="${ONYX_SKIP_PATH_HINT:-0}"
 
+# Scratch dir for downloads. Declared at global scope (not `local` in
+# main) so the EXIT trap can still see it — a `local` would be out of
+# scope when the trap fires, tripping `set -u` ("tmpdir: unbound") and
+# leaking the temp dir.
+tmpdir=""
+cleanup() { [ -n "${tmpdir:-}" ] && rm -rf "${tmpdir}"; }
+trap cleanup EXIT
+
 # Tput colors — degrade gracefully when stdout isn't a tty.
 if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
   C_BOLD="$(tput bold)"
@@ -271,7 +279,7 @@ main() {
   say "Onyx installer"
   printf "  %srepository:%s   https://github.com/%s\n" "$C_DIM" "$C_RESET" "$ONYX_REPO"
 
-  local target version tmpdir
+  local target version
   target="$(detect_target)"
   printf "  %starget:%s       %s\n" "$C_DIM" "$C_RESET" "$target"
 
@@ -282,7 +290,6 @@ main() {
   printf "\n"
 
   tmpdir="$(mktemp -d -t onyx-install.XXXXXX)"
-  trap 'rm -rf "$tmpdir"' EXIT
 
   # Install each requested binary.
   for bin in $ONYX_BINS; do
