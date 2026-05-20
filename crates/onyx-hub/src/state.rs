@@ -184,15 +184,40 @@ impl HubState {
         self
     }
 
-    /// Check + consume one token for `conn`. Returns `true` if the
-    /// caller should process the frame, `false` if the connection
-    /// has exceeded its rate quota and the frame should be silently
-    /// dropped. When no rate limiter is installed, always returns
-    /// `true` (limiter is opt-in).
-    pub fn check_rate(&mut self, conn: ConnId) -> bool {
+    /// Check + consume one token for the authenticated identity
+    /// `peer_pk` (Noise XK static key). Returns `true` if the caller
+    /// should process the frame, `false` if the identity has exceeded
+    /// its rate quota and the frame should be silently dropped. When
+    /// no rate limiter is installed, always returns `true` (limiter is
+    /// opt-in).
+    ///
+    /// Keyed on identity, not connection, so reconnecting or opening
+    /// parallel connections under the same key shares one budget
+    /// (closes the reconnect-reset bypass).
+    pub fn check_rate(&mut self, peer_pk: &[u8; 32]) -> bool {
         match &mut self.rate_limiter {
-            Some(rl) => rl.check(conn),
+            Some(rl) => rl.check(*peer_pk),
             None => true,
+        }
+    }
+
+    /// Connection-teardown hook for the rate limiter: drop this
+    /// identity's bucket only if it has refilled to full (a full
+    /// bucket is identical to no bucket). A throttled bucket is
+    /// retained so a reconnect can't reset the budget.
+    pub fn forget_rate_if_full(&mut self, peer_pk: &[u8; 32]) {
+        if let Some(rl) = &mut self.rate_limiter {
+            rl.forget_if_full(peer_pk);
+        }
+    }
+
+    /// Periodic-GC hook: evict every rate-limit bucket that has
+    /// refilled to full, bounding the bucket map. Returns the number
+    /// evicted (0 when no limiter is installed).
+    pub fn evict_full_rate_buckets(&mut self) -> usize {
+        match &mut self.rate_limiter {
+            Some(rl) => rl.evict_full(),
+            None => 0,
         }
     }
 
@@ -497,6 +522,12 @@ impl HubState {
     }
 
     /// Remove a connection and all its subscriptions.
+    ///
+    /// Note: the rate-limit bucket is NOT dropped here — it's keyed on
+    /// the identity (Noise static key), not the connection, and is
+    /// reclaimed separately via [`Self::forget_rate_if_full`] (only
+    /// when full) so a reconnect can't reset a throttled budget
+    /// (HIGH-3). The caller invokes that with the identity in scope.
     pub fn unregister_conn(&mut self, conn: ConnId) {
         self.senders.remove(&conn);
         for subs in self.subscribers.values_mut() {
@@ -504,11 +535,6 @@ impl HubState {
         }
         // Reclaim empty-set entries so subscribers doesn't grow without bound.
         self.subscribers.retain(|_, subs| !subs.is_empty());
-        // T8.x-ratelimit: drop the rate bucket too — otherwise the
-        // map slowly leaks one entry per disconnected conn id.
-        if let Some(rl) = &mut self.rate_limiter {
-            rl.forget(conn);
-        }
     }
 
     // ── KeyPackage directory (T6.1) ────────────────────────────────────────

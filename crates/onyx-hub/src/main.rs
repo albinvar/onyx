@@ -609,14 +609,26 @@ fn spawn_periodic_gc(gc_state: Arc<Mutex<HubState>>, age_days: u32) {
                 .and_then(|d| i64::try_from(d.as_millis()).ok())
                 .unwrap_or(0);
             let cutoff = now_ms - i64::from(age_days) * 24 * 60 * 60 * 1000;
-            let result = {
-                let s = gc_state.lock().await;
-                s.gc_queue_entries_older_than(cutoff)
+            let (result, evicted_buckets) = {
+                let mut s = gc_state.lock().await;
+                let r = s.gc_queue_entries_older_than(cutoff);
+                // HIGH-3: bound the rate-limit bucket map by dropping
+                // any bucket that has refilled to full (identical to
+                // no bucket — safe to drop). Throttled buckets are
+                // left in place so a reconnect can't reset them.
+                let evicted = s.evict_full_rate_buckets();
+                (r, evicted)
             };
             if let Ok(n) = result
                 && n > 0
             {
                 info!(deleted = n, "hub queue GC: dropped stale rows");
+            }
+            if evicted_buckets > 0 {
+                info!(
+                    evicted = evicted_buckets,
+                    "hub rate-limit GC: dropped full buckets"
+                );
             }
         }
     });

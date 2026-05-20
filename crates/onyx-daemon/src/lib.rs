@@ -2031,7 +2031,7 @@ async fn handle_hub_delivery(
     //    documented as a known window in `replay_guard` rustdoc.
     {
         let mut seen = state.seen_envelopes.lock().await;
-        if !seen.check_and_record(&body) {
+        if !seen.check_and_record(&target, &body) {
             debug!(
                 target_b32 = %encode_b32(&target),
                 body_bytes = body.len(),

@@ -288,6 +288,41 @@ async fn finalize_file(
         return None;
     }
 
+    // §2.11 cap-list (receive-side enforcement): re-sniff the
+    // ASSEMBLED bytes and refuse executables regardless of the
+    // sender-claimed MIME. The accept_file_meta check trusts the
+    // sender's `mime` string, which a malicious sender can lie about
+    // (label an ELF as image/png). Magic-byte sniffing here can't be
+    // fooled that way. We refuse if either `infer`'s app/executable
+    // classifier fires OR the sniffed MIME is in our auditable
+    // refuse-list. (Sniffing can't catch shebang scripts reliably —
+    // those have no magic bytes — so the cap remains best-effort, but
+    // it's no longer pure sender-honor-system for compiled binaries.)
+    if let Some(kind) = infer::get(&assembled) {
+        let sniffed = kind.mime_type();
+        if infer::is_app(&assembled) || is_executable_mime(sniffed) {
+            warn!(
+                claimed_mime = mime,
+                sniffed_mime = sniffed,
+                "file finalize: refused — assembled bytes sniff as executable (cap §2.11)"
+            );
+            return None;
+        }
+    }
+
+    // §2.4 cap-list: validate the conversation key before using it as
+    // a path segment. It is locally derived today (`room/<base32>` or
+    // `peer/<base32>`), but validating here makes the path join
+    // robust against any future caller that routes peer-influenced
+    // input through — defense against a latent path-traversal.
+    if !is_valid_conversation_key(conversation) {
+        warn!(
+            conversation,
+            "file finalize: invalid conversation key; refusing to build storage path"
+        );
+        return None;
+    }
+
     // Build storage path. §2.4 + §2.5 + §5 cap-list.
     let cfg = &state.files_config;
     let conv_dir = cfg.storage_dir.join(conversation);
@@ -369,6 +404,31 @@ pub fn sanitize_filename(raw: &str) -> String {
         return "unnamed".to_string();
     }
     out
+}
+
+/// T-files.b cap-list §2.4: validate a conversation key before it is
+/// used as a filesystem path segment. Accepts exactly the shape the
+/// daemon produces locally — `room/<base32>` or `peer/<base32>` where
+/// the base32 tail is 1..=16 lowercase RFC-4648 chars (`a-z`, `2-7`).
+/// Anything else (path separators beyond the single `/`, `..`,
+/// absolute paths, NUL, uppercase, over-length) is rejected. This is
+/// the guard that keeps `storage_dir.join(conversation)` from ever
+/// escaping `storage_dir`.
+#[must_use]
+pub fn is_valid_conversation_key(conversation: &str) -> bool {
+    let Some((prefix, tail)) = conversation.split_once('/') else {
+        return false;
+    };
+    if prefix != "room" && prefix != "peer" {
+        return false;
+    }
+    if tail.is_empty() || tail.len() > 16 {
+        return false;
+    }
+    // Lowercase base32 (RFC 4648) alphabet only — no second '/',
+    // no '.', no path-traversal bytes can survive this.
+    tail.bytes()
+        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
 /// T-files.b cap-list §2.11: executable MIME types refused by
@@ -634,6 +694,31 @@ mod tests {
             sanitize_filename("with spaces and 漢字"),
             "with_spaces_and___"
         );
+    }
+
+    #[test]
+    fn valid_conversation_key_accepts_local_shapes_only() {
+        // The shapes the daemon actually produces.
+        assert!(is_valid_conversation_key("room/abcdefgh"));
+        assert!(is_valid_conversation_key("peer/a2b3c4d5"));
+        assert!(is_valid_conversation_key("room/a")); // 1 char ok
+        assert!(is_valid_conversation_key("room/abcdefghijklmnop")); // 16 ok
+
+        // Traversal / injection attempts must all be rejected.
+        assert!(!is_valid_conversation_key("room/../../etc"));
+        assert!(!is_valid_conversation_key("../secrets"));
+        assert!(!is_valid_conversation_key("/abs/path"));
+        assert!(!is_valid_conversation_key("room/with/slash"));
+        assert!(!is_valid_conversation_key("room/")); // empty tail
+        assert!(!is_valid_conversation_key("room/abcdefghijklmnopq")); // 17 > 16
+        assert!(!is_valid_conversation_key("ROOM/abcdefgh")); // wrong prefix case
+        assert!(!is_valid_conversation_key("group/abcdefgh")); // unknown prefix
+        assert!(!is_valid_conversation_key("room/UPPER")); // uppercase tail
+        assert!(!is_valid_conversation_key("room/has.dot")); // '.' not base32
+        assert!(!is_valid_conversation_key("room/has-dash")); // '-' not base32
+        assert!(!is_valid_conversation_key("room/01")); // 0,1 not in base32 alphabet
+        assert!(!is_valid_conversation_key("noslash"));
+        assert!(!is_valid_conversation_key(""));
     }
 
     #[test]

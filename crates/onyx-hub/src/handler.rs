@@ -106,15 +106,20 @@ where
         &mut session,
         &state,
         conn_id,
+        &peer_pk,
         &mut rx,
         cover_traffic_mean_secs,
     )
     .await;
 
-    // Always clean up subscriptions on exit.
+    // Always clean up subscriptions on exit. The rate-limit bucket is
+    // keyed on the identity (peer_pk), not the connection, and is only
+    // dropped here if it has refilled to full — a throttled bucket
+    // survives so a reconnect can't reset the budget (HIGH-3).
     {
         let mut s = state.lock().await;
         s.unregister_conn(conn_id);
+        s.forget_rate_if_full(&peer_pk);
     }
     info!(conn = conn_id, "hub: connection closed");
 
@@ -323,6 +328,7 @@ async fn serve_frames<S>(
     session: &mut Session,
     state: &Arc<Mutex<HubState>>,
     conn_id: u64,
+    peer_pk: &[u8; 32],
     rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     cover_traffic_mean_secs: Option<u64>,
 ) -> anyhow::Result<()>
@@ -380,7 +386,7 @@ where
                         // Drop silently on empty bucket (matches our
                         // "fail closed, log loudly" posture for other
                         // misbehaving-client signals).
-                        if !state.lock().await.check_rate(conn_id) {
+                        if !state.lock().await.check_rate(peer_pk) {
                             warn!(
                                 conn = conn_id,
                                 "hub: DELIVER rate-limited (bucket empty); dropping frame"
@@ -416,7 +422,7 @@ where
                         // DELIVER — one connection's DELIVER spam
                         // and KP_PUBLISH spam compete for the same
                         // budget.
-                        if !state.lock().await.check_rate(conn_id) {
+                        if !state.lock().await.check_rate(peer_pk) {
                             warn!(
                                 conn = conn_id,
                                 "hub: KP_PUBLISH rate-limited (bucket empty); dropping frame"
