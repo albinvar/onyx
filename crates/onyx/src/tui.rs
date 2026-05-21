@@ -1927,33 +1927,36 @@ fn truncate_for_display(s: &str, max: usize) -> String {
     }
 }
 
-/// UX overhaul: the right-hand Details pane. Shows context about the
-/// currently-selected conversation — for a room: its name, member
-/// count, and roster (each member's short fingerprint, with "you"
-/// flagged); for a DM peer: connection state + fingerprint; for no
-/// selection: a short getting-started hint.
-// Linear render fn with three distinct selection branches; over the
-// 100-line budget but splitting per-branch helpers wouldn't aid
-// readability (same rationale as render_modal).
-#[allow(clippy::too_many_lines)]
-fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+/// UX overhaul: render one titled, colored, bordered sub-panel filled
+/// with `lines`. The building block of the split Details column.
+fn boxed(
+    frame: &mut ratatui::Frame<'_>,
+    rect: Rect,
+    title: &str,
+    color: Color,
+    lines: Vec<Line<'_>>,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(color))
         .title(Span::styled(
-            " Details ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            format!(" {title} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
-    let head = |t: &str| -> Line<'static> {
-        Line::from(Span::styled(
-            format!(" {t}"),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))
-    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// UX overhaul: the right-hand Details column — split into individually
+/// titled, colored sub-panels (a small dashboard) rather than one box.
+/// Room → Channel / Members / Actions; DM peer → Peer / Note;
+/// nothing selected → Getting Started.
+#[allow(clippy::too_many_lines)]
+fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let kv = |k: &str, v: String| -> Line<'static> {
         Line::from(vec![
             Span::styled(format!(" {k}: "), Style::default().fg(Color::Gray)),
@@ -1967,19 +1970,32 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         .map(|s| s.fingerprint.clone())
         .unwrap_or_default();
 
-    let lines: Vec<Line> = match app.selected_entry() {
+    match app.selected_entry() {
         Some(SelectedEntry::Room(r)) => {
-            let mut v = vec![
-                head("Channel"),
-                kv("name", format!("#{}", r.name)),
-                kv("members", r.members.len().to_string()),
-                kv("id", short_id(&r.group_id_b32)),
-                Line::from(""),
-                head("Roster"),
-            ];
+            // Channel (cyan) │ Members (magenta, fills) │ Actions (green).
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Min(3),
+                    Constraint::Length(4),
+                ])
+                .split(area);
+            boxed(
+                frame,
+                rows[0],
+                "Channel",
+                Color::Cyan,
+                vec![
+                    kv("name", format!("#{}", r.name)),
+                    kv("members", r.members.len().to_string()),
+                    kv("id", short_id(&r.group_id_b32)),
+                ],
+            );
+            let mut roster: Vec<Line> = Vec::with_capacity(r.members.len());
             for m in &r.members {
                 let is_me = !my_fp.is_empty() && m == &my_fp;
-                v.push(Line::from(vec![
+                roster.push(Line::from(vec![
                     Span::styled(" • ", Style::default().fg(Color::Magenta)),
                     Span::styled(
                         short_id(&m.replace(' ', "")),
@@ -1992,9 +2008,29 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     },
                 ]));
             }
-            v
+            boxed(frame, rows[1], "Members", Color::Magenta, roster);
+            boxed(
+                frame,
+                rows[2],
+                "Actions",
+                Color::Green,
+                vec![
+                    Line::from(vec![
+                        Span::styled(" ^I ", Style::default().fg(Color::Yellow)),
+                        Span::styled("invite peer", Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" ^F ", Style::default().fg(Color::Yellow)),
+                        Span::styled("send file", Style::default().fg(Color::White)),
+                    ]),
+                ],
+            );
         }
         Some(SelectedEntry::Peer(p)) => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(5), Constraint::Min(3)])
+                .split(area);
             let state = if p.connected {
                 Span::styled(
                     "● connected",
@@ -2005,51 +2041,64 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             } else {
                 Span::styled("○ offline", Style::default().fg(Color::DarkGray))
             };
-            vec![
-                head("Direct message"),
-                kv("peer", p.short_id.clone()),
-                Line::from(vec![
-                    Span::styled(" state: ", Style::default().fg(Color::Gray)),
-                    state,
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    " Files: DMs don't support files yet —",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    " make a room to share files.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ]
+            boxed(
+                frame,
+                rows[0],
+                "Peer",
+                Color::Cyan,
+                vec![
+                    kv("peer", p.short_id.clone()),
+                    Line::from(vec![
+                        Span::styled(" state: ", Style::default().fg(Color::Gray)),
+                        state,
+                    ]),
+                ],
+            );
+            boxed(
+                frame,
+                rows[1],
+                "Note",
+                Color::DarkGray,
+                vec![
+                    Line::from(Span::styled(
+                        " DMs don't support files yet.",
+                        Style::default().fg(Color::Gray),
+                    )),
+                    Line::from(Span::styled(
+                        " Make a room to share files.",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ],
+            );
         }
-        None => vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " Select a conversation",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                " on the left (↑/↓).",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                " Ctrl-K opens the palette,",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                " F1 shows all keys.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ],
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+        None => {
+            boxed(
+                frame,
+                area,
+                "Getting Started",
+                Color::DarkGray,
+                vec![
+                    Line::from(Span::styled(
+                        " Pick a conversation (↑/↓).",
+                        Style::default().fg(Color::Gray),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " Ctrl-K  command palette",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(Span::styled(
+                        " F1      all shortcuts",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(Span::styled(
+                        " Ctrl-E  copy invite",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ],
+            );
+        }
+    }
 }
 
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
@@ -2289,7 +2338,21 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
-    let block = Block::default().borders(Borders::ALL).title(" Compose ");
+    // UX overhaul: colored border + a title that names the current
+    // target ("Compose → #general" / "→ alice"), so it's always clear
+    // where a message will go.
+    let (title, border) = match app.selected_entry() {
+        Some(SelectedEntry::Room(r)) => (format!(" Compose → #{} ", r.name), Color::Green),
+        Some(SelectedEntry::Peer(p)) => (format!(" Compose → {} ", p.short_id), Color::Green),
+        None => (" Compose ".to_string(), Color::DarkGray),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            title,
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ));
 
     let line = if let Some(Err(msg)) = &app.last_send_result {
         Line::from(vec![
