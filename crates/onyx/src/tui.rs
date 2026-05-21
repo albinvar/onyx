@@ -2154,6 +2154,10 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+// Linear render fn: title selection + empty-state branches + message
+// styling loop. Over the 100-line budget but cohesive (same rationale
+// as render_modal / render_details).
+#[allow(clippy::too_many_lines)]
 fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let (title, scrollback_key, who_label) = match app.selected_entry() {
         Some(SelectedEntry::Peer(p)) => (
@@ -2170,20 +2174,68 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     if app.selected_entry().is_none() {
-        let body = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "No conversation selected.",
-                Style::default().fg(Color::Gray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Use ↑/↓ to pick a peer or room once one shows up.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .block(block)
-        .wrap(Wrap { trim: false });
-        frame.render_widget(body, area);
+        // UX overhaul: brand-new user (no peers, no rooms) gets a real
+        // welcome + concrete first steps, instead of a bare "nothing
+        // selected". Once they have conversations, it's just the
+        // "pick one" hint.
+        let brand_new = app.peers.is_empty() && app.rooms.is_empty();
+        let body = if brand_new {
+            let step = |k: &str, d: &str| -> Line<'static> {
+                Line::from(vec![
+                    Span::styled(
+                        format!("   {k:<8}"),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(d.to_string(), Style::default().fg(Color::White)),
+                ])
+            };
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Welcome to Onyx 🖤",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  You're not connected to anyone yet. To start:",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                step("Ctrl-E", "copy your invite link — send it to a friend"),
+                step("", "(they run `onyx accept <link>`)"),
+                Line::from(""),
+                step("Ctrl-N", "create a room / channel"),
+                step("Ctrl-K", "command palette — run anything by name"),
+                step("F1", "see every keyboard shortcut"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Note: rooms & file-sharing need a hub configured",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  (--hub …). See README for setup.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        } else {
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Pick a conversation on the left with ↑/↓.",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Ctrl-K palette · F1 help · Ctrl-E invite",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        };
+        frame.render_widget(body.block(block).wrap(Wrap { trim: false }), area);
         return;
     }
     let lines: Vec<Line<'_>> = match app.scrollback.get(&scrollback_key) {
