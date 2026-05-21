@@ -1525,12 +1525,28 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let main_area = chunks[0];
     let status_area = chunks[1];
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Min(0)])
-        .split(main_area);
+    // UX overhaul: 3-pane layout (Conversations │ Chat │ Details)
+    // when the terminal is wide enough; gracefully falls back to the
+    // 2-pane layout on narrow terminals so nothing gets crushed.
+    let wide = main_area.width >= 92;
+    let cols = if wide {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(24),
+                Constraint::Min(0),
+                Constraint::Length(32),
+            ])
+            .split(main_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(0)])
+            .split(main_area)
+    };
     let peers_area = cols[0];
     let chat_col = cols[1];
+    let details_area = if wide { Some(cols[2]) } else { None };
 
     let chat_rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1542,6 +1558,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     render_peers(frame, peers_area, app);
     render_messages(frame, messages_area, app);
     render_composer(frame, composer_area, app);
+    if let Some(d) = details_area {
+        render_details(frame, d, app);
+    }
     render_status(frame, status_area, app);
 
     // T-polish.6: modal overlay rendered LAST so it draws on top
@@ -1906,6 +1925,131 @@ fn truncate_for_display(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max.saturating_sub(8)).collect();
         format!("{head}…({})", s.len())
     }
+}
+
+/// UX overhaul: the right-hand Details pane. Shows context about the
+/// currently-selected conversation — for a room: its name, member
+/// count, and roster (each member's short fingerprint, with "you"
+/// flagged); for a DM peer: connection state + fingerprint; for no
+/// selection: a short getting-started hint.
+// Linear render fn with three distinct selection branches; over the
+// 100-line budget but splitting per-branch helpers wouldn't aid
+// readability (same rationale as render_modal).
+#[allow(clippy::too_many_lines)]
+fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Details ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let head = |t: &str| -> Line<'static> {
+        Line::from(Span::styled(
+            format!(" {t}"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let kv = |k: &str, v: String| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!(" {k}: "), Style::default().fg(Color::Gray)),
+            Span::styled(v, Style::default().fg(Color::White)),
+        ])
+    };
+    let my_fp = app
+        .last_status
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map(|s| s.fingerprint.clone())
+        .unwrap_or_default();
+
+    let lines: Vec<Line> = match app.selected_entry() {
+        Some(SelectedEntry::Room(r)) => {
+            let mut v = vec![
+                head("Channel"),
+                kv("name", format!("#{}", r.name)),
+                kv("members", r.members.len().to_string()),
+                kv("id", short_id(&r.group_id_b32)),
+                Line::from(""),
+                head("Roster"),
+            ];
+            for m in &r.members {
+                let is_me = !my_fp.is_empty() && m == &my_fp;
+                v.push(Line::from(vec![
+                    Span::styled(" • ", Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        short_id(&m.replace(' ', "")),
+                        Style::default().fg(if is_me { Color::Cyan } else { Color::White }),
+                    ),
+                    if is_me {
+                        Span::styled(" (you)", Style::default().fg(Color::Cyan))
+                    } else {
+                        Span::raw("")
+                    },
+                ]));
+            }
+            v
+        }
+        Some(SelectedEntry::Peer(p)) => {
+            let state = if p.connected {
+                Span::styled(
+                    "● connected",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("○ offline", Style::default().fg(Color::DarkGray))
+            };
+            vec![
+                head("Direct message"),
+                kv("peer", p.short_id.clone()),
+                Line::from(vec![
+                    Span::styled(" state: ", Style::default().fg(Color::Gray)),
+                    state,
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Files: DMs don't support files yet —",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    " make a room to share files.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        None => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " Select a conversation",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                " on the left (↑/↓).",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Ctrl-K opens the palette,",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                " F1 shows all keys.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
