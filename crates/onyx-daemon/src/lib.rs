@@ -1447,8 +1447,8 @@ async fn handle_room_app_frame(
         let party = state.mls_party.lock().await;
         match party.load_group(group_id) {
             Ok(Some(mut room_group)) => room_group
-                .process_incoming(&party, payload)
-                .map(|im| (im, room_group.epoch())),
+                .process_incoming_with_sender(&party, payload)
+                .map(|(im, sender)| (im, sender, room_group.epoch())),
             Ok(None) => {
                 debug!(
                     group_id_b32 = %encode_b32(group_id),
@@ -1462,7 +1462,7 @@ async fn handle_room_app_frame(
             }
         }
     };
-    let Ok((incoming, epoch)) = processed_result else {
+    let Ok((incoming, sender_identity, epoch)) = processed_result else {
         // T6.3.i: process_incoming failed — most likely the message
         // arrived ahead of a commit that would have advanced us to
         // the right epoch (e.g. a KEM-ad encrypted at N+1 reached
@@ -1506,6 +1506,18 @@ async fn handle_room_app_frame(
         );
         return;
     };
+    // Task 321: attribute the message to the sender's REAL fingerprint
+    // (from the MLS credential), not the transport-key placeholder. The
+    // BasicCredential identity is the Ed25519 fingerprint bytes; if for
+    // any reason it isn't 32 bytes, fall back to the old placeholder so
+    // attribution degrades gracefully rather than dropping the message.
+    let sender_fp = sender_identity
+        .as_deref()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map_or_else(
+            || format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub)),
+            |arr| onyx_core::crypto::Fingerprint::from_bytes(arr).to_string(),
+        );
     match msg {
         onyx_core::room::RoomAppMessage::Text { text } => {
             info!(
@@ -1516,23 +1528,21 @@ async fn handle_room_app_frame(
                 "room: incoming text message"
             );
             // T-polish.3: persist to room_messages so the TUI can
-            // backfill scrollback after restart. Sender_fp is a
-            // placeholder for now (MLS-credential extraction lands
-            // in a follow-up — see CHANGELOG note for T-polish.3).
+            // backfill scrollback after restart. Task 321: sender_fp is
+            // now the real MLS-credential fingerprint.
             let now_ms = i64::try_from(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis()),
             )
             .unwrap_or(0);
-            let sender_fp_placeholder = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
             {
                 let vault = state.vault.lock().await;
                 if let Err(e) = vault.append_room_message(
                     state.identity_id,
                     group_id,
                     false,
-                    &sender_fp_placeholder,
+                    &sender_fp,
                     &text,
                     now_ms,
                 ) {
@@ -1586,9 +1596,8 @@ async fn handle_room_app_frame(
         } => {
             // T-files.b: handshake-side of a file transfer. Run
             // the receive caps + allocate the in-flight buffer.
-            // sender_fp here is a placeholder — see same note in
-            // the Text arm. Conversation = "room/<gid_short>".
-            let sender_fp = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
+            // Task 321: sender_fp is the real MLS fingerprint (computed
+            // above). Conversation = "room/<gid_short>".
             let conversation =
                 format!("room/{}", crate::conversations::short_id_of_group(group_id));
             let now_ms = now_unix_ms_i64();
@@ -1617,8 +1626,8 @@ async fn handle_room_app_frame(
         }
         onyx_core::room::RoomAppMessage::FileChunk { id, index, bytes } => {
             // T-files.b: chunk-side. accept_file_chunk dedups,
-            // appends, and triggers finalize when complete.
-            let sender_fp = format!("(peer/{})", short_id_of_peer_pub(sender_peer_pub));
+            // appends, and triggers finalize when complete. Task 321:
+            // uses the real sender_fp computed above.
             let now_ms = now_unix_ms_i64();
             if let Some(path) = files::accept_file_chunk(
                 state,

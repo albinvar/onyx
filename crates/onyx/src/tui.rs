@@ -66,8 +66,9 @@
 //! peer is in `backfilled` we don't ask again — live events take
 //! over.
 //!
-//! Room scrollback persists via `ApiRequest::RoomHistory` (T-polish.3);
-//! same backfill semantics.
+//! Rooms get the same treatment via `ApiRequest::RoomHistory`,
+//! tracked by the separate `backfilled_rooms` set (task 320) — room
+//! scrollback reloads on restart with the same dedup semantics as DMs.
 //!
 //! ## Unread + sort (T-polish.5)
 //!
@@ -149,6 +150,10 @@ struct AppState {
     /// Set of `short_id`s we've already fetched History for. Prevents
     /// re-firing the backfill request every refresh tick.
     backfilled: HashSet<String>,
+    /// Rooms (by `room/<short>` key) whose persisted history we've
+    /// already fetched via `RoomHistory`. Mirrors `backfilled` for
+    /// DMs so room scrollback reloads on restart instead of vanishing.
+    backfilled_rooms: HashSet<String>,
     /// T-polish.4: per-conversation scroll offset into the
     /// scrollback. 0 = pinned to the bottom (most recent visible);
     /// positive values scroll up by that many lines. Reset to 0
@@ -353,6 +358,7 @@ impl AppState {
             last_send_result: None,
             tail_active: false,
             backfilled: HashSet::new(),
+            backfilled_rooms: HashSet::new(),
             messages_scroll: HashMap::new(),
             unread: HashMap::new(),
             last_activity_ms: HashMap::new(),
@@ -1352,7 +1358,25 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
             )
         })
         .collect();
-    for (_gid_b32, conv_key) in room_keys {
+    for (gid_b32, conv_key) in room_keys {
+        // Task 320: reload persisted room scrollback once per room
+        // (mirrors the DM History backfill above). Without this, room
+        // messages vanish from the TUI on restart even though the
+        // daemon persisted them. `backfilled_rooms` short-circuits
+        // after the first successful fetch.
+        if !app.backfilled_rooms.contains(&conv_key) {
+            let req = ApiRequest::RoomHistory {
+                group_id_b32: gid_b32.clone(),
+                limit: 200,
+            };
+            if let Ok(ApiResponse::RoomHistoryOk { messages, .. }) =
+                client::one_shot(socket, &req).await
+            {
+                merge_room_history(app, &conv_key, messages);
+                app.backfilled_rooms.insert(conv_key.clone());
+            }
+        }
+
         let req = ApiRequest::ListReceivedFiles {
             conversation: conv_key.clone(),
             limit: 200,
@@ -1363,6 +1387,38 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
             apply_received_files(app, &conv_key, files);
         }
     }
+}
+
+/// Task 320: merge persisted `RoomHistory` rows into a room's
+/// scrollback, deduplicating against already-present live lines by
+/// `(ts_unix_ms, text)` — same shape as [`merge_history`] for DMs.
+/// Room messages carry no hub/direct tier, so `via_hub` is false.
+fn merge_room_history(
+    app: &mut AppState,
+    conv_key: &str,
+    messages: Vec<onyx_core::api::RoomHistoryEntry>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let entry = app.scrollback.entry(conv_key.to_string()).or_default();
+    let live_keys: HashSet<(u64, String)> = entry
+        .iter()
+        .map(|l| (l.ts_unix_ms, l.text.clone()))
+        .collect();
+    let mut prepend: Vec<ChatLine> = messages
+        .into_iter()
+        .filter(|m| !live_keys.contains(&(m.ts_unix_ms, m.text.clone())))
+        .map(|m| ChatLine {
+            direction: m.direction,
+            text: m.text,
+            ts_unix_ms: m.ts_unix_ms,
+            via_hub: false,
+        })
+        .collect();
+    let existing = std::mem::take(entry);
+    prepend.extend(existing);
+    *entry = prepend;
 }
 
 /// T-files.e: merge the daemon's per-room file list into the

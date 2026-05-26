@@ -576,6 +576,21 @@ impl MlsGroupState {
         party: &MlsParty,
         ciphertext: &[u8],
     ) -> Result<IncomingRoomMessage> {
+        Ok(self.process_incoming_with_sender(party, ciphertext)?.0)
+    }
+
+    /// Like [`Self::process_incoming`] but also returns the sender's
+    /// MLS credential identity (task 321). For our `BasicCredential`s
+    /// that identity field is exactly the sender's Ed25519 fingerprint
+    /// bytes (see [`MlsParty::from_identity`]), so the caller can
+    /// attribute the message to a real fingerprint instead of a
+    /// transport-key placeholder. `None` when the credential isn't a
+    /// BasicCredential we can read.
+    pub fn process_incoming_with_sender(
+        &mut self,
+        party: &MlsParty,
+        ciphertext: &[u8],
+    ) -> Result<(IncomingRoomMessage, Option<Vec<u8>>)> {
         let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
             .map_err(|_| Error::InvalidEncoding("mls: incoming message not TLS-encoded"))?;
         let protocol_msg: ProtocolMessage = match mls_in.extract() {
@@ -591,15 +606,22 @@ impl MlsGroupState {
             .group
             .process_message(&party.provider, protocol_msg)
             .map_err(|_| Error::VerificationFailed)?;
+        // Snapshot the sender's credential-identity bytes before the
+        // message is consumed by `into_content()`.
+        let sender_identity: Option<Vec<u8>> =
+            BasicCredential::try_from(processed.credential().clone())
+                .ok()
+                .map(|bc| bc.identity().to_vec());
         match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(am) => {
-                Ok(IncomingRoomMessage::Application(am.into_bytes()))
-            }
+            ProcessedMessageContent::ApplicationMessage(am) => Ok((
+                IncomingRoomMessage::Application(am.into_bytes()),
+                sender_identity,
+            )),
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 self.group
                     .merge_staged_commit(&party.provider, *staged)
                     .map_err(internal("mls: merge_staged_commit failed"))?;
-                Ok(IncomingRoomMessage::Commit)
+                Ok((IncomingRoomMessage::Commit, sender_identity))
             }
             _ => Err(Error::InvalidEncoding(
                 "mls: processed message is not Application or StagedCommit",
