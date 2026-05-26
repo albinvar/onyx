@@ -1961,7 +1961,7 @@ fn render_invite_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, url: &str, co
         )),
         Line::from(""),
         Line::from(Span::styled(
-            " Share this with a friend; they run `onyx accept <url>`.",
+            " Share with a friend; they run:  onyx accept '<url>'  (quotes!)",
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -2311,7 +2311,7 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 )),
                 Line::from(""),
                 step("Ctrl-E", "copy your invite link — send it to a friend"),
-                step("", "(they run `onyx accept <link>`)"),
+                step("", "(they run: onyx accept '<link>')"),
                 Line::from(""),
                 step("Ctrl-N", "create a room / channel"),
                 step("Ctrl-K", "command palette — run anything by name"),
