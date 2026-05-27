@@ -6,6 +6,75 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-21 — Red-team pass: live hub attacks + decoder fuzz
+
+Authorized penetration testing of our own system. **Every attack mounted was blocked.** Locked in as regression tests.
+
+  * **Live malicious-client attacks** against the hub (`crates/onyx-hub/src/handler.rs` test module — real Noise XK handshake, then crafted frames):
+    - `attack_unsigned_subscribe_is_rejected` — old unsigned SUBSCRIBE format → rejected, no queue stolen.
+    - `attack_subscribe_to_victims_known_inbox_is_rejected` — attacker signs a SUBSCRIBE for a victim's *published* intro inbox with its own key → rejected by the ownership check (HIGH-1).
+    - `attack_replayed_subscribe_proof_is_rejected` — a SUBSCRIBE proof signed over a different connection's handshake hash (captured replay) → rejected by the handshake-hash binding.
+    - `attack_garbage_frame_does_not_crash_connection` — unknown frame type + junk payload → no panic, connection survives and still delivers.
+  * **Decoder fuzz** (`crates/onyx-core/tests/fuzz_no_panic.rs`, ~36k random-input cases): every public parser touching untrusted bytes — `InnerFrame`, `GossipFrame`, `RoomAppMessage`, `BootstrapPayload`, `decode_signed_subscribe`, hybrid-KEM key parsers, `Fingerprint::parse`, `Invite::parse` — **zero panics** (a panic on attacker input is a remote DoS).
+
+Honest ceiling, recorded for the threat model: this proves "survives the attacks we knew to write," NOT "proven secure." It does not cover the crypto primitives themselves, timing/traffic analysis (idle-circuit cover traffic still unbuilt), Sybil/real-Tor abuse, or anything an external audit would surface.
+
+---
+
+## 2026-05-21 — Two verified-bug fixes (320, 321)
+
+Found by re-auditing feature-completeness — both were things a real user hits.
+
+  * **320 — room scrollback now reloads on restart.** The `RoomHistory` API existed but the TUI never called it (only DM `History` was wired; a doc comment falsely claimed rooms worked). Added a per-room `RoomHistory` backfill tracked by a new `backfilled_rooms` set, merged with the same `(ts,text)` dedup as DMs.
+  * **321 — real MLS sender attribution.** Incoming room messages/files showed a `(peer/<x25519>)` placeholder. Added `MlsGroupState::process_incoming_with_sender`, which also returns the sender's MLS credential identity (for our `BasicCredential`s that *is* the Ed25519 fingerprint). `process_incoming` stays a wrapper so existing tests/callers are untouched; the daemon now persists + attributes messages/files to the real fingerprint.
+  * Minor (partial 324): invite modal + welcome screen now show the **quoted** `onyx accept '<url>'` form (the unquoted `&` was a shell-parse trap).
+
+Gate: clippy `-D warnings`, `cargo test --workspace` = 465 passed.
+
+---
+
+## 2026-05-20/21 — TUI UX overhaul (discoverability + 3-pane dashboard + first-run)
+
+The TUI was capable but undiscoverable. Made it usable. Decision (with user): rich view of *joined* rooms/DMs only — **no global directory**, anonymity model unchanged.
+
+  * **Discoverability pack** (`8ed96f3`): `F1` keyboard-help overlay (every binding, grouped + colored), `Ctrl-K` fuzzy command palette (run any action by name, backed by a `PaletteAction` enum), `Ctrl-E` build+copy invite link (OSC52 clipboard, works over SSH; modal fallback shows the URL), and a colored always-visible keybind footer.
+  * **3-pane layout** (`215d358`, `fea6fd1`): Conversations │ Chat │ Details on terminals ≥92 cols (2-pane fallback below). The Details column is split into individually-titled, colored sub-panels — Room → Channel / Members (roster, "you" flagged) / Actions; Peer → Peer / Note; none → Getting Started. Composer gets a colored border + target title (`Compose → #general`).
+  * **Welcome / first-run state** (`4710478`): a brand-new user (no peers, no rooms) gets a real welcome + concrete first steps instead of a blank pane.
+  * **Logs to file in TUI modes** (`8164856`): `onyx` (combined) and `onyx tui` now write tracing to `~/.onyx/onyx.log` instead of stderr, which was shredding the ratatui frame. Headless `onyx daemon` keeps stderr.
+
+---
+
+## 2026-05-20 — Local-testability: `--hub-tcp` + demo script
+
+  * **`onyx --hub-tcp addr,b32pubkey`** (`9439cd7`) — TEST-ONLY plain-TCP hub dial, mirroring the hub's existing `--listen-tcp`, so the full rooms+files flow can be exercised locally without Tor. The daemon `Config` + `spawn_tcp_hub_tasks` plumbing already existed (smoke harness); this exposes the CLI flag and sets `no_tor` when it's the only hub.
+  * **`scripts/local-hub-demo.sh`** — starts a local TCP hub and prints the ready-to-paste alice/bob client commands + a rooms/files cheat sheet. Verified end-to-end: hub → signed SUBSCRIBE → KP publish → room create → invite → MLS Welcome + join (inviter-auth passes) → send-file → receive → on-disk + manifest.
+
+---
+
+## 2026-05-20 — Releases v0.1.0 → v0.1.3 + installer hardening
+
+First public, verifiable, installable releases. Several real release-pipeline bugs fixed along the way (each found by actually cutting a release and watching it):
+
+  * **v0.1.0** — first tag. Build green on all targets but the GitHub release-upload action flaked into a *draft* (asset-metadata race), so `/releases/latest` 404'd until manually published.
+  * **Pipeline fixes:** Intel-Mac (`x86_64-apple-darwin`) moved off the deprecated/scarce `macos-13` runner — which had wedged a release for 8.5 h — to cross-compile on `macos-latest` via the universal Apple SDK (`4d96f6c` set up native aarch64-linux first); hyphenated tags marked **pre-release** so an RC can't hijack `latest` (`061c4c2`).
+  * **`install.sh` fixes:** EXIT-trap `tmpdir: unbound` + temp-dir leak (`909ebdd`); **version resolver** switched from fragile `/releases/latest` redirect-parsing to the GitHub API `tag_name` (`27df402`) — the redirect bug had produced a garbage download URL for the bare one-liner.
+  * **v0.1.1 / v0.1.2 / v0.1.3** — each verified end-to-end on this machine (`curl …/latest/…/install.sh | bash` → resolve → SHA256 verify → install → `onyx --version` → clean exit). **v0.1.3 is current `latest`** and carries the UX overhaul + 320/321 fixes + `--hub-tcp`.
+
+Note: the one-liner installer auto-publishes via CI but the draft-publish + `--latest` flag step is currently done manually after each build (the softprops upload race). Worth hardening the workflow to do it automatically — tracked informally.
+
+---
+
+## 2026-05-20 — Security audit fixes (batch 1/2): HIGH-3 + 4×MEDIUM + LOW
+
+First batch of the internal multi-agent security review (batch 2 below has the larger HIGH-1/HIGH-2 changes). All committed `0ff2cd5`, `90bbf49`, `bccadad`.
+
+  * **HIGH-3** — hub rate limiter re-keyed from per-connection id to the authenticated Noise static key, so reconnecting (or fanning out across parallel connections) no longer resets the budget. Buckets evicted only when full; periodic GC sweep.
+  * **HIGH-2** (`90bbf49`) — sealed-sender envelope now binds the recipient's hybrid-KEM pubkey into both the Ed25519 signature and the AEAD aad, blocking cross-recipient reflection by a malicious legitimate recipient. Reflection-rejection test added.
+  * **MEDIUM** — replay-guard dedup scoped to `target ‖ body` (not body alone); executable-MIME refuse re-sniffs the *assembled* bytes (`infer`) instead of trusting the sender's claimed MIME; hub offline-queue depth + global-byte caps; daemon file-reassembly global byte budget + stalled-transfer reaper.
+  * **LOW** — conversation-key path-traversal guard before `storage_dir.join`; bumped yanked `enumset` (cargo-deny advisories now clean).
+
+---
+
 ## 2026-05-20 — Security audit fixes (batch 2/2): HIGH-1, Welcome-auth, hybrid combiner + release-pipeline fix
 
 Second batch from the internal multi-agent security review (batch 1 was the same-day commits `0ff2cd5`/`90bbf49`/`bccadad`). These are the larger changes that needed careful, isolated work.
