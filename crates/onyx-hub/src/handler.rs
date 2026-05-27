@@ -726,6 +726,217 @@ mod tests {
         tokio::spawn(async move { hub_handle_connection(stream, &hub_sk, state).await })
     }
 
+    // ── Adversarial / red-team tests ───────────────────────────────────
+    //
+    // These act as a MALICIOUS client: real Noise XK handshake against
+    // the hub, then crafted frames attempting the attacks the security
+    // audit identified. Each asserts the attack is BLOCKED. A failure
+    // here is a real regression in the hub's trust boundary.
+
+    use std::time::Duration;
+
+    /// Helper: did the attacker receive ANY frame within the window?
+    /// `false` = the hub delivered nothing (attack blocked).
+    async fn received_anything<S>(stream: &mut S, session: &mut Session) -> bool
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        matches!(
+            tokio::time::timeout(Duration::from_millis(300), read_frame(stream, session)).await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// ATTACK (HIGH-1): subscribe with the OLD unsigned format (bare
+    /// 16-byte routing id). The hub must reject it (no valid proof), so
+    /// a delivery to that id is never routed to the attacker.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn attack_unsigned_subscribe_is_rejected() {
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let attacker_sk = IdentitySecret::generate();
+        let state = Arc::new(Mutex::new(HubState::new()));
+        let (client, hub) = tokio::io::duplex(65_536);
+        let _hub_task = spawn_hub(hub, hub_sk_clone(&hub_sk), state.clone());
+
+        let target: RoutingId = [0x77; 16];
+        let mut stream = client;
+        let mut session = handshake_initiator(&mut stream, &attacker_sk, &hub_pk)
+            .await
+            .expect("handshake");
+        // Old unsigned SUBSCRIBE: raw routing id, no signer_pk/sig.
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: FRAME_SUBSCRIBE,
+                payload: target.to_vec(),
+            },
+        )
+        .await
+        .expect("write");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A delivery to `target` must NOT reach the attacker.
+        state.lock().await.deliver(target, b"secret".to_vec());
+        assert!(
+            !received_anything(&mut stream, &mut session).await,
+            "BREACH: unsigned SUBSCRIBE was honored — attacker received a delivery"
+        );
+    }
+
+    /// ATTACK (HIGH-1): subscribe to a VICTIM's published introduction
+    /// inbox using the attacker's own (different) signing key. The hub
+    /// knows the inbox (a KP is published there) and must reject the
+    /// subscription because the signer doesn't own it.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn attack_subscribe_to_victims_known_inbox_is_rejected() {
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let attacker_sk = IdentitySecret::generate();
+        let state = Arc::new(Mutex::new(HubState::new()));
+
+        // Victim's identity + their (publicly derivable) intro inbox.
+        let victim_signing = onyx_core::crypto::SigningKey::generate();
+        let victim_inbox =
+            onyx_core::routing::introduction_inbox(&victim_signing.verifying_key().fingerprint());
+        // Victim has published a KeyPackage there → hub knows it's an
+        // introduction inbox.
+        state
+            .lock()
+            .await
+            .publish_keypackage(victim_inbox, b"victim-kp-bytes".to_vec());
+
+        let (client, hub) = tokio::io::duplex(65_536);
+        let _hub_task = spawn_hub(hub, hub_sk_clone(&hub_sk), state.clone());
+        let mut stream = client;
+        let mut session = handshake_initiator(&mut stream, &attacker_sk, &hub_pk)
+            .await
+            .expect("handshake");
+        // Attacker signs a SUBSCRIBE for the victim's inbox with the
+        // attacker's OWN key — a valid signature, but for an inbox the
+        // attacker doesn't own.
+        let attacker_signing = onyx_core::crypto::SigningKey::generate();
+        let hh = session.handshake_hash();
+        let payload =
+            onyx_core::routing::encode_signed_subscribe(&attacker_signing, &hh, &[victim_inbox]);
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: FRAME_SUBSCRIBE,
+                payload,
+            },
+        )
+        .await
+        .expect("write");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state
+            .lock()
+            .await
+            .deliver(victim_inbox, b"victim mail".to_vec());
+        assert!(
+            !received_anything(&mut stream, &mut session).await,
+            "BREACH: attacker subscribed to a victim's known intro inbox and stole a delivery"
+        );
+    }
+
+    /// ATTACK (HIGH-1 replay-binding): replay a SUBSCRIBE proof that was
+    /// signed against a DIFFERENT connection's handshake hash (as if
+    /// captured from the victim's wire). The hub verifies against THIS
+    /// connection's hash, so the signature fails and the id is dropped.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn attack_replayed_subscribe_proof_is_rejected() {
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let attacker_sk = IdentitySecret::generate();
+        let state = Arc::new(Mutex::new(HubState::new()));
+        let (client, hub) = tokio::io::duplex(65_536);
+        let _hub_task = spawn_hub(hub, hub_sk_clone(&hub_sk), state.clone());
+
+        let target: RoutingId = [0x55; 16];
+        let mut stream = client;
+        let mut session = handshake_initiator(&mut stream, &attacker_sk, &hub_pk)
+            .await
+            .expect("handshake");
+        // A proof signed over some OTHER handshake hash (captured replay).
+        let signing = onyx_core::crypto::SigningKey::generate();
+        let stale_hh = [0xEE_u8; 32];
+        let payload = onyx_core::routing::encode_signed_subscribe(&signing, &stale_hh, &[target]);
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: FRAME_SUBSCRIBE,
+                payload,
+            },
+        )
+        .await
+        .expect("write");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.lock().await.deliver(target, b"x".to_vec());
+        assert!(
+            !received_anything(&mut stream, &mut session).await,
+            "BREACH: a replayed SUBSCRIBE proof (wrong handshake hash) was accepted"
+        );
+    }
+
+    /// ATTACK (DoS / fuzz): send a validly-encrypted frame with an
+    /// unknown frame type + garbage payload. The hub must not panic or
+    /// drop the connection — it logs + ignores, and the SAME connection
+    /// can still do legitimate work afterward.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn attack_garbage_frame_does_not_crash_connection() {
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let client_sk = IdentitySecret::generate();
+        let state = Arc::new(Mutex::new(HubState::new()));
+        let (client, hub) = tokio::io::duplex(65_536);
+        let _hub_task = spawn_hub(hub, hub_sk_clone(&hub_sk), state.clone());
+
+        let mut stream = client;
+        let mut session = handshake_initiator(&mut stream, &client_sk, &hub_pk)
+            .await
+            .expect("handshake");
+        // Unknown frame type + random payload.
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: 0x00,
+                payload: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF],
+            },
+        )
+        .await
+        .expect("write garbage");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The connection must still be alive: a legitimate signed
+        // SUBSCRIBE + delivery round-trips.
+        let own_id: RoutingId = [0x42; 16];
+        let signing = onyx_core::crypto::SigningKey::generate();
+        let hh = session.handshake_hash();
+        let payload = onyx_core::routing::encode_signed_subscribe(&signing, &hh, &[own_id]);
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: FRAME_SUBSCRIBE,
+                payload,
+            },
+        )
+        .await
+        .expect("write subscribe after garbage");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.lock().await.deliver(own_id, b"still-alive".to_vec());
+        assert!(
+            received_anything(&mut stream, &mut session).await,
+            "connection died after a garbage frame — should have survived + delivered"
+        );
+    }
+
     /// Alice subscribes; bob delivers; alice receives over the wire.
     #[allow(clippy::similar_names)]
     #[tokio::test]
