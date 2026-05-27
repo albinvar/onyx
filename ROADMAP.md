@@ -9,16 +9,22 @@ For finished work with full design notes + verification + carry-forward, see `CH
 ## Status at a glance
 
 ```
-done       ────────────────────────►  T1 T2 T3 T4 T5 T6.1 T6.2 T7.0 (+ docs)
-in flight  ────────────────────────►  (none — between phases)
-next       ────────────────────────►  T7.1 → T7.2 → T6.3
-later      ────────────────────────►  T6.4 → security/release hardening
-won't do   ────────────────────────►  see §6
+done       ──►  T1–T7.x · T6.1–T6.4 rooms · T8.x multi-hub+federation · files ·
+                invite URLs · single-binary · cover-traffic (opt-in) · install/
+                signed releases (v0.1.0–v0.1.3) · TUI UX overhaul · security
+                audit (8 findings fixed) + red-team
+in flight  ──►  (between phases)
+next       ──►  DM file sending · first-run wizard · TUI settings/sidebar ·
+                room member-removal  (tasks 322–325)
+later      ──►  idle-circuit cover traffic · reliability soak · bootstrap hub
+won't do   ──►  see §6
+must-have  ──►  EXTERNAL SECURITY AUDIT (the one thing that gates a "secure" claim)
 ```
 
-- **Commits:** 40-ish on `main`.
-- **Tests:** 216 passing, full CI gate (`fmt`, `clippy -D warnings`, `cargo deny`).
-- **External review status:** none. See `SECURITY.md` §1.
+- **Current release:** v0.1.3 (`latest`), sigstore-signed; one-liner installer.
+- **Tests:** 470+ passing (incl. adversarial hub attacks + ~36k-case decoder fuzz), full CI gate (`fmt`, `clippy -D warnings`, `cargo deny`).
+- **Security:** internal audit + red-team done — `THREAT_MODEL.md` §8.3. **External review: none** (still the #1 gap). See `SECURITY.md` §1.
+- **Note:** this file summarizes; `CHANGELOG.md` is the authoritative chronological log and is current through the latest commit.
 
 ---
 

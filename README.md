@@ -24,10 +24,10 @@ Anonymous, end-to-end-encrypted chat over Tor. Rust core, hybrid P2P + optional 
 
 Onyx is **pre-1.0 research and engineering**. As of writing:
 
-- **No external security audit has been conducted.** Not by anyone. Not at any depth.
-- The codebase is ~12,000 lines of Rust written by one developer working with an AI assistant over a few weeks.
-- The cryptographic primitives are sound (Ed25519, X25519, ChaCha20-Poly1305, Argon2id, ML-KEM-768, MLS via openmls 0.8, Noise XK via snow). The way we *compose* them has not been independently reviewed.
-- **216 internal tests pass.** They cover correctness, not metadata-resistance against an adversary.
+- **No external security audit has been conducted.** Not by anyone. Not at any depth. An *internal* audit + red-team has been done (`THREAT_MODEL.md` §8.3) — that is not the same thing and does not replace it.
+- The codebase is ~27,000 lines of Rust written by one developer working with an AI assistant over a few weeks.
+- The cryptographic primitives are sound (Ed25519, X25519, ChaCha20-Poly1305, Argon2id, ML-KEM-768, MLS via openmls 0.8, Noise XK via snow). The way we *compose* them has had an internal review but no independent one.
+- **470+ internal tests pass**, including adversarial hub attacks and a ~36k-case decoder fuzz. They cover correctness + the attacks we knew to write — not metadata-resistance against a determined adversary, and not "proven secure."
 
 **Practical consequence:** appropriate for **learning, demos, hobby chat, and contributing to the codebase**. Not appropriate for any communication where your safety, freedom, or livelihood depends on the protocol's security. Use Signal, Briar, or other mature tools for those.
 
@@ -43,30 +43,36 @@ Each user runs a long-running daemon (`onyxd`) that owns their long-term identit
 
 ## 2. Project status
 
+Current release: **v0.1.3** (sigstore-signed; install via the one-liner in §3).
+
 | Binary | What it does | State |
 |---|---|---|
-| `onyxd` | Daemon: vault, Tor circuit, hidden service, Noise+MLS chat path, hub client | **functional end-to-end** |
-| `onyx`  | CLI + multi-pane Ratatui TUI; talks to `onyxd` over Unix socket | **functional, growing CLI surface** |
-| `onyx-hub` | Optional relay: stores sealed envelopes + KeyPackage directory | **functional v0** (in-memory state, no auth yet) |
+| `onyx` | Single binary: run with no args = daemon **+** TUI in one process. Also the CLI. | **functional** |
+| `onyxd` | Headless daemon (vault, Tor circuit, hidden service, Noise+MLS chat, hub client) for systemd/Docker | **functional end-to-end** |
+| `onyx-hub` | Optional relay: stores sealed envelopes + KeyPackage directory | **functional** (signed-SUBSCRIBE auth + per-identity rate limit + queue caps; still no invite-only registration) |
 
 What works today (verified end-to-end):
 
-- Two daemons over real Tor: handshake, MLS bootstrap, **live two-way chat** in the TUI.
-- Two daemons over **local TCP** (`--listen-tcp` / `--dial-tcp`, **test-only**) — same chat path without 60-second Tor bootstrap, useful for development.
-- A hub serving sealed-sender envelopes; daemons publish their MLS KeyPackages to it; first-contact via hub works in both `msg/v1` (per-message PFS) and `mls/v1` (full MLS PCS) tiers.
-- CLI subcommands: `status`, `identity`, `tui`, `send-bootstrap`, `send-bootstrap-mls`, `fetch-keypackage`.
-- MLS state persistence: groups survive daemon restart; reconnects resume the same MLS epoch.
-- TUI with live tail subscription, peer list, message scrollback, history backfill across restarts, and a visible `[hub]` security-tier badge for hub-relayed messages.
+- **1:1 DM** over real Tor: Noise XK handshake → MLS bootstrap → live two-way chat.
+- **Multi-party rooms / channels** (MLS): create, invite, join, send; file sharing within rooms (metadata stripped by default).
+- **Sealed-sender first contact** via the hub in both `msg/v1` (per-message PFS) and `mls/v1` (full MLS PCS) tiers; post-quantum hybrid X25519+ML-KEM-768 envelopes.
+- **Invite URLs**: `onyx invite --with-kp --with-hubs` → share → `onyx accept '<url>'`.
+- **TUI**: 3-pane dashboard (Conversations │ Chat │ Details), live tail, scrollback + history backfill (DMs *and* rooms) across restart, real sender fingerprints, `[hub]` security-tier badge, and discoverability — `F1` help, `Ctrl-K` command palette, `Ctrl-E` copy-invite (OSC52), `Ctrl-N` room, `Ctrl-I` invite, `Ctrl-F` send file.
+- **Local TCP test mode** (no Tor): `--listen-tcp`/`--dial-tcp` for DMs; `onyx-hub --listen-tcp` + `onyx --hub-tcp` for rooms/files. `scripts/local-hub-demo.sh` sets up a two-party demo.
+- **Signed releases** (`v0.1.0`–`v0.1.3`) + verified one-liner installer (`INSTALL.md`, `RELEASES.md`).
+- **MLS state persistence**: groups survive restart; reconnects resume the same epoch.
+- **Internal security audit + red-team**: 8 findings fixed, all mounted attacks blocked, ~36k-case decoder fuzz, locked as regression tests (`THREAT_MODEL.md` §8.3). **Internal only — not an external audit.**
 
-What's **not** done yet (carry-forward, with item numbers from `THREAT_MODEL.md` §8.2):
+What's **not** done yet (carry-forward — see `THREAT_MODEL.md` §8.2/§8.3 and `ROADMAP.md`):
 
-- Single-binary merge — today you run `onyxd` + `onyx` separately (T7.1 planned).
-- Invite URLs — peer onboarding still requires copy-pasting fingerprints + KEM publics + KPs (T7.2 planned).
-- Multi-party rooms / channels (T6.3 planned).
-- Ongoing MLS app messages routed over hub (T6.x — needed for fully-asynchronous chat without any direct circuit).
-- Hub-side ownership validation of routing IDs (§8.2 #15, mitigated recipient-side).
-- Reproducible builds + signed releases.
-- External security audit.
+- **DM file sending** — files work in rooms only; the DM channel needs a tagged-message migration.
+- **First-run wizard** — the TUI guides you but doesn't yet walk first-launch setup (passphrase + hub).
+- **TUI settings panel**, sidebar grouping (DMs/Channels), room member removal (kick).
+- **Idle-circuit cover traffic** (§8.2 #3) — biggest remaining anonymity gap.
+- **Invite-only hub registration** (§8.2 #4); session-token subscriptions are unauthenticated by design (§8.3 residual #1).
+- **A bootstrap public hub** — there's no default hub, so two parties must share/run one to chat asynchronously.
+- **External security audit** (§8.2 #7) — the single most important open item.
+- **Real-world reliability soak** — never run in production; reconnection / offline-ordering / real-Tor churn unexercised.
 
 ---
 

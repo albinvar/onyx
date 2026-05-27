@@ -212,6 +212,48 @@ Also rows in 8.1 updated this turn:
 
 Each item is also enumerated in the relevant CHANGELOG entry. This list and the CHANGELOG must stay in sync.
 
+Status updates to §8.2 items from the 2026-05 internal audit (see §8.3):
+
+  * **#4 (hub auth)** — partially closed. The hub now (a) authenticates SUBSCRIBE and enforces *ownership* of any **published** introduction inbox (HIGH-1), (b) rate-limits per authenticated identity (HIGH-3), and (c) caps offline-queue memory. **Still open**: invite-only / token registration (anyone with the static key can still connect), and **session-token subscriptions remain unauthenticated by design** (see §8.3 residuals).
+  * **#5 (sender-fingerprint fallback)** — closed. Incoming room messages/files are now attributed to the real Ed25519 fingerprint pulled from the MLS credential (`process_incoming_with_sender`, task 321); the `(peer/<x25519>)` placeholder only remains as a graceful fallback if the credential isn't 32 bytes.
+  * **#6 (reproducible builds + signed releases)** — closed. Sigstore-keyless signed releases ship (`v0.1.0`–`v0.1.3`), verifiable via `RELEASES.md`.
+  * **#9 (fuzzing wire decoders)** — closed. `crates/onyx-core/tests/fuzz_no_panic.rs` runs ~36k random-input cases against every public decoder; zero panics (see §8.3).
+
+---
+
+### 8.3 Internal security audit + red-team (2026-05-20/21)
+
+A multi-agent internal review of the security-critical code, followed by an adversarial red-team pass. **All identified findings were fixed; all attacks mounted were blocked.** This is internal review — it does **not** substitute for the external audit still tracked as §8.2 #7.
+
+**Findings fixed:**
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| HIGH-1 | Hub SUBSCRIBE unauthenticated — anyone could subscribe to a victim's deterministic introduction inbox and drain its queue (message theft + metadata leak) | Signed SUBSCRIBE (`signer_pk ‖ Ed25519-sig ‖ ids`), sig bound to the Noise handshake hash (replay-proof per connection); hub rejects subscribing to a **known** intro inbox not owned by the signer (`is_known_intro_inbox` vs the KP directory) |
+| HIGH-2 | Sealed-sender envelope bound nothing to the recipient → a malicious legitimate recipient could reflect a signed payload to a different victim | Recipient hybrid-KEM pubkey bound into both the Ed25519 signature and the AEAD aad |
+| HIGH-3 | Rate limit keyed on per-connection id → reset by reconnecting / parallel connections | Keyed on the authenticated Noise static key; full buckets evicted, throttled buckets retained |
+| MED | Replay-guard dedup ignored the routing target | Dedup over `target ‖ body` |
+| MED | Executable-MIME refuse trusted the sender's claimed MIME | Re-sniff the assembled bytes (`infer`) on receive |
+| MED | Unbounded hub offline-queue memory | Per-id depth cap + global byte cap |
+| MED | Unbounded daemon file-reassembly memory; stalled transfers pinned forever | Global in-flight byte budget + stalled-transfer reaper |
+| MED | Hybrid-KEM combiner wasn't the robust (X-Wing/PQXDH) form | Bind both recipient static pubkeys into the KDF |
+| LOW | Latent path traversal in the conversation key before `storage_dir.join` | `is_valid_conversation_key` guard |
+
+**Red-team (all blocked, locked as regression tests):**
+
+  * Live malicious-client attacks against the hub (real Noise handshake): unsigned SUBSCRIBE, subscribe-to-victim's-known-inbox, replayed SUBSCRIBE proof (wrong handshake hash), garbage-frame crash attempt — all rejected; connection survives garbage without panic.
+  * Decoder fuzz: ~36k random-input cases across every untrusted-byte parser — zero panics.
+
+**Residuals (honest accounting — what the audit did NOT close):**
+
+  1. **Session-token subscriptions are unauthenticated by design.** Tier-2 per-epoch routing tokens are derived from a group-private MLS exporter secret the hub never sees, so the hub *cannot* authenticate a subscription to one without breaking the unlinkability the two-tier scheme exists to provide. They rely on 128-bit unguessability. An attacker who *learns* a current token (e.g. a former group member) could subscribe to it until the next epoch rotation.
+  2. **Introduction inboxes are only protected once a KeyPackage is published there** (that's how the hub knows an id is an inbox). An unpublished inbox is treated as a session token. Most flows auto-publish on connect, so this is covered in practice.
+  3. **No invite-only hub registration** (§8.2 #4). Anyone with the hub's static key can still open a session.
+  4. **Replay guard is in-memory with a ≤60 s restart window** (§8.2 #16 detail) — unchanged.
+  5. **The crypto primitives themselves** (X25519, ML-KEM-768, MLS, ChaCha20-Poly1305) are assumed correct; the underlying libraries (`snow`, `openmls`, `ml-kem`) are not fully audited (§4 trust assumptions, N5).
+  6. **Timing / traffic analysis** — idle-circuit cover traffic is still unbuilt (§8.2 #3, A2 caveat, N1).
+  7. **External audit (§8.2 #7) remains the single most important open item.** Everything above is "survives the attacks we knew to write," not "proven secure."
+
 ---
 
 *See `DESIGN.md` for the full system specification and `SECURITY.md` for the enforcement principles and disclosure policy.*
