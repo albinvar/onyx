@@ -1390,35 +1390,45 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
 }
 
 /// Task 320: merge persisted `RoomHistory` rows into a room's
-/// scrollback, deduplicating against already-present live lines by
-/// `(ts_unix_ms, text)` — same shape as [`merge_history`] for DMs.
-/// Room messages carry no hub/direct tier, so `via_hub` is false.
+/// scrollback. Room messages carry no hub/direct tier, so `via_hub`
+/// is false. Dedup + prepend is shared with DMs via
+/// [`prepend_history_lines`].
 fn merge_room_history(
     app: &mut AppState,
     conv_key: &str,
     messages: Vec<onyx_core::api::RoomHistoryEntry>,
 ) {
-    if messages.is_empty() {
-        return;
-    }
-    let entry = app.scrollback.entry(conv_key.to_string()).or_default();
-    let live_keys: HashSet<(u64, String)> = entry
+    let lines = messages.into_iter().map(|m| ChatLine {
+        direction: m.direction,
+        text: m.text,
+        ts_unix_ms: m.ts_unix_ms,
+        via_hub: false,
+    });
+    prepend_history_lines(
+        app.scrollback.entry(conv_key.to_string()).or_default(),
+        lines,
+    );
+}
+
+/// Prepend backfilled history `lines` (oldest → newest) to the front of
+/// a conversation's `scrollback`, dropping any that duplicate an
+/// already-stored live entry by `(ts_unix_ms, text)`. Live entries that
+/// arrived during the History round-trip keep their position at the
+/// end. Shared by DM ([`merge_history`]) and room ([`merge_room_history`])
+/// backfill so the dedup rule lives in exactly one place.
+fn prepend_history_lines(scrollback: &mut Vec<ChatLine>, lines: impl Iterator<Item = ChatLine>) {
+    let live_keys: HashSet<(u64, String)> = scrollback
         .iter()
         .map(|l| (l.ts_unix_ms, l.text.clone()))
         .collect();
-    let mut prepend: Vec<ChatLine> = messages
-        .into_iter()
-        .filter(|m| !live_keys.contains(&(m.ts_unix_ms, m.text.clone())))
-        .map(|m| ChatLine {
-            direction: m.direction,
-            text: m.text,
-            ts_unix_ms: m.ts_unix_ms,
-            via_hub: false,
-        })
+    let mut prepend: Vec<ChatLine> = lines
+        .filter(|l| !live_keys.contains(&(l.ts_unix_ms, l.text.clone())))
         .collect();
-    let existing = std::mem::take(entry);
-    prepend.extend(existing);
-    *entry = prepend;
+    if prepend.is_empty() {
+        return;
+    }
+    prepend.append(scrollback);
+    *scrollback = prepend;
 }
 
 /// T-files.e: merge the daemon's per-room file list into the
@@ -1479,27 +1489,16 @@ fn apply_received_files(
 /// entries by `(ts_unix_ms, text)`. Live entries that happened during
 /// the History fetch keep their position at the end of the buffer.
 fn merge_history(app: &mut AppState, peer_short: &str, messages: Vec<HistoryEntry>) {
-    let entry = app.scrollback.entry(peer_short.to_string()).or_default();
-    if messages.is_empty() {
-        return;
-    }
-    let live_keys: HashSet<(u64, String)> = entry
-        .iter()
-        .map(|l| (l.ts_unix_ms, l.text.clone()))
-        .collect();
-    let mut prepend: Vec<ChatLine> = messages
-        .into_iter()
-        .filter(|m| !live_keys.contains(&(m.ts_unix_ms, m.text.clone())))
-        .map(|m| ChatLine {
-            direction: m.direction,
-            text: m.text,
-            ts_unix_ms: m.ts_unix_ms,
-            via_hub: m.via_hub,
-        })
-        .collect();
-    let existing = std::mem::take(entry);
-    prepend.extend(existing);
-    *entry = prepend;
+    let lines = messages.into_iter().map(|m| ChatLine {
+        direction: m.direction,
+        text: m.text,
+        ts_unix_ms: m.ts_unix_ms,
+        via_hub: m.via_hub,
+    });
+    prepend_history_lines(
+        app.scrollback.entry(peer_short.to_string()).or_default(),
+        lines,
+    );
 }
 
 // ── Background tasks ─────────────────────────────────────────────────────
