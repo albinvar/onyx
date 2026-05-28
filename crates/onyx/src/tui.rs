@@ -253,6 +253,14 @@ enum ModalState {
         url: String,
         copied: bool,
     },
+    /// Task 324: read-only settings / identity panel — your
+    /// fingerprint, KEM pubkey, Tor state, daemon version, and
+    /// configured hubs. Fetched async on open (via the command
+    /// palette). Any key closes. Runtime config (cover traffic,
+    /// intro-inbox) is set at daemon launch and not shown here.
+    Settings {
+        info: Vec<(String, String)>,
+    },
 }
 
 /// UX overhaul: actions runnable from the command palette (`Ctrl-K`).
@@ -264,17 +272,19 @@ enum PaletteAction {
     InvitePeer,
     SendFile,
     CopyInvite,
+    Settings,
     Help,
     Quit,
 }
 
 impl PaletteAction {
     /// All actions, in palette display order.
-    const ALL: [PaletteAction; 6] = [
+    const ALL: [PaletteAction; 7] = [
         PaletteAction::CreateRoom,
         PaletteAction::InvitePeer,
         PaletteAction::SendFile,
         PaletteAction::CopyInvite,
+        PaletteAction::Settings,
         PaletteAction::Help,
         PaletteAction::Quit,
     ];
@@ -284,8 +294,9 @@ impl PaletteAction {
         match self {
             PaletteAction::CreateRoom => "Create room",
             PaletteAction::InvitePeer => "Invite peer to room",
-            PaletteAction::SendFile => "Send file to room",
+            PaletteAction::SendFile => "Send file (room or DM peer)",
             PaletteAction::CopyInvite => "Copy my invite link",
+            PaletteAction::Settings => "Settings / identity",
             PaletteAction::Help => "Show keyboard help",
             PaletteAction::Quit => "Quit Onyx",
         }
@@ -298,6 +309,7 @@ impl PaletteAction {
             PaletteAction::InvitePeer => "^I",
             PaletteAction::SendFile => "^F",
             PaletteAction::CopyInvite => "^E",
+            PaletteAction::Settings => "",
             PaletteAction::Help => "F1",
             PaletteAction::Quit => "^C",
         }
@@ -790,7 +802,8 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
     match (&mut modal, key.code) {
         // Esc closes any modal without submitting. Help + Invite are
         // read-only overlays, so ANY key dismisses them too.
-        (_, KeyCode::Esc) | (ModalState::Help | ModalState::Invite { .. }, _) => {
+        (_, KeyCode::Esc)
+        | (ModalState::Help | ModalState::Invite { .. } | ModalState::Settings { .. }, _) => {
             return;
         }
         // UX overhaul: command palette navigation + filtering.
@@ -994,11 +1007,13 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                     keep_metadata,
                 },
             }),
-            // Help / CommandPalette / Invite never set submit_intent
-            // (they're handled inline above), so they can't reach here.
-            ModalState::Help | ModalState::CommandPalette { .. } | ModalState::Invite { .. } => {
-                None
-            }
+            // Help / CommandPalette / Invite / Settings never set
+            // submit_intent (handled inline above), so they can't
+            // reach here.
+            ModalState::Help
+            | ModalState::CommandPalette { .. }
+            | ModalState::Invite { .. }
+            | ModalState::Settings { .. } => None,
         };
         if let Some(req) = req {
             match client::one_shot(&app.socket_path, &req).await {
@@ -1149,6 +1164,7 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
             }
         }
         PaletteAction::CopyInvite => open_invite_modal(app).await,
+        PaletteAction::Settings => open_settings_modal(app).await,
         PaletteAction::Help => app.modal = Some(ModalState::Help),
         PaletteAction::Quit => app.quit_requested = true,
     }
@@ -1167,6 +1183,57 @@ async fn open_invite_modal(app: &mut AppState) {
             app.last_send_result = Some(Err(format!("invite: {e:#}")));
         }
     }
+}
+
+/// Task 324: open the read-only settings / identity panel. Pulls
+/// identity + hubs from `Identity` and tor/version from the cached
+/// `Status` snapshot.
+async fn open_settings_modal(app: &mut AppState) {
+    let mut info: Vec<(String, String)> = Vec::new();
+    if let Some(Ok(s)) = &app.last_status {
+        info.push(("Fingerprint".into(), s.fingerprint.clone()));
+        info.push((
+            "Tor".into(),
+            match s.tor_state {
+                TorState::Ready => "ready".into(),
+                TorState::Disabled => "disabled (test mode)".into(),
+            },
+        ));
+        info.push(("Daemon".into(), format!("v{}", s.daemon_version)));
+    }
+    match client::one_shot(&app.socket_path, &ApiRequest::Identity).await {
+        Ok(ApiResponse::IdentityOk {
+            identity_pub_b32,
+            identity_kem_pub_b32,
+            hubs,
+            ..
+        }) => {
+            info.push(("Identity pub".into(), identity_pub_b32));
+            info.push((
+                "KEM pub".into(),
+                format!(
+                    "{}… ({} chars)",
+                    short_id(&identity_kem_pub_b32),
+                    identity_kem_pub_b32.len()
+                ),
+            ));
+            info.push((
+                "Hubs".into(),
+                if hubs.is_empty() {
+                    "none configured (rooms/DM-offline need one)".into()
+                } else {
+                    format!("{} configured", hubs.len())
+                },
+            ));
+        }
+        Ok(other) => info.push(("identity".into(), format!("unexpected: {other:?}"))),
+        Err(e) => info.push(("identity".into(), format!("error: {e:#}"))),
+    }
+    info.push((
+        "Config".into(),
+        "cover-traffic / intro-inbox set at daemon launch".into(),
+    ));
+    app.modal = Some(ModalState::Settings { info });
 }
 
 /// UX overhaul: assemble an `onyx://invite/v1?…` URL from the daemon's
@@ -1704,6 +1771,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
         }
         ModalState::Invite { .. } => 11,
+        ModalState::Settings { info } => u16::try_from(info.len() + 4).unwrap_or(14),
     };
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -1880,7 +1948,41 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             render_palette_modal(frame, rect, query, *selected);
         }
         ModalState::Invite { url, copied } => render_invite_modal(frame, rect, url, *copied),
+        ModalState::Settings { info } => render_settings_modal(frame, rect, info),
     }
+}
+
+/// Task 324: read-only settings / identity panel.
+fn render_settings_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, info: &[(String, String)]) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Settings / Identity  (any key to close) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let lines: Vec<Line> = info
+        .iter()
+        .map(|(k, v)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {k:<14}"),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(v.clone(), Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 /// UX overhaul: keybinding cheat-sheet overlay (F1). Two columns of
@@ -2176,18 +2278,12 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             boxed(
                 frame,
                 rows[1],
-                "Note",
-                Color::DarkGray,
-                vec![
-                    Line::from(Span::styled(
-                        " DMs don't support files yet.",
-                        Style::default().fg(Color::Gray),
-                    )),
-                    Line::from(Span::styled(
-                        " Make a room to share files.",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ],
+                "Actions",
+                Color::Green,
+                vec![Line::from(vec![
+                    Span::styled(" ^F ", Style::default().fg(Color::Yellow)),
+                    Span::styled("send file (direct)", Style::default().fg(Color::White)),
+                ])],
             );
         }
         None => {
@@ -2220,6 +2316,10 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     }
 }
 
+// Linear render fn: empty-state branch + grouped DM/Channels item
+// build + visual-row mapping. Over the 100-line budget but cohesive
+// (same rationale as the other render_* helpers).
+#[allow(clippy::too_many_lines)]
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2258,7 +2358,22 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
 
-    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(app.peers.len() + app.rooms.len());
+    // Task 324: group into "Direct messages" / "Channels" sections
+    // with headers. Headers are non-selectable list rows, so we map
+    // the entry index (`app.selected`, into peers++rooms) to the
+    // VISUAL row index the ListState should highlight.
+    let header = |t: &str| -> ListItem<'_> {
+        ListItem::new(Line::from(Span::styled(
+            t.to_string(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )))
+    };
+    let mut items: Vec<ListItem<'_>> = Vec::with_capacity(app.peers.len() + app.rooms.len() + 2);
+    if !app.peers.is_empty() {
+        items.push(header("DIRECT MESSAGES"));
+    }
     for p in &app.peers {
         let dot = if p.connected {
             Span::styled("● ", Style::default().fg(Color::Green))
@@ -2293,6 +2408,9 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         }
         items.push(ListItem::new(Line::from(spans)));
     }
+    if !app.rooms.is_empty() {
+        items.push(header("CHANNELS"));
+    }
     for r in &app.rooms {
         let label = format!("#{} ({}m)", r.name, r.members.len());
         let mut spans = vec![
@@ -2316,9 +2434,23 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         .block(block)
         .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
         .highlight_symbol("▶ ");
-    let total = app.total_entries();
+    // Map the selected entry index to its visual row. DM section, when
+    // present, is [header, peers…] = 1 + peers.len() rows; the channels
+    // header adds 1 before the rooms.
+    let sel = app.selected.min(app.total_entries().saturating_sub(1));
+    let visual = if sel < app.peers.len() {
+        1 + sel // skip the DM header
+    } else {
+        let dm_rows = if app.peers.is_empty() {
+            0
+        } else {
+            1 + app.peers.len()
+        };
+        let room_idx = sel - app.peers.len();
+        dm_rows + 1 + room_idx // + channels header
+    };
     let mut state = ListState::default();
-    state.select(Some(app.selected.min(total.saturating_sub(1))));
+    state.select(Some(visual));
     frame.render_stateful_widget(list, area, &mut state);
 }
 

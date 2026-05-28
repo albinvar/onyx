@@ -6,6 +6,21 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Task 324: TUI settings panel + sidebar grouping
+
+Completes task 324 (the invite-quote hint shipped earlier).
+
+  * **Sidebar grouping**: the Peers & Rooms list is now split into **DIRECT MESSAGES** / **CHANNELS** sections with colored headers. Headers are non-selectable rows; the selected *entry* index is mapped to the correct *visual* row so the `▶` highlight + arrow-key navigation stay correct (verified by hand across the 0-peers / 0-rooms / both edge cases).
+  * **Settings / Identity panel**: new read-only modal (command palette → "Settings / identity") showing fingerprint, Tor state, daemon version, identity pubkey, KEM-pub summary, and configured-hub count. Fetched on open from `Status` (cached) + `Identity`. Any key closes. Runtime config (cover-traffic / intro-inbox) is set at daemon launch and noted as such rather than shown as toggleable.
+  * **`PaletteAction::Settings`** added (palette now has 7 actions).
+  * Fixed a stale Details-pane note that claimed "DMs don't support files yet" — they do now (task 322); the peer Details pane shows a `^F send file (direct)` action instead.
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **482 passed**.
+
+Open follow-up: settings are read-only — live toggling cover-traffic / intro-inbox needs a daemon runtime-config API (not built).
+
+---
+
 ## 2026-05-29 — Task 323: first-run / unlock wizard
 
 `onyx` (combined daemon+TUI mode) no longer dead-ends a new user on the `--passphrase` wall. When launched **interactively** without a passphrase, it now prompts:
