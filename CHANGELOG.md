@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Task 322: DM file sending
+
+Files are no longer rooms-only. A directly-connected DM peer can now receive files over the peer's DM MLS group.
+
+**Design choice — reuse, don't duplicate.** Rather than a parallel `DmAppMessage` enum, the DM channel now carries the **existing `RoomAppMessage` tagged envelope** (`Text` / `FileMeta` / `FileChunk`). DM text used to be raw UTF-8; it now rides `RoomAppMessage::Text`. This means the entire chunk → accept → cap-check → BLAKE2b-256-verify → finalize → manifest pipeline in `files.rs` is shared verbatim with rooms — zero duplicated file logic.
+
+  * **`PeerOutbound::DmFrame(RoomAppMessage)`** — file frames are pushed (plaintext) to the peer-session task, which encrypts them in the peer's DM group exactly like `Dm(text)`. No cross-task MLS access needed.
+  * **Receive**: `handle_dm_app_frame` decodes the envelope — `Text` → chat message; `FileMeta`/`FileChunk` → the shared `files::accept_*` pipeline scoped to a `peer/<short>` conversation; `KemAdvertisement` is room-only and ignored on DMs. The sender is attributed to the peer's **real fingerprint** (derived from the DM group roster, consistent with task 321).
+  * **Send**: `ApiRequest::SendFileToPeer` + `handle_send_file_to_peer` — sanitize (strip metadata) → chunk → `.send().await` each frame (respects the bounded channel's backpressure for many-chunk files). **Direct-only** in v1: requires a live conversation (no hub fallback for DM files yet).
+  * **CLI**: `onyx files send --peer-short <short> --path <file> [--keep-filename] [--keep-metadata]`.
+  * **TUI**: `Ctrl-F` now works for a selected **peer** as well as a room (new `FileTarget` enum routes to `SendFileToRoom` vs `SendFileToPeer`); the modal shows `→ <peer> (DM)`.
+
+**Verified live** (two daemons over `--listen-tcp`/`--dial-tcp`, no Tor): alice→bob file send → bob's `files list --conversation peer/<short>` shows it → on-disk with correct content + the real sender fingerprint. Wire-format note: DM text changed from raw UTF-8 to CBOR-tagged; both ends run the new code (pre-release, no compat concern).
+
+Gate: `clippy -D warnings` clean; `cargo test --workspace` = **482 passed**.
+
+Still open (DM files v1 limitations): no hub fallback (peer must be online); no DM-file unread/auto-render poll in the TUI yet (use `onyx files list`); no progress bar for multi-MB transfers.
+
+---
+
 ## 2026-05-21 — Red-team pass: live hub attacks + decoder fuzz
 
 Authorized penetration testing of our own system. **Every attack mounted was blocked.** Locked in as regression tests.

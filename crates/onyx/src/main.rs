@@ -431,13 +431,28 @@ enum RoomCommand {
 #[derive(Subcommand, Debug)]
 enum FilesCommand {
     /// List files received from peers / in rooms.
-    /// `conversation` is `peer-<short>` for DMs (when DM file
-    /// support lands) or `room/<short_b32>` for rooms.
+    /// `conversation` is `peer/<short>` for DMs or
+    /// `room/<short_b32>` for rooms.
     List {
         #[arg(long)]
         conversation: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+    },
+    /// Send a file to a directly-connected DM peer (task 322).
+    /// Requires a live conversation with the peer (direct-only).
+    /// Metadata is stripped by default; pass `--keep-metadata` for
+    /// formats we can't strip (non-image), `--keep-filename` to keep
+    /// the original name instead of a random one.
+    Send {
+        #[arg(long)]
+        peer_short: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        keep_filename: bool,
+        #[arg(long)]
+        keep_metadata: bool,
     },
 }
 
@@ -765,6 +780,23 @@ async fn dispatch_files(socket: &std::path::Path, cmd: FilesCommand) -> anyhow::
                 ApiRequest::ListReceivedFiles {
                     conversation,
                     limit,
+                },
+            )
+            .await
+        }
+        FilesCommand::Send {
+            peer_short,
+            path,
+            keep_filename,
+            keep_metadata,
+        } => {
+            one_shot_print(
+                socket,
+                ApiRequest::SendFileToPeer {
+                    peer_short,
+                    path,
+                    keep_filename,
+                    keep_metadata,
                 },
             )
             .await

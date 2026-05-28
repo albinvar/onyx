@@ -54,7 +54,7 @@ Current release: **v0.1.3** (sigstore-signed; install via the one-liner in §3).
 What works today (verified end-to-end):
 
 - **1:1 DM** over real Tor: Noise XK handshake → MLS bootstrap → live two-way chat.
-- **Multi-party rooms / channels** (MLS): create, invite, join, send; file sharing within rooms (metadata stripped by default).
+- **Multi-party rooms / channels** (MLS): create, invite, join, send; file sharing in rooms **and** DMs (metadata stripped by default; `Ctrl-F` or `onyx files send`/`onyx room send-file`).
 - **Sealed-sender first contact** via the hub in both `msg/v1` (per-message PFS) and `mls/v1` (full MLS PCS) tiers; post-quantum hybrid X25519+ML-KEM-768 envelopes.
 - **Invite URLs**: `onyx invite --with-kp --with-hubs` → share → `onyx accept '<url>'`.
 - **TUI**: 3-pane dashboard (Conversations │ Chat │ Details), live tail, scrollback + history backfill (DMs *and* rooms) across restart, real sender fingerprints, `[hub]` security-tier badge, and discoverability — `F1` help, `Ctrl-K` command palette, `Ctrl-E` copy-invite (OSC52), `Ctrl-N` room, `Ctrl-I` invite, `Ctrl-F` send file.
@@ -65,7 +65,6 @@ What works today (verified end-to-end):
 
 What's **not** done yet (carry-forward — see `THREAT_MODEL.md` §8.2/§8.3 and `ROADMAP.md`):
 
-- **DM file sending** — files work in rooms only; the DM channel needs a tagged-message migration.
 - **First-run wizard** — the TUI guides you but doesn't yet walk first-launch setup (passphrase + hub).
 - **TUI settings panel**, sidebar grouping (DMs/Channels), room member removal (kick).
 - **Idle-circuit cover traffic** (§8.2 #3) — biggest remaining anonymity gap.

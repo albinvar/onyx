@@ -349,6 +349,14 @@ async fn dispatch_one_shot(
             handle_send_file_to_room(group_id_b32, path, *keep_filename, *keep_metadata, state)
                 .await
         }
+        ApiRequest::SendFileToPeer {
+            peer_short,
+            path,
+            keep_filename,
+            keep_metadata,
+        } => {
+            handle_send_file_to_peer(peer_short, path, *keep_filename, *keep_metadata, state).await
+        }
         ApiRequest::ListReceivedFiles {
             conversation,
             limit,
@@ -1390,6 +1398,123 @@ async fn handle_send_file_to_room(
         delivered_to_hub: total_hub,
         skipped_no_kem: total_skipped,
         total_members,
+    }
+}
+
+/// Task 322: send a file to a directly-connected DM peer. Same
+/// sanitize + chunk pipeline as the room path, but each frame is
+/// pushed (plaintext) to the peer-session task via `PeerOutbound::
+/// DmFrame`, which encrypts it in the peer's DM MLS group. Direct-only:
+/// requires a live conversation (no hub fallback for DM files in v1).
+async fn handle_send_file_to_peer(
+    peer_short: &str,
+    path: &str,
+    keep_filename: bool,
+    keep_metadata: bool,
+    state: &DaemonState,
+) -> ApiResponse {
+    use crate::files::{SanitizeOpts, chunk_file_for_send, sanitize_file, sanitize_filename};
+
+    // 1. Require a live conversation with the peer (same gate as DM text).
+    let handle_opt = state
+        .conversations
+        .lock()
+        .await
+        .handle_for_short(peer_short);
+    let Some(handle) = handle_opt else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: format!(
+                "no live conversation with peer {peer_short} (DM files are direct-only)"
+            ),
+        };
+    };
+
+    // 2. Sanitize (strip metadata + sniff MIME).
+    let cleaned = match sanitize_file(std::path::Path::new(path), SanitizeOpts { keep_metadata }) {
+        Ok(c) => c,
+        Err(e) => {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: format!("sanitize_file: {e}"),
+            };
+        }
+    };
+
+    // 3. Per-file send-size cap.
+    let size = cleaned.bytes.len() as u64;
+    if size > state.files_config.max_send_size_bytes {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: format!(
+                "file size {} exceeds max_send_size_bytes {}",
+                size, state.files_config.max_send_size_bytes
+            ),
+        };
+    }
+
+    // 4. file_id + content hash + wire name (same logic as the room path).
+    let mut file_id = [0u8; 16];
+    onyx_core::crypto::fill_random(&mut file_id);
+    let content_hash = onyx_core::crypto::blake2b_256(&[&cleaned.bytes]);
+    let raw_name = std::path::Path::new(path).file_name().map_or_else(
+        || "unnamed".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let wire_name = if keep_filename {
+        sanitize_filename(&raw_name)
+    } else {
+        let ext = std::path::Path::new(&raw_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin");
+        format!("file.{ext}")
+    };
+
+    // 5. Chunk + push each frame to the peer session (it encrypts in
+    //    the DM group). `.send().await` respects the bounded channel's
+    //    backpressure so a many-chunk file doesn't overflow it.
+    let messages = chunk_file_for_send(
+        file_id,
+        &wire_name,
+        &cleaned.mime,
+        &cleaned.bytes,
+        state.files_config.chunk_size_bytes,
+        &content_hash,
+    );
+    let chunks_count = u32::try_from(messages.len() - 1).unwrap_or(u32::MAX);
+    for msg in messages {
+        if handle
+            .outbound_tx
+            .send(crate::conversations::PeerOutbound::DmFrame(msg))
+            .await
+            .is_err()
+        {
+            return ApiResponse::Error {
+                code: ApiErrorCode::NotReady,
+                message: format!("peer {peer_short} disconnected mid-transfer"),
+            };
+        }
+    }
+
+    let file_id_b32 = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &file_id);
+    tracing::info!(
+        op = "send_file_to_peer",
+        peer_short,
+        file_id_b32 = %file_id_b32,
+        size,
+        mime = %cleaned.mime,
+        chunks = chunks_count,
+        stripped = cleaned.stripped,
+        "dm file sent"
+    );
+    ApiResponse::SendFileToPeerOk {
+        peer_short: peer_short.to_string(),
+        file_id_b32,
+        size,
+        mime: cleaned.mime,
+        stripped_metadata: cleaned.stripped,
+        chunks: chunks_count,
     }
 }
 

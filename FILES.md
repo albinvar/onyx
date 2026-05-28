@@ -200,11 +200,11 @@ RoomAppMessage::FileChunk {
 }
 ```
 
-For DMs: same shape, transmitted as MLS application messages on the DM group (existing T2.x path). DMs don't go through the `RoomAppMessage` enum today; T-files.b adds a parallel `DmAppMessage` enum that wraps Text + FileMeta + FileChunk.
+For DMs (task 322, implemented): the DM channel **reuses the same `RoomAppMessage` envelope** rather than a parallel `DmAppMessage` type. DM text used to be raw UTF-8 (`encrypt_application(text.as_bytes())`); it now rides `RoomAppMessage::Text`, so `FileMeta`/`FileChunk` flow over the DM group identically to rooms and the entire `files.rs` accept/verify/finalize pipeline is shared verbatim. `KemAdvertisement` is room-only and ignored on the DM channel. `PeerOutbound::DmFrame(RoomAppMessage)` carries file frames to the peer-session task, which encrypts them in the DM group.
 
 **Why CBOR + tagged enum**: same forward-compatibility rationale as T6.3.h (CHANNELS.md). Future content types (typing, reactions, etc.) compose as new variants without coordinated upgrades.
 
-**Why a separate enum for DMs**: the existing DM path encrypts raw UTF-8 plaintext (`encrypt_application(text.as_bytes())`). To add file framing without breaking back-compat, the DM path migrates to a tagged enum the same way rooms did in T6.3.h. Brief installed-base disruption — same posture as T6.3.h's migration.
+**Why reuse `RoomAppMessage` instead of a separate DM enum** (revised from the original plan): the envelope shape is identical for both tiers, and reuse means a single tested chunk/accept/finalize path. The DM wire format changes from raw UTF-8 to CBOR-tagged — a brief installed-base disruption, same posture as T6.3.h's migration, acceptable pre-release.
 
 ## §8 Slice plan
 

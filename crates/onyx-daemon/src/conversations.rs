@@ -48,9 +48,16 @@ pub const OUTBOUND_MAILBOX: usize = 32;
 /// state (T6.3.d) before decrypting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerOutbound {
-    /// DM plaintext — the peer-session task encrypts in this peer's
-    /// DM group before sending.
+    /// DM plaintext text — the peer-session task wraps it in
+    /// `RoomAppMessage::Text` and encrypts in this peer's DM group
+    /// before sending.
     Dm(String),
+    /// A DM application frame (task 322: file transfer). The
+    /// peer-session task CBOR-encodes it and encrypts in this peer's
+    /// DM group, exactly like `Dm`. The DM channel reuses the
+    /// `RoomAppMessage` tagged envelope so the whole chunk/accept/
+    /// finalize pipeline in `files.rs` is shared with rooms.
+    DmFrame(onyx_core::room::RoomAppMessage),
     /// Already-MLS-encrypted room ciphertext — the peer-session
     /// task sends as-is; the room sender already encrypted in the
     /// room's group state.

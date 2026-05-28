@@ -270,9 +270,21 @@ pub enum ApiRequest {
         #[serde(default)]
         keep_metadata: bool,
     },
+    /// Send a file to a directly-connected DM peer (task 322). Same
+    /// sanitize + chunk pipeline as `SendFileToRoom`, but the frames
+    /// ride the peer's DM MLS group. Requires a live conversation with
+    /// the peer (direct-only — no hub fallback for DM files in v1).
+    SendFileToPeer {
+        peer_short: String,
+        path: String,
+        #[serde(default)]
+        keep_filename: bool,
+        #[serde(default)]
+        keep_metadata: bool,
+    },
     /// List files received from peers / in rooms (T-files.d). Returns
-    /// most-recent-first. `conversation` is `peer-<short>` for DMs
-    /// (when DM file support lands) or `room/<short_b32>` for rooms.
+    /// most-recent-first. `conversation` is `peer/<short>` for DMs
+    /// or `room/<short_b32>` for rooms.
     ListReceivedFiles { conversation: String, limit: u32 },
     /// Fetch the persisted scrollback for a room (T-polish.3).
     /// Returns up to `limit` most recent messages oldest → newest
@@ -427,6 +439,16 @@ pub enum ApiResponse {
         #[serde(default)]
         skipped_no_kem: u32,
         total_members: u32,
+    },
+    /// Reply to [`ApiRequest::SendFileToPeer`] (task 322). The file was
+    /// sanitized + chunked + sent over the peer's DM MLS group.
+    SendFileToPeerOk {
+        peer_short: String,
+        file_id_b32: String,
+        size: u64,
+        mime: String,
+        stripped_metadata: bool,
+        chunks: u32,
     },
     /// Reply to [`ApiRequest::ListReceivedFiles`] (T-files.d).
     ListReceivedFilesOk {

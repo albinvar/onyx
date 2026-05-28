@@ -1298,6 +1298,10 @@ async fn derive_peer_fingerprint(
     vk.fingerprint().to_base32_grouped()
 }
 
+// One linear select!-loop driving a peer's DM session (inbound
+// decrypt+dispatch, outbound encrypt+send). Over the 100-line budget
+// but cohesive — same rationale as the room/render handlers.
+#[allow(clippy::too_many_lines)]
 async fn drive_peer_session<S>(
     stream: &mut S,
     session: &mut Session,
@@ -1349,9 +1353,25 @@ where
                                     .decrypt_application(&party, &frame.payload)
                                     .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
                             };
-                            let text = String::from_utf8_lossy(&plaintext).into_owned();
-                            let mut reg = state.conversations.lock().await;
-                            reg.push_message(peer_pub, MessageDirection::Incoming, text);
+                            // Task 322: the DM channel now carries the
+                            // `RoomAppMessage` tagged envelope (Text /
+                            // FileMeta / FileChunk), not raw UTF-8. Derive
+                            // the peer's real fingerprint from the DM
+                            // group roster (the member that isn't us) for
+                            // file attribution.
+                            let peer_fp = {
+                                let party = state.mls_party.lock().await;
+                                let ours = party.signing_public_bytes();
+                                group
+                                    .member_signing_keys()
+                                    .into_iter()
+                                    .find(|k| *k != ours)
+                                    .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+                                    .map(|a| {
+                                        onyx_core::crypto::Fingerprint::from_bytes(a).to_string()
+                                    })
+                            };
+                            handle_dm_app_frame(&plaintext, peer_pub, peer_fp, state).await;
                         } else {
                             // Room-tier (T6.3.d): load the matching room
                             // group, decrypt against it, emit a room-
@@ -1384,13 +1404,31 @@ where
                 };
                 let (frame_payload, log_text) = match outbound {
                     conversations::PeerOutbound::Dm(text) => {
+                        // Task 322: DM text now rides the RoomAppMessage
+                        // tagged envelope (so files can share the channel).
+                        let cbor = onyx_core::room::RoomAppMessage::Text { text: text.clone() }
+                            .to_cbor()
+                            .map_err(|e| anyhow::anyhow!("dm text encode failed: {e}"))?;
                         let ct = {
                             let party = state.mls_party.lock().await;
                             group
-                                .encrypt_application(&party, text.as_bytes())
+                                .encrypt_application(&party, &cbor)
                                 .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
                         };
                         (ct, text)
+                    }
+                    conversations::PeerOutbound::DmFrame(msg) => {
+                        // Task 322: a DM file frame (FileMeta / FileChunk).
+                        let cbor = msg
+                            .to_cbor()
+                            .map_err(|e| anyhow::anyhow!("dm frame encode failed: {e}"))?;
+                        let ct = {
+                            let party = state.mls_party.lock().await;
+                            group
+                                .encrypt_application(&party, &cbor)
+                                .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
+                        };
+                        (ct, "[dm file frame]".to_string())
                     }
                     conversations::PeerOutbound::RoomFrame(ct) => {
                         // Pre-encrypted in the room's MLS group state
@@ -1415,6 +1453,88 @@ where
                 .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
                 info!(text = %log_text, "chat message sent");
             }
+        }
+    }
+}
+
+/// Task 322: handle a decrypted DM application frame. The DM channel
+/// carries the `RoomAppMessage` tagged envelope (shared with rooms):
+/// `Text` is surfaced as an incoming chat message; `FileMeta` /
+/// `FileChunk` run the same receive pipeline as room files, scoped to
+/// the `peer/<short>` conversation. `KemAdvertisement` is room-only
+/// and ignored on the DM channel. `peer_fp` is the peer's real
+/// fingerprint (from the DM group roster) for file attribution.
+async fn handle_dm_app_frame(
+    plaintext: &[u8],
+    peer_pub: &[u8; 32],
+    peer_fp: Option<String>,
+    state: &Arc<DaemonState>,
+) {
+    let Ok(msg) = onyx_core::room::RoomAppMessage::from_cbor(plaintext) else {
+        debug!(
+            plaintext_bytes = plaintext.len(),
+            "dm: decrypted but RoomAppMessage decode failed; dropping"
+        );
+        return;
+    };
+    let conversation = format!("peer/{}", short_id_of_peer_pub(peer_pub));
+    let sender_fp = peer_fp.unwrap_or_else(|| format!("(peer/{})", short_id_of_peer_pub(peer_pub)));
+    match msg {
+        onyx_core::room::RoomAppMessage::Text { text } => {
+            state.conversations.lock().await.push_message(
+                peer_pub,
+                MessageDirection::Incoming,
+                text,
+            );
+        }
+        onyx_core::room::RoomAppMessage::FileMeta {
+            id,
+            name,
+            mime,
+            size,
+            chunks,
+            chunk_size,
+            content_hash,
+        } => {
+            let now_ms = now_unix_ms_i64();
+            let decision = files::accept_file_meta(
+                state,
+                &sender_fp,
+                &conversation,
+                id.as_ref(),
+                &name,
+                &mime,
+                size,
+                chunks,
+                chunk_size,
+                content_hash.as_ref(),
+                now_ms,
+            )
+            .await;
+            match decision {
+                files::AcceptDecision::Accepted => {
+                    info!(sender_fp = %sender_fp, size, chunks, "dm file accepted; awaiting chunks");
+                }
+                other => warn!(?other, sender_fp = %sender_fp, "dm file rejected"),
+            }
+        }
+        onyx_core::room::RoomAppMessage::FileChunk { id, index, bytes } => {
+            let now_ms = now_unix_ms_i64();
+            if let Some(path) = files::accept_file_chunk(
+                state,
+                &sender_fp,
+                id.as_ref(),
+                index,
+                bytes.as_ref(),
+                now_ms,
+            )
+            .await
+            {
+                info!(path = %path.display(), "dm file received + persisted");
+            }
+        }
+        onyx_core::room::RoomAppMessage::KemAdvertisement { .. } => {
+            debug!("dm: KemAdvertisement is room-only; ignoring on DM channel");
         }
     }
 }

@@ -225,7 +225,9 @@ enum ModalState {
     /// from FILES.md §3 — privacy-by-default, with opt-out flags
     /// for the operator who knows what they're doing.
     SendFile {
-        group_id_b32: String,
+        /// Where the file goes — a room (`SendFileToRoom`) or a
+        /// directly-connected DM peer (`SendFileToPeer`, task 322).
+        target: FileTarget,
         path: String,
         keep_filename: bool,
         keep_metadata: bool,
@@ -302,10 +304,30 @@ impl PaletteAction {
     }
 }
 
+/// Task 322: the destination for a file send in the `SendFile` modal —
+/// either a multi-party room or a directly-connected DM peer.
+#[derive(Debug, Clone)]
+enum FileTarget {
+    Room { group_id_b32: String },
+    Peer { peer_short: String },
+}
+
+/// Map the current selection to a [`FileTarget`] for the send-file modal.
+fn file_target_for(entry: SelectedEntry<'_>) -> FileTarget {
+    match entry {
+        SelectedEntry::Room(r) => FileTarget::Room {
+            group_id_b32: r.group_id_b32.clone(),
+        },
+        SelectedEntry::Peer(p) => FileTarget::Peer {
+            peer_short: p.short_id.clone(),
+        },
+    }
+}
+
 /// What the current selection refers to (T6.3.f.2). `Peer` drives
 /// DM `Send`s; `Room` drives multi-party `SendRoom`s. The composer
 /// pane title and the send dispatcher both branch on this.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum SelectedEntry<'a> {
     Peer(&'a PeerInfo),
     Room(&'a RoomInfo),
@@ -672,23 +694,22 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             }
             return false;
         }
-        // T-files.e: Ctrl-F opens the send-file modal. Same
-        // selection gate as Ctrl-I — files only flow into rooms
-        // today (DM file sending is documented out of scope in
-        // FILES.md §7). Defaults match daemon defaults: strip
-        // metadata + replace filename. The operator can flip
-        // both toggles in the modal.
+        // T-files.e / task 322: Ctrl-F opens the send-file modal for
+        // the selected conversation — a room (SendFileToRoom) or a DM
+        // peer (SendFileToPeer). Defaults match the daemon: strip
+        // metadata + random filename; toggles flip both in the modal.
         (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => {
-            if let Some(SelectedEntry::Room(r)) = app.selected_entry() {
+            if let Some(target) = app.selected_entry().map(file_target_for) {
                 app.modal = Some(ModalState::SendFile {
-                    group_id_b32: r.group_id_b32.clone(),
+                    target,
                     path: String::new(),
                     keep_filename: false,
                     keep_metadata: false,
                     focus: 0,
                 });
             } else {
-                app.last_send_result = Some(Err("send-file needs a room selected".to_string()));
+                app.last_send_result =
+                    Some(Err("send-file needs a peer or room selected".to_string()));
             }
             return false;
         }
@@ -949,21 +970,29 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 peer_kem_pub_b32: kem_pub_b32,
                 peer_kp_b64: kp_b64,
             }),
-            // T-files.e: SendFile dispatches to the same daemon
-            // handler the CLI calls (`onyx room send-file`). The
-            // modal trims the path so trailing whitespace from
-            // paste-into-terminal doesn't blow up open().
+            // T-files.e / task 322: SendFile dispatches to the room
+            // (`SendFileToRoom`) or peer (`SendFileToPeer`) handler
+            // depending on the target. Path trimmed so a trailing
+            // paste-whitespace doesn't blow up open().
             ModalState::SendFile {
-                group_id_b32,
+                target,
                 path,
                 keep_filename,
                 keep_metadata,
                 ..
-            } => Some(ApiRequest::SendFileToRoom {
-                group_id_b32,
-                path: path.trim().to_string(),
-                keep_filename,
-                keep_metadata,
+            } => Some(match target {
+                FileTarget::Room { group_id_b32 } => ApiRequest::SendFileToRoom {
+                    group_id_b32,
+                    path: path.trim().to_string(),
+                    keep_filename,
+                    keep_metadata,
+                },
+                FileTarget::Peer { peer_short } => ApiRequest::SendFileToPeer {
+                    peer_short,
+                    path: path.trim().to_string(),
+                    keep_filename,
+                    keep_metadata,
+                },
             }),
             // Help / CommandPalette / Invite never set submit_intent
             // (they're handled inline above), so they can't reach here.
@@ -1028,6 +1057,37 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                         "file send delivery counts"
                     );
                 }
+                Ok(ApiResponse::SendFileToPeerOk {
+                    peer_short,
+                    file_id_b32,
+                    size,
+                    mime,
+                    stripped_metadata,
+                    chunks,
+                }) => {
+                    // Task 322: local "you sent <file>" line in the DM
+                    // scrollback (keyed by the peer's short_id).
+                    let now = now_unix_ms();
+                    let label = format!(
+                        "📎 sent {} ({} bytes, {}, {} chunks{})",
+                        short_id(&file_id_b32),
+                        size,
+                        mime,
+                        chunks,
+                        if stripped_metadata { ", stripped" } else { "" }
+                    );
+                    app.scrollback
+                        .entry(peer_short.clone())
+                        .or_default()
+                        .push(ChatLine {
+                            direction: MessageDirection::Outgoing,
+                            text: label,
+                            ts_unix_ms: now,
+                            via_hub: false,
+                        });
+                    app.last_activity_ms.insert(peer_short, now);
+                    app.last_send_result = Some(Ok(()));
+                }
                 Ok(ApiResponse::Error { message, .. }) => {
                     app.last_send_result = Some(Err(message));
                 }
@@ -1075,16 +1135,17 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
             }
         }
         PaletteAction::SendFile => {
-            if let Some(SelectedEntry::Room(r)) = app.selected_entry() {
+            if let Some(target) = app.selected_entry().map(file_target_for) {
                 app.modal = Some(ModalState::SendFile {
-                    group_id_b32: r.group_id_b32.clone(),
+                    target,
                     path: String::new(),
                     keep_filename: false,
                     keep_metadata: false,
                     focus: 0,
                 });
             } else {
-                app.last_send_result = Some(Err("send-file needs a room selected".to_string()));
+                app.last_send_result =
+                    Some(Err("send-file needs a peer or room selected".to_string()));
             }
         }
         PaletteAction::CopyInvite => open_invite_modal(app).await,
@@ -1731,21 +1792,24 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             frame.render_widget(body, rect);
         }
         ModalState::SendFile {
-            group_id_b32,
+            target,
             path,
             keep_filename,
             keep_metadata,
             focus,
         } => {
-            // T-files.e: send-file modal. Three rows. Path is a
-            // free-form line; the two toggles are rendered as
+            // T-files.e / task 322: send-file modal. Three rows. Path
+            // is a free-form line; the two toggles are rendered as
             // [x]/[ ] checkboxes. Hint at the bottom reminds the
             // operator what defaults-off means (FILES.md §3).
             let block = Block::default().borders(Borders::ALL).title(Span::styled(
                 " Send File  (Tab=cycle, Space=toggle, Esc=cancel, Enter=send) ",
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-            let sending_to = format!(" → room/{} ", short_id(group_id_b32));
+            let sending_to = match target {
+                FileTarget::Room { group_id_b32 } => format!(" → room/{} ", short_id(group_id_b32)),
+                FileTarget::Peer { peer_short } => format!(" → {peer_short} (DM) "),
+            };
             let path_focused = *focus == 0;
             let path_line = Line::from(vec![
                 Span::styled(
