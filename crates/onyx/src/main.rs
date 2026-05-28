@@ -595,7 +595,76 @@ fn build_daemon_config(
     })
 }
 
-async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
+/// Task 323: interactive first-run / unlock wizard. Returns the vault
+/// passphrase. A fresh vault (file missing) gets a create-and-confirm
+/// flow with an explicit "no recovery" warning + an 8-char minimum; an
+/// existing vault gets a single unlock prompt. Input is hidden (no
+/// echo) via the crossterm dependency we already have — no new
+/// password-input crate, no plaintext in scrollback.
+fn first_run_wizard(vault_path: &std::path::Path) -> anyhow::Result<String> {
+    let fresh = !vault_path.exists();
+    if !fresh {
+        return read_hidden_line("Unlock your Onyx vault — passphrase: ");
+    }
+    eprintln!("Welcome to Onyx 🖤");
+    eprintln!(
+        "Setting up your encrypted vault at {}.",
+        vault_path.display()
+    );
+    eprintln!("Choose a passphrase — it protects your identity keys at rest (Argon2id).");
+    eprintln!("There is NO recovery if you forget it. Store it in a password manager.\n");
+    loop {
+        let p1 = read_hidden_line("  New passphrase (min 8 chars): ")?;
+        if p1.chars().count() < 8 {
+            eprintln!("  too short — try again.");
+            continue;
+        }
+        let p2 = read_hidden_line("  Confirm passphrase: ")?;
+        if p1 != p2 {
+            eprintln!("  passphrases didn't match — try again.");
+            continue;
+        }
+        eprintln!("  ✓ vault passphrase set.\n");
+        return Ok(p1);
+    }
+}
+
+/// Read a line from the terminal without echoing it, using crossterm
+/// raw mode. `Enter` submits, `Backspace` edits, `Esc`/`Ctrl-C`
+/// cancels. Raw mode is always restored, even on error/cancel.
+fn read_hidden_line(prompt: &str) -> anyhow::Result<String> {
+    use crossterm::event::{Event, KeyCode, KeyModifiers, read};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::io::Write as _;
+
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    enable_raw_mode().map_err(|e| anyhow::anyhow!("raw mode: {e}"))?;
+    let mut buf = String::new();
+    let result = loop {
+        match read() {
+            Ok(Event::Key(k)) => match k.code {
+                KeyCode::Enter => break Ok(std::mem::take(&mut buf)),
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Esc => break Err(anyhow::anyhow!("cancelled")),
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err(anyhow::anyhow!("cancelled"));
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => break Err(anyhow::anyhow!("read input: {e}")),
+        }
+    };
+    disable_raw_mode().ok();
+    eprintln!();
+    result
+}
+
+async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
     // Resolve the optional --socket once so every arm sees the same
     // path. Defaulting to `~/.onyx/onyx.sock` matches the daemon's
     // default api_socket; the parent dir is auto-created by
@@ -607,6 +676,25 @@ async fn dispatch(args: Args) -> anyhow::Result<ExitCode> {
     match args.cmd {
         // ── No subcommand: launch daemon + TUI in one process ───────────
         None => {
+            // Task 323: first-run wizard. When launched interactively
+            // without a passphrase, prompt for it (hidden) instead of
+            // erroring — fresh vault → "create + confirm", existing →
+            // "unlock". A new user is no longer blocked by the
+            // --passphrase wall. Non-interactive (piped) falls through
+            // to build_daemon_config's helpful error.
+            if args.passphrase.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                let vault_path = args
+                    .vault
+                    .clone()
+                    .unwrap_or_else(onyx_daemon::default_vault_path);
+                match first_run_wizard(&vault_path) {
+                    Ok(p) => args.passphrase = Some(p),
+                    Err(e) => {
+                        eprintln!("onyx: {e:#}");
+                        return Ok(ExitCode::from(2));
+                    }
+                }
+            }
             let config = build_daemon_config(&args, &socket)?;
             // Spawn the daemon work in a background task.
             let daemon_handle = tokio::spawn(async move {

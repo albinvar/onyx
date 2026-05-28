@@ -6,6 +6,23 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Task 323: first-run / unlock wizard
+
+`onyx` (combined daemon+TUI mode) no longer dead-ends a new user on the `--passphrase` wall. When launched **interactively** without a passphrase, it now prompts:
+
+  * **Fresh vault** (file missing) → a welcome + create-and-confirm flow: choose a passphrase (8-char minimum, confirmed twice) with an explicit "there is NO recovery if you forget it" warning.
+  * **Existing vault** → a single hidden unlock prompt.
+
+Input is **hidden (no echo)**, implemented with the **crossterm dependency we already have** — no new password-input crate, nothing in shell scrollback. `Esc`/`Ctrl-C` cancels; raw mode is always restored.
+
+**Non-interactive is unchanged**: when stdin isn't a TTY (piped, systemd) or a passphrase is already supplied via `ONYX_PASSPHRASE`/`--passphrase`, the wizard is skipped — the helpful "requires --passphrase" error still fires for scripted use. `onyx daemon` (headless) keeps requiring the env var.
+
+Verified: non-TTY path errors cleanly (no hang, no prompt); build + clippy clean. The interactive flow needs a real terminal to exercise (manual test).
+
+Open follow-up: the wizard does the passphrase; it doesn't yet walk hub setup (the welcome screen + `Ctrl-E`/`--hub` cover that for now).
+
+---
+
 ## 2026-05-29 — Task 322: DM file sending
 
 Files are no longer rooms-only. A directly-connected DM peer can now receive files over the peer's DM MLS group.

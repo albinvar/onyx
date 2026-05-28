@@ -83,7 +83,7 @@ What's **not** done yet (carry-forward — see `THREAT_MODEL.md` §8.2/§8.3 and
 curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh | bash
 ```
 
-Auto-detects your OS + CPU (macOS arm64/x86_64, Linux x86_64/aarch64), downloads the right prebuilt binary, **verifies it with sigstore cosign**, and drops `onyx` in `~/.local/bin/onyx`. Then run `onyx` — it boots the daemon + TUI in one process.
+Auto-detects your OS + CPU (macOS arm64/x86_64, Linux x86_64/aarch64), downloads the right prebuilt binary, **verifies it with sigstore cosign**, and drops `onyx` in `~/.local/bin/onyx`. Then just run `onyx` — it boots the daemon + TUI in one process and, on first run, **prompts you to set a vault passphrase** (hidden input; no recovery if forgotten). Set `ONYX_PASSPHRASE` in the environment to skip the prompt (e.g. for headless/scripted use).
 
 For Windows: use WSL2 + the Linux installer, or build from source below.
 
