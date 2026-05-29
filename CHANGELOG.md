@@ -6,6 +6,17 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Finish D-3 + T-3 (the two partials from batch 3)
+
+A follow-up review flagged both as only half-closed. Completed:
+
+  * **D-3 (log hygiene) — now fully closed for identifiers.** Batch 3 moved *peer* identifiers to `debug`; this moves the node's **own** identifiers too — own `.onion` (was `info` at the HS-publish line), own intro-inbox id, and the own-fingerprint tracing span (`info_span!("inbound", local_fpr=…)` → no fp field). No identity/onion/social-graph value lands in the default (info) log anymore. Trade-off, documented: a headless accept-mode operator who needs their own `.onion` must enable debug logging (a Status-API field is the cleaner follow-up). The log file is still plaintext at rest (out of scope).
+  * **T-3 (X25519-as-Ed25519 fallback) — core function fixed.** Batch 3 only added a warn on the DM pin-check path; the core `derive_peer_fingerprint` still returned the raw-X25519 fallback silently at three points. All three now `warn!` that sender identity is unverified (without logging the peer's raw key, per D-3). Combined with T-1 pinning, the sender binding is now both warned-on and pinned.
+
+Docs: THREAT_MODEL §8.5 (D-3 → Fixed, T-3 → Fixed). Gate: clippy `-D warnings` + fmt clean; `cargo test --workspace` = **503 passed** (logging-only changes; no test delta). Remaining deep-pass items, all genuinely untouched and tracked as residuals: D-1 (ephemeral Noise), T-2 (invite auth), P-1 (conversation keying), P-3 (serial delivery HOL), G-2 (MLS committer authority), H-2 (forgeable gossip `seen_by`), D-4 (identity→onion key).
+
+---
+
 ## 2026-05-29 — T-1: TOFU key pinning + key-change warning + `contact list`
 
 Second deep-pass HIGH residual (§8.5). Onyx had no defence against a peer's identity key *changing* after first contact — a key rotation or a man-in-the-middle would go silently unnoticed.

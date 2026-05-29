@@ -683,11 +683,14 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     let mut hub_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(args.hubs.len());
     if want_hubs {
         let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
+        // D-3: our intro-inbox id is a self-identifier; keep the full
+        // value at debug so it doesn't persist in the default on-disk
+        // log. The operational milestone stays at info without it.
         info!(
-            our_inbox_b32 = %encode_b32(&our_inbox),
             hub_count = args.hubs.len(),
-            "hub: our introduction-inbox routing id derived; spawning one client task per hub"
+            "hub: spawning one client task per configured hub"
         );
+        debug!(our_inbox_b32 = %encode_b32(&our_inbox), "hub: our introduction-inbox routing id");
         // IdentitySecret + HybridKemSecret deliberately don't impl
         // Clone. Round-trip via bytes once here; each spawned task
         // reconstructs them on the worker. Both buffers are wrapped
@@ -857,11 +860,16 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("hidden service publish failed: {e}"))?;
 
     if let Some(addr) = hs.onion_address() {
+        // D-3: the node's own .onion is a self-identifier; keep the full
+        // address at debug so it doesn't persist in the default on-disk
+        // log. Operators who need it for direct-dial can run with debug
+        // logging (a Status-API field is the cleaner follow-up). The
+        // info line confirms publication without the address.
         info!(
-            onion = %addr,
             port = ONYX_HS_PORT,
-            "hidden service published — peer needs onion + port + identity_pub_b32"
+            "hidden service published (run with debug logging to print the .onion address)"
         );
+        debug!(onion = %addr, port = ONYX_HS_PORT, "hidden service onion address");
     } else {
         warn!("hidden service has no address yet — Arti will produce one shortly");
     }
@@ -875,8 +883,9 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
             let state = state.clone();
-            let our_fpr = state.identity.fingerprint();
-            let span = info_span!("inbound", local_fpr = %our_fpr);
+            // D-3: don't put our own fingerprint on the span — it would
+            // propagate to every child log line in the default log.
+            let span = info_span!("inbound");
             tokio::spawn(
                 async move {
                     if let Err(e) = handle_inbound(stream, state).await {
@@ -1381,13 +1390,31 @@ async fn derive_peer_fingerprint(
         let party = state.mls_party.lock().await;
         party.signing_public_bytes()
     };
+    // T-3: each fallback means we could NOT derive the peer's real
+    // Ed25519 fingerprint from the MLS group and are attributing the
+    // message under the unverified `(peer/<x25519>)` placeholder — i.e.
+    // the sender *identity* is not cryptographically attributed. Warn
+    // on each path (the peer's raw key is deliberately NOT logged, to
+    // avoid the D-3 social-graph leak).
     let Some(peer_sig_bytes) = group.peer_signing_key_bytes(&our_signing_pub) else {
+        warn!(
+            "fingerprint: peer MLS signing key not found in group; attributing under an \
+             unverified (peer/<x25519>) placeholder — sender identity is NOT verified"
+        );
         return fallback.to_string();
     };
     let Ok(arr) = <[u8; 32]>::try_from(peer_sig_bytes.as_slice()) else {
+        warn!(
+            "fingerprint: peer MLS signing key is not 32 bytes; attributing under an \
+             unverified (peer/<x25519>) placeholder — sender identity is NOT verified"
+        );
         return fallback.to_string();
     };
     let Ok(vk) = VerifyingKey::from_bytes(arr) else {
+        warn!(
+            "fingerprint: peer MLS signing key is not a valid Ed25519 point; attributing \
+             under an unverified (peer/<x25519>) placeholder — sender identity is NOT verified"
+        );
         return fallback.to_string();
     };
     vk.fingerprint().to_base32_grouped()
