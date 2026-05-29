@@ -542,6 +542,35 @@ impl MlsGroupState {
         serialize_mls_message(&commit)
     }
 
+    /// Task 325: produce an MLS `Remove` commit evicting the member
+    /// whose signing key (== fingerprint bytes) is `target_signing_key`.
+    /// Returns the serialised commit, which must be fanned out to every
+    /// remaining member so their group state advances and the removed
+    /// member's leaf vanishes (the removed member, if it processes the
+    /// commit, learns it's been evicted). Merges the pending commit so
+    /// our own state advances. `VerificationFailed` if the target isn't
+    /// a current member.
+    pub fn remove_member(
+        &mut self,
+        party: &MlsParty,
+        target_signing_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        let leaf = self
+            .group
+            .members()
+            .find(|m| m.signature_key.as_slice() == target_signing_key)
+            .map(|m| m.index)
+            .ok_or(Error::VerificationFailed)?;
+        let (commit, _welcome, _group_info) = self
+            .group
+            .remove_members(&party.provider, &party.signature_keys, &[leaf])
+            .map_err(internal("mls: remove_members failed"))?;
+        self.group
+            .merge_pending_commit(&party.provider)
+            .map_err(internal("mls: merge_pending_commit after remove failed"))?;
+        serialize_mls_message(&commit)
+    }
+
     /// Encrypt an application message for the group.
     pub fn encrypt_application(&mut self, party: &MlsParty, plaintext: &[u8]) -> Result<Vec<u8>> {
         let out = self
@@ -1217,6 +1246,79 @@ mod tests {
             pt_carol,
             IncomingRoomMessage::Application(b"hello room".to_vec())
         );
+    }
+
+    // ── Task 325: remove_member ───────────────────────────────────
+
+    /// alice creates a group with bob + carol, then removes carol.
+    /// bob processes the Remove commit and advances; alice+bob can
+    /// still exchange messages; carol — having processed the commit
+    /// that evicts her — can no longer decrypt new traffic.
+    #[test]
+    fn remove_member_evicts_target_keeps_others() {
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let bob = MlsParty::new(b"bob".to_vec()).unwrap();
+        let carol = MlsParty::new(b"carol".to_vec()).unwrap();
+
+        let mut alice_group = alice.create_group().unwrap();
+        let (_c, welcome_bob) = alice_group
+            .invite(&alice, &bob.key_package_bytes().unwrap())
+            .unwrap();
+        let mut bob_group = bob.join_from_welcome(&welcome_bob).unwrap();
+        let (commit_carol_to_bob, welcome_carol) = alice_group
+            .invite(&alice, &carol.key_package_bytes().unwrap())
+            .unwrap();
+        let mut carol_group = carol.join_from_welcome(&welcome_carol).unwrap();
+        bob_group
+            .process_incoming(&bob, &commit_carol_to_bob)
+            .unwrap();
+        assert_eq!(alice_group.epoch(), 2);
+
+        // alice removes carol (by carol's signing key = fingerprint).
+        let remove_commit = alice_group
+            .remove_member(&alice, &carol.signing_public_bytes())
+            .expect("remove carol");
+        assert_eq!(alice_group.epoch(), 3, "remove advances the epoch");
+
+        // bob processes the remove commit and advances to epoch 3.
+        let r = bob_group.process_incoming(&bob, &remove_commit).unwrap();
+        assert!(matches!(r, IncomingRoomMessage::Commit));
+        assert_eq!(bob_group.epoch(), 3);
+
+        // carol processes it too — she learns she's evicted.
+        let _ = carol_group.process_incoming(&carol, &remove_commit);
+
+        // alice ↔ bob still works at epoch 3.
+        let ct = alice_group
+            .encrypt_application(&alice, b"after kick")
+            .unwrap();
+        assert_eq!(
+            bob_group.process_incoming(&bob, &ct).unwrap(),
+            IncomingRoomMessage::Application(b"after kick".to_vec())
+        );
+        // carol can NOT decrypt the post-removal message.
+        assert!(
+            carol_group.process_incoming(&carol, &ct).is_err(),
+            "evicted member must not decrypt post-removal traffic"
+        );
+    }
+
+    /// Removing a fingerprint that isn't in the group is rejected
+    /// (no commit produced, epoch unchanged).
+    #[test]
+    fn remove_member_rejects_non_member() {
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let bob = MlsParty::new(b"bob".to_vec()).unwrap();
+        let stranger = MlsParty::new(b"stranger".to_vec()).unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let (_c, welcome_bob) = alice_group
+            .invite(&alice, &bob.key_package_bytes().unwrap())
+            .unwrap();
+        let _ = bob.join_from_welcome(&welcome_bob).unwrap();
+        let epoch_before = alice_group.epoch();
+        let res = alice_group.remove_member(&alice, &stranger.signing_public_bytes());
+        assert!(matches!(res, Err(Error::VerificationFailed)));
+        assert_eq!(alice_group.epoch(), epoch_before, "no-op on non-member");
     }
 
     #[test]

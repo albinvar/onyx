@@ -301,6 +301,17 @@ pub enum ApiRequest {
     /// Requires `--hub` (the Remove commit fans out the same way
     /// as an Add commit in [`Self::InviteToRoom`]).
     LeaveRoom { group_id_b32: String },
+    /// Remove (kick) another member from a room (task 325). The
+    /// daemon issues an MLS `Remove` commit evicting the member whose
+    /// fingerprint is `peer_fingerprint`, fans the commit out to all
+    /// current members (incl. the evicted one, so it learns), advances
+    /// the epoch, and updates the local roster. Requires `--hub`.
+    /// `peer_fingerprint` is the base32-grouped form shown in the
+    /// Details roster / `room list`.
+    RemoveFromRoom {
+        group_id_b32: String,
+        peer_fingerprint: String,
+    },
     /// Send `text` to every current member of the room identified
     /// by `group_id_b32` (T6.3.d, direct path only). The daemon
     /// encrypts the plaintext **once** in the room's MLS group
@@ -418,6 +429,13 @@ pub enum ApiResponse {
     /// `onyx identity`-printed form). Delivery to the recipient is
     /// asynchronous — they join the moment they decode the Welcome.
     InviteToRoomOk {
+        group_id_b32: String,
+        members: Vec<String>,
+    },
+    /// Reply to [`ApiRequest::RemoveFromRoom`] (task 325). `members`
+    /// is the roster AFTER the remove commit (the evicted member is
+    /// gone).
+    RemoveFromRoomOk {
         group_id_b32: String,
         members: Vec<String>,
     },

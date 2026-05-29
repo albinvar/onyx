@@ -404,6 +404,17 @@ enum RoomCommand {
         #[arg(long)]
         group_id: String,
     },
+    /// Remove (kick) another member from a room (task 325). Issues an
+    /// MLS Remove commit evicting `--peer-fingerprint`, fans it out to
+    /// all members, and refreshes the roster. Requires `--hub` on the
+    /// daemon. The fingerprint is the base32-grouped form shown in
+    /// `room list` / the TUI Details roster.
+    Remove {
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        peer_fingerprint: String,
+    },
     /// Send a file to every member of a room (T-files.d). The
     /// daemon sanitizes metadata by default (raster images get
     /// decoded + re-encoded; PDF/Office/video/audio are refused
@@ -831,6 +842,19 @@ async fn dispatch_room(socket: &std::path::Path, cmd: RoomCommand) -> anyhow::Re
                 socket,
                 ApiRequest::LeaveRoom {
                     group_id_b32: group_id,
+                },
+            )
+            .await
+        }
+        RoomCommand::Remove {
+            group_id,
+            peer_fingerprint,
+        } => {
+            one_shot_print(
+                socket,
+                ApiRequest::RemoveFromRoom {
+                    group_id_b32: group_id,
+                    peer_fingerprint,
                 },
             )
             .await

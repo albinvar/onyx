@@ -1040,6 +1040,149 @@ async fn wait_for_room_in_list(socket: &Path, group_id_b32: &str) -> RoomInfo {
     }
 }
 
+/// Poll `ListRooms` until the room's roster reaches EXACTLY `n`
+/// members (task 325 remove: wait for the roster to SHRINK after a
+/// remove commit is processed).
+async fn poll_room_members_exact(socket: &Path, group_id_b32: &str, n: usize) -> RoomInfo {
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if let ApiResponse::ListRoomsOk { rooms } = one_shot(socket, &ApiRequest::ListRooms).await
+            && let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32)
+            && r.members.len() == n
+        {
+            return r;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "room {group_id_b32} on {} never reached exactly {n} members",
+                socket.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Pull `(fingerprint, identity_kem_pub_b32)` from a daemon's Identity.
+async fn identity_fp_kem(sock: &Path, who: &str) -> (String, String) {
+    match one_shot_until_ok(sock, &ApiRequest::Identity, who).await {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => (fingerprint, identity_kem_pub_b32),
+        other => panic!("{who} Identity: {other:?}"),
+    }
+}
+
+/// Task 325 end-to-end: alice builds a 3-party room (alice+bob+carol),
+/// then removes carol. Verifies the Remove commit fans out: alice's
+/// reply roster shrinks to 2, bob's daemon processes the commit and
+/// his roster shrinks to 2, and a subsequent room send from alice
+/// targets only the one remaining member (bob).
+#[tokio::test(flavor = "multi_thread")]
+async fn rooms_e2e_remove_member_kicks_target() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
+        .with_test_writer()
+        .try_init();
+
+    let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
+    let (alice_sock, _a) = spawn_daemon(&hub_addr, &hub_pub_b32, "aliceK").await;
+    let (bob_sock, _b) = spawn_daemon(&hub_addr, &hub_pub_b32, "bobK").await;
+    let (carol_sock, _c) = spawn_daemon(&hub_addr, &hub_pub_b32, "carolK").await;
+    let _ = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
+
+    let (bob_fp, bob_kem) = identity_fp_kem(&bob_sock, "bob ready").await;
+    let (carol_fp, carol_kem) = identity_fp_kem(&carol_sock, "carol ready").await;
+
+    let group_id_b32 = match one_shot(
+        &alice_sock,
+        &ApiRequest::CreateRoom {
+            name: "kickroom".into(),
+        },
+    )
+    .await
+    {
+        ApiResponse::CreateRoomOk { group_id_b32, .. } => group_id_b32,
+        other => panic!("CreateRoom: {other:?}"),
+    };
+
+    // Invite bob, then carol (mirrors the 3-party flow).
+    for (fp, kem, who) in [(&bob_fp, &bob_kem, "bob"), (&carol_fp, &carol_kem, "carol")] {
+        let kp = match one_shot_until_ok(
+            &alice_sock,
+            &ApiRequest::FetchPeerKeyPackage {
+                peer_fingerprint: fp.clone(),
+            },
+            &format!("fetch {who} KP"),
+        )
+        .await
+        {
+            ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+            other => panic!("fetch {who} KP: {other:?}"),
+        };
+        match one_shot(
+            &alice_sock,
+            &ApiRequest::InviteToRoom {
+                group_id_b32: group_id_b32.clone(),
+                peer_fingerprint: fp.clone(),
+                peer_kem_pub_b32: kem.clone(),
+                peer_kp_b64: kp,
+            },
+        )
+        .await
+        {
+            ApiResponse::InviteToRoomOk { .. } => {}
+            other => panic!("InviteToRoom ({who}): {other:?}"),
+        }
+    }
+    // Bob processes carol's add commit → roster 3.
+    let _ = poll_room_members(&bob_sock, &group_id_b32, 3).await;
+
+    // alice removes carol.
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::RemoveFromRoom {
+            group_id_b32: group_id_b32.clone(),
+            peer_fingerprint: carol_fp.clone(),
+        },
+    )
+    .await
+    {
+        ApiResponse::RemoveFromRoomOk { members, .. } => {
+            assert_eq!(members.len(), 2, "alice roster must shrink to 2 after kick");
+            assert!(
+                !members.contains(&carol_fp),
+                "carol must be gone from alice's roster"
+            );
+        }
+        other => panic!("RemoveFromRoom: {other:?}"),
+    }
+
+    // Bob's daemon processes the remove commit → his roster shrinks to 2.
+    let bob_after = poll_room_members_exact(&bob_sock, &group_id_b32, 2).await;
+    assert!(
+        !bob_after.members.contains(&carol_fp),
+        "carol must be gone from bob's roster too"
+    );
+
+    // A subsequent send from alice targets only bob (1 member besides self).
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::SendRoom {
+            group_id_b32: group_id_b32.clone(),
+            text: "after the kick".into(),
+        },
+    )
+    .await
+    {
+        ApiResponse::SendRoomOk { total_members, .. } => {
+            assert_eq!(total_members, 1, "only bob remains besides alice");
+        }
+        other => panic!("SendRoom post-remove: {other:?}"),
+    }
+}
+
 /// Compile-time sanity: HashMap is in scope (used implicitly via
 /// some helpers; suppressed-warning shim for now).
 #[allow(dead_code)]

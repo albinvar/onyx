@@ -6,6 +6,25 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Task 325: room membership management (remove/kick)
+
+Rooms could add members but not remove them. Now a member can be kicked.
+
+  * **`MlsGroupState::remove_member(party, target_signing_key)`** — issues an MLS `Remove` commit evicting the member whose signing key (= fingerprint bytes) matches, merges the pending commit (advances our epoch), returns the commit bytes. `VerificationFailed` if the target isn't a current member.
+  * **`ApiRequest::RemoveFromRoom { group_id_b32, peer_fingerprint }`** + **`handle_remove_from_room`** — mirrors `handle_leave_room` but targets a member and KEEPS the local group: capture the old-epoch routing token, issue the Remove commit, fan it out to all current members (incl. the evicted one, so its daemon processes the eviction), persist the advanced MLS state + the refreshed roster. Refuses to remove self (use `leave`). Requires `--hub`. Deliberately does NOT drop cached member KEMs (that helper drops *all* of them; the evicted member's stale KEM is harmless since fan-outs use the refreshed roster).
+  * **CLI**: `onyx room remove --group-id X --peer-fingerprint Y`.
+
+**Tests (all cases):**
+  * `mls::tests::remove_member_evicts_target_keeps_others` — 3-party: alice removes carol; bob processes the commit + advances; alice↔bob still decrypt; **carol can no longer decrypt** post-removal traffic.
+  * `mls::tests::remove_member_rejects_non_member` — removing a non-member is a no-op error (epoch unchanged).
+  * `rooms_e2e_remove_member_kicks_target` (smoke) — full daemon path over the hub: alice builds a 3-party room, removes carol; alice's reply roster = 2, **bob's roster shrinks to 2** (commit fanned out + processed), and a subsequent `SendRoom` targets only the 1 remaining member.
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **485 passed** (+3).
+
+Not done: TUI keybind for remove (CLI-only for now — the target fingerprint is visible in the Details roster / `room list`).
+
+---
+
 ## 2026-05-29 — Release v0.1.4 + auto-publish workflow fix
 
   * **v0.1.4** cut + published as `latest` — ships tasks 320–324 (room-history reload, real sender attribution, DM file sending, first-run wizard, settings panel + sidebar grouping). Verified: one-liner installs v0.1.4 (resolve → SHA256 verify → `onyx --version`).

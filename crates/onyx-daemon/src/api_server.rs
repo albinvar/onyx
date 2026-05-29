@@ -336,6 +336,10 @@ async fn dispatch_one_shot(
             new_name,
         } => handle_rename_room(group_id_b32, new_name, state).await,
         ApiRequest::LeaveRoom { group_id_b32 } => handle_leave_room(group_id_b32, state).await,
+        ApiRequest::RemoveFromRoom {
+            group_id_b32,
+            peer_fingerprint,
+        } => handle_remove_from_room(group_id_b32, peer_fingerprint, state).await,
         ApiRequest::RoomHistory {
             group_id_b32,
             limit,
@@ -1204,6 +1208,148 @@ async fn handle_leave_room(group_id_b32: &str, state: &DaemonState) -> ApiRespon
     ApiResponse::LeaveRoomOk {
         group_id_b32: group_id_b32.to_string(),
         members: members_count,
+    }
+}
+
+/// Task 325: remove (kick) another member from a room. Mirrors
+/// `handle_leave_room` but targets a member by fingerprint and KEEPS
+/// the local group (we stay a member): issue a Remove commit, fan it
+/// out to all current members (incl. the evicted one), advance the
+/// epoch, refresh + persist the roster. Requires `--hub`.
+// Linear handler: parse → remove commit → fan out → persist roster.
+// Over the 100-line budget but cohesive (same rationale as the other
+// room handlers).
+#[allow(clippy::too_many_lines)]
+async fn handle_remove_from_room(
+    group_id_b32: &str,
+    peer_fingerprint: &str,
+    state: &DaemonState,
+) -> ApiResponse {
+    if state.hub_outbounds.is_empty() {
+        return ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+        };
+    }
+    let Some(group_id_bytes) = base32::decode(
+        base32::Alphabet::Rfc4648Lower { padding: false },
+        group_id_b32,
+    ) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "group_id_b32 is not valid base32".into(),
+        };
+    };
+    let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer_fingerprint did not parse".into(),
+        };
+    };
+    let our_fp = state.identity.fingerprint().to_string();
+    if peer_fingerprint == our_fp {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "use `leave` to remove yourself, not `remove`".into(),
+        };
+    }
+
+    // Issue the Remove commit. Capture the OLD-epoch routing token
+    // BEFORE the commit advances us (existing members are still
+    // subscribed to it), same as invite/leave.
+    let (commit_bytes, members_before, members_after, old_epoch_token, room_meta) = {
+        let party = state.mls_party.lock().await;
+        let Ok(Some(mut group)) = party.load_group(&group_id_bytes) else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: "no MLS group with that group_id".into(),
+            };
+        };
+        let old_token = group
+            .export_routing_secret(&party)
+            .ok()
+            .map(|s| onyx_core::routing::session_token(&s, 0));
+        let before = crate::members_b32_from_group(&group);
+        let Ok(commit) = group.remove_member(&party, fp.as_bytes()) else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: "that fingerprint is not a current member of the room".into(),
+            };
+        };
+        let after = crate::members_b32_from_group(&group);
+        // Room name/created_at for the roster re-save (upsert).
+        let meta = {
+            let vault = state.vault.lock().await;
+            vault
+                .list_rooms(state.identity_id)
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|r| r.group_id == group_id_bytes))
+                .map(|r| (r.name, r.created_at_ms))
+        };
+        (commit, before, after, old_token, meta)
+    };
+
+    // Fan the commit out to all members the room had BEFORE removal
+    // (except us) — including the evicted member so its daemon
+    // processes the commit and drops the group.
+    let recipients: Vec<String> = members_before
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != our_fp)
+        .map(str::to_owned)
+        .collect();
+    if !recipients.is_empty() {
+        fanout_room_mls_bytes(
+            &group_id_bytes,
+            &commit_bytes,
+            &recipients,
+            state,
+            "remove-commit",
+            old_epoch_token,
+        )
+        .await;
+    }
+
+    // Persist post-remove MLS state + refreshed roster.
+    let snapshot_opt = {
+        let party = state.mls_party.lock().await;
+        party.snapshot_state().ok()
+    };
+    {
+        let vault = state.vault.lock().await;
+        if let Some(snap) = snapshot_opt {
+            let _ = vault.save_mls_state(state.identity_id, &snap);
+        }
+        if let Some((name, created_at_ms)) = &room_meta {
+            let _ = vault.save_room(
+                state.identity_id,
+                &group_id_bytes,
+                name,
+                &members_after,
+                *created_at_ms,
+            );
+        }
+        // Note: we deliberately do NOT drop cached member KEMs here.
+        // `forget_room_member_kems` would drop ALL of them (breaking
+        // hub-fallback to the remaining members); the evicted member's
+        // stale KEM is harmless because future fan-outs iterate the
+        // refreshed roster, which no longer includes them.
+    }
+
+    let members: Vec<String> = members_after
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    tracing::info!(
+        group_id_b32,
+        removed = %peer_fingerprint,
+        remaining = members.len(),
+        "room: removed member (task 325)"
+    );
+    ApiResponse::RemoveFromRoomOk {
+        group_id_b32: group_id_b32.to_string(),
+        members,
     }
 }
 
