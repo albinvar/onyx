@@ -197,7 +197,7 @@ async fn dispatch_one_shot(
     match req {
         ApiRequest::Status => ApiResponse::StatusOk {
             api_version: API_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            daemon_version: onyx_core::VERSION.to_string(),
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
             fingerprint: state.identity.fingerprint().to_string(),
             tor_state,

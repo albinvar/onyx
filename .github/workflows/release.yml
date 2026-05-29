@@ -94,6 +94,12 @@ jobs:
             --remap-path-prefix ${HOME}/.cargo=/cargo
             -C link-arg=-s
         run: |
+          # Stamp the user-facing version (git tag minus the `v`) into
+          # the binaries so `--version` and the daemon's reported
+          # `daemon_version` match the published artifact name + release.
+          # `onyx_core::VERSION` reads this via `option_env!`, falling
+          # back to the workspace `0.0.1` on local dev builds.
+          export ONYX_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
           # --locked: refuse to update Cargo.lock; same dep set as
           # committed. --release: optimized + stripped. Every target
           # builds natively on its own runner (no cross-compilation),

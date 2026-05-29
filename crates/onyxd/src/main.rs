@@ -15,7 +15,7 @@ use clap::Parser;
 use onyx_daemon::Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "onyxd", version, about = "Onyx daemon (headless)")]
+#[command(name = "onyxd", version = onyx_core::VERSION, about = "Onyx daemon (headless)")]
 struct Args {
     /// Path to the encrypted vault file. Defaults to `~/.onyx/vault.db`
     /// (the parent directory is auto-created with mode 0700 if missing).

@@ -36,6 +36,22 @@ pub mod wire;
 /// Onyx protocol version transmitted in the HELLO frame (DESIGN.md §5.3).
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Release version string, the single source of truth for every
+/// binary's `--version` and the daemon's reported `daemon_version`.
+///
+/// The workspace `Cargo.toml` version is deliberately pinned at
+/// `0.0.1` (internal crate versioning); user-facing releases are
+/// tagged independently (`vX.Y.Z`). At release-build time the CI
+/// workflow exports `ONYX_RELEASE_VERSION` from the git tag, so a
+/// published binary reports the version that matches its filename and
+/// GitHub release. Local/dev builds (no env set) fall back to the
+/// crate version. `option_env!` is const-evaluable, so this stays a
+/// `const` with zero runtime cost.
+pub const VERSION: &str = match option_env!("ONYX_RELEASE_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Label namespace for all HKDF/BLAKE2 derivations. Bumping this string
 /// invalidates every cross-protocol derivation, so it changes only with a
 /// protocol-incompatible revision.

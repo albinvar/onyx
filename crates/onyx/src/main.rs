@@ -64,7 +64,7 @@ use onyx_core::api::{ApiRequest, ApiResponse};
 #[derive(Parser, Debug)]
 #[command(
     name = "onyx",
-    version,
+    version = onyx_core::VERSION,
     about = "Onyx — anonymous E2E-encrypted chat over Tor. Run with no \
              subcommand to launch the daemon + TUI in one process."
 )]

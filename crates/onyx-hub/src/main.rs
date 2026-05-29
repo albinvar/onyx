@@ -58,7 +58,7 @@ const HUB_HS_PORT: u16 = 1;
 #[derive(Parser, Debug)]
 #[command(
     name = "onyx-hub",
-    version,
+    version = onyx_core::VERSION,
     about = "Onyx hub — encrypted store-and-forward relay"
 )]
 struct Args {
