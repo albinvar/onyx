@@ -200,6 +200,13 @@ Even though Tor wraps the bytes, the *fact that you are running Tor* is visible 
   * **What would close it:** bridge configuration support, snowflake integration.
   * **Effort:** Arti supports bridges; surfacing the config in Onyx is ~half session.
 
+### 3.11 Per-conversation circuit isolation (D-2) — in place
+
+Each hub connection and each direct peer dial runs through its own **circuit-isolation group** (`TorRuntime::isolated()`, wrapping Arti's `isolated_client`). Two of your conversations therefore never ride the same Tor circuit, so an adversary observing a middle/exit relay can't trivially link them as "the same user," and one circuit's failure or compromise is scoped to a single peer.
+
+  * **Scope (honest):** this isolates *circuits*, not *guards*. Tor deliberately reuses a small, sticky set of entry guards across all your circuits — adding more guards would make guard-discovery attacks easier, not harder — so the entry relay is shared by design; isolation operates at the circuit layer above it. It is also no defense against the global passive adversary of §3.1 (who correlates timing across circuits regardless of isolation).
+  * **Not unit-tested:** verifying real isolation needs a live Tor network, so this rests on Arti's `isolated_client` contract (the same reason the hidden-service path is integration-stubbed). Real-circuit verification rides along with `scripts/real_tor_smoke.sh`.
+
 ---
 
 ## 4. Practical recommendations

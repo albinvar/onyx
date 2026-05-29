@@ -713,7 +713,12 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
 
             let state_for_hub_task = state.clone();
-            let tor_clone = tor.clone();
+            // D-2: each hub connection gets its own circuit-isolation
+            // group, so a network/exit observer can't link this user's
+            // separate hub sessions by seeing them share a Tor circuit.
+            // The isolated client is held across this task's reconnect
+            // loop, so the per-hub isolation is stable.
+            let tor_clone = tor.isolated();
             // Per-iter Zeroizing clones — both buffers are no longer
             // Copy (the Zeroizing wrapper opts out), so each spawned
             // task gets its own scrub-on-drop copy of the seed bytes.
@@ -1081,7 +1086,11 @@ async fn run_dial_mode(
     // D-3: the peer's onion host is a social-graph identifier — debug,
     // not info, so it stays out of the default on-disk log.
     debug!(host = %host, port = port, "dialing peer onion…");
+    // D-2: dial this peer through its own circuit-isolation group, so
+    // this direct conversation never shares a Tor circuit with the hub
+    // sessions or with another peer dial.
     let stream = tor
+        .isolated()
         .dial(&host, port)
         .await
         .map_err(|e| anyhow::anyhow!("dial failed: {e}"))?;

@@ -6,6 +6,17 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — D-2: per-conversation Tor circuit isolation
+
+First of the deep-pass HIGH residuals (§8.5). Previously every Tor dial — all hub connections + every peer dial — shared the same Arti `TorClient`, so they could ride the same circuit; an adversary observing a middle/exit relay could link two of a user's conversations as "the same user."
+
+  * **`TorRuntime::isolated()`** (wraps Arti's `isolated_client`) returns a clone whose dials form a fresh **circuit-isolation group**. Threaded in: each hub task gets its own isolated client (stable across its reconnect loop), and each peer dial in `run_dial_mode` dials through a fresh isolated client. Two conversations now never share a Tor circuit, and a circuit's failure/compromise is scoped to one peer.
+  * **Honest scope:** isolates *circuits*, not *guards* — Tor intentionally reuses a small sticky guard set (more guards = easier guard discovery), so the entry relay is shared by design. No defense against the global timing adversary (§3.1). Behavior can't be unit-tested without a live Tor network (rests on Arti's `isolated_client` contract, like the integration-stubbed HS path); real-circuit verification rides with `scripts/real_tor_smoke.sh`.
+
+Docs: ANONYMITY §3.11 (new), THREAT_MODEL §8.5 (D-2 → Fixed). Gate: clippy `-D warnings` clean; `cargo test --workspace` = **500 passed** (no new tests — isolation needs live Tor; see above). Remaining HIGH residuals: D-1 (ephemeral Noise), T-1 (key pinning + Contact), T-2 (invite auth), P-1 (conversation keying).
+
+---
+
 ## 2026-05-29 — Security review deep pass, batch 3 (H-3, G-1, P-2, T-3, D-3 + residuals)
 
 A deeper architectural/protocol review pass (mixed manual + agent) reaching past the config/DoS layer of batches 1–2 into anonymity, first-contact trust, and federation correctness. Full per-finding table + tracked-residual list in THREAT_MODEL §8.5. **Confidentiality core held again; still not the formal external audit (§8.2 #7).** Fixed the contained ones; the rest are real, mostly-architectural residuals documented honestly (not claimed fixed).

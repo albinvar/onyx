@@ -131,6 +131,30 @@ impl TorRuntime {
             .map_err(|_| Error::Internal("tor: dial failed"))
     }
 
+    /// Return a clone of this client whose outbound dials form a fresh
+    /// **circuit-isolation group** (Arti's `isolated_client`): streams
+    /// opened through the returned runtime will not share a Tor circuit
+    /// with streams from this runtime or from any other isolated clone
+    /// (D-2). Use one isolated runtime per logical peer — each hub
+    /// connection, each peer conversation — so a network/exit observer
+    /// can't trivially link two of the user's conversations by seeing
+    /// them ride the same circuit, and a single circuit's compromise or
+    /// failure is scoped to one peer.
+    ///
+    /// **Scope (honest):** this isolates *circuits*, not *guards*. Tor
+    /// deliberately reuses a small, sticky guard set across all circuits
+    /// — more guards would make guard-discovery attacks easier, not
+    /// harder — so the entry relay is intentionally shared; isolation
+    /// operates at the circuit layer above it. It also does nothing
+    /// against a global passive adversary correlating timing across
+    /// circuits (see `ANONYMITY.md` §3.1).
+    #[must_use]
+    pub fn isolated(&self) -> Self {
+        Self {
+            inner: Arc::new(self.inner.isolated_client()),
+        }
+    }
+
     /// Publish a v3 hidden service under the given nickname.
     ///
     /// Returns an [`HiddenService`] handle (with `onion_address()`) plus
