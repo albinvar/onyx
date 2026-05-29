@@ -6,6 +6,41 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — Release v0.1.6 — audit-hardening + all five deep-pass HIGHs
+
+A large security-hardening release. Bundles everything landed since v0.1.5: the first 2026-05-29 internal audit's full triage (M-1, A-1…A-9 with honest dispositions) **plus** the deeper review pass's full HIGH list. **All five deep-pass HIGHs are now resolved.**
+
+**HIGH-severity findings closed (deep pass):**
+
+  * **D-1 — ephemeral Noise static** (`--ephemeral-noise-static`, opt-in). Per-handshake fresh X25519 keypair as the Noise static; the hub no longer sees the long-term identity at the transport layer. Honest composition note: closes leak #1 of §3.2's three; #2 and #3 close when the user adds `--no-intro-inbox-subscribe` + avoids `KP_PUBLISH`.
+  * **T-2 — signed + expiring invites** (`onyx://invite/v2`). Ed25519 over a length-prefixed canonical blob covering every field; daemon-side signing via the new `BuildInvite` API verb. Closes partial side-channel tampering; the fundamental full-invite-substitution limit is mitigated by OOB-fp verification + T-1's later detection.
+  * **T-1 — TOFU key pinning + `key changed` warning + `onyx contact list`**. Vault pins fingerprint → X25519 binding on first contact; later differing key is kept-not-overwritten and flagged + warned.
+  * **D-2 — Tor circuit isolation**. Each hub connection + each peer dial dials through its own Arti `isolated_client`. Isolates circuits, not guards (guards intentionally shared by Tor design).
+  * **P-1 — verified closed by composition** of HIGH-2 + T-1 + P-2 (analysis only, no code change needed — full reasoning written down in §8.5).
+
+**Audit-hardening (first pass batches 1–3):**
+
+  * **M-1** vault Argon2 `DEFAULT` (256 MiB) not `FLOOR`.
+  * **A-1** rate-limit peer-hub gossip (CPU-DoS/amplifier fix).
+  * **A-2** SUBSCRIBE id caps (per-frame + per-conn).
+  * **A-3** offline-queue per-entry overhead accounting.
+  * **A-5** envelope CBOR size cap + field-length validation.
+  * **A-9** KP_FETCH rate-limited (presence-enum oracle).
+  * **H-3** gossip TTL clamped on receipt (kills 255× amplification).
+  * **G-1** in-room KEM advertisements keyed on MLS-credential sender, not body.
+  * **P-2** short-id collision guard (no hijack).
+  * **T-3** `derive_peer_fingerprint` fallback warns at all three paths.
+  * **L-2** API-socket parent-dir privacy warning.
+  * **D-3** identity / onion / fingerprint moved out of the default (info) log.
+  * **A-6** vestigial `pad_to` doc corrected (frame-layer bucket padding does the real work).
+  * **A-4 / A-7 / A-8** accepted-by-design / already-documented / moot — dispositioned with reasons.
+
+**Honest caveats (unchanged):** still **no formal external audit** — §8.2 #7 remains the headline open item; every "fixed" above is "survives the attacks we wrote tests for." Deep-pass MEDs remaining: **P-3** (serial delivery HOL), **G-2** (MLS committer authority), **H-2** (forgeable gossip `seen_by`), **D-4** (identity-derived onion).
+
+Gate: `cargo test --workspace` = **511 passed** (+22 since v0.1.5); clippy `-D warnings` + `cargo fmt --check` clean across the workspace.
+
+---
+
 ## 2026-05-30 — D-1: ephemeral Noise static (opt-in) — last deep-pass HIGH
 
 The final deep-pass HIGH. `--ephemeral-noise-static` (default off) makes the daemon's Noise XK static to each hub a **freshly-generated X25519 keypair per handshake** — the hub no longer learns the long-term identity X25519 at the transport layer. The long-term identity stays in HIGH-2 sealed-sender envelopes (running end-to-end *inside* Noise frames), so DMs/rooms keep working; only the transport identifier changes per connection.
