@@ -6,6 +6,22 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Security review deep pass, batch 3 (H-3, G-1, P-2, T-3, D-3 + residuals)
+
+A deeper architectural/protocol review pass (mixed manual + agent) reaching past the config/DoS layer of batches 1–2 into anonymity, first-contact trust, and federation correctness. Full per-finding table + tracked-residual list in THREAT_MODEL §8.5. **Confidentiality core held again; still not the formal external audit (§8.2 #7).** Fixed the contained ones; the rest are real, mostly-architectural residuals documented honestly (not claimed fixed).
+
+  * **H-3 (MED) — gossip TTL clamp.** `GossipFrame::decode` accepted any `ttl` up to 255, so a malicious peer could amplify a frame across up to 255 hops in a cycle. Both gossip handlers now clamp inbound TTL to `GOSSIP_TTL_DEFAULT` before decrementing (no-op for honest forwards). Test: `gossip_publish_inflated_ttl_is_clamped`.
+  * **G-1 (MED) — KEM-directory poisoning.** The in-room `KemAdvertisement` handler persisted the **body-supplied** `fingerprint`, letting a member advertise a KEM under another member's identity (delivery DoS / interception). Now keyed on the **MLS-credential-derived `sender_fp`**; a body fingerprint that disagrees is dropped as a poisoning attempt.
+  * **P-2 (MED) — short-id hijack.** The 8-char (40-bit) conversation short id was grindable and `by_short` was overwritten unconditionally, so an attacker could collide a victim's short id and have the user's sends misdirected. New `insert_short_id` refuses to overwrite a different peer's short id (keeps the original, warns); the colliding peer stays reachable by full key. Test: `short_id_collision_does_not_hijack_existing_peer`.
+  * **T-3 (MED) — DM sender-attribution fallback.** The DM-path `(peer/<x25519>)` fallback (§8.2 #5 for DMs) was visually distinct but silent; it now `warn!`s that the sender identity is unverified. Full fix needs identity-key pinning (T-1, residual).
+  * **D-3 (MED, partial) — log hygiene.** Social-graph identifiers (peer pubkeys ×4 + peer onion-dial host) moved from `info` to `debug`, so they no longer persist in the default plaintext `~/.onyx/onyx.log`. Remaining (residual): own onion (operator needs it), own inbox/fingerprint, and the plaintext-log-at-rest caveat — full hygiene pass tracked.
+
+**Tracked residuals (analyzed, NOT fixed — see §8.5):** D-1 (hub Noise static = identity → §3.2 ephemeral-key redesign), D-2 (Tor circuit isolation), D-4 (identity-derived onion key), T-1 (key pinning + `Contact` command), T-2 (invite auth/expiry), P-1 (conversation keying on X25519 vs fingerprint), P-3 (serial delivery HOL DoS), G-2 (MLS committer-authority — now has a residual row), H-1 (queue-fill denial-of-delivery, partially mitigated by A-1), H-2 (forgeable gossip `seen_by`). The HIGH next-candidates are **D-2 (circuit isolation)** and **T-1 (key pinning)**.
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **500 passed** (+3: the H-3 test runs in both hub targets + the P-2 daemon test).
+
+---
+
 ## 2026-05-29 — External audit hardening, batch 2 (A-1, A-3, A-5, A-6, A-9 + dispositions)
 
 Completes the 2026-05-29 security review triage. **No confidentiality findings; all DoS-hardening or parser robustness.** Full per-finding table in THREAT_MODEL §8.4. (This was a mixed manual+agent review — it does **not** close the formal external-audit gap §8.2 #7, which stays open.)

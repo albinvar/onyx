@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use onyx_core::api::{ApiResponse, HistoryEntry, MessageDirection, PeerInfo};
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tracing::warn;
 
 /// Per-peer outbound queue depth. The API's `Send` handler `try_send`s
 /// into this; if full it returns an [`ApiErrorCode::NotReady`]-style
@@ -151,6 +152,31 @@ impl ConversationRegistry {
     ///
     /// Pushes [`ApiResponse::EventPeerConnected`] to all current
     /// `Tail` subscribers.
+    /// P-2: insert a `short_id → peer_pub` mapping, refusing to
+    /// overwrite an existing mapping to a **different** peer. The
+    /// 8-char (40-bit) short id is grindable, so a silent overwrite
+    /// would let an attacker who generates a key colliding on a
+    /// victim's short id hijack it and have the user's short-id sends
+    /// misdirected. On collision we keep the original owner and warn;
+    /// the colliding peer is still reachable by its full pubkey.
+    /// Re-registering the same peer (same short id → same key) is a
+    /// no-op overwrite and allowed.
+    fn insert_short_id(&mut self, short_id: String, peer_pub: [u8; 32]) {
+        match self.by_short.get(&short_id) {
+            Some(existing) if *existing != peer_pub => {
+                warn!(
+                    short_id = %short_id,
+                    "conversations: short-id collision with a different peer; keeping the \
+                     original owner (possible grinding attack — the new peer is still \
+                     addressable by full key)"
+                );
+            }
+            _ => {
+                self.by_short.insert(short_id, peer_pub);
+            }
+        }
+    }
+
     pub fn register(
         &mut self,
         peer_pub: [u8; 32],
@@ -166,7 +192,7 @@ impl ConversationRegistry {
             fingerprint,
             outbound_tx,
         };
-        self.by_short.insert(short_id, peer_pub);
+        self.insert_short_id(short_id, peer_pub);
         let state = ConversationState {
             handle: handle.clone(),
             connected: true,
@@ -220,7 +246,7 @@ impl ConversationRegistry {
             fingerprint,
             outbound_tx,
         };
-        self.by_short.insert(short_id, peer_pub);
+        self.insert_short_id(short_id, peer_pub);
         let state = ConversationState {
             handle: handle.clone(),
             // `connected: false` because there's no live direct
@@ -498,6 +524,35 @@ mod tests {
         assert_eq!(handle.short_id.len(), 8);
         let h = reg.handle_for_short(&handle.short_id).expect("present");
         assert_eq!(h.peer_pub, handle.peer_pub);
+    }
+
+    #[tokio::test]
+    async fn short_id_collision_does_not_hijack_existing_peer() {
+        // P-2: the 8-char short id is grindable; a second peer that
+        // collides on it must NOT overwrite the first peer's mapping
+        // (which would misdirect the user's short-id sends to the
+        // attacker). Both b32 strings share the first 8 chars.
+        let mut reg = ConversationRegistry::new();
+        let victim_b32 = "aaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let attacker_b32 = "aaaaaaaaccccccccccccccccccccccccccccccccccccc";
+        let (victim, _rxv) = reg.register([1u8; 32], victim_b32, "victim-fpr".into());
+        let (attacker, _rxa) = reg.register([2u8; 32], attacker_b32, "attacker-fpr".into());
+
+        assert_eq!(
+            victim.short_id, attacker.short_id,
+            "test setup: the two short ids must collide"
+        );
+        // Both peers are independently registered (by full key)...
+        assert_eq!(reg.list().len(), 2, "both peers should be registered");
+        // ...but the short-id lookup still resolves to the FIRST owner,
+        // so the user's short-id sends are not hijacked.
+        let resolved = reg
+            .handle_for_short(&victim.short_id)
+            .expect("short id present");
+        assert_eq!(
+            resolved.peer_pub, victim.peer_pub,
+            "a colliding short id must not hijack the original owner"
+        );
     }
 
     #[tokio::test]

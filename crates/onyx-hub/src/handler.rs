@@ -244,19 +244,20 @@ async fn handle_gossip_publish(
         "hub: gossiped KeyPackage accepted (ownership verified)"
     );
 
-    // Forward to other peers (TTL decrement + seen_by rewrite via
-    // GossipFrame::forward). Skip the source peer to avoid bouncing.
-    if let Some(fwd) = frame.forward([0u8; 16]) {
-        // We re-encode via fan_out_kp_to_peers_except so the
-        // outgoing seen_by gets set to OUR hash (the dummy [0;16]
-        // we passed to forward() above is overwritten — we only
-        // used forward() for the TTL-decrement logic).
-        let _ = fwd; // suppress unused: we only needed the TTL check
+    // Forward to other peers (skip the source to avoid bouncing).
+    // H-3: clamp the inbound TTL to the protocol default BEFORE
+    // decrementing, so a peer claiming an inflated TTL (e.g. 255)
+    // can't amplify a frame across far more hops than the mesh
+    // intends. A legitimate forwarded frame already carries
+    // ttl ≤ GOSSIP_TTL_DEFAULT, so the clamp is a no-op for honest
+    // traffic and only bites a hostile inflated value.
+    let new_ttl = frame
+        .ttl
+        .min(onyx_core::wire::GOSSIP_TTL_DEFAULT)
+        .saturating_sub(1);
+    if new_ttl > 0 {
         let s = state.lock().await;
-        let new_ttl = frame.ttl.saturating_sub(1);
-        if new_ttl > 0 {
-            s.fan_out_kp_to_peers_except(source_pubkey, new_ttl, frame.routing_id, &frame.body);
-        }
+        s.fan_out_kp_to_peers_except(source_pubkey, new_ttl, frame.routing_id, &frame.body);
     }
 }
 
@@ -319,7 +320,12 @@ async fn handle_gossip_deliver(
     // Re-fanout to OTHER peers under the same policy as origin:
     // - Eager: always forward.
     // - Lazy: forward only when we couldn't deliver locally.
-    let new_ttl = frame.ttl.saturating_sub(1);
+    // H-3: clamp inbound TTL to the protocol default before
+    // decrementing (see handle_gossip_publish) to bound amplification.
+    let new_ttl = frame
+        .ttl
+        .min(onyx_core::wire::GOSSIP_TTL_DEFAULT)
+        .saturating_sub(1);
     let should_forward = new_ttl > 0
         && match mode {
             crate::state::GossipMode::Eager => true,
@@ -1646,6 +1652,42 @@ mod tests {
             let fwd = onyx_core::wire::GossipFrame::decode(&inner.payload).unwrap();
             assert_eq!(fwd.ttl, 2, "TTL decremented from 3 to 2");
             assert_eq!(fwd.seen_by, our_hash, "seen_by rewritten to OUR hash");
+        }
+    }
+
+    /// H-3: an inbound gossip frame claiming an inflated TTL (255) is
+    /// clamped to `GOSSIP_TTL_DEFAULT` before forwarding, so a hostile
+    /// peer can't amplify a frame across far more hops than the mesh
+    /// intends. The forwarded copy must carry `DEFAULT - 1`, not 254.
+    #[tokio::test]
+    async fn gossip_publish_inflated_ttl_is_clamped() {
+        use onyx_core::wire::{GOSSIP_TTL_DEFAULT, GossipFrame};
+        let our_hash = [0x5A; 16];
+        let (state, mut peer_rxs) = fed_state(our_hash, 2);
+        let state = Arc::new(Mutex::new(state));
+
+        let (kp_bytes, rid) = fresh_kp_and_routing_id();
+        let frame = GossipFrame {
+            ttl: 255, // hostile inflated TTL
+            seen_by: [0x42; 16],
+            routing_id: rid,
+            body: kp_bytes,
+        };
+        let payload = frame.encode();
+        let source_pk = [0x99; 32];
+        handle_gossip_publish(&payload, &state, &source_pk).await;
+
+        for (idx, (_pk, rx)) in peer_rxs.iter_mut().enumerate() {
+            let inner = rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("peer #{idx} should have received the forward"));
+            let fwd = GossipFrame::decode(&inner.payload).unwrap();
+            assert_eq!(
+                fwd.ttl,
+                GOSSIP_TTL_DEFAULT - 1,
+                "inflated inbound TTL must be clamped to DEFAULT before forwarding"
+            );
         }
     }
 

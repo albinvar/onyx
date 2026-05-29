@@ -275,6 +275,37 @@ A second security review (mixed manual + agent-driven analysis). **This is not t
 
 Tests landed with the fixes: `subscribe_enforces_per_conn_subscription_cap`, `resubscribe_same_id_does_not_double_count_against_cap`, `check_rate_throttles_any_connection_after_its_budget` (A-1/A-2), `offline_queue_byte_accounting_frees_on_drain` updated for overhead (A-3), `envelope_rejects_invalid_field_lengths` + `envelope_rejects_oversized_cbor` (A-5).
 
+### 8.5 Security review — 2026-05-29, deep pass (mixed manual + agent)
+
+A deeper architectural/protocol pass following §8.4. **Still not the formal third-party external audit (§8.2 #7), which remains open.** These reach past the config/DoS layer into anonymity architecture, first-contact trust, and federation correctness — so several are genuinely multi-session protocol work, not one-line fixes. Honest split:
+
+**Fixed in this pass (contained, tested where unit-testable):**
+
+| ID | Sev | Finding | Resolution |
+|----|-----|---------|------------|
+| H-3 | MED | Inbound gossip TTL not clamped → up to 255× amplification | **Fixed** — both gossip handlers clamp inbound TTL to `GOSSIP_TTL_DEFAULT` before decrementing. Test: `gossip_publish_inflated_ttl_is_clamped`. |
+| G-1 | MED | `KemAdvertisement.fingerprint` persisted from the message body → KEM-directory poisoning | **Fixed** — keyed on the MLS-credential-derived `sender_fp`; a body fingerprint that disagrees is dropped as a poisoning attempt. |
+| P-2 | MED | 8-char (40-bit) short id with unconditional `by_short` overwrite → grindable send-misdirection | **Fixed** — `insert_short_id` refuses to overwrite a different peer's short id (keeps the original, warns); colliding peer still reachable by full key. Test: `short_id_collision_does_not_hijack_existing_peer`. |
+| T-3 | MED | DM-path X25519-as-Ed25519 silent fingerprint fallback (§8.2 #5 for the DM path) | **Fixed (logging)** — fallback now `warn!`s that sender identity is unverified, on top of the already-distinct `(peer/<x25519>)` rendering. Full resolution = key pinning (T-1, residual). |
+| D-3 | MED | Social-graph identifiers logged at `info` to the plaintext `~/.onyx/onyx.log` | **Partially fixed** — peer pubkeys (×4 sites) and peer onion-dial host moved to `debug`, so the **social graph** no longer persists in the default log. Remaining (residual): own onion (operator needs it to share), own inbox/fingerprint, and the general "log file is plaintext at rest" caveat — a full hygiene pass + redaction policy is tracked. |
+
+**Tracked residuals — analyzed, NOT yet fixed (honest; these are real and mostly architectural):**
+
+| ID | Sev | Finding | Status / why deferred |
+|----|-----|---------|------------------------|
+| D-1 | HIGH | Hub Noise static key = long-term X25519 identity → hub clusters all of a user's routing ids/tokens under one authenticated identity | The §3.2 structural leak. Fix = **ephemeral per-session Noise keys** (+ separated publish/subscribe) — substantial protocol redesign, already called out in `ANONYMITY.md` §3.2 as deferred. **Open.** |
+| D-2 | HIGH | No Tor circuit isolation (`StreamPrefs`/`IsolationToken` absent) → all dials share guards | Fixable with arti `StreamPrefs` per conversation/hub; medium effort. **Open — high-value next.** |
+| D-4 | MED | Onion service key random (`OnionServiceConfigBuilder::default()`), not identity-derived → §4.3 onion↔identity verification can't work | Needs provisioning the HS key from the identity (arti support TBD). **Open.** |
+| T-1 | HIGH | No key pinning / "key changed" warning / `Contact` command (TOFU) | First-contact MITM goes undetected on key change. Medium effort (pin fingerprint→key on first contact, warn on change, surface in UI). **Open — high-value next.** Pairs with T-3. |
+| T-2 | HIGH | Invite has no signature/MAC/nonce/expiry → invite-channel MITM owns first contact | Partly fundamental (first-contact over an unauthenticated channel can always be MITM'd); mitigations = OOB fingerprint verification (exists) + invite expiry/nonce to limit replay/staleness. **Open.** |
+| P-1 | HIGH | `register_hub_only` keyed on attacker-chosen `peer_pub` (X25519), not the bound Ed25519 fingerprint | Needs analysis of the X25519↔fingerprint binding across the conversation registry; potential slot-confusion. **Open — needs careful verification before a fix.** |
+| P-3 | MED | Hub deliveries processed inline + serial → junk-envelope CPU / head-of-line DoS | Architectural (bound/parallelize the recipient decode path, or fast-reject). Partly blunted by the recipient replay guard + sealed-envelope drop. **Open.** |
+| G-2 | MED | No committer-authority model — any MLS member can add/remove any member | Largely inherent to plain MLS (no admin roles); an authority/policy layer is a design effort. **Documented residual** (this row). **Open.** |
+| H-1 | 🟠→🟡 | Federated peer can fill a target inbox's offline queue to the cap → targeted denial-of-delivery | **Partially mitigated** by A-1 (rate-limits the fill *rate*) + the per-id depth cap; a slow fill to the cap still drops legit messages. Fundamental tension: the hub can't distinguish junk from real sealed envelopes. **Open (partial).** |
+| H-2 | MED | Forgeable gossip `seen_by` → a peer can forge our hash to make us drop a frame (directory-partition / suppression) | The loop-check trusts an unauthenticated `seen_by`; a malicious peer exploits it to suppress propagation. Mitigation needs authenticated forwarding metadata. **Open.** |
+
+**Bottom line (unchanged honesty):** the confidentiality core held across two review passes; the open items above are real anonymity/trust/federation hardening, several requiring protocol-level work. None are claimed fixed until they are. The formal external audit (§8.2 #7) is still the headline gap.
+
 ---
 
 *See `DESIGN.md` for the full system specification and `SECURITY.md` for the enforcement principles and disclosure policy.*

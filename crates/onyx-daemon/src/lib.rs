@@ -909,7 +909,10 @@ where
 
     let peer_pub = session.peer_static_key();
     let peer_pub_b32 = encode_b32(&peer_pub);
-    info!(
+    // D-3: peer identity pubkey is a social-graph identifier; keep it
+    // at debug so it doesn't persist in the default ~/.onyx/onyx.log
+    // (seized-device leak). The operational milestone stays loggable.
+    debug!(
         peer_identity_pub_b32 = %peer_pub_b32,
         "Noise XK complete; awaiting MLS intent from initiator"
     );
@@ -1075,7 +1078,9 @@ async fn run_dial_mode(
     let peer_pub_bytes: [u8; 32] =
         decode_b32_32(peer_pubkey_b32).context("--dial-pubkey must decode to 32 bytes")?;
 
-    info!(host = %host, port = port, "dialing peer onion…");
+    // D-3: the peer's onion host is a social-graph identifier — debug,
+    // not info, so it stays out of the default on-disk log.
+    debug!(host = %host, port = port, "dialing peer onion…");
     let stream = tor
         .dial(&host, port)
         .await
@@ -1119,7 +1124,9 @@ where
              aborting before any application traffic"
         ));
     }
-    info!(
+    // D-3: peer identifier at debug (see above) — keep it out of the
+    // default on-disk log.
+    debug!(
         peer_identity_pub_b32 = %learned_peer,
         "peer X25519 matches --dial-pubkey ✓"
     );
@@ -1163,13 +1170,13 @@ where
     };
 
     if let Some(gid) = &existing_group_id {
-        info!(
+        debug!(
             peer_identity_pub_b32 = %learned_peer,
             existing_group_id_bytes = gid.len(),
             "resuming existing MLS group (initiator)"
         );
     } else {
-        info!(
+        debug!(
             peer_identity_pub_b32 = %learned_peer,
             "no prior group — bootstrapping (initiator)"
         );
@@ -1515,7 +1522,22 @@ async fn handle_dm_app_frame(
         return;
     };
     let conversation = format!("peer/{}", short_id_of_peer_pub(peer_pub));
-    let sender_fp = peer_fp.unwrap_or_else(|| format!("(peer/{})", short_id_of_peer_pub(peer_pub)));
+    // T-3 / §8.2 #5: when we have no authenticated Ed25519 fingerprint
+    // for the DM peer, attribute under a `(peer/<x25519-short>)`
+    // placeholder that is visually distinct from a real fingerprint
+    // AND log a warn — the sender *identity* is not verified on this
+    // path (the Noise handshake authenticates the X25519 static key,
+    // which is a different key from the Ed25519 identity). Full
+    // resolution needs identity-key pinning (T-1).
+    let sender_fp = peer_fp.unwrap_or_else(|| {
+        warn!(
+            peer_short = %short_id_of_peer_pub(peer_pub),
+            "dm: no authenticated Ed25519 fingerprint for this peer; attributing the \
+             message under a non-identity (peer/<x25519>) placeholder — sender identity \
+             is NOT verified"
+        );
+        format!("(peer/{})", short_id_of_peer_pub(peer_pub))
+    });
     match msg {
         onyx_core::room::RoomAppMessage::Text { text } => {
             state.conversations.lock().await.push_message(
@@ -1717,29 +1739,45 @@ async fn handle_room_app_frame(
             kem_pub,
         } => {
             // T6.3.h: in-room KEM-pub advertisement from another
-            // member. Persist into room_member_kems so we can hub-
-            // fallback to that member later. Authenticity comes from
-            // the MLS ratchet (only a current member could encrypt
-            // this); the sealed-envelope outer Ed25519 layer adds
-            // the sender identity binding for the hub path.
-            let vault = state.vault.lock().await;
-            match vault.save_room_member_kem(
-                state.identity_id,
-                group_id,
-                &fingerprint,
-                kem_pub.as_ref(),
-            ) {
-                Ok(()) => info!(
-                    group_id_b32 = %encode_b32(group_id),
-                    member_fp = %fingerprint,
-                    kem_bytes = kem_pub.len(),
-                    "room: KEM advertisement persisted"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    member_fp = %fingerprint,
-                    "room: KEM advertisement save failed"
-                ),
+            // member, persisted into room_member_kems so we can
+            // hub-fallback to that member later.
+            //
+            // G-1: key the entry on `sender_fp` — the fingerprint
+            // pulled from the MLS *credential* of whoever sent this
+            // frame — NOT the `fingerprint` carried in the message
+            // body. A member can only advertise their OWN KEM; using
+            // the body value would let a malicious member persist a
+            // KEM under another member's fingerprint, poisoning that
+            // member's directory entry (delivery DoS, or worse if the
+            // poisoned KEM is the attacker's). If the body claims a
+            // different fingerprint, drop it as a poisoning attempt.
+            if fingerprint == sender_fp {
+                let vault = state.vault.lock().await;
+                match vault.save_room_member_kem(
+                    state.identity_id,
+                    group_id,
+                    &sender_fp,
+                    kem_pub.as_ref(),
+                ) {
+                    Ok(()) => info!(
+                        group_id_b32 = %encode_b32(group_id),
+                        member_fp = %sender_fp,
+                        kem_bytes = kem_pub.len(),
+                        "room: KEM advertisement persisted"
+                    ),
+                    Err(e) => warn!(
+                        error = %e,
+                        member_fp = %sender_fp,
+                        "room: KEM advertisement save failed"
+                    ),
+                }
+            } else {
+                warn!(
+                    claimed_fp = %fingerprint,
+                    authenticated_fp = %sender_fp,
+                    "room: KEM advertisement body fingerprint != MLS-credential sender; \
+                     dropping as a poisoning attempt"
+                );
             }
         }
         onyx_core::room::RoomAppMessage::FileMeta {
