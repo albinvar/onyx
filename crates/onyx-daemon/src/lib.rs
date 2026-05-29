@@ -2434,7 +2434,14 @@ fn open_or_create_vault(path: &std::path::Path, passphrase: &[u8]) -> anyhow::Re
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating vault parent directory {}", parent.display()))?;
         }
-        Vault::create(path, passphrase, &Argon2Params::FLOOR)
+        // M-1: production vaults use the full 256 MiB DEFAULT KDF
+        // cost, not the 64 MiB FLOOR (the FLOOR is the minimum the
+        // daemon will *accept* on open, intended for already-created
+        // low-memory-device vaults — not the bar for fresh ones). The
+        // params are persisted per-vault in `vault_meta`, so existing
+        // FLOOR vaults keep unlocking with their stored cost; only
+        // newly-created vaults get the stronger offline-crack cost.
+        Vault::create(path, passphrase, &Argon2Params::DEFAULT)
             .map_err(|e| anyhow::anyhow!("vault create failed: {e}"))
     }
 }

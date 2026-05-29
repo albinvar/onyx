@@ -667,7 +667,10 @@ fn open_or_create_vault(path: &std::path::Path, passphrase: &[u8]) -> anyhow::Re
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating vault parent directory {}", parent.display()))?;
         }
-        Vault::create(path, passphrase, &Argon2Params::FLOOR)
+        // M-1: fresh vaults use the 256 MiB DEFAULT KDF cost, not the
+        // 64 MiB FLOOR (which is only the minimum accepted on open).
+        // Params persist per-vault, so existing vaults are unaffected.
+        Vault::create(path, passphrase, &Argon2Params::DEFAULT)
             .map_err(|e| anyhow::anyhow!("vault create failed: {e}"))
     }
 }

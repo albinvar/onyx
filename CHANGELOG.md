@@ -6,6 +6,18 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — External audit hardening, batch 1 (M-1, L-2, A-2)
+
+A fresh external audit (config-hardening + DoS findings; **no confidentiality breaks** — crypto core, sealed-sender reflection-safety, and untrusted-byte parsers all confirmed solid). Each finding re-verified against current code before fixing. This batch lands the top of the suggested triage; A-1 (gossip DoS) and the rest follow.
+
+  * **M-1 (MED) — production vaults now use Argon2 `DEFAULT` (256 MiB), not `FLOOR` (64 MiB).** Both production `Vault::create` sites (daemon + hub) were passing `Argon2Params::FLOOR`, which is meant only as the *minimum the daemon will accept on open* (for already-created low-memory-device vaults), not the bar for fresh ones — so `DEFAULT` was dead code and new vaults had a 4× cheaper offline-crack cost. Verified safe: `vault_meta` persists the KDF params per-vault, so existing FLOOR vaults keep unlocking with their stored cost; only newly-created vaults get the stronger params. (Cost: e2e smoke daemons now pay the 256 MiB derive on first launch — adds ~1 s/daemon, well inside the 15 s setup timeout.)
+  * **L-2 (LOW→MED) — API-socket parent-dir privacy warning.** The socket carries full control of the identity and must be owner-only. The `bind`→`chmod 0600` is non-atomic, so the audit flagged that the UID guarantee "rests entirely on post-bind chmod." Clarified + hardened honestly: for the **default** path the guarantee actually rests on the **0700 parent dir** (`~/.onyx`, created mode 0700 at startup) — a socket inside a 0700 dir is unreachable by other users regardless of its own mode or the bind race. The only exploitable case is a *custom* `--api-socket` path placed in a world-traversable dir; `bind_listener` now emits a loud `warn!` in exactly that case. (Deliberately **not** fixed via a process-global `umask` toggle — mutating umask inside a multi-threaded async runtime is a worse hazard than the LOW finding it addresses; SO_PEERCRED noted as possible future defense-in-depth.) The audit's "default path is CWD" note was stale — the default is `~/.onyx/onyx.sock`.
+  * **A-2 (MED) — SUBSCRIBE id caps.** A signed-SUBSCRIBE frame was bounded only by the 64 KiB Noise frame cap (~4000 ids) with no numeric limit, and nothing bounded how many distinct routing ids one connection could pin in `subscribers` across many frames. Added `MAX_SUBSCRIBE_IDS_PER_FRAME = 256` (frames over it are dropped, not truncated — a real client never exceeds it) and `MAX_SUBSCRIPTIONS_PER_CONN = 16384` (per-connection-lifetime, tracked in `sub_count`, released on `unregister_conn`; re-subscribing the same id doesn't double-count, so epoch re-subscribes are safe). Tests: `subscribe_enforces_per_conn_subscription_cap` (cap cuts off at the limit; a reconnect gets a fresh budget) + `resubscribe_same_id_does_not_double_count_against_cap`.
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **493 passed** (+2 A-2 tests).
+
+---
+
 ## 2026-05-29 — Release v0.1.5 + `--version` stamping fix
 
   * **v0.1.5** cut — ships task 325 (room member removal/kick) + task 327 (constant-rate cover traffic, "high mode"). First release where the binaries' reported version matches the tag.

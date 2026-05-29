@@ -383,6 +383,19 @@ where
                             warn!(conn = conn_id, "hub: empty SUBSCRIBE frame; ignoring");
                             continue;
                         }
+                        // A-2: drop (don't truncate) frames over the
+                        // per-frame id cap. A legitimate client never
+                        // exceeds it; truncation would silently lose a
+                        // real subscription.
+                        if requested.len() > crate::state::MAX_SUBSCRIBE_IDS_PER_FRAME {
+                            warn!(
+                                conn = conn_id,
+                                requested = requested.len(),
+                                cap = crate::state::MAX_SUBSCRIBE_IDS_PER_FRAME,
+                                "hub: SUBSCRIBE id count exceeds per-frame cap; ignoring frame"
+                            );
+                            continue;
+                        }
                         let signer_inbox = onyx_core::routing::introduction_inbox(
                             &onyx_core::crypto::Fingerprint::from_bytes(signer.to_bytes()),
                         );

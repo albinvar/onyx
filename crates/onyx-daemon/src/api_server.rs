@@ -75,6 +75,33 @@ async fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
         tokio::fs::create_dir_all(parent).await.map_err(|e| {
             anyhow::anyhow!("creating API socket parent dir {}: {e}", parent.display())
         })?;
+
+        // L-2 (defense in depth): the API socket carries full control
+        // of this identity, so only the owner UID must be able to
+        // reach it. We chmod the socket itself to 0600 below, but that
+        // chmod is necessarily *after* bind — a non-atomic window. The
+        // durable guarantee is the *parent directory* being owner-only
+        // (the default `~/.onyx` is created mode 0700 at startup): a
+        // socket inside a 0700 dir is unreachable by other users
+        // regardless of its own mode or the bind→chmod race. We can't
+        // safely chmod an operator-chosen parent (it might be a shared
+        // dir like `/tmp`), so instead we loudly warn if the resolved
+        // parent is group/other-accessible. A custom `--api-socket`
+        // path in a shared directory is the only scenario where the
+        // bind→chmod window is actually exploitable.
+        if let Ok(meta) = std::fs::metadata(parent) {
+            let mode = meta.permissions().mode();
+            if mode & 0o077 != 0 {
+                warn!(
+                    path = %parent.display(),
+                    mode = format!("{:#o}", mode & 0o7777),
+                    "API socket parent directory is accessible by group/other; the local \
+                     UID guarantee then rests only on the socket's own 0600 mode, which is \
+                     set just after bind (a brief race). Place the socket in an owner-only \
+                     directory (e.g. the default ~/.onyx, mode 0700)."
+                );
+            }
+        }
     }
 
     if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {

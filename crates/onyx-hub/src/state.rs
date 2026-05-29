@@ -100,6 +100,26 @@ pub const MAX_QUEUE_DEPTH_PER_ID: usize = 1024;
 /// space. 256 MiB is generous for a relay and still bounded.
 pub const MAX_TOTAL_QUEUED_BYTES: usize = 256 * 1024 * 1024;
 
+/// A-2: max routing ids the hub will accept in a single SUBSCRIBE
+/// frame. A signed-SUBSCRIBE frame is bounded only by the 64 KiB
+/// Noise frame cap (~4000 ids), so without this a single frame could
+/// register thousands of `subscribers` entries. A legitimate client
+/// subscribes to its intro inbox plus a per-(room, epoch) token per
+/// room; 256 in one frame is already generous (incremental joins send
+/// far smaller batches). Frames over the cap are dropped, not
+/// truncated — a real client never exceeds it, so exceeding it is a
+/// signal, and truncation would silently lose a legitimate id.
+pub const MAX_SUBSCRIBE_IDS_PER_FRAME: usize = 256;
+
+/// A-2: max distinct routing ids one connection may hold subscribed
+/// over its lifetime. Bounds the `subscribers` memory a single
+/// connection can pin even if it stays under the per-frame cap by
+/// sending many frames. Generous enough for a heavy user in many
+/// rooms across many epoch advances (old-epoch tokens linger until
+/// disconnect); a reconnect resets the count. At 16 bytes/id this is
+/// ≤256 KiB of routing ids per connection.
+pub const MAX_SUBSCRIPTIONS_PER_CONN: usize = 16_384;
+
 /// All the mutable state the hub keeps.
 ///
 /// **Persistence (T8.0):** `queues` and `keypackages` are write-through-
@@ -120,6 +140,10 @@ pub struct HubState {
     next_conn_id: ConnId,
     senders: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
     subscribers: HashMap<RoutingId, HashSet<ConnId>>,
+    /// A-2: distinct-subscription count per connection, enforced
+    /// against [`MAX_SUBSCRIPTIONS_PER_CONN`]. Incremented only on a
+    /// genuinely-new (id, conn) pair; cleared in `unregister_conn`.
+    sub_count: HashMap<ConnId, usize>,
     queues: HashMap<RoutingId, Vec<Vec<u8>>>,
     /// MLS KeyPackage directory. Maps a routing id (typically the
     /// publisher's introduction-inbox id) to the latest KeyPackage
@@ -397,8 +421,26 @@ impl HubState {
     /// duplicate anyway, so this is belt-and-braces.)
     pub fn subscribe(&mut self, conn: ConnId, ids: &[RoutingId]) -> Vec<Vec<u8>> {
         let mut drained = Vec::new();
+        // A-2: bound the distinct subscriptions one connection can
+        // pin. Tracked in a local + written back to avoid holding a
+        // `&mut sub_count` borrow across the `subscribers`/`queues`
+        // mutations below.
+        let mut count = self.sub_count.get(&conn).copied().unwrap_or(0);
         for id in ids {
-            self.subscribers.entry(*id).or_default().insert(conn);
+            if count >= MAX_SUBSCRIPTIONS_PER_CONN {
+                warn!(
+                    conn,
+                    cap = MAX_SUBSCRIPTIONS_PER_CONN,
+                    "hub: connection hit per-conn subscription cap; refusing further ids"
+                );
+                break;
+            }
+            // `insert` returns true only when the (id, conn) pair is
+            // genuinely new, so re-subscribing to the same id (e.g. an
+            // epoch re-subscribe) doesn't double-count against the cap.
+            if self.subscribers.entry(*id).or_default().insert(conn) {
+                count += 1;
+            }
             if let Some(q) = self.queues.remove(id) {
                 // Draining frees the bytes from the global accounting.
                 let freed: usize = q.iter().map(Vec::len).sum();
@@ -418,6 +460,7 @@ impl HubState {
                 }
             }
         }
+        self.sub_count.insert(conn, count);
         drained
     }
 
@@ -595,6 +638,7 @@ impl HubState {
     /// (HIGH-3). The caller invokes that with the identity in scope.
     pub fn unregister_conn(&mut self, conn: ConnId) {
         self.senders.remove(&conn);
+        self.sub_count.remove(&conn); // A-2: release the per-conn count
         for subs in self.subscribers.values_mut() {
             subs.remove(&conn);
         }
@@ -752,6 +796,84 @@ mod tests {
             state.queue_len(&id),
             MAX_QUEUE_DEPTH_PER_ID,
             "queue depth must be clamped at the per-id cap"
+        );
+    }
+
+    #[test]
+    fn subscribe_enforces_per_conn_subscription_cap() {
+        // A-2: one connection cannot pin more than
+        // MAX_SUBSCRIPTIONS_PER_CONN distinct routing ids, bounding the
+        // `subscribers` memory a single peer can grow.
+        let mut state = HubState::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let conn = state.register_conn(tx);
+
+        let n = MAX_SUBSCRIPTIONS_PER_CONN + 10;
+        let ids: Vec<RoutingId> = (0..n)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                id
+            })
+            .collect();
+        state.subscribe(conn, &ids);
+
+        // Everything up to the cap registered; everything past it didn't.
+        assert_eq!(state.subscriber_count(&ids[0]), 1);
+        assert_eq!(
+            state.subscriber_count(&ids[MAX_SUBSCRIPTIONS_PER_CONN - 1]),
+            1
+        );
+        assert_eq!(
+            state.subscriber_count(&ids[MAX_SUBSCRIPTIONS_PER_CONN]),
+            0,
+            "id past the per-conn cap must be refused"
+        );
+        assert_eq!(state.subscriber_count(&ids[n - 1]), 0);
+
+        // A reconnect (fresh ConnId) gets its own budget — the cap is
+        // per-connection-lifetime, not global, so it can't lock a
+        // legitimate client out after a reconnect.
+        let (tx2, _rx2) = mpsc::channel(8);
+        let conn2 = state.register_conn(tx2);
+        state.subscribe(conn2, &ids[MAX_SUBSCRIPTIONS_PER_CONN..]);
+        assert_eq!(
+            state.subscriber_count(&ids[MAX_SUBSCRIPTIONS_PER_CONN]),
+            1,
+            "a new connection has its own fresh subscription budget"
+        );
+    }
+
+    #[test]
+    fn resubscribe_same_id_does_not_double_count_against_cap() {
+        // A-2: re-subscribing the same id (e.g. an epoch re-subscribe)
+        // must not consume a fresh slot each time, or a legitimate
+        // client refreshing tokens would burn through the cap.
+        let mut state = HubState::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let conn = state.register_conn(tx);
+        let id: RoutingId = [9u8; 16];
+
+        // Subscribe to the same id many times.
+        for _ in 0..1000 {
+            state.subscribe(conn, &[id]);
+        }
+        // Now nearly fill the budget with distinct ids; the last one
+        // must still register, proving the 1000 repeats consumed a
+        // single slot, not 1000.
+        let distinct = MAX_SUBSCRIPTIONS_PER_CONN - 1;
+        let ids: Vec<RoutingId> = (0..distinct)
+            .map(|i| {
+                let mut x = [1u8; 16];
+                x[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                x
+            })
+            .collect();
+        state.subscribe(conn, &ids);
+        assert_eq!(
+            state.subscriber_count(&ids[distinct - 1]),
+            1,
+            "repeats must not have exhausted the per-conn budget"
         );
     }
 
