@@ -6,6 +6,13 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Release v0.1.4 + auto-publish workflow fix
+
+  * **v0.1.4** cut + published as `latest` — ships tasks 320–324 (room-history reload, real sender attribution, DM file sending, first-run wizard, settings panel + sidebar grouping). Verified: one-liner installs v0.1.4 (resolve → SHA256 verify → `onyx --version`).
+  * **Release-workflow fix**: every release so far (v0.1.0–v0.1.4) hit the `softprops/action-gh-release` asset-metadata race — the upload succeeds but the job exits non-zero leaving the release a *draft*, forcing a manual `gh release edit --draft=false --latest`. Now the upload step is `continue-on-error: true` and a final always-run step force-publishes (`gh release edit --draft=false`, plus `--latest` only for non-hyphen tags so an `-rc` can't hijack `/releases/latest`). A genuine create failure still surfaces (the edit fails when the release doesn't exist). No more manual publish step. Will be exercised on the next cut.
+
+---
+
 ## 2026-05-29 — Task 324: TUI settings panel + sidebar grouping
 
 Completes task 324 (the invite-quote hint shipped earlier).

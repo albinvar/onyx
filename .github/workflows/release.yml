@@ -221,6 +221,13 @@ jobs:
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
+        # The action intermittently hits an asset-metadata race
+        # ("Not Found … present after refresh") and exits non-zero
+        # AFTER uploading all assets — leaving the release as a draft.
+        # Don't fail the job on that; the "Ensure published" step below
+        # force-publishes. A genuine create failure still surfaces there
+        # (gh release edit fails when the release doesn't exist).
+        continue-on-error: true
         with:
           # Any tag with a SemVer pre-release suffix (a hyphen — e.g.
           # v0.1.0-rc.1, v0.1.0-beta) is marked as a GitHub pre-release.
@@ -280,3 +287,22 @@ jobs:
             ```
 
             See `RELEASES.md` in the repo for the full verifier walkthrough.
+
+      - name: Ensure release is published + flagged latest
+        # Always runs (even after the upload action's draft/metadata
+        # flake). Force the release out of draft; flag `latest` only for
+        # full releases (no hyphen) so a `-rc` can't hijack
+        # /releases/latest. Idempotent. This is what used to be a manual
+        # `gh release edit` after every cut.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$tag" == *-* ]]; then
+            gh release edit "$tag" --draft=false
+          else
+            gh release edit "$tag" --draft=false --latest
+          fi
+          echo "published $tag"
