@@ -151,6 +151,19 @@ where
             // Peer disconnected (or wire error). Clean exit.
             return Ok(());
         };
+        // A-1: rate-limit ALL inbound peer-hub frames before any work.
+        // GOSSIP_PUBLISH triggers MLS KeyPackage validation (CPU), and
+        // both gossip verbs take the state lock + re-fan-out to other
+        // peers — so an abusive (but allowlisted) peer hub flooding
+        // gossip is a CPU-DoS / amplification vector. Keyed on the
+        // peer hub's authenticated static key, same token bucket as
+        // client frames. Drop over budget but keep the session open
+        // (matches the client-path posture). `None` limiter (ephemeral
+        // / test hubs) accepts everything, unchanged.
+        if !state.lock().await.check_rate(source_pubkey) {
+            warn!("hub: peer-hub frame rate-limited (bucket empty); dropping frame");
+            continue;
+        }
         match frame.frame_type {
             FRAME_GOSSIP_PUBLISH => {
                 handle_gossip_publish(&frame.payload, state, source_pubkey).await;
@@ -582,6 +595,20 @@ where
                         );
                     }
                     FRAME_KP_FETCH => {
+                        // A-9: KP_FETCH is a presence-enumeration oracle
+                        // (it reveals whether a routing id has a published
+                        // KP), so throttle it on the same per-static-key
+                        // bucket as DELIVER/KP_PUBLISH to bound how fast a
+                        // connection can probe the directory. Drop silently
+                        // over budget (no KP_RESPONSE), matching the
+                        // "fail closed, log loudly" posture.
+                        if !state.lock().await.check_rate(peer_pk) {
+                            warn!(
+                                conn = conn_id,
+                                "hub: KP_FETCH rate-limited (bucket empty); dropping frame"
+                            );
+                            continue;
+                        }
                         // Payload = exactly 16 bytes routing id. Respond
                         // with FRAME_KP_RESPONSE: status (1 B) + body.
                         if frame.payload.len() != 16 {

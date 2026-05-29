@@ -6,6 +6,21 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — External audit hardening, batch 2 (A-1, A-3, A-5, A-6, A-9 + dispositions)
+
+Completes the 2026-05-29 security review triage. **No confidentiality findings; all DoS-hardening or parser robustness.** Full per-finding table in THREAT_MODEL §8.4. (This was a mixed manual+agent review — it does **not** close the formal external-audit gap §8.2 #7, which stays open.)
+
+  * **A-1 (MED→HIGH) — peer-hub gossip rate-limiting.** Inbound `FRAME_GOSSIP_PUBLISH`/`GOSSIP_DELIVER` from an allowlisted peer hub triggered MLS KP validation + lock + re-fanout with no throttle — a CPU-DoS / amplification vector. Now every peer-hub frame passes the same per-static-key token bucket as client frames (`--max-frames-per-minute`, default 600), keyed on the peer's authenticated static key. **Correction to the finding**: the expensive KP validation already ran *lock-free* (the global mutex is only held briefly for the loop-check/store/fanout), and re-fanout was already TTL+seen_by bounded — so rate-limiting (not de-mutexing) was the actual fix.
+  * **A-3 (MED) — offline-queue memory accounting.** `MAX_TOTAL_QUEUED_BYTES` counted only payload bytes, ignoring the per-entry `Vec`/HashMap/durable-row overhead — so a flood of tiny payloads across many distinct routing ids could pin multiples of the 256 MiB cap in real memory. Now every accounting site (enqueue / drain / restart-warm / admission) charges `payload + QUEUE_ENTRY_OVERHEAD_BYTES` (128), making the cap a faithful upper bound regardless of distribution. Existing `offline_queue_byte_accounting_frees_on_drain` test updated.
+  * **A-5 (MED) — envelope decode hardening.** `MessageEnvelope::from_cbor` gained a pre-decode size cap (`MAX_ENVELOPE_CBOR_BYTES` = 128 KiB) and boundary validation of field lengths: `nonce` (==12), `sig` (==64 when present), `to`/`from`/`room` (≤`MAX_ROUTING_ID_LEN` = 64, kept variable for forward-compat). Was already 64 KiB-bounded on the Noise path; this is fail-fast defense-in-depth so a malformed envelope is rejected at the boundary, not mis-sliced downstream. Tests: `envelope_rejects_invalid_field_lengths`, `envelope_rejects_oversized_cbor`.
+  * **A-9 (LOW) — KP_FETCH throttling.** The presence-enumeration oracle (`FRAME_KP_FETCH`) was unthrottled; it now consults the same per-static-key rate bucket as DELIVER/KP_PUBLISH.
+  * **A-6 (LOW, anon) — not a real gap.** `MessageEnvelope.pad_to` is vestigial advisory metadata; the on-wire padding guarantee is applied AND enforced at the `InnerFrame` bucket layer (`encode_padded` always pads to a bucket, `decode` rejects non-bucket lengths, AEAD covers the padding). Corrected the misleading doc comment that implied an unimplemented (and unnecessary) cross-check; deliberately did NOT add one (it would duplicate the frame layer and add the timing-leak surface `InnerFrame::decode` avoids).
+  * **Dispositions (no code change):** **A-4 (MED)** `SendFile*` arbitrary-path read — accepted by design; the API socket is owner-only (L-2), so the caller is the same UID and choosing files to send is the feature; the socket ACL is the trust boundary. **A-7 (LOW)** replay-guard ≤60 s restart window — already documented (§8.2 #16). **A-8 (LOW)** variable-time canary compare — moot (reached only after AEAD success).
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **497 passed** (+4 since batch 1: the 2 A-5 wire tests + the A-1 rate-gate test, which runs in both hub targets; A-3 reuses an updated test).
+
+---
+
 ## 2026-05-29 — External audit hardening, batch 1 (M-1, L-2, A-2)
 
 A fresh external audit (config-hardening + DoS findings; **no confidentiality breaks** — crypto core, sealed-sender reflection-safety, and untrusted-byte parsers all confirmed solid). Each finding re-verified against current code before fixing. This batch lands the top of the suggested triage; A-1 (gossip DoS) and the rest follow.

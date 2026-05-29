@@ -100,6 +100,18 @@ pub const MAX_QUEUE_DEPTH_PER_ID: usize = 1024;
 /// space. 256 MiB is generous for a relay and still bounded.
 pub const MAX_TOTAL_QUEUED_BYTES: usize = 256 * 1024 * 1024;
 
+/// A-3: per-queued-payload memory overhead charged against
+/// [`MAX_TOTAL_QUEUED_BYTES`] *in addition to* the payload bytes. The
+/// raw byte cap ignored the real per-entry cost — each queued payload
+/// is a `Vec<u8>` (header + allocation) and, in the worst case of one
+/// payload per distinct routing id, also pins a `HashMap` entry (key +
+/// bucket) plus a durable-store row. A flood of tiny payloads spread
+/// across many distinct ids could therefore pin multiples of the cap
+/// in real memory. Charging a fixed, conservative overhead per payload
+/// makes the cap a faithful upper bound on actual memory regardless of
+/// how entries are distributed across ids.
+pub const QUEUE_ENTRY_OVERHEAD_BYTES: usize = 128;
+
 /// A-2: max routing ids the hub will accept in a single SUBSCRIBE
 /// frame. A signed-SUBSCRIBE frame is bounded only by the 64 KiB
 /// Noise frame cap (~4000 ids), so without this a single frame could
@@ -214,7 +226,10 @@ impl HubState {
         // Warm the queue cache, seeding the byte accounting so the
         // global cap stays accurate across restarts.
         for (rid, payloads) in store.load_all_queues()? {
-            me.queued_bytes += payloads.iter().map(Vec::len).sum::<usize>();
+            // A-3: account payload bytes + per-entry overhead, matching
+            // the live enqueue path so the cap is consistent post-restart.
+            me.queued_bytes += payloads.iter().map(Vec::len).sum::<usize>()
+                + payloads.len() * QUEUE_ENTRY_OVERHEAD_BYTES;
             me.queues.insert(rid, payloads);
         }
         me.durable_store = Some(store);
@@ -442,8 +457,11 @@ impl HubState {
                 count += 1;
             }
             if let Some(q) = self.queues.remove(id) {
-                // Draining frees the bytes from the global accounting.
-                let freed: usize = q.iter().map(Vec::len).sum();
+                // Draining frees the bytes from the global accounting —
+                // payload bytes + the same per-entry overhead charged on
+                // enqueue (A-3), so the counter returns to where it was.
+                let freed: usize =
+                    q.iter().map(Vec::len).sum::<usize>() + q.len() * QUEUE_ENTRY_OVERHEAD_BYTES;
                 self.queued_bytes = self.queued_bytes.saturating_sub(freed);
                 drained.extend(q);
                 if let Some(store) = &mut self.durable_store {
@@ -513,7 +531,7 @@ impl HubState {
         // Write through to disk first (borrow), then take ownership
         // into the in-memory queue and update the byte accounting.
         self.enqueue_durable(target, &payload);
-        self.queued_bytes += payload.len();
+        self.queued_bytes += payload.len() + QUEUE_ENTRY_OVERHEAD_BYTES; // A-3
         self.queues.entry(target).or_default().push(payload);
     }
 
@@ -529,7 +547,13 @@ impl HubState {
             );
             return false;
         }
-        if self.queued_bytes.saturating_add(len) > MAX_TOTAL_QUEUED_BYTES {
+        // A-3: include the per-entry overhead in the admission check so
+        // the cap reflects the memory this enqueue will actually pin.
+        if self
+            .queued_bytes
+            .saturating_add(len + QUEUE_ENTRY_OVERHEAD_BYTES)
+            > MAX_TOTAL_QUEUED_BYTES
+        {
             warn!(
                 queued_bytes = self.queued_bytes,
                 "hub: total offline-queue byte cap reached; dropping envelope"
@@ -878,6 +902,36 @@ mod tests {
     }
 
     #[test]
+    fn check_rate_throttles_any_connection_after_its_budget() {
+        // A-1 / HIGH-3: the per-static-key token bucket is the single
+        // gate both client frames (DELIVER/KP_PUBLISH) and peer-hub
+        // gossip frames (`serve_peer_frames`) pass through. With a
+        // small budget a key is accepted up to the cap then throttled,
+        // so a flooding peer hub — keyed on its authenticated static
+        // key — can't burn unbounded CPU on KP validation + re-fanout.
+        let budget = 5;
+        let mut state = HubState::new().with_rate_limit(budget);
+        let peer_key = [0xABu8; 32];
+        for i in 0..budget {
+            assert!(
+                state.check_rate(&peer_key),
+                "frame {i} within budget must pass"
+            );
+        }
+        assert!(
+            !state.check_rate(&peer_key),
+            "over-budget frame must be throttled"
+        );
+        // Buckets are per-static-key, so one flooder can't starve a
+        // distinct peer/client.
+        let other = [0xCDu8; 32];
+        assert!(
+            state.check_rate(&other),
+            "a distinct static key has its own independent bucket"
+        );
+    }
+
+    #[test]
     fn offline_queue_byte_accounting_frees_on_drain() {
         // The global byte counter must go back down when a subscriber
         // drains a queue, so a long-running hub doesn't leak its
@@ -887,12 +941,17 @@ mod tests {
         for _ in 0..10 {
             state.deliver(id, vec![0u8; 1000]);
         }
-        assert_eq!(state.queued_bytes, 10_000);
+        // A-3: accounting now charges payload bytes + a per-entry
+        // overhead, so 10 × (1000 + overhead) is the expected total.
+        assert_eq!(state.queued_bytes, 10 * (1000 + QUEUE_ENTRY_OVERHEAD_BYTES));
         let (tx, _rx) = mpsc::channel(8);
         let conn = state.register_conn(tx);
         let drained = state.subscribe(conn, &[id]);
         assert_eq!(drained.len(), 10);
-        assert_eq!(state.queued_bytes, 0, "draining must free the byte budget");
+        assert_eq!(
+            state.queued_bytes, 0,
+            "draining must free the byte budget (payload + overhead)"
+        );
     }
 
     #[tokio::test]

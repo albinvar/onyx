@@ -313,6 +313,24 @@ impl InnerFrame {
 /// Current envelope protocol version. Bump when the field set changes.
 pub const ENVELOPE_VERSION: u8 = 1;
 
+/// A-5: hard upper bound on the CBOR bytes [`MessageEnvelope::from_cbor`]
+/// will even attempt to decode. The live Noise path already caps frames
+/// at 64 KiB; this is generous defense-in-depth (2× that) so any caller —
+/// including non-Noise/sealed-bootstrap paths — fails fast on an absurd
+/// blob before allocating, without tripping on any legitimate envelope.
+pub const MAX_ENVELOPE_CBOR_BYTES: usize = 128 * 1024;
+
+/// A-5: sane upper bound on the variable-length `to`/`from` routing-id
+/// fields. They're 16 bytes today (`blake2b_128`) but typed
+/// variable-length for forward-compat; this rejects pathological lengths
+/// while leaving room for a future longer id scheme.
+pub const MAX_ROUTING_ID_LEN: usize = 64;
+
+/// Ed25519 signature length — the `sig` field, when present, is exactly
+/// this. (Mirrors `ed25519_dalek::Signature::BYTE_SIZE`; pinned locally
+/// so the wire module doesn't depend on the dalek constant.)
+pub const ENVELOPE_SIG_LEN: usize = 64;
+
 /// Body of a `DELIVER` frame.
 ///
 /// `from` and `sig` are `None` for the sealed-sender bootstrap envelope
@@ -356,8 +374,20 @@ pub struct MessageEnvelope {
     #[serde(rename = "nonce")]
     pub nonce: ByteBuf,
 
-    /// Padding bucket size the sender claims. The receiver also sees the
-    /// actual on-wire length and SHOULD reject a mismatch.
+    /// Advisory bucket-size hint the sender claims. **Vestigial — NOT a
+    /// security guarantee, and NOT independently enforced** (A-6).
+    ///
+    /// The padding that actually hides message size on the wire is
+    /// applied and enforced one layer down, at the [`InnerFrame`]:
+    /// [`InnerFrame::encode_padded`] always zero-pads to a `bucket::*`
+    /// size, and [`InnerFrame::decode`] rejects any frame whose length
+    /// is not exactly a bucket (with the AEAD tag covering the whole
+    /// padded buffer, so a peer cannot under-pad undetected). This
+    /// `pad_to` field carries no padding bytes of its own and is read
+    /// by no decision logic; a cross-check here would be redundant with
+    /// the frame layer and would add exactly the kind of length-
+    /// dependent branch on otherwise-uniform plaintext that
+    /// `InnerFrame::decode` deliberately avoids. Do not rely on it.
     #[serde(rename = "pad_to")]
     pub pad_to: u16,
 
@@ -383,12 +413,47 @@ impl MessageEnvelope {
     /// Decode from CBOR bytes. Verifies the protocol version is one we
     /// recognise; everything else is a structural check via serde.
     pub fn from_cbor(bytes: &[u8]) -> Result<Self> {
+        // A-5: reject an oversized blob before decoding/allocating.
+        if bytes.len() > MAX_ENVELOPE_CBOR_BYTES {
+            return Err(Error::InvalidEncoding("envelope: CBOR exceeds size cap"));
+        }
         let envelope: Self = ciborium::from_reader(bytes)
             .map_err(|_| Error::InvalidEncoding("envelope: malformed CBOR"))?;
         if envelope.version != ENVELOPE_VERSION {
             return Err(Error::InvalidEncoding(
                 "envelope: unrecognised protocol version",
             ));
+        }
+        // A-5: validate field lengths at the decode boundary so a
+        // malformed envelope is rejected here rather than mis-sliced or
+        // failing obscurely deeper in the pipeline. `nonce` is a fixed
+        // 12-byte AEAD nonce and `sig` (when present) a 64-byte Ed25519
+        // signature — both exact. `to`/`from` stay variable-length for
+        // forward-compat but get a sane upper bound.
+        if envelope.nonce.len() != crate::crypto::Nonce::SIZE {
+            return Err(Error::InvalidEncoding("envelope: nonce length invalid"));
+        }
+        if envelope.to.len() > MAX_ROUTING_ID_LEN {
+            return Err(Error::InvalidEncoding("envelope: `to` routing id too long"));
+        }
+        if let Some(from) = &envelope.from
+            && from.len() > MAX_ROUTING_ID_LEN
+        {
+            return Err(Error::InvalidEncoding(
+                "envelope: `from` routing id too long",
+            ));
+        }
+        if let Some(room) = &envelope.room
+            && room.len() > MAX_ROUTING_ID_LEN
+        {
+            return Err(Error::InvalidEncoding(
+                "envelope: `room` routing id too long",
+            ));
+        }
+        if let Some(sig) = &envelope.sig
+            && sig.len() != ENVELOPE_SIG_LEN
+        {
+            return Err(Error::InvalidEncoding("envelope: signature length invalid"));
         }
         Ok(envelope)
     }
@@ -703,6 +768,47 @@ mod tests {
         let bytes = e.to_cbor().unwrap();
         assert!(matches!(
             MessageEnvelope::from_cbor(&bytes),
+            Err(Error::InvalidEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn envelope_rejects_invalid_field_lengths() {
+        // A-5: from_cbor validates field lengths at the decode boundary.
+        // Wrong-length nonce → reject.
+        let mut bad_nonce = sample_envelope_normal();
+        bad_nonce.nonce = ByteBuf::from(vec![0u8; 11]);
+        assert!(matches!(
+            MessageEnvelope::from_cbor(&bad_nonce.to_cbor().unwrap()),
+            Err(Error::InvalidEncoding(_))
+        ));
+
+        // Wrong-length signature → reject.
+        let mut bad_sig = sample_envelope_normal();
+        bad_sig.sig = Some(ByteBuf::from(vec![0u8; 63]));
+        assert!(matches!(
+            MessageEnvelope::from_cbor(&bad_sig.to_cbor().unwrap()),
+            Err(Error::InvalidEncoding(_))
+        ));
+
+        // Over-long `to` routing id → reject.
+        let mut bad_to = sample_envelope_normal();
+        bad_to.to = ByteBuf::from(vec![0u8; MAX_ROUTING_ID_LEN + 1]);
+        assert!(matches!(
+            MessageEnvelope::from_cbor(&bad_to.to_cbor().unwrap()),
+            Err(Error::InvalidEncoding(_))
+        ));
+
+        // A valid envelope still decodes (guard against an over-strict check).
+        assert!(MessageEnvelope::from_cbor(&sample_envelope_normal().to_cbor().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn envelope_rejects_oversized_cbor() {
+        // A-5: a blob over the size cap is refused before decoding.
+        let huge = vec![0u8; MAX_ENVELOPE_CBOR_BYTES + 1];
+        assert!(matches!(
+            MessageEnvelope::from_cbor(&huge),
             Err(Error::InvalidEncoding(_))
         ));
     }

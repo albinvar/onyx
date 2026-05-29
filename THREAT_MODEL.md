@@ -255,6 +255,26 @@ A multi-agent internal review of the security-critical code, followed by an adve
   6. **Timing / traffic analysis** — constant-rate "high mode" cover (`--constant-rate-ms`, T-cover.const) now exists opt-in for the client→hub **upstream**, making that cadence invariant; the **hub-side (downstream) constant-rate, direct peer-circuit cover, and real-Tor measurement remain unbuilt/unverified** (§8.2 #3, A2 caveat, N1).
   7. **External audit (§8.2 #7) remains the single most important open item.** Everything above is "survives the attacks we knew to write," not "proven secure."
 
+### 8.4 Security review — 2026-05-29 (mixed manual + agent)
+
+A second security review (mixed manual + agent-driven analysis). **This is not the formal third-party external audit still tracked as §8.2 #7 — that gap remains open and the "no external audit" disclaimer stands.** Verdict: crypto core and untrusted-byte parsers held up (robust hybrid KEM, reflection-safe sealed-sender, no panicking decoders); **all findings were config-hardening or DoS, not confidentiality breaks.** Each was re-verified against the code before any change. Status:
+
+| ID | Sev | Finding | Resolution |
+|----|-----|---------|------------|
+| M-1 | MED | Production vaults created with Argon2 `FLOOR` (64 MiB), not `DEFAULT` (256 MiB) | **Fixed** — both production `Vault::create` sites now use `DEFAULT`. Safe: KDF params persist per-vault, so existing vaults unlock unchanged. |
+| L-2 | LOW→MED | API-socket `bind`→`chmod` non-atomic | **Hardened + clarified** — the default path's UID guarantee rests on the 0700 parent dir (`~/.onyx`), not the chmod; `bind_listener` now warns if a *custom* socket parent is group/other-accessible (the only exploitable case). Avoided a process-global umask toggle (worse hazard than the finding). Audit's "default = CWD" note was stale. |
+| A-1 | MED→HIGH | Peer-hub gossip path un-rate-limited (CPU-DoS / amplifier) | **Fixed** — all inbound peer-hub frames now pass the same per-static-key token bucket as client frames (default 600/min). Note: the expensive MLS KP validation already ran *lock-free*, not under the global mutex as stated; re-fanout was already TTL-bounded. |
+| A-2 | MED | SUBSCRIBE accepted ~4000 ids/frame, unbounded per-conn | **Fixed** — `MAX_SUBSCRIBE_IDS_PER_FRAME` (256, drop over cap) + `MAX_SUBSCRIPTIONS_PER_CONN` (16384, per-conn-lifetime, dedup-safe). |
+| A-3 | MED | Queue byte-cap ignored per-distinct-key overhead | **Fixed** — accounting charges `payload + QUEUE_ENTRY_OVERHEAD_BYTES` (128) per entry at every site (enqueue / drain / restart-warm / admission), so `MAX_TOTAL_QUEUED_BYTES` faithfully bounds real memory regardless of id distribution. |
+| A-4 | MED | `SendFile*` reads an arbitrary daemon-readable path from IPC (confused-deputy exfil) | **Accepted by design** — the API socket is owner-only (0600 + 0700 parent dir, L-2), so the only caller is the same UID running the daemon; sending user-chosen files is the feature. The socket ACL is the trust boundary; a path allowlist would break the feature. |
+| A-5 | MED | `MessageEnvelope::from_cbor` had no size cap / field-length validation | **Fixed** — explicit `MAX_ENVELOPE_CBOR_BYTES` (128 KiB) pre-decode cap + boundary validation of `nonce` (==12), `sig` (==64 when present), and `to`/`from`/`room` (≤`MAX_ROUTING_ID_LEN`). Was already 64 KiB-bounded on the Noise path; this is fail-fast defense-in-depth. |
+| A-6 | LOW (anon) | `MessageEnvelope.pad_to` decoded but not enforced | **Not a real gap** — the on-wire padding guarantee is applied AND enforced one layer down at the `InnerFrame` bucket layer (`encode_padded` always pads to a bucket; `decode` rejects non-bucket lengths; AEAD covers the padding). `pad_to` is vestigial advisory metadata read by no decision logic; its misleading doc comment was corrected (a cross-check here would duplicate the frame layer and add the timing-leak surface `InnerFrame::decode` deliberately avoids). |
+| A-7 | LOW | Replay-guard ≤60 s restart window | **Already documented** (§8.2 #16, residual #4) — unchanged. |
+| A-8 | LOW | Canary compare variable-time | **Moot** — reached only *after* AEAD success, so it leaks nothing an attacker who already passed the AEAD doesn't have. |
+| A-9 | LOW | KP_FETCH un-throttled presence-enumeration oracle | **Fixed** — KP_FETCH now consults the same per-static-key rate bucket as DELIVER/KP_PUBLISH. |
+
+Tests landed with the fixes: `subscribe_enforces_per_conn_subscription_cap`, `resubscribe_same_id_does_not_double_count_against_cap`, `check_rate_throttles_any_connection_after_its_budget` (A-1/A-2), `offline_queue_byte_accounting_frees_on_drain` updated for overhead (A-3), `envelope_rejects_invalid_field_lengths` + `envelope_rejects_oversized_cbor` (A-5).
+
 ---
 
 *See `DESIGN.md` for the full system specification and `SECURITY.md` for the enforcement principles and disclosure policy.*

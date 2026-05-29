@@ -107,14 +107,16 @@ struct Args {
     max_queue_age_days: u32,
 
     /// Per-connection rate limit for DELIVER + KP_PUBLISH frames
-    /// (T8.x-ratelimit). Each connection gets a token bucket capped
-    /// at this many frames; sustained refill rate is the same value
-    /// per minute. A normal client never approaches this limit
-    /// (typical chat = single-digit frames/min); the cap exists to
-    /// prevent a single hostile or misbehaving client from
-    /// monopolising the hub's CPU/disk by spamming DELIVERs or
-    /// KP_PUBLISHes (the latter triggers MLS validation work per
-    /// frame).
+    /// (T8.x-ratelimit) and peer-hub gossip frames (A-1). Each
+    /// connection (client OR peer hub) gets a token bucket capped at
+    /// this many frames, keyed on its authenticated static key;
+    /// sustained refill rate is the same value per minute. A normal
+    /// client never approaches this limit (typical chat = single-digit
+    /// frames/min); the cap exists to prevent a single hostile or
+    /// misbehaving client — or an abusive allowlisted peer hub
+    /// flooding gossip — from monopolising the hub's CPU/disk by
+    /// spamming frames (DELIVER/KP_PUBLISH/GOSSIP_PUBLISH each trigger
+    /// routing, MLS validation, or re-fanout work per frame).
     ///
     /// SUBSCRIBE frames are NOT limited (cheap). Set to 0 to
     /// disable the limiter entirely (NOT recommended for any
