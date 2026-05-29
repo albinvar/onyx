@@ -6,6 +6,21 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — P-1: verified closed (no code change needed)
+
+Traced the audit's "`register_hub_only` keyed on attacker-chosen `peer_pub` (X25519), not the bound fingerprint" end-to-end against the current tree to give a real verdict rather than another deferral.
+
+**Chain that closes it (all already in place):**
+
+  * **HIGH-2 in `open_bootstrap` (routing.rs:553):** verifies the inner Ed25519 signature **before** returning anything. The signed blob covers `sender_signing_pk ‖ sender_identity_pk ‖ recipient_kem ‖ mls_welcome`, so `sender_x25519` (the value that flows into `register_hub_only`) is cryptographically bound to `sender_signing_pk` — whose raw bytes **are** the fingerprint. An attacker cannot present a `(victim_fp, attacker_x25519)` pair without the victim's signing key.
+  * **T-1 `pin_check_peer` runs before every register site** (direct 1344→1348, msg/v1 hub-only 2473→2475, MLS-Welcome hub-only 2655→2711 — above the room/DM branch). The `(fp, x25519)` binding is recorded on first contact and any later change is flagged + warned.
+  * **P-2 `insert_short_id`** blocks short-id collision overwrites — the realistic registry-hijack vector.
+  * **Keying on X25519 is required by design.** Inbound Noise XK authenticates X25519, not fingerprint (those are different keys); for a *new* peer the registry MUST look up by what Noise hands us. The fingerprint binding is established post-pin.
+
+**Verdict: no exploitable gap.** The audit's framing predated the HIGH-2 + T-1 + P-2 stack. Documented as **Verified closed** in THREAT_MODEL §8.5 with the reasoning. No code change, no test delta (all paths already covered by HIGH-2's adversarial tests + T-1's pin tests + P-2's collision test). Only **D-1** (ephemeral Noise keys — the §3.2 redesign) remains in the deep-pass HIGH list.
+
+---
+
 ## 2026-05-30 — T-2: signed + expiring invites (`onyx://invite/v2`)
 
 The deep-pass HIGH that **T-1 alone can't close** — T-1 pins a peer's key on first contact, but if a first-contact MITM substituted the invite, you pin the *attacker's* key. T-2 makes the invite itself tamper-evident.
