@@ -109,6 +109,15 @@ struct Args {
     #[arg(long, env = "ONYX_CONSTANT_RATE_MS")]
     constant_rate_ms: Option<u64>,
 
+    /// **D-1, anonymity opt-in.** Per-connection ephemeral X25519 as
+    /// the Noise XK static so the hub no longer learns the long-term
+    /// identity from the transport. Necessary but not sufficient for
+    /// §3.2 — compose with `--no-intro-inbox-subscribe` and avoid
+    /// publishing a KP on this connection for full closure (see
+    /// `ANONYMITY.md` §3.2).
+    #[arg(long, env = "ONYX_EPHEMERAL_NOISE_STATIC")]
+    ephemeral_noise_static: bool,
+
     /// **Privacy opt-out.** Skip subscribing to your fingerprint-
     /// derived introduction inbox on every configured hub. You
     /// lose first-contact reachability via the hub. Rooms still
@@ -159,6 +168,7 @@ impl TryFrom<Args> for Config {
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,
             constant_rate_ms: a.constant_rate_ms,
+            ephemeral_noise_static: a.ephemeral_noise_static,
             subscribe_intro_inbox: !a.no_intro_inbox_subscribe,
         })
     }

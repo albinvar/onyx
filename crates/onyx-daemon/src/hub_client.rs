@@ -129,6 +129,7 @@ pub async fn run_hub_session<F, Fut>(
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     on_deliver: F,
     self_publish: Option<&SelfPublish>,
+    ephemeral_noise: bool,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
@@ -138,6 +139,7 @@ where
         host = %host,
         port = port,
         subscriptions = subscribe_to.len(),
+        ephemeral_noise,
         "hub: dialling"
     );
     let mut stream = tor
@@ -146,7 +148,21 @@ where
         .map_err(|e| anyhow::anyhow!("hub dial failed: {e}"))?;
     info!("hub: Tor circuit established, starting Noise XK handshake");
 
-    let mut session = handshake_initiator(&mut stream, our_identity_sk, hub_pubkey)
+    // D-1: when ephemeral_noise is on, generate a fresh X25519 keypair
+    // *for this handshake only* and use it as the Noise static — the
+    // hub never learns the long-term identity X25519 from the Noise
+    // layer. The long-term identity stays in HIGH-2 sealed-sender
+    // envelopes (which run end-to-end inside Noise frames), so all
+    // DMs/rooms keep working. `Option` here so the borrow checker can
+    // see the ephemeral key outlives the handshake-borrow; it's
+    // dropped (and Zeroize'd by IdentitySecret) when this fn returns.
+    let ephemeral_sk = if ephemeral_noise {
+        Some(IdentitySecret::generate())
+    } else {
+        None
+    };
+    let noise_static: &IdentitySecret = ephemeral_sk.as_ref().unwrap_or(our_identity_sk);
+    let mut session = handshake_initiator(&mut stream, noise_static, hub_pubkey)
         .await
         .map_err(|e| anyhow::anyhow!("hub Noise handshake failed: {e}"))?;
     // HIGH-1: replay-binds the signed SUBSCRIBE proof to this connection.
@@ -217,6 +233,7 @@ pub async fn run_hub_session_tcp<F, Fut>(
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     on_deliver: F,
     self_publish: Option<&SelfPublish>,
+    ephemeral_noise: bool,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
@@ -225,6 +242,7 @@ where
     info!(
         addr = %addr,
         subscriptions = subscribe_to.len(),
+        ephemeral_noise,
         "hub-tcp: dialling"
     );
     let mut stream = tokio::net::TcpStream::connect(addr)
@@ -232,7 +250,16 @@ where
         .map_err(|e| anyhow::anyhow!("hub-tcp dial failed: {e}"))?;
     info!("hub-tcp: TCP connected, starting Noise XK handshake");
 
-    let mut session = handshake_initiator(&mut stream, our_identity_sk, hub_pubkey)
+    // D-1: see run_hub_session for the rationale — ephemeral per-call
+    // Noise static so the hub never sees the long-term identity X25519
+    // at the Noise layer when this flag is on.
+    let ephemeral_sk = if ephemeral_noise {
+        Some(IdentitySecret::generate())
+    } else {
+        None
+    };
+    let noise_static: &IdentitySecret = ephemeral_sk.as_ref().unwrap_or(our_identity_sk);
+    let mut session = handshake_initiator(&mut stream, noise_static, hub_pubkey)
         .await
         .map_err(|e| anyhow::anyhow!("hub-tcp Noise handshake failed: {e}"))?;
     let handshake_hash = session.handshake_hash();

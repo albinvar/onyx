@@ -146,6 +146,28 @@ struct Args {
     #[arg(long, env = "ONYX_CONSTANT_RATE_MS", global = true)]
     constant_rate_ms: Option<u64>,
 
+    /// **D-1, anonymity opt-in.** Use a freshly-generated X25519
+    /// keypair as the Noise XK static on every handshake to each hub
+    /// — so the hub no longer learns your long-term identity X25519
+    /// from the transport layer. The long-term identity is still used
+    /// by sealed-sender envelopes (running end-to-end *inside* Noise
+    /// frames), so DMs/rooms keep working; only the transport
+    /// identifier changes per connection.
+    ///
+    /// **Necessary but not sufficient for §3.2.** The hub still
+    /// identifies you via your `SUBSCRIBE` to `introduction_inbox(fp)`
+    /// (use `--no-intro-inbox-subscribe` to close that) AND via any
+    /// `KP_PUBLISH` (avoid publishing on this connection). Compose
+    /// the three to actually close §3.2 — useful for the "established
+    /// rooms only, no first-contact reachability" profile. See
+    /// `ANONYMITY.md` §3.2.
+    ///
+    /// **Trade-off**: the hub's per-static-key rate limit becomes
+    /// effectively per-connection in this mode (reconnect resets the
+    /// bucket). Per-frame caps still bound resource use.
+    #[arg(long, env = "ONYX_EPHEMERAL_NOISE_STATIC", global = true)]
+    ephemeral_noise_static: bool,
+
     /// **Privacy opt-out.** Skip subscribing to your fingerprint-
     /// derived introduction inbox (`introduction_inbox(fp)`) on
     /// every configured hub. You can still SEND first-contact
@@ -631,6 +653,7 @@ fn build_daemon_config(
         dial_tcp: args.dial_tcp.clone(),
         cover_traffic_mean_secs: args.cover_traffic_mean_secs,
         constant_rate_ms: args.constant_rate_ms,
+        ephemeral_noise_static: args.ephemeral_noise_static,
         // T-rotation.a: --no-intro-inbox-subscribe flips this to
         // false. Default true preserves first-contact reachability.
         subscribe_intro_inbox: !args.no_intro_inbox_subscribe,

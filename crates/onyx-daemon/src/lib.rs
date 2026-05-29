@@ -199,6 +199,30 @@ pub struct Config {
     /// steady `bucket::SMALL`/slot of bandwidth. Mutually exclusive
     /// with [`cover_traffic_mean_secs`]. See `ANONYMITY.md` §3.1.
     pub constant_rate_ms: Option<u64>,
+    /// D-1 (`--ephemeral-noise-static`): when `true`, the daemon's
+    /// **Noise XK static key** to the hub is a freshly-generated
+    /// X25519 keypair on every handshake — the hub no longer learns
+    /// the long-term identity X25519 from the Noise layer. The
+    /// long-term identity is still used by HIGH-2 sealed-sender
+    /// envelopes (which run end-to-end *inside* Noise frames), so DMs
+    /// and rooms keep working; only the transport identifier changes.
+    ///
+    /// **Necessary but not sufficient for §3.2.** The hub still
+    /// learns your identity through (a) `SUBSCRIBE` to
+    /// `introduction_inbox(fp)` and (b) `FRAME_KP_PUBLISH` — see
+    /// `ANONYMITY.md` §3.2. To actually close §3.2 you need to
+    /// compose ephemeral Noise with `--no-intro-inbox-subscribe`
+    /// AND not publish a KP on this connection. Useful profile:
+    /// "I'm in established rooms only, never accepting first contact
+    /// via this hub" — the hub then cannot identify you on this
+    /// connection at all.
+    ///
+    /// **Trade-off.** The per-static-key rate limiter (HIGH-3,
+    /// `--max-frames-per-minute` on the hub) becomes effectively
+    /// per-connection in this mode — a reconnect gets a fresh
+    /// bucket. The user accepts this for the anonymity gain; per-
+    /// connection frame caps still bound resource use.
+    pub ephemeral_noise_static: bool,
     /// T-rotation.a: when `true` (the v0 default), the daemon
     /// subscribes to its own `introduction_inbox(fingerprint)` on
     /// every configured hub so it can receive first-contact
@@ -602,6 +626,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         tor_hub_count,
         args.cover_traffic_mean_secs,
         args.subscribe_intro_inbox,
+        args.ephemeral_noise_static,
         &mut hub_tcp_rxs,
     ) {
         warn!(error = %e, "failed to spawn TCP-hub tasks; continuing without them");
@@ -731,6 +756,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             let mut outbound_rx = hub_tor_rxs.remove(0);
             let host = host.clone();
             let subscribe_intro_inbox_task = args.subscribe_intro_inbox;
+            let ephemeral_noise_static = args.ephemeral_noise_static;
             let span = info_span!("hub", idx, host = %host, port);
 
             hub_tasks.push(tokio::spawn(async move {
@@ -797,6 +823,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                             }
                         },
                         self_publish.as_ref(),
+                        ephemeral_noise_static,
                     )
                     .await;
                     match result {
@@ -1940,6 +1967,7 @@ fn spawn_tcp_hub_tasks(
     tor_hub_count: usize,
     cover_traffic_mean_secs: Option<u64>,
     subscribe_intro_inbox: bool,
+    ephemeral_noise_static: bool,
     hub_tcp_rxs: &mut Vec<mpsc::Receiver<hub_client::HubOutbound>>,
 ) -> anyhow::Result<()> {
     if hub_tcp_addrs.is_empty() {
@@ -2011,6 +2039,7 @@ fn spawn_tcp_hub_tasks(
                             }
                         },
                         self_publish.as_ref(),
+                        ephemeral_noise_static,
                     )
                     .await;
                     match result {

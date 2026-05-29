@@ -6,6 +6,23 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — D-1: ephemeral Noise static (opt-in) — last deep-pass HIGH
+
+The final deep-pass HIGH. `--ephemeral-noise-static` (default off) makes the daemon's Noise XK static to each hub a **freshly-generated X25519 keypair per handshake** — the hub no longer learns the long-term identity X25519 at the transport layer. The long-term identity stays in HIGH-2 sealed-sender envelopes (running end-to-end *inside* Noise frames), so DMs/rooms keep working; only the transport identifier changes per connection.
+
+  * **Implementation.** `Config.ephemeral_noise_static`; `run_hub_session` + `run_hub_session_tcp` each take a new `ephemeral_noise: bool` and, when on, generate a fresh `IdentitySecret` inside the call (`IdentitySecret::generate()`), use it as the Noise static for that handshake, and let it drop (Zeroize'd) when the call returns. Long-term `our_identity_sk` is the fallback when the flag is off. Threaded through both the Tor and TCP hub spawn paths in `lib.rs`.
+  * **Honest scope (the §3.2 doc was always upfront about this).** §3.2 has **three** identity leaks; D-1 alone closes only **leak #1** (Noise static). The hub still identifies you via your `SUBSCRIBE` to `introduction_inbox(fp)` (leak #2) and any `KP_PUBLISH` (leak #3). To **actually close §3.2** the user must compose `--ephemeral-noise-static` with `--no-intro-inbox-subscribe` (closes #2) AND avoid publishing a KP on the connection (closes #3) — the realistic profile is **"established rooms only, no first-contact reachability via this hub."** For that user the hub literally cannot identify them on the connection.
+  * **Trade-off.** The hub's per-static-key rate limit (HIGH-3, `--max-frames-per-minute`) becomes effectively per-connection in this mode (each reconnect generates a new static → new bucket). The user accepts this for the anonymity gain; per-frame caps still bound resource use. Default off because most users want first-contact reachability + rate-limit continuity.
+  * **Future** that would let D-1 become default: separated publish/subscribe connections + oblivious-recipient routing for first-contact (both noted in `ANONYMITY.md` §3.2).
+
+**Tests (+1):** `rooms_e2e_ephemeral_noise_static_does_not_break_flow` — full room flow (KP fetch + Welcome + commit + SendRoom + EventMessage roundtrip) with both daemons in ephemeral mode.
+
+Docs: THREAT_MODEL §8.5 D-1 → Fixed (opt-in, with composition note), ANONYMITY §3.2 (D-1 bullet + the "what would close all three" line updated to reflect D-1 landed). Gate: clippy `-D warnings` + fmt clean; `cargo test --workspace` = **511 passed** (+1).
+
+**All five deep-pass HIGHs now resolved:** D-2 (circuit isolation), T-1 (key pinning), T-2 (signed invites), P-1 (verified closed by composition), D-1 (ephemeral Noise opt-in). Remaining deep-pass MEDs: P-3 (serial delivery HOL), G-2 (MLS committer authority), H-2 (forgeable gossip `seen_by`), D-4 (identity-derived onion). The formal external audit (§8.2 #7) is still the headline open item.
+
+---
+
 ## 2026-05-30 — P-1: verified closed (no code change needed)
 
 Traced the audit's "`register_hub_only` keyed on attacker-chosen `peer_pub` (X25519), not the bound fingerprint" end-to-end against the current tree to give a real verdict rather than another deferral.

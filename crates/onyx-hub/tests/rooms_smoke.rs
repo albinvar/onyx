@@ -112,7 +112,7 @@ async fn spawn_hub_with_cover(cover_traffic_mean_secs: Option<u64>) -> (String, 
 /// running on a background task; the tempdir keeps the vault +
 /// socket alive until the test drops it.
 async fn spawn_daemon(hub_addr: &str, hub_pubkey_b32: &str, label: &str) -> (PathBuf, TempDir) {
-    spawn_daemon_with_opts(hub_addr, hub_pubkey_b32, label, true, None).await
+    spawn_daemon_with_opts(hub_addr, hub_pubkey_b32, label, true, None, false).await
 }
 
 /// Variant that lets the caller toggle `subscribe_intro_inbox`
@@ -128,6 +128,7 @@ async fn spawn_daemon_with_opts(
     label: &str,
     subscribe_intro_inbox: bool,
     constant_rate_ms: Option<u64>,
+    ephemeral_noise_static: bool,
 ) -> (PathBuf, TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let vault_path = dir.path().join(format!("{label}-vault.db"));
@@ -150,6 +151,7 @@ async fn spawn_daemon_with_opts(
         dial_tcp: None,
         cover_traffic_mean_secs: None,
         constant_rate_ms,
+        ephemeral_noise_static,
         subscribe_intro_inbox,
     };
 
@@ -380,9 +382,9 @@ async fn rooms_e2e_constant_rate_cover_does_not_break_flow() {
 
     let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
     let (alice_sock, _alice_dir) =
-        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "alice_cr", true, Some(50)).await;
+        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "alice_cr", true, Some(50), false).await;
     let (bob_sock, _bob_dir) =
-        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_cr", true, Some(50)).await;
+        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_cr", true, Some(50), false).await;
 
     let alice_identity = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
     let bob_identity = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
@@ -480,6 +482,128 @@ async fn rooms_e2e_constant_rate_cover_does_not_break_flow() {
     })
     .await;
     assert_eq!(event, "paced hello");
+}
+
+/// D-1: with `ephemeral_noise_static` on, each daemon's Noise XK
+/// static to the hub is a freshly-generated key per handshake (the
+/// hub no longer sees the long-term identity X25519 at the transport
+/// layer). This test proves the full room flow — KP publish, invite,
+/// Welcome, commit, room message routed via the hub — still works
+/// with both daemons in ephemeral mode. The end-to-end identity bind
+/// (HIGH-2 sealed-sender + T-1 pinning + MLS credential) is
+/// independent of the Noise static, so functional correctness must
+/// hold regardless.
+#[tokio::test(flavor = "multi_thread")]
+async fn rooms_e2e_ephemeral_noise_static_does_not_break_flow() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
+        .with_test_writer()
+        .try_init();
+
+    let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
+    let (alice_sock, _alice_dir) =
+        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "alice_eph", true, None, true).await;
+    let (bob_sock, _bob_dir) =
+        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_eph", true, None, true).await;
+
+    let alice_identity = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
+    let bob_identity = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
+    let (bob_fp, bob_kem_b32) = match bob_identity {
+        ApiResponse::IdentityOk {
+            fingerprint,
+            identity_kem_pub_b32,
+            ..
+        } => (fingerprint, identity_kem_pub_b32),
+        other => panic!("bob Identity returned {other:?}"),
+    };
+    let alice_fp = match alice_identity {
+        ApiResponse::IdentityOk { fingerprint, .. } => fingerprint,
+        other => panic!("alice Identity returned {other:?}"),
+    };
+
+    let group_id_b32 = match one_shot(
+        &alice_sock,
+        &ApiRequest::CreateRoom {
+            name: "ephemeral-room".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::CreateRoomOk { group_id_b32, .. } => group_id_b32,
+        other => panic!("CreateRoom returned {other:?}"),
+    };
+
+    let bob_kp_b64 = match one_shot_until_ok(
+        &alice_sock,
+        &ApiRequest::FetchPeerKeyPackage {
+            peer_fingerprint: bob_fp.clone(),
+        },
+        "alice fetch bob KP (ephemeral)",
+    )
+    .await
+    {
+        ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+        other => panic!("FetchPeerKeyPackage returned {other:?}"),
+    };
+
+    let mut bob_tail = open_tail(&bob_sock).await;
+
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::InviteToRoom {
+            group_id_b32: group_id_b32.clone(),
+            peer_fingerprint: bob_fp.clone(),
+            peer_kem_pub_b32: bob_kem_b32,
+            peer_kp_b64: bob_kp_b64,
+        },
+    )
+    .await
+    {
+        ApiResponse::InviteToRoomOk { ref members, .. } => assert!(
+            members.iter().any(|m| m == &alice_fp) && members.iter().any(|m| m == &bob_fp),
+            "invite roster must include both: {members:?}"
+        ),
+        other => panic!("InviteToRoom returned {other:?}"),
+    }
+
+    let bob_rooms = wait_for_room_in_list(&bob_sock, &group_id_b32).await;
+    assert_eq!(bob_rooms.name, "ephemeral-room");
+
+    match one_shot(
+        &alice_sock,
+        &ApiRequest::SendRoom {
+            group_id_b32: group_id_b32.clone(),
+            text: "ephemeral hello".to_string(),
+        },
+    )
+    .await
+    {
+        ApiResponse::SendRoomOk {
+            total_members,
+            delivered_to_hub,
+            ..
+        } => {
+            assert_eq!(total_members, 1, "expected 1 other member");
+            assert_eq!(
+                delivered_to_hub, 1,
+                "expected 1 hub delivery to bob over ephemeral-static session"
+            );
+        }
+        other => panic!("SendRoom returned {other:?}"),
+    }
+
+    let expected_peer_short = format!("room/{}", &group_id_b32.chars().take(8).collect::<String>());
+    let event = wait_for_tail_event(&mut bob_tail, |e| match e {
+        ApiResponse::EventMessage {
+            peer_short,
+            direction: MessageDirection::Incoming,
+            text,
+            ..
+        } if *peer_short == expected_peer_short && text == "ephemeral hello" => Some(text.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(event, "ephemeral hello");
 }
 
 /// T-cover.hub: hub-side cover traffic must NOT interfere with the
@@ -624,7 +748,7 @@ async fn rooms_e2e_no_intro_inbox_opt_out_queues_first_contact() {
     let (alice_sock, _alice_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "alice_ni").await;
     // Bob with the opt-out.
     let (bob_sock, bob_dir) =
-        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_ni", false, None).await;
+        spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_ni", false, None, false).await;
 
     let _ = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
     let bob_id = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
