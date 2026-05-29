@@ -202,6 +202,11 @@ pub enum ApiRequest {
     /// [`ApiResponse::ListRoomsOk`] with one [`RoomInfo`] per room,
     /// ordered by `created_at_ms` ascending (older first).
     ListRooms,
+    /// List every pinned contact (T-1 TOFU key pinning). Returns
+    /// [`ApiResponse::ListContactsOk`] with one [`ContactInfo`] per
+    /// peer whose identity key we've pinned, newest contact first.
+    /// Powers `onyx contact list`.
+    ListContacts,
     /// Invite `peer` into the existing room identified by
     /// `group_id_b32` (T6.3.c). The daemon loads the persisted MLS
     /// group, calls `MlsGroupState::invite` against the peer's
@@ -422,6 +427,9 @@ pub enum ApiResponse {
     /// Reply to [`ApiRequest::ListRooms`]. `rooms` is ordered by
     /// `created_at_ms` ascending (older first).
     ListRoomsOk { rooms: Vec<RoomInfo> },
+    /// Reply to [`ApiRequest::ListContacts`]. `contacts` is ordered by
+    /// most-recent contact first.
+    ListContactsOk { contacts: Vec<ContactInfo> },
     /// Reply to [`ApiRequest::InviteToRoom`] on success. `group_id_b32`
     /// echoes the room's stable identifier; `members` is the room's
     /// refreshed member-fingerprint list AFTER the invite commit
@@ -609,6 +617,24 @@ pub struct RoomInfo {
     /// Daemon wall-clock at room creation. Used by clients to
     /// sort the room list; not authoritative across members.
     pub created_at_ms: u64,
+}
+
+/// One row in [`ApiResponse::ListContactsOk`] (T-1 TOFU key pinning).
+/// One per peer whose identity key we've pinned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContactInfo {
+    /// Peer Ed25519 fingerprint (the identity), base32-grouped.
+    pub fingerprint: String,
+    /// X25519 identity key pinned at first contact, base32.
+    pub x25519_pub_b32: String,
+    /// Wall-clock (ms) of first contact.
+    pub first_seen_ms: u64,
+    /// Wall-clock (ms) of most recent contact.
+    pub last_seen_ms: u64,
+    /// `true` if a key different from the pinned one was ever presented
+    /// — a key rotation or a man-in-the-middle. The user should
+    /// re-verify the fingerprint out of band.
+    pub key_changed: bool,
 }
 
 /// One row in [`ApiResponse::RoomHistoryOk`] (T-polish.3).

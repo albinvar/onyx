@@ -299,6 +299,22 @@ async fn rooms_e2e_alice_invites_bob_and_sends() {
         bob_rooms.members
     );
 
+    // T-1: receiving alice's Welcome (first contact) pins her identity
+    // key on bob's side. It must surface via `contact list` with no
+    // key-change flag — exercises the full vault→API→pin path.
+    let contacts = match one_shot(&bob_sock, &ApiRequest::ListContacts).await {
+        ApiResponse::ListContactsOk { contacts } => contacts,
+        other => panic!("ListContacts returned {other:?}"),
+    };
+    assert!(
+        !contacts.is_empty(),
+        "bob should have pinned a peer identity key on first contact"
+    );
+    assert!(
+        contacts.iter().all(|c| !c.key_changed),
+        "no pinned key should be flagged changed on a clean first contact: {contacts:?}"
+    );
+
     // 7. alice sends a room message. Both daemons must route via the
     //    hub fallback (no direct Noise session between them).
     let send = one_shot(

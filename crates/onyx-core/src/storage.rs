@@ -205,6 +205,60 @@ CREATE INDEX IF NOT EXISTS received_files_by_quota
   ON received_files (identity_id, sender_fp, received_at_ms);
 ";
 
+/// Additive extension for T-1 — TOFU pinned peer identity keys.
+/// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
+/// tables; no `SCHEMA_VERSION` bump.
+///
+/// One row per (our identity, peer Ed25519 fingerprint): the peer's
+/// X25519 identity key as **first seen** (trust-on-first-use). On a
+/// later contact the daemon compares the presented key against the
+/// pinned one; a mismatch sets `key_changed = 1` and the pinned key is
+/// **kept, not overwritten** — we hold the first-seen key and flag the
+/// change so the user can re-verify out of band (a MITM or a key
+/// rotation both surface here). Plaintext columns, same posture as
+/// `room_member_kems` / `mls_peer_groups` (the bytes are a public key +
+/// a fingerprint, not secrets).
+const SCHEMA_PINNED_KEYS_ADD: &str = "
+CREATE TABLE IF NOT EXISTS pinned_keys (
+  identity_id    INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  fingerprint    TEXT NOT NULL,
+  x25519_pub     BLOB NOT NULL,
+  first_seen_ms  INTEGER NOT NULL,
+  last_seen_ms   INTEGER NOT NULL,
+  key_changed    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (identity_id, fingerprint)
+);
+";
+
+/// Outcome of [`Vault::pin_or_verify`] (T-1 trust-on-first-use key
+/// pinning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// No prior pin for this fingerprint — the key was just pinned.
+    New,
+    /// The presented key matches the pinned key.
+    Match,
+    /// The presented key DIFFERS from the pinned one (possible MITM or
+    /// key rotation). The pinned key is kept; `pinned` is the X25519 key
+    /// on record from first contact.
+    Mismatch { pinned: [u8; 32] },
+}
+
+/// One pinned contact, as returned by [`Vault::list_pinned`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedContact {
+    /// Peer Ed25519 fingerprint (the identity), as stored.
+    pub fingerprint: String,
+    /// X25519 identity key pinned at first contact.
+    pub x25519_pub: [u8; 32],
+    /// Wall-clock (ms) of first contact.
+    pub first_seen_ms: u64,
+    /// Wall-clock (ms) of the most recent contact.
+    pub last_seen_ms: u64,
+    /// `true` if a key different from the pinned one was ever presented.
+    pub key_changed: bool,
+}
+
 /// Additive extension for T-polish.3 — persistent room scrollback.
 /// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
 /// tables; no `SCHEMA_VERSION` bump.
@@ -381,6 +435,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_RECEIVED_FILES_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -396,6 +452,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_ROOM_MESSAGES_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_RECEIVED_FILES_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
             .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
@@ -527,6 +585,115 @@ impl Vault {
             )
             .optional()
             .map_err(map_db_err)
+    }
+
+    /// T-1: trust-on-first-use pin/verify of a peer's X25519 identity
+    /// key, keyed on their Ed25519 `fingerprint`. On first sight the key
+    /// is pinned ([`PinOutcome::New`]); on a later contact it is compared
+    /// against the pinned key — [`PinOutcome::Match`] if equal, else
+    /// [`PinOutcome::Mismatch`]. A mismatch sets the persistent
+    /// `key_changed` flag and **keeps** the first-seen key rather than
+    /// trusting the new one (the caller decides what to do — warn, etc.).
+    /// `now_ms` is the wall-clock to stamp.
+    pub fn pin_or_verify(
+        &self,
+        identity_id: i64,
+        fingerprint: &str,
+        x25519: &[u8; 32],
+        now_ms: u64,
+    ) -> Result<PinOutcome> {
+        #[allow(clippy::cast_possible_wrap)]
+        let now = now_ms as i64;
+        let existing: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT x25519_pub FROM pinned_keys \
+                 WHERE identity_id = ? AND fingerprint = ?",
+                params![identity_id, fingerprint],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(map_db_err)?;
+
+        match existing {
+            None => {
+                self.conn
+                    .execute(
+                        "INSERT INTO pinned_keys \
+                         (identity_id, fingerprint, x25519_pub, first_seen_ms, last_seen_ms, key_changed) \
+                         VALUES (?, ?, ?, ?, ?, 0)",
+                        params![identity_id, fingerprint, x25519.as_slice(), now, now],
+                    )
+                    .map_err(map_db_err)?;
+                Ok(PinOutcome::New)
+            }
+            Some(pinned_bytes) if pinned_bytes.as_slice() == x25519.as_slice() => {
+                self.conn
+                    .execute(
+                        "UPDATE pinned_keys SET last_seen_ms = ? \
+                         WHERE identity_id = ? AND fingerprint = ?",
+                        params![now, identity_id, fingerprint],
+                    )
+                    .map_err(map_db_err)?;
+                Ok(PinOutcome::Match)
+            }
+            Some(pinned_bytes) => {
+                // Keep the pinned key; flag the change. Re-pinning a new
+                // key is a deliberate user action, not an auto-accept.
+                self.conn
+                    .execute(
+                        "UPDATE pinned_keys SET last_seen_ms = ?, key_changed = 1 \
+                         WHERE identity_id = ? AND fingerprint = ?",
+                        params![now, identity_id, fingerprint],
+                    )
+                    .map_err(map_db_err)?;
+                let mut pinned = [0u8; 32];
+                if pinned_bytes.len() == pinned.len() {
+                    pinned.copy_from_slice(&pinned_bytes);
+                }
+                Ok(PinOutcome::Mismatch { pinned })
+            }
+        }
+    }
+
+    /// T-1: list every pinned contact for `identity_id`, newest contact
+    /// first. Powers `onyx contact list`.
+    pub fn list_pinned(&self, identity_id: i64) -> Result<Vec<PinnedContact>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT fingerprint, x25519_pub, first_seen_ms, last_seen_ms, key_changed \
+                 FROM pinned_keys WHERE identity_id = ? ORDER BY last_seen_ms DESC",
+            )
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(map_db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (fingerprint, x, first, last, changed) = row.map_err(map_db_err)?;
+            let mut x25519_pub = [0u8; 32];
+            if x.len() == x25519_pub.len() {
+                x25519_pub.copy_from_slice(&x);
+            }
+            #[allow(clippy::cast_sign_loss)]
+            out.push(PinnedContact {
+                fingerprint,
+                x25519_pub,
+                first_seen_ms: first as u64,
+                last_seen_ms: last as u64,
+                key_changed: changed != 0,
+            });
+        }
+        Ok(out)
     }
 
     /// Load and decrypt the MLS state for `identity_id`, returning
@@ -1139,6 +1306,80 @@ mod tests {
         assert_eq!(rooms[0].name, "alpha-renamed");
         assert_eq!(rooms[0].members_b32, "fp_alice,fp_bob");
         assert_eq!(rooms[0].created_at_ms, 1_500);
+    }
+
+    #[test]
+    fn pin_or_verify_pins_then_matches() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let fp = "fp_bob";
+        let key = [7u8; 32];
+        assert_eq!(
+            v.pin_or_verify(id, fp, &key, 1_000).unwrap(),
+            PinOutcome::New
+        );
+        assert_eq!(
+            v.pin_or_verify(id, fp, &key, 2_000).unwrap(),
+            PinOutcome::Match
+        );
+        let contacts = v.list_pinned(id).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].fingerprint, fp);
+        assert_eq!(contacts[0].x25519_pub, key);
+        assert_eq!(contacts[0].first_seen_ms, 1_000);
+        assert_eq!(contacts[0].last_seen_ms, 2_000);
+        assert!(!contacts[0].key_changed);
+    }
+
+    #[test]
+    fn pin_or_verify_detects_key_change_and_keeps_original() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let fp = "fp_bob";
+        let orig = [1u8; 32];
+        let attacker = [2u8; 32];
+        assert_eq!(
+            v.pin_or_verify(id, fp, &orig, 1_000).unwrap(),
+            PinOutcome::New
+        );
+        // A different key for the same fingerprint → mismatch; the
+        // original pinned key is reported and KEPT.
+        assert_eq!(
+            v.pin_or_verify(id, fp, &attacker, 2_000).unwrap(),
+            PinOutcome::Mismatch { pinned: orig }
+        );
+        let contacts = v.list_pinned(id).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0].x25519_pub, orig,
+            "pinned key must NOT be overwritten on mismatch"
+        );
+        assert!(
+            contacts[0].key_changed,
+            "mismatch must set the persistent key_changed flag"
+        );
+        // The original key still verifies (we kept it, didn't trust the new one).
+        assert_eq!(
+            v.pin_or_verify(id, fp, &orig, 3_000).unwrap(),
+            PinOutcome::Match
+        );
+    }
+
+    #[test]
+    fn pin_or_verify_isolates_by_identity() {
+        let mut v = fresh_vault();
+        let (alice, _) = v.create_identity("alice").unwrap();
+        let (bob, _) = v.create_identity("bob").unwrap();
+        let fp = "fp_carol";
+        let key = [9u8; 32];
+        assert_eq!(
+            v.pin_or_verify(alice, fp, &key, 1).unwrap(),
+            PinOutcome::New
+        );
+        // Bob's view is independent — the same fingerprint is New for him.
+        assert_eq!(v.pin_or_verify(bob, fp, &key, 1).unwrap(), PinOutcome::New);
+        assert_eq!(v.list_pinned(alice).unwrap().len(), 1);
+        assert_eq!(v.list_pinned(bob).unwrap().len(), 1);
     }
 
     #[test]

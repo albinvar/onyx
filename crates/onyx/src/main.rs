@@ -327,6 +327,23 @@ enum Command {
         #[command(subcommand)]
         cmd: FilesCommand,
     },
+    /// Contact / pinned-key subcommands (T-1). `onyx contact list`
+    /// shows every peer whose identity key you've pinned on first
+    /// contact, and flags any whose key has since changed (a key
+    /// rotation or a man-in-the-middle — re-verify out of band).
+    Contact {
+        #[command(subcommand)]
+        cmd: ContactCommand,
+    },
+}
+
+/// Subcommands under `onyx contact`. Pure dispatch to `ApiRequest::*`.
+#[derive(Subcommand, Debug)]
+enum ContactCommand {
+    /// List every pinned contact (newest contact first), with each
+    /// one's fingerprint, pinned key, first/last-seen, and a
+    /// `key_changed` flag.
+    List,
 }
 
 /// Subcommands under `onyx room`. Each maps directly to one
@@ -793,6 +810,7 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
         Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
         Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
         Some(Command::Files { cmd }) => dispatch_files(&socket, cmd).await,
+        Some(Command::Contact { cmd }) => dispatch_contact(&socket, cmd).await,
     }
 }
 
@@ -928,6 +946,16 @@ async fn dispatch_files(socket: &std::path::Path, cmd: FilesCommand) -> anyhow::
             )
             .await
         }
+    }
+}
+
+/// Dispatch `onyx contact …` subcommands (T-1).
+async fn dispatch_contact(
+    socket: &std::path::Path,
+    cmd: ContactCommand,
+) -> anyhow::Result<ExitCode> {
+    match cmd {
+        ContactCommand::List => one_shot_print(socket, ApiRequest::ListContacts).await,
     }
 }
 

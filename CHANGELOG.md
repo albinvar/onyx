@@ -6,6 +6,19 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — T-1: TOFU key pinning + key-change warning + `contact list`
+
+Second deep-pass HIGH residual (§8.5). Onyx had no defence against a peer's identity key *changing* after first contact — a key rotation or a man-in-the-middle would go silently unnoticed.
+
+  * **Vault pinning.** New additive `pinned_keys` table + `Vault::pin_or_verify(identity_id, fingerprint, x25519, now_ms) -> PinOutcome` (`New` / `Match` / `Mismatch { pinned }`) and `list_pinned`. Trust-on-first-use: the peer's Ed25519-fingerprint → X25519-identity-key binding is recorded on first sight; a later differing key is **kept, not overwritten** (re-pinning is a deliberate user action, never an auto-accept) and the persistent `key_changed` flag is set. 3 unit tests (pin→match, mismatch-keeps-original + flags, per-identity isolation).
+  * **Daemon enforcement.** `pin_check_peer` runs at every conversation-registration point — direct dial, msg/v1 bootstrap, and the MLS Welcome path (placed *before* the room-vs-DM branch so both room invites and 2-party bootstraps are covered). On mismatch it `warn!`s loudly (possible MITM/rotation — re-verify out of band). Unverified `(peer/<x25519>)` placeholder fingerprints (T-3) are skipped — no real identity to pin.
+  * **Surfacing.** `onyx contact list` → API `ListContacts` / `ContactInfo` (fingerprint, pinned key, first/last-seen, `key_changed`). e2e: `rooms_e2e_alice_invites_bob_and_sends` now asserts bob pins alice's key on the Welcome and flags no change.
+  * **Honest scope:** detection-only — it warns, it does **not** block (a chat key rotation is legitimate, so hard-blocking like SSH would be wrong here); there's no re-pin/accept UI yet; and first-contact MITM itself remains T-2. The warning is delivered via the log + the `contact list` flag (a live TUI banner is a follow-up).
+
+Docs: THREAT_MODEL §8.5 (T-1 → Fixed). Gate: clippy `-D warnings` + fmt clean; `cargo test --workspace` = **503 passed** (+3 vault tests + the e2e pin assertion). Remaining HIGH residuals: D-1 (ephemeral Noise), T-2 (invite auth), P-1 (conversation keying).
+
+---
+
 ## 2026-05-29 — D-2: per-conversation Tor circuit isolation
 
 First of the deep-pass HIGH residuals (§8.5). Previously every Tor dial — all hub connections + every peer dial — shared the same Arti `TorClient`, so they could ride the same circuit; an adversary observing a middle/exit relay could link two of a user's conversations as "the same user."

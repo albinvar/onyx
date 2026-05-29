@@ -1242,6 +1242,45 @@ async fn persist_mls_snapshot(state: &DaemonState, snapshot: &[u8]) -> anyhow::R
     Ok(())
 }
 
+/// T-1: trust-on-first-use pin/verify of a peer's X25519 identity key
+/// against their Ed25519 `fingerprint`, called as we register a
+/// conversation. Placeholder fingerprints (the unverified
+/// `(peer/<x25519>)` DM fallback, T-3) are skipped — there's no real
+/// identity to pin. On a MISMATCH (the presented key differs from the
+/// key pinned at first contact) we `warn!` loudly: it's a key rotation
+/// or a man-in-the-middle, and the user should re-verify the
+/// fingerprint out of band. The pinned key is kept, not auto-trusted;
+/// `onyx contact list` flags the change.
+async fn pin_check_peer(state: &DaemonState, fingerprint: &str, x25519: &[u8; 32]) {
+    if fingerprint.starts_with("(peer/") {
+        return; // unverified placeholder — no real identity to pin
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    let outcome = {
+        let vault = state.vault.lock().await;
+        vault.pin_or_verify(state.identity_id, fingerprint, x25519, now_ms)
+    };
+    match outcome {
+        Ok(onyx_core::storage::PinOutcome::New) => {
+            debug!(fingerprint = %fingerprint, "contact: pinned peer identity key (first contact)");
+        }
+        Ok(onyx_core::storage::PinOutcome::Match) => {}
+        Ok(onyx_core::storage::PinOutcome::Mismatch { .. }) => {
+            warn!(
+                fingerprint = %fingerprint,
+                "contact: peer identity key CHANGED from the pinned first-contact key — \
+                 possible key rotation OR man-in-the-middle. Re-verify the fingerprint out \
+                 of band before trusting this conversation (`onyx contact list` flags it)."
+            );
+        }
+        Err(e) => warn!(error = %e, "contact: pin/verify failed"),
+    }
+}
+
 async fn record_peer_group(
     state: &DaemonState,
     peer_x25519: &[u8; 32],
@@ -1291,6 +1330,9 @@ where
     // group isn't a tidy 2-party one (e.g. multi-party room) or the
     // bytes don't decode as a valid Ed25519 point.
     let fingerprint = derive_peer_fingerprint(&group, &state, &peer_pub_b32).await;
+
+    // T-1: pin/verify this peer's identity key before registering.
+    pin_check_peer(&state, &fingerprint, &peer_pub).await;
 
     let (handle, mut outbound_rx) = {
         let mut reg = state.conversations.lock().await;
@@ -2400,6 +2442,8 @@ async fn handle_hub_delivery(
             // 3. Register the sender as a hub-only peer (idempotent),
             //    then push the message tagged as via-hub so the TUI
             //    can render the weaker security tier visibly.
+            // T-1: pin/verify the sender's identity key first.
+            pin_check_peer(state, &sender_fingerprint, &sender_x25519).await;
             let mut reg = state.conversations.lock().await;
             let handle = reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
             reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text.clone());
@@ -2576,6 +2620,12 @@ async fn process_hub_mls_welcome(
         let _ = party.forget_group(&group.group_id_bytes());
         return;
     }
+
+    // T-1: pin/verify the (now-authenticated) inviter's identity key.
+    // Placed here — after the signer-in-roster check, before the
+    // room-vs-DM branch — so it fires for BOTH room invites and 2-party
+    // DM bootstraps (the per-branch registration paths diverge below).
+    pin_check_peer(state, &sender_fingerprint, &sender_x25519).await;
 
     // Persist the post-join MLS state so the group survives a daemon
     // restart.

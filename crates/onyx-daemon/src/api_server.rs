@@ -339,6 +339,7 @@ async fn dispatch_one_shot(
         ApiRequest::ExportKeyPackage => handle_export_key_package(state).await,
         ApiRequest::CreateRoom { name } => handle_create_room(name, state).await,
         ApiRequest::ListRooms => handle_list_rooms(state).await,
+        ApiRequest::ListContacts => handle_list_contacts(state).await,
         ApiRequest::InviteToRoom {
             group_id_b32,
             peer_fingerprint,
@@ -554,6 +555,33 @@ async fn handle_list_rooms(state: &DaemonState) -> ApiResponse {
         })
         .collect();
     ApiResponse::ListRoomsOk { rooms }
+}
+
+/// T-1: list the TOFU-pinned contacts for `onyx contact list`.
+async fn handle_list_contacts(state: &DaemonState) -> ApiResponse {
+    let rows = {
+        let vault = state.vault.lock().await;
+        match vault.list_pinned(state.identity_id) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list_pinned: {e}"),
+                };
+            }
+        }
+    };
+    let contacts = rows
+        .into_iter()
+        .map(|c| onyx_core::api::ContactInfo {
+            fingerprint: c.fingerprint,
+            x25519_pub_b32: encode_b32(&c.x25519_pub),
+            first_seen_ms: c.first_seen_ms,
+            last_seen_ms: c.last_seen_ms,
+            key_changed: c.key_changed,
+        })
+        .collect();
+    ApiResponse::ListContactsOk { contacts }
 }
 
 /// Invite a peer into an existing room (T6.3.c). Parallels
