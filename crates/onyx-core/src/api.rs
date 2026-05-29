@@ -207,6 +207,24 @@ pub enum ApiRequest {
     /// peer whose identity key we've pinned, newest contact first.
     /// Powers `onyx contact list`.
     ListContacts,
+    /// T-2: build a **signed** invite URL (`onyx://invite/v2?…`),
+    /// minted by the daemon so the inviter's Ed25519 identity key
+    /// signs the canonical invite bytes (fingerprint + KEM + optional
+    /// KP + optional hub list + expiry + nonce). The signature lets
+    /// the recipient detect partial tampering on the side-channel
+    /// (swapped KEM, KP, or hubs); it does NOT defeat full-invite
+    /// substitution by a first-contact MITM (mitigated by OOB
+    /// fingerprint verification + T-1 pinning).
+    ///
+    /// `with_kp` includes a fresh MLS KeyPackage (MLS-tier accept).
+    /// `with_hubs` includes the daemon's configured hub list (T8.2
+    /// transparency). `ttl_secs` overrides the default invite TTL;
+    /// `None` means the daemon's default (30 days).
+    BuildInvite {
+        with_kp: bool,
+        with_hubs: bool,
+        ttl_secs: Option<u64>,
+    },
     /// Invite `peer` into the existing room identified by
     /// `group_id_b32` (T6.3.c). The daemon loads the persisted MLS
     /// group, calls `MlsGroupState::invite` against the peer's
@@ -430,6 +448,18 @@ pub enum ApiResponse {
     /// Reply to [`ApiRequest::ListContacts`]. `contacts` is ordered by
     /// most-recent contact first.
     ListContactsOk { contacts: Vec<ContactInfo> },
+    /// Reply to [`ApiRequest::BuildInvite`]. `url` is the full
+    /// `onyx://invite/v2?…` string. `exp_ms` echoes the expiry the
+    /// daemon stamped into the signature so the caller can display
+    /// "valid until …" without re-parsing the URL. `hubs_attached` is
+    /// the number of hub entries embedded in the URL (`0` when
+    /// `with_hubs` was false OR when the daemon has none configured —
+    /// the CLI uses this to warn the operator).
+    BuildInviteOk {
+        url: String,
+        exp_ms: u64,
+        hubs_attached: usize,
+    },
     /// Reply to [`ApiRequest::InviteToRoom`] on success. `group_id_b32`
     /// echoes the room's stable identifier; `members` is the room's
     /// refreshed member-fingerprint list AFTER the invite commit

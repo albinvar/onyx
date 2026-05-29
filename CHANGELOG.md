@@ -6,6 +6,25 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — T-2: signed + expiring invites (`onyx://invite/v2`)
+
+The deep-pass HIGH that **T-1 alone can't close** — T-1 pins a peer's key on first contact, but if a first-contact MITM substituted the invite, you pin the *attacker's* key. T-2 makes the invite itself tamper-evident.
+
+  * **New wire format `onyx://invite/v2?…`.** Adds `&exp=<unix-ms>&nonce=<b64u>&sig=<b64u>` on top of v1. The signature is Ed25519 over a length-prefixed canonical blob:
+    `SIGN_CONTEXT_V2 ‖ fp(32) ‖ kem_len(u16BE) ‖ kem_bytes ‖ kp_len(u32BE) ‖ kp_bytes ‖ hubs_count(u16BE) ‖ (hub_len(u16BE) ‖ hub_bytes)* ‖ exp_ms(u64BE) ‖ nonce(16)`.
+    The fingerprint **is** the verifying key (raw 32 bytes by design, `crypto.rs`), so verification needs no out-of-band key.
+  * **Daemon-side signing via a new `BuildInvite` API verb.** The CLI no longer constructs invites locally (it doesn't hold the signing key); `onyx invite [--with-kp] [--with-hubs]` now calls `ApiRequest::BuildInvite` → daemon mints (optionally a KP via the existing `handle_export_key_package` path), attaches hubs, signs with `state.identity.signing()`, returns `BuildInviteOk { url, exp_ms, hubs_attached }`. Default TTL **30 days**, overridable via `ttl_secs`. Stderr prints "signed (v2) invite, expires at …".
+  * **`onyx accept` verifies on the boundary.** Signed invites get `verify_signature(now_ms)` called before any send; failure aborts with a clear error. Unsigned (v1) invites still work for back-compat but print a loud WARNING that the side-channel could have tampered with any field. **v1 paths carrying sig fields are refused as a downgrade attempt** (a MITM stripping `/v2` → `/v1` to skip verification gets caught at parse).
+  * **Backward compat.** `Invite::new` / `Invite::with_key_package` still produce unsigned (v1) invites for tests / external callers. `Invite::sign(signing, exp_ms, nonce)` is the new builder for v2. `is_signed()` lets callers check.
+
+**Honest scope (partial closure of an intrinsic gap):** T-2 closes *partial* tampering on the side-channel — an attacker who swaps the KEM, KP, or hub list mid-flight breaks the signature. It does **not** defeat **full-invite substitution**: a MITM who replaces the entire invite (their own fingerprint + their own keys + their own signature) is still indistinguishable on an unauthenticated channel; that requires either OOB fingerprint verification (user reads the fp out of band) or T-1's later key-change detection. This is the fundamental limit of any invite system; T-2 closes everything *short* of the full substitution.
+
+**Tests (+7):** `v2_signed_round_trip_and_verify`, `v2_signature_rejects_tampered_kem`, `v2_signature_rejects_tampered_hubs`, `v2_signature_rejects_swapped_fingerprint`, `v1_with_signature_fields_is_rejected_no_downgrade`, `v2_missing_sig_field_is_rejected`, `v2_malformed_sig_length_is_rejected`.
+
+Docs: THREAT_MODEL §8.5 T-2 → Fixed (with the honest-scope caveat). Gate: clippy `-D warnings` + fmt clean; `cargo test --workspace` = **510 passed** (+7 invite tests). Remaining deep-pass HIGHs: **D-1** (ephemeral Noise keys, the §3.2 redesign) and **P-1** (conversation keying — verification-first).
+
+---
+
 ## 2026-05-29 — Finish D-3 + T-3 (the two partials from batch 3)
 
 A follow-up review flagged both as only half-closed. Completed:

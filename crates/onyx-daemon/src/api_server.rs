@@ -340,6 +340,11 @@ async fn dispatch_one_shot(
         ApiRequest::CreateRoom { name } => handle_create_room(name, state).await,
         ApiRequest::ListRooms => handle_list_rooms(state).await,
         ApiRequest::ListContacts => handle_list_contacts(state).await,
+        ApiRequest::BuildInvite {
+            with_kp,
+            with_hubs,
+            ttl_secs,
+        } => handle_build_invite(state, *with_kp, *with_hubs, *ttl_secs).await,
         ApiRequest::InviteToRoom {
             group_id_b32,
             peer_fingerprint,
@@ -582,6 +587,88 @@ async fn handle_list_contacts(state: &DaemonState) -> ApiResponse {
         })
         .collect();
     ApiResponse::ListContactsOk { contacts }
+}
+
+/// T-2: default invite TTL when the caller doesn't override — 30 days.
+/// Long enough that users have time to share an invite over typical
+/// side-channels; short enough that a leaked invite isn't usable
+/// indefinitely.
+const DEFAULT_INVITE_TTL_SECS: u64 = 30 * 86_400;
+
+/// T-2: build a signed (v2) invite URL inside the daemon, where the
+/// identity signing key actually lives. The CLI / API caller just
+/// hands us the booleans + optional TTL and we mint, optionally
+/// attach a fresh MLS KeyPackage + the configured hub list, sign with
+/// `state.identity.signing()`, and return the URL + the stamped
+/// expiry.
+async fn handle_build_invite(
+    state: &DaemonState,
+    with_kp: bool,
+    with_hubs: bool,
+    ttl_secs: Option<u64>,
+) -> ApiResponse {
+    use base64::Engine;
+    // Optional KP — reuse the existing handler so the mint + snapshot
+    // + vault-persist path stays one place (no duplicated MLS logic).
+    let kp_bytes = if with_kp {
+        match handle_export_key_package(state).await {
+            ApiResponse::ExportKeyPackageOk { kp_b64 } => {
+                match base64::engine::general_purpose::STANDARD.decode(kp_b64) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        return ApiResponse::Error {
+                            code: ApiErrorCode::Internal,
+                            message: format!("invite: KP base64 decode failed: {e}"),
+                        };
+                    }
+                }
+            }
+            other @ ApiResponse::Error { .. } => return other,
+            other => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("invite: unexpected ExportKeyPackage response: {other:?}"),
+                };
+            }
+        }
+    } else {
+        None
+    };
+
+    let fp = state.identity.fingerprint();
+    let kem_b32 = encode_b32(&state.identity.kem_public().to_bytes());
+    let mut inv = match kp_bytes {
+        Some(kp) => onyx_core::invite::Invite::with_key_package(fp, kem_b32, kp),
+        None => onyx_core::invite::Invite::new(fp, kem_b32),
+    };
+    if with_hubs {
+        let hubs: Vec<String> = state
+            .configured_hubs
+            .iter()
+            .map(|h| format!("{},{}", h.onion, h.pubkey))
+            .collect();
+        if !hubs.is_empty() {
+            inv = inv.with_hubs(hubs);
+        }
+    }
+
+    // exp_ms = now + ttl. `saturating_add` everywhere so an absurd TTL
+    // can't underflow / panic; the signed `exp_ms` is just u64 ms.
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    let ttl = ttl_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
+    let exp_ms = now_ms.saturating_add(ttl.saturating_mul(1000));
+    let nonce: [u8; 16] = onyx_core::crypto::random_array();
+    let hubs_attached = inv.hubs.len();
+    let signed = inv.sign(state.identity.signing(), exp_ms, nonce);
+    ApiResponse::BuildInviteOk {
+        url: signed.to_url(),
+        exp_ms,
+        hubs_attached,
+    }
 }
 
 /// Invite a peer into an existing room (T6.3.c). Parallels

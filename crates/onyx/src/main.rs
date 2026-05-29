@@ -57,7 +57,6 @@ mod tui;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use base64::Engine;
 use clap::{Parser, Subcommand};
 use onyx_core::api::{ApiRequest, ApiResponse};
 
@@ -959,66 +958,76 @@ async fn dispatch_contact(
     }
 }
 
-/// Build an `onyx://invite/v1?…` URL from the daemon's identity and
-/// print it on stdout. Plain string output (not JSON) — this is meant
-/// to be piped directly into a clipboard / chat client. With
-/// `with_kp`, also calls `ExportKeyPackage` and bundles a fresh KP
-/// in the URL so `onyx accept` on the other side will use MLS-tier
-/// bootstrap (full PCS) instead of msg/v1 (PFS only).
+/// T-2: ask the daemon to build a **signed** invite URL
+/// (`onyx://invite/v2?…`) — the signing key lives there, not in the
+/// CLI. Plain string output on stdout (pipeable); the signed-invite
+/// expiry + hub status go to stderr. With `with_kp` the daemon also
+/// mints + bundles a fresh MLS KeyPackage so `onyx accept` on the
+/// other side uses MLS-tier bootstrap (full PCS) instead of msg/v1.
 async fn run_invite(
     socket: &std::path::Path,
     with_kp: bool,
     with_hubs: bool,
 ) -> anyhow::Result<ExitCode> {
-    let id_resp = client::one_shot(socket, &ApiRequest::Identity).await?;
-    let (fingerprint, kem, daemon_hubs) = match id_resp {
-        ApiResponse::IdentityOk {
-            fingerprint,
-            identity_kem_pub_b32,
-            hubs,
-            ..
-        } => (fingerprint, identity_kem_pub_b32, hubs),
-        ApiResponse::Error { .. } => {
-            println!("{}", serde_json::to_string_pretty(&id_resp)?);
-            return Ok(ExitCode::from(1));
-        }
-        other => anyhow::bail!("unexpected daemon response to Identity: {other:?}"),
-    };
-    let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
-
-    let mut invite = if with_kp {
-        let kp_resp = client::one_shot(socket, &ApiRequest::ExportKeyPackage).await?;
-        let kp_b64_std = match kp_resp {
-            ApiResponse::ExportKeyPackageOk { kp_b64 } => kp_b64,
-            ApiResponse::Error { .. } => {
-                println!("{}", serde_json::to_string_pretty(&kp_resp)?);
-                return Ok(ExitCode::from(1));
+    let resp = client::one_shot(
+        socket,
+        &ApiRequest::BuildInvite {
+            with_kp,
+            with_hubs,
+            ttl_secs: None,
+        },
+    )
+    .await?;
+    match resp {
+        ApiResponse::BuildInviteOk {
+            url,
+            exp_ms,
+            hubs_attached,
+        } => {
+            if with_hubs && hubs_attached == 0 {
+                eprintln!(
+                    "onyx: warning — --with-hubs requested but daemon has no hubs \
+                     configured; the URL will not carry a hub list. Pass `--hub \
+                     onion:port,b32pubkey` (one or more times) to the daemon to populate it."
+                );
             }
-            other => anyhow::bail!("unexpected daemon response to ExportKeyPackage: {other:?}"),
-        };
-        // API returns standard base64; Invite stores raw bytes and
-        // re-emits as base64url in the URL. Convert once so the Invite
-        // type stays decoupled from the API encoding.
-        let kp_bytes = base64::engine::general_purpose::STANDARD
-            .decode(kp_b64_std)
-            .map_err(|e| anyhow::anyhow!("daemon returned invalid base64 KP: {e}"))?;
-        onyx_core::invite::Invite::with_key_package(fp, kem, kp_bytes)
-    } else {
-        onyx_core::invite::Invite::new(fp, kem)
-    };
-    if with_hubs {
-        if daemon_hubs.is_empty() {
             eprintln!(
-                "onyx: warning — --with-hubs requested but daemon has no hubs configured; \
-                 the URL will not carry a hub list. Pass `--hub onion:port,b32pubkey` (one \
-                 or more times) to the daemon to populate it."
+                "onyx: signed (v2) invite, expires at unix-ms {exp_ms} ({} from now)",
+                humanize_remaining_ms(exp_ms),
             );
-        } else {
-            invite = invite.with_hubs(daemon_hubs);
+            println!("{url}");
+            Ok(ExitCode::SUCCESS)
         }
+        ApiResponse::Error { .. } => {
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+            Ok(ExitCode::from(1))
+        }
+        other => anyhow::bail!("unexpected daemon response to BuildInvite: {other:?}"),
     }
-    println!("{}", invite.to_url());
-    Ok(ExitCode::SUCCESS)
+}
+
+/// Best-effort "in ~N days/hours" string from a Unix-ms timestamp,
+/// for human-friendly invite-expiry messages on stderr.
+fn humanize_remaining_ms(exp_ms: u64) -> String {
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    if exp_ms <= now_ms {
+        return "already expired".into();
+    }
+    let remaining_secs = (exp_ms - now_ms) / 1000;
+    let days = remaining_secs / 86_400;
+    if days > 0 {
+        return format!("~{days} days");
+    }
+    let hours = remaining_secs / 3600;
+    if hours > 0 {
+        return format!("~{hours} hours");
+    }
+    let mins = remaining_secs / 60;
+    format!("~{mins} min")
 }
 
 /// Parse an invite URL, then ship a sealed-sender bootstrap to the
@@ -1035,6 +1044,33 @@ async fn run_invite(
 async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow::Result<ExitCode> {
     let invite = onyx_core::invite::Invite::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
+
+    // T-2: signed (v2) invites get their signature verified here BEFORE
+    // we send anything — a tampered-but-still-parseable URL must be
+    // rejected at the boundary. Unsigned (v1) invites still work for
+    // backward compat but the operator gets a loud warning that the
+    // side-channel could have substituted any of the fields (the
+    // attacker would still need to substitute the WHOLE invite, so
+    // the OOB-fingerprint check is the user-level defense — T-2's
+    // signing only catches PARTIAL tampering).
+    if invite.is_signed() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        invite
+            .verify_signature(now_ms)
+            .map_err(|e| anyhow::anyhow!("invite signature did not verify: {e}"))?;
+        eprintln!("onyx: invite v2 signature verified ✓");
+    } else {
+        eprintln!(
+            "onyx: WARNING — this is an unsigned (v1) invite; the side-channel could have \
+             substituted any field (KEM, KP, hubs). Verify the recipient's fingerprint out \
+             of band before sending anything sensitive. Re-issue with `onyx invite` from a \
+             current daemon to get a signed (v2) URL."
+        );
+    }
 
     // T8.2 transparency + T8.2-check intersection: if the inviter
     // disclosed their hub list, surface it to stderr AND check it
