@@ -133,6 +133,20 @@ struct Args {
     #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS", global = true)]
     cover_traffic_mean_secs: Option<u64>,
 
+    /// **Opt-in, "high mode".** Slot interval (in milliseconds) for
+    /// constant-rate client→hub cover traffic. When set, the daemon
+    /// sends exactly one frame per slot to each hub — a queued real
+    /// frame if ready, otherwise a FRAME_PAD — so the upstream cadence
+    /// is invariant whether you are chatting or idle. Stronger than
+    /// the Poisson `--cover-traffic-mean-secs` (which real bursts
+    /// still ride above) but costs up to one slot of latency per real
+    /// frame plus a steady PAD/slot of bandwidth. Covers the
+    /// client→hub direction only; mutually exclusive with
+    /// `--cover-traffic-mean-secs`. 200–2000 ms is a sane range. See
+    /// `ANONYMITY.md` §3.1.
+    #[arg(long, env = "ONYX_CONSTANT_RATE_MS", global = true)]
+    constant_rate_ms: Option<u64>,
+
     /// **Privacy opt-out.** Skip subscribing to your fingerprint-
     /// derived introduction inbox (`introduction_inbox(fp)`) on
     /// every configured hub. You can still SEND first-contact
@@ -600,6 +614,7 @@ fn build_daemon_config(
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
         cover_traffic_mean_secs: args.cover_traffic_mean_secs,
+        constant_rate_ms: args.constant_rate_ms,
         // T-rotation.a: --no-intro-inbox-subscribe flips this to
         // false. Default true preserves first-contact reachability.
         subscribe_intro_inbox: !args.no_intro_inbox_subscribe,

@@ -99,6 +99,16 @@ struct Args {
     #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS")]
     cover_traffic_mean_secs: Option<u64>,
 
+    /// **Opt-in, "high mode".** Slot interval (in milliseconds) for
+    /// constant-rate client→hub cover traffic: one frame per slot to
+    /// each hub (a queued real frame or a FRAME_PAD), making the
+    /// upstream cadence invariant. Stronger than the Poisson
+    /// `--cover-traffic-mean-secs` but costs up to one slot of latency
+    /// per real frame. Mutually exclusive with that flag.
+    /// See `ANONYMITY.md` §3.1.
+    #[arg(long, env = "ONYX_CONSTANT_RATE_MS")]
+    constant_rate_ms: Option<u64>,
+
     /// **Privacy opt-out.** Skip subscribing to your fingerprint-
     /// derived introduction inbox on every configured hub. You
     /// lose first-contact reachability via the hub. Rooms still
@@ -148,6 +158,7 @@ impl TryFrom<Args> for Config {
             listen_tcp: a.listen_tcp,
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,
+            constant_rate_ms: a.constant_rate_ms,
             subscribe_intro_inbox: !a.no_intro_inbox_subscribe,
         })
     }

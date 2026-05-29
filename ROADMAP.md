@@ -10,13 +10,15 @@ For finished work with full design notes + verification + carry-forward, see `CH
 
 ```
 done       ──►  T1–T7.x · T6.1–T6.4 rooms · T8.x multi-hub+federation · files ·
-                invite URLs · single-binary · cover-traffic (opt-in) · install/
-                signed releases (v0.1.0–v0.1.3) · TUI UX overhaul · security
-                audit (8 findings fixed) + red-team
+                invite URLs · single-binary · install/signed releases (v0.1.0–
+                v0.1.4) · TUI UX overhaul · security audit (8 findings fixed) +
+                red-team · DM file sending · first-run wizard · TUI settings/
+                sidebar · room member-removal (tasks 322–325) · cover traffic:
+                opt-in Poisson + constant-rate "high mode" upstream (task 327)
 in flight  ──►  (between phases)
-next       ──►  DM file sending · first-run wizard · TUI settings/sidebar ·
-                room member-removal  (tasks 322–325)
-later      ──►  idle-circuit cover traffic · reliability soak · bootstrap hub
+next       ──►  reliability soak (task 326) · bootstrap public hub (task 328)
+later      ──►  constant-rate hub (downstream) + peer-circuit cover · real-Tor
+                measurement
 won't do   ──►  see §6
 must-have  ──►  EXTERNAL SECURITY AUDIT (the one thing that gates a "secure" claim)
 ```
@@ -109,8 +111,8 @@ These are the phases I'd recommend tackling in order. Each one is independently 
 
 **Why next:** the headline IRC feature. Big lift (estimated 4–6 hours across several commits) but the crypto is in place. T6.1's KP directory already supports the multi-invite path.
 
-### Cover traffic on idle Tor circuits *(biggest remaining anonymity gap)*
-`ANONYMITY.md` §3.1. Today's frame size buckets shape transmitted frames; idle circuits leak presence. Adding constant-rate cover traffic raises the cost of timing-correlation attacks against A2 (hub) and global-passive observers. Substantial design + impl work (~1-2 sessions); needs careful sink discipline so dummies never surface as events.
+### Cover traffic on idle Tor circuits *(partially landed — T-cover.const)*
+`ANONYMITY.md` §3.1. **Done (task 327):** opt-in constant-rate "high mode" (`--constant-rate-ms`) funnels all client→hub frames through a fixed-slot pacer — one frame per slot, real-if-queued else `FRAME_PAD` — so the **upstream** cadence is invariant whether chatting or idle. Sink discipline is clean: PAD frames are produced and consumed entirely inside the pacer + hub layers and never surface as events (proven by the e2e smoke). **Remaining:** a constant-rate **hub** binary so the downstream (hub→client) direction is invariant too; cover on direct peer-to-peer (DM/room) Tor circuits; and real-Tor measurement of the indistinguishability claim against a passive circuit observer.
 
 ### T6.4 — Async MLS application messages over hub
 Today's hub path establishes an MLS group via Welcome but ongoing in-group chat requires one peer to direct-dial the other (existing T2.x resume path takes over). T6.4 adds a wire format for MLS application messages routed via per-epoch session-token routing ids (`routing::session_token`). After it lands, **fully asynchronous chat works without ever needing both peers on Tor simultaneously.**

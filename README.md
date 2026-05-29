@@ -65,9 +65,7 @@ What works today (verified end-to-end):
 
 What's **not** done yet (carry-forward — see `THREAT_MODEL.md` §8.2/§8.3 and `ROADMAP.md`):
 
-- **First-run wizard** — the TUI guides you but doesn't yet walk first-launch setup (passphrase + hub).
-- **TUI settings panel**, sidebar grouping (DMs/Channels), room member removal (kick).
-- **Idle-circuit cover traffic** (§8.2 #3) — biggest remaining anonymity gap.
+- **Full idle-circuit cover traffic** (§8.2 #3) — opt-in constant-rate "high mode" (`--constant-rate-ms`) now makes the client→hub **upstream** cadence invariant; the hub-side **downstream** direction, direct peer-circuit cover, and real-Tor measurement remain.
 - **Invite-only hub registration** (§8.2 #4); session-token subscriptions are unauthenticated by design (§8.3 residual #1).
 - **A bootstrap public hub** — there's no default hub, so two parties must share/run one to chat asynchronously.
 - **External security audit** (§8.2 #7) — the single most important open item.

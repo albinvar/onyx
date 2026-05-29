@@ -176,6 +176,29 @@ pub struct Config {
     /// above 60s mean the gap between cover frames is long enough
     /// that real-traffic bursts still stand out.
     pub cover_traffic_mean_secs: Option<u64>,
+    /// T-cover.const ("high mode"): when `Some(ms)`, route **all**
+    /// client → hub outbound through a constant-rate pacer that emits
+    /// exactly one frame every `ms` milliseconds — a queued real frame
+    /// if one is ready at the slot boundary, otherwise a `FRAME_PAD`.
+    ///
+    /// Unlike the Poisson [`cover_traffic_mean_secs`] emitter (which
+    /// adds dummy frames *on top of* real traffic, so real bursts
+    /// still ride above the noise floor), constant-rate makes the
+    /// observable upstream cadence **invariant**: a hub-watching
+    /// observer sees one frame per slot whether you are actively
+    /// chatting or idle, so the inter-frame timing distribution no
+    /// longer distinguishes the two.
+    ///
+    /// **Honest scope.** This covers the **client → hub (upstream)**
+    /// direction only. The hub → client (downstream) direction still
+    /// uses the hub's own (Poisson) cover, so the full bidirectional
+    /// guarantee also needs a constant-rate hub. It is per-connection
+    /// and does NOT defeat a global adversary correlating Tor entry/
+    /// exit, nor TCP open/close ("alice connected") events. It costs
+    /// up to one slot of added latency on every real frame plus a
+    /// steady `bucket::SMALL`/slot of bandwidth. Mutually exclusive
+    /// with [`cover_traffic_mean_secs`]. See `ANONYMITY.md` §3.1.
+    pub constant_rate_ms: Option<u64>,
     /// T-rotation.a: when `true` (the v0 default), the daemon
     /// subscribes to its own `introduction_inbox(fingerprint)` on
     /// every configured hub so it can receive first-contact
@@ -461,6 +484,22 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // then fails cleanly with NotReady rather than queueing into a
     // void.
     let want_hubs = !args.hubs.is_empty() && !args.no_tor;
+    // T-cover.const: constant-rate ("high mode") and Poisson cover are
+    // two different disciplines for the same channel; running both at
+    // once is incoherent (the pacer already emits a PAD on every idle
+    // slot, so a second Poisson injector only adds non-constant noise
+    // back on top of the constant cadence). Refuse the contradictory
+    // config loudly rather than silently picking a winner.
+    if args.constant_rate_ms.is_some() && args.cover_traffic_mean_secs.is_some() {
+        anyhow::bail!(
+            "--constant-rate-ms and --cover-traffic-mean-secs are mutually exclusive: \
+             constant-rate already emits a PAD on every idle slot. Pick one."
+        );
+    }
+    let constant_rate = args
+        .constant_rate_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
     // Tor-hub channels first, then TCP-hub channels. Build two
     // separate rx Vecs so each spawn loop drains its own without
     // an implicit ordering dependency (T-smoke: the TCP spawn now
@@ -474,14 +513,12 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         let mut tor_rxs = Vec::with_capacity(tor_hub_count);
         let mut tcp_rxs = Vec::with_capacity(tcp_hub_count);
         for _ in 0..tor_hub_count {
-            let (tx, rx) =
-                mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+            let (tx, rx) = make_hub_outbound_channel(constant_rate);
             txs.push(tx);
             tor_rxs.push(rx);
         }
         for _ in 0..tcp_hub_count {
-            let (tx, rx) =
-                mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+            let (tx, rx) = make_hub_outbound_channel(constant_rate);
             txs.push(tx);
             tcp_rxs.push(rx);
         }
@@ -1921,6 +1958,92 @@ async fn run_cover_traffic_loop(tx: mpsc::Sender<hub_client::HubOutbound>, mean_
     }
 }
 
+/// Build one hub's outbound channel pair: `(Sender held by the API,
+/// Receiver drained by the hub session)`.
+///
+/// With `constant_rate` set (T-cover.const "high mode") this
+/// interposes a [`run_constant_rate_pacer`] task between the two: the
+/// API pushes into the pacer's input, and the pacer forwards exactly
+/// one frame per slot — a queued real frame or a `Pad` — into the
+/// session's input. The session loop ([`hub_client::serve_session`])
+/// is unchanged; it simply writes whatever the pacer hands it, so the
+/// constant cadence is produced entirely in this isolated, testable
+/// stage. Without `constant_rate` it returns a plain channel and the
+/// API talks to the session directly (the default, zero-overhead
+/// path).
+fn make_hub_outbound_channel(
+    constant_rate: Option<std::time::Duration>,
+) -> (
+    mpsc::Sender<hub_client::HubOutbound>,
+    mpsc::Receiver<hub_client::HubOutbound>,
+) {
+    let (api_tx, api_rx) =
+        mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+    match constant_rate {
+        None => (api_tx, api_rx),
+        Some(slot) => {
+            let (session_tx, session_rx) =
+                mpsc::channel::<hub_client::HubOutbound>(hub_client::OUTBOUND_QUEUE_CAPACITY);
+            let slot_ms = u64::try_from(slot.as_millis()).unwrap_or(u64::MAX);
+            tokio::spawn(
+                run_constant_rate_pacer(api_rx, session_tx, slot)
+                    .instrument(info_span!("cover-const", slot_ms)),
+            );
+            (api_tx, session_rx)
+        }
+    }
+}
+
+/// T-cover.const: drain `real_rx` at a fixed cadence and forward into
+/// `paced_tx`, emitting one queued real frame per slot or a
+/// `HubOutbound::Pad` when the slot finds nothing waiting. The result
+/// is an **invariant** client→hub frame cadence: a hub-watching
+/// observer sees one frame every `slot` whether the user is chatting
+/// or idle, so the inter-frame timing distribution no longer
+/// distinguishes the two states.
+///
+/// Contrast with [`run_cover_traffic_loop`] (Poisson): that injects
+/// dummy frames *alongside* real ones, so a real burst still rises
+/// above the noise floor and an adversary autocorrelating the rate
+/// can eventually pull it back out. Constant-rate removes the rate
+/// signal entirely (at the cost of up to one slot of latency on every
+/// real frame, plus a steady PAD/slot of bandwidth even when idle).
+///
+/// `MissedTickBehavior::Delay` is load-bearing for the security
+/// property: if a slot's forward stalls (the session's input is full
+/// because the hub link is slow or reconnecting), the next tick is
+/// scheduled one full `slot` after the stall clears — never a burst
+/// of catch-up frames that would reintroduce a detectable rate spike.
+///
+/// Terminates when either side closes: `real_rx` disconnecting (the
+/// API's Sender — held in `DaemonState` for the process lifetime — so
+/// this only happens on shutdown) or `paced_tx` failing to send (the
+/// session Receiver dropped). Both are the clean shutdown signal.
+async fn run_constant_rate_pacer(
+    mut real_rx: mpsc::Receiver<hub_client::HubOutbound>,
+    paced_tx: mpsc::Sender<hub_client::HubOutbound>,
+    slot: std::time::Duration,
+) {
+    info!(slot_ms = slot.as_millis(), "constant-rate pacer: started");
+    let mut ticker = tokio::time::interval(slot);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let frame = match real_rx.try_recv() {
+            Ok(action) => action,
+            Err(mpsc::error::TryRecvError::Empty) => hub_client::HubOutbound::Pad,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                info!("constant-rate pacer: input channel closed; ending");
+                return;
+            }
+        };
+        if paced_tx.send(frame).await.is_err() {
+            info!("constant-rate pacer: session channel closed; ending");
+            return;
+        }
+    }
+}
+
 /// Sample an exponentially-distributed inter-arrival interval with
 /// mean `mean_secs`. Uses the inverse-CDF method: `-mean * ln(u)`
 /// where `u` is uniform on `(0, 1]`. Both clamps documented on
@@ -2689,5 +2812,112 @@ mod cover_traffic_tests {
             avg_ms >= target_ms / 2 && avg_ms <= target_ms * 3 / 2,
             "avg {avg_ms}ms should be within ±50% of target {target_ms}ms"
         );
+    }
+
+    // --- T-cover.const: constant-rate pacer -----------------------
+
+    /// Helper: a small Deliver action tagged by the first target byte
+    /// so tests can assert ordering/identity without caring about the
+    /// body. (`HubOutbound` isn't `PartialEq` — the `FetchKp` variant
+    /// carries a oneshot — so tests match on `target[0]` instead.)
+    fn deliver_tagged(tag: u8) -> hub_client::HubOutbound {
+        hub_client::HubOutbound::Deliver {
+            target: [tag; 16],
+            body: vec![tag],
+        }
+    }
+
+    /// The security-relevant invariant: every slot emits exactly one
+    /// frame, real frames are forwarded first **in FIFO order**, and
+    /// once the real queue drains the pacer keeps emitting `Pad` —
+    /// i.e. the wire cadence is identical whether or not real traffic
+    /// is flowing. Timing-independent by construction: we enqueue the
+    /// reals *before* spawning the pacer, then read the first four
+    /// emitted frames and assert the sequence `[real, real, pad, pad]`.
+    #[tokio::test]
+    async fn constant_rate_pacer_forwards_reals_in_order_then_pads() {
+        let (api_tx, api_rx) = mpsc::channel(16);
+        let (sess_tx, mut sess_rx) = mpsc::channel(16);
+        // Enqueue two real frames before the pacer starts so the first
+        // two slots are guaranteed to find them (no scheduler race).
+        api_tx.send(deliver_tagged(7)).await.unwrap();
+        api_tx.send(deliver_tagged(8)).await.unwrap();
+        tokio::spawn(run_constant_rate_pacer(
+            api_rx,
+            sess_tx,
+            std::time::Duration::from_millis(10),
+        ));
+
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), sess_rx.recv())
+                .await
+                .expect("pacer should emit within the timeout")
+                .expect("pacer channel should stay open");
+            got.push(frame);
+        }
+
+        match &got[0] {
+            hub_client::HubOutbound::Deliver { target, .. } => assert_eq!(target[0], 7),
+            other => panic!("slot 0 should be the first real frame, got {other:?}"),
+        }
+        match &got[1] {
+            hub_client::HubOutbound::Deliver { target, .. } => assert_eq!(target[0], 8),
+            other => panic!("slot 1 should be the second real frame, got {other:?}"),
+        }
+        assert!(
+            matches!(got[2], hub_client::HubOutbound::Pad),
+            "slot 2 should be a Pad once the real queue drained, got {:?}",
+            got[2]
+        );
+        assert!(
+            matches!(got[3], hub_client::HubOutbound::Pad),
+            "slot 3 should keep emitting Pad while idle, got {:?}",
+            got[3]
+        );
+    }
+
+    /// An idle pacer (no real traffic ever) still emits a steady
+    /// stream of `Pad` — this is the whole point of "high mode": an
+    /// idle circuit looks identical to an active one on the wire.
+    #[tokio::test]
+    async fn constant_rate_pacer_emits_pads_while_fully_idle() {
+        let (_api_tx, api_rx) = mpsc::channel(16);
+        let (sess_tx, mut sess_rx) = mpsc::channel(16);
+        tokio::spawn(run_constant_rate_pacer(
+            api_rx,
+            sess_tx,
+            std::time::Duration::from_millis(10),
+        ));
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), sess_rx.recv())
+                .await
+                .expect("idle pacer should still emit within the timeout")
+                .expect("pacer channel should stay open");
+            assert!(
+                matches!(frame, hub_client::HubOutbound::Pad),
+                "idle slot must be a Pad, got {frame:?}"
+            );
+        }
+    }
+
+    /// The pacer terminates cleanly when the session side goes away
+    /// (the hub session's Receiver dropped on shutdown). Without this
+    /// the task would leak on every reconnect-free shutdown.
+    #[tokio::test]
+    async fn constant_rate_pacer_exits_when_session_closed() {
+        let (_api_tx, api_rx) = mpsc::channel(16);
+        let (sess_tx, sess_rx) = mpsc::channel::<hub_client::HubOutbound>(16);
+        let handle = tokio::spawn(run_constant_rate_pacer(
+            api_rx,
+            sess_tx,
+            std::time::Duration::from_millis(10),
+        ));
+        // Drop the consumer; the next slot's send fails → pacer returns.
+        drop(sess_rx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("pacer should exit promptly after the session closes")
+            .expect("pacer task should not panic");
     }
 }

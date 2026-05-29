@@ -6,6 +6,30 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Task 327: constant-rate cover traffic ("high mode", T-cover.const)
+
+The biggest remaining anonymity item. Onyx already had **Poisson** client↔hub cover (`--cover-traffic-mean-secs`), but that only injects dummy frames *on top of* real traffic — a real burst still rises above the noise floor, so an adversary autocorrelating the rate can eventually pull "alice is actively chatting" back out. The honest THREAT_MODEL row (§5#5) and §8.2 #3 / §8.3 #6 named the unbuilt stronger mode: **constant-rate**.
+
+  * **What landed**: `--constant-rate-ms <MS>` (on `onyx` + `onyxd`; env `ONYX_CONSTANT_RATE_MS`). When set, **all** client→hub outbound is funnelled through a fixed-slot pacer (`run_constant_rate_pacer`) that emits **exactly one frame per slot** — a queued real frame if one is ready at the slot boundary, otherwise a `FRAME_PAD`. The observable upstream cadence becomes *invariant*: one frame per slot whether chatting or idle, so the inter-frame timing distribution no longer separates the two states (the property Poisson only approximates).
+  * **Design — isolated pacer stage, not a hot-loop rewrite.** `make_hub_outbound_channel(constant_rate)` interposes the pacer between the API-facing `Sender` (held in `DaemonState`) and the hub session's `Receiver`: API → pacer input → (one frame/slot) → session input. `hub_client::serve_session` is **unchanged** — it writes whatever the pacer hands it, so the constant cadence is produced entirely in one small, testable stage. Lowest-risk way to add this. `MissedTickBehavior::Delay` is load-bearing: a stalled slot (slow/reconnecting hub link) reschedules one full slot later, never a burst of catch-up frames that would reintroduce a rate spike.
+  * **Mutual exclusion**: `--constant-rate-ms` and `--cover-traffic-mean-secs` are incoherent together (the pacer already fills idle slots); the daemon refuses the combination at startup rather than silently picking a winner.
+
+**Honest scope (kept out of any "secure" claim):** covers the **client→hub upstream only**. The hub→client downstream still uses the hub's Poisson cover, so the full bidirectional invariant-cadence guarantee also needs a constant-rate *hub* (not built). It's per-connection — no defense against a global Tor entry/exit observer (N1) or the TCP open/close leak (§3.2). It costs up to one slot of latency per real frame plus a steady `bucket::SMALL`/slot of bandwidth. And the end-to-end "a passive Tor observer can't distinguish active from idle" claim is **not yet measured on real circuits**.
+
+**Tests (all cases):**
+  * `constant_rate_pacer_forwards_reals_in_order_then_pads` — the core invariant, timing-independent: enqueue two reals before the pacer starts, read the first four emitted frames, assert `[real, real, pad, pad]` (one-per-slot, reals-first FIFO, idle→PAD).
+  * `constant_rate_pacer_emits_pads_while_fully_idle` — an idle pacer still emits a steady PAD stream (an idle circuit looks identical to an active one).
+  * `constant_rate_pacer_exits_when_session_closed` — clean termination when the session Receiver drops (no task leak on shutdown).
+  * `rooms_e2e_constant_rate_cover_does_not_break_flow` (smoke) — two daemons with a 50 ms slot; a real room message (KP fetch → invite/Welcome → commit → SendRoom) still routes end-to-end through both paced hub sessions and arrives at the peer.
+
+Docs synced: `ANONYMITY.md` §3.1 (new constant-rate bullet + honest limits; TL;DR corrected from "no cover traffic" to "opt-in, off by default"), `THREAT_MODEL.md` §5#5 / §5 verified table / §8.2 #3 / §8.2 status / §8.3 #6.
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **489 passed** (+4).
+
+Not done (logged as remaining in §8.2 #3): constant-rate **hub** binary (downstream half), cover on direct peer-to-peer (DM/room) Tor circuits, real-Tor measurement.
+
+---
+
 ## 2026-05-29 — Task 325: room membership management (remove/kick)
 
 Rooms could add members but not remove them. Now a member can be kicked.
