@@ -6,6 +6,13 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-29 — Release v0.1.5 + `--version` stamping fix
+
+  * **v0.1.5** cut — ships task 325 (room member removal/kick) + task 327 (constant-rate cover traffic, "high mode"). First release where the binaries' reported version matches the tag.
+  * **`--version` stamping**: every release so far (v0.1.0–v0.1.4) shipped a binary that *named* itself `vX.Y.Z` (artifact filename) but *reported* `0.0.1` from `--version` and the daemon's `daemon_version`, because both read `CARGO_PKG_VERSION` and the workspace version is pinned at `0.0.1` (internal crate versioning; releases tagged independently). Now `onyx_core::VERSION` is the single source of truth: it prefers a build-time `ONYX_RELEASE_VERSION` (the release workflow exports the tag minus `v` before `cargo build`) and falls back to `CARGO_PKG_VERSION` for local dev builds. A new `crates/onyx-core/build.rs` emits `rerun-if-env-changed=ONYX_RELEASE_VERSION` so the CI build cache can't serve an onyx-core artifact compiled for an earlier tag (which would bake in a stale version). Verified locally: default → `onyx 0.0.1`; `ONYX_RELEASE_VERSION=0.1.5` → recompiles → `onyx 0.1.5`.
+
+---
+
 ## 2026-05-29 — Task 327: constant-rate cover traffic ("high mode", T-cover.const)
 
 The biggest remaining anonymity item. Onyx already had **Poisson** client↔hub cover (`--cover-traffic-mean-secs`), but that only injects dummy frames *on top of* real traffic — a real burst still rises above the noise floor, so an adversary autocorrelating the rate can eventually pull "alice is actively chatting" back out. The honest THREAT_MODEL row (§5#5) and §8.2 #3 / §8.3 #6 named the unbuilt stronger mode: **constant-rate**.
