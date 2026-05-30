@@ -41,10 +41,18 @@ ONYX_HUB_PASSPHRASE=demo-hub "$HUB" \
 HUB_PID=$!
 trap 'kill "$HUB_PID" 2>/dev/null || true' EXIT
 
-# Wait for the hub to print its identity pubkey.
+# Wait for the hub to print its identity pubkey. The `|| true` is
+# load-bearing under `set -e -o pipefail`: until the hub has actually
+# logged the line, `grep -o` finds nothing and exits 1; without the
+# guard, pipefail propagates that, the assignment "fails", set -e
+# silently exits the WHOLE script, the EXIT trap kills the hub mid-
+# Argon2 — and the operator sees the script disappear with an empty
+# hub log and no clue why. Bumped the wait from 9 s to 30 s while
+# here, because the M-1 vault hardening (Argon2 DEFAULT 256 MiB)
+# pushed vault unlock from ~0.3 s to ~4 s on first start.
 HUB_PUB=""
-for _ in $(seq 1 30); do
-  HUB_PUB="$(strip <"$WORK/hub/log" | grep -o 'hub_pub_b32=[a-z2-7]*' | head -1 | cut -d= -f2)"
+for _ in $(seq 1 100); do
+  HUB_PUB="$(strip <"$WORK/hub/log" | grep -o 'hub_pub_b32=[a-z2-7]*' | head -1 | cut -d= -f2 || true)"
   [ -n "$HUB_PUB" ] && break
   sleep 0.3
 done
