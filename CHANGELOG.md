@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — D-1 redone: privacy-by-default hub connections (supersedes the earlier opt-in)
+
+A re-audit correctly called the earlier `--ephemeral-noise-static` opt-in (the "D-1: ephemeral Noise static (opt-in)" entry further down) **theatre**: off by default, and even when on it still leaked the long-term identity to the hub because the signed SUBSCRIBE proof carried the long-term Ed25519 signing key (= fingerprint), the daemon still subscribed to `introduction_inbox(fp)`, and it still published a KeyPackage. The hub re-linked the user on every connection regardless. This entry supersedes that one.
+
+**Fix — one master switch, private by default:**
+
+  * **`Config.first_contact_reachable` (default `false` = private)** replaces the two split flags. CLI/env: `--first-contact-reachable` / `ONYX_FIRST_CONTACT_REACHABLE` on `onyx` + `onyxd`. Removed: `--ephemeral-noise-static`, `--no-intro-inbox-subscribe`.
+  * **Private mode (default)** closes all four §3.2 hub-linkage channels together: fresh per-connection **ephemeral Noise static** + fresh per-connection **ephemeral Ed25519 SUBSCRIBE-signing key** (the leak the opt-in missed — threaded through `run_hub_session` / `run_hub_session_tcp` / `serve_session` for incremental room-token subscribes too) + **no `introduction_inbox(fp)` subscription** + **no KeyPackage publish**. The hub cannot link the connection to the long-term identity. Rooms (session-token routed) and direct onion dials are unaffected; the long-term identity still drives the end-to-end sealed-sender layer inside Noise frames.
+  * **Reachable mode (`--first-contact-reachable`)** restores long-term Noise + long-term SUBSCRIBE signing + intro-inbox + KP publish for users who want first-contact discoverability via that hub, accepting hub-side linkage.
+
+**Adversarial test:** `rooms_e2e_private_mode_leaks_no_identity_to_hub` inspects the hub's `HubState` and asserts a private-mode daemon causes **zero KeyPackages** stored + intro inbox unknown, with a reachable-mode counter-check that a KP *does* land otherwise. This test caught a real bug mid-development: the first cut wired the ephemeral keys but **forgot to gate the KP publish + intro-inbox subscription** in both spawn paths, so the hub still saw the identity — the test failed (asserted 0 KPs, got 1) and the gating was completed before this entry is true.
+
+**Process note (honest):** during this work I pushed two intermediate commits (`a635f69`, `2fca203`) while the tree was in a broken/half-gated state — `a635f69` had the failing adversarial test, and `2fca203` didn't compile (dangling `ephemeral_noise_static` references). Both were fixed forward (`15c83fe` restores a clean build: 511 tests pass, clippy `-D warnings` + fmt clean). I should have verified each before pushing; the green-before-push discipline lapsed under the display issues and is restored.
+
+**Breaking (v0, acceptable):** the daemon is now private by default — users who relied on first-contact reachability via a hub must pass `--first-contact-reachable`.
+
+THREAT_MODEL §8.5 D-1 + ANONYMITY §3.2 updated to match. The earlier "ephemeral Noise static (opt-in)" entry below is left in place as the historical record of what was tried and why it was insufficient.
+
+---
+
 ## 2026-05-30 — T-2 batch: kill the misleading ✓, refuse v1 by default, daemon-side verify, pin cross-check, NEW-1/2/3
 
 Acting on a re-audit's correct finding that the previous T-2 ship was partial: signed invites caught partial tampering but the green "invite v2 signature verified ✓" UX *lied* about full-invite-MITM, the daemon trusted the CLI for signature verification, and three corner cases (v1 downgrade by path rewrite, attacker-chosen unbounded `exp`, junk-pin from raw-X25519 fallback) were live.
