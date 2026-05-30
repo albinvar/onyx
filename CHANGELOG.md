@@ -6,6 +6,20 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — A1.2: integration test proving run() actually invokes the clearnet guard
+
+The A1.2 clearnet guard shipped with only *unit* tests of the pure `clearnet_guard` classifier — nothing proved `run()` calls it. That exact gap let the wiring silently fail to apply for several commits (the daemon accepted clearnet transport with no acknowledgement while unit tests stayed green; `main` was even briefly non-compiling). This adds the missing integration test.
+
+- New `crates/onyx-daemon/tests/clearnet_guard.rs` (3 tests) driving the real `run()` entry point:
+  - `run_refuses_hub_tcp_without_ack` — `--hub-tcp` + no ack ⇒ `run()` returns `Err("REFUSING TO START … --hub-tcp")` **and the vault file is never created** (guard refuses before any side effect).
+  - `run_refuses_no_tor_without_ack` — same for `--no-tor`.
+  - `run_does_not_refuse_tor_only_config` — a Tor-only config is never hit by the guard.
+- A 10s `tokio::time::timeout` wraps `run()` so the test has real teeth: if the guard wiring is ever removed, `run()` falls through to serving the API forever and the test **times out** instead of passing.
+- **Mutation-verified:** neutering the guard's `Refuse` arm makes both refusal tests FAIL (timeout); restoring it makes all 3 pass. Confirmed, then reverted.
+- Adds `tempfile` as an `onyx-daemon` dev-dependency.
+
+Gate: `cargo test --workspace` = 518 passed / 0 failed (+3); clippy `-D warnings` 0/0; fmt clean.
+
 ## 2026-05-30 — A0.3 room-path fix: complete the key-changed send block (audit catch)
 
 A clean-room audit found that the original A0.3 commit (`0590c1f`) — which claimed to block sends to a key-changed (possibly-MITM'd) contact on **all four** send paths — had actually wired `pin_block` into only **two**: `Send` (DM text) and `SendFileToPeer`. The two **room** paths, `handle_send_room` and `handle_send_file_to_room`, had **no** check, so a key-changed member of a room was NOT blocked — contradicting the CHANGELOG/THREAT_MODEL text that said room paths "fail closed if any member is compromised." This was masked because A0.3 shipped with no integration test exercising the wiring (only the `is_pin_compromised` predicate was unit-tested).

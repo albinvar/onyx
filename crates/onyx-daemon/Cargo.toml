@@ -26,5 +26,10 @@ image = { workspace = true }
 # T-files.c: content-based MIME sniffing (FILES.md §3.3).
 infer = { workspace = true }
 
+[dev-dependencies]
+# A1.2 integration test: a throwaway vault path that's never actually
+# touched (the clearnet guard refuses before any vault side effect).
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
