@@ -696,6 +696,29 @@ impl Vault {
         Ok(out)
     }
 
+    /// A0.3: is the pinned contact for `fingerprint` flagged
+    /// `key_changed` (its identity key differs from what we pinned on
+    /// first contact — a possible MITM / rotation)? Single-row lookup
+    /// for the outbound-send block.
+    ///
+    /// Returns `Ok(false)` when there is no pin for this fingerprint
+    /// (nothing pinned yet ⇒ nothing compromised) AND when the pin
+    /// matches. Returns `Ok(true)` ONLY when a pin exists and is
+    /// flagged. Sends should refuse on `true`.
+    pub fn is_pin_compromised(&self, identity_id: i64, fingerprint: &str) -> Result<bool> {
+        let changed: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT key_changed FROM pinned_keys \
+                 WHERE identity_id = ? AND fingerprint = ?",
+                params![identity_id, fingerprint],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_db_err)?;
+        Ok(changed == Some(1))
+    }
+
     /// Load and decrypt the MLS state for `identity_id`, returning
     /// `None` if no row exists. The returned `Vec` is plaintext bytes
     /// suitable for [`crate::mls::MlsParty::from_identity_and_state`].
@@ -1363,6 +1386,29 @@ mod tests {
             v.pin_or_verify(id, fp, &orig, 3_000).unwrap(),
             PinOutcome::Match
         );
+    }
+
+    #[test]
+    fn is_pin_compromised_reflects_key_change() {
+        // A0.3: the send-block predicate. false when unpinned or
+        // matching; true only once a key change has been recorded.
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let fp = "fp_bob";
+
+        // Unpinned → not compromised (nothing to violate yet).
+        assert!(!v.is_pin_compromised(id, fp).unwrap());
+
+        // Pinned, matching → not compromised.
+        v.pin_or_verify(id, fp, &[1u8; 32], 1_000).unwrap();
+        assert!(!v.is_pin_compromised(id, fp).unwrap());
+
+        // A different key for the same fp → compromised (sends must block).
+        v.pin_or_verify(id, fp, &[2u8; 32], 2_000).unwrap();
+        assert!(v.is_pin_compromised(id, fp).unwrap());
+
+        // A different identity's fp is unaffected.
+        assert!(!v.is_pin_compromised(id, "fp_other").unwrap());
     }
 
     #[test]
