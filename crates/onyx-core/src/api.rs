@@ -743,6 +743,12 @@ pub enum MessageDirection {
 pub enum TorState {
     /// `--no-tor` was passed; the daemon is online but not anonymising.
     Disabled,
+    /// Arti is still bootstrapping onto the Tor network. `percent` is
+    /// the bootstrap progress 0..=100 from arti's `bootstrap_status()`.
+    /// The API server now comes up *before* bootstrap completes (so the
+    /// TUI can show a real progress bar), so a `Status` poll during
+    /// startup reports this instead of an unreachable socket.
+    Bootstrapping { percent: u8 },
     /// Arti is bootstrapped and the hidden service has been requested.
     Ready,
 }

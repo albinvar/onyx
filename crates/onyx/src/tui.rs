@@ -1247,6 +1247,7 @@ async fn open_settings_modal(app: &mut AppState) {
             "Tor".into(),
             match s.tor_state {
                 TorState::Ready => "ready".into(),
+                TorState::Bootstrapping { percent } => format!("bootstrapping {percent}%"),
                 TorState::Disabled => "disabled (test mode)".into(),
             },
         ));
@@ -2514,8 +2515,30 @@ fn render_daemon_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppSta
             Line::from(Span::styled("reconnecting…", theme::muted())),
         ],
         Some(Ok(s)) => {
+            // UX phase 5: while bootstrapping, the daemon box shows a
+            // real progress bar built from arti's reported percentage
+            // instead of the binary ready/off glyph.
+            if let TorState::Bootstrapping { percent } = s.tor_state {
+                let filled = (usize::from(percent) * 10 / 100).min(10);
+                let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
+                return frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(vec![
+                            Span::styled("◌ ", theme::warn()),
+                            Span::styled("bootstrapping tor", theme::warn()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled(bar, theme::warn()),
+                            Span::styled(format!(" {percent}%"), theme::muted()),
+                        ]),
+                    ])
+                    .block(block),
+                    area,
+                );
+            }
             let (glyph, label, style) = match s.tor_state {
                 TorState::Ready => ("◉", "tor ready", theme::ok()),
+                TorState::Bootstrapping { .. } => ("◌", "bootstrapping", theme::warn()),
                 TorState::Disabled => ("○", "tor off (clearnet)", theme::warn()),
             };
             let tail = if app.tail_active {
@@ -2865,6 +2888,9 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         Some(Ok(s)) => {
             let tor = match s.tor_state {
                 TorState::Ready => Span::styled("tor ready", theme::ok()),
+                TorState::Bootstrapping { percent } => {
+                    Span::styled(format!("tor bootstrapping {percent}%"), theme::warn())
+                }
                 TorState::Disabled => Span::styled("tor disabled", theme::warn()),
             };
             let live = if app.tail_active {
