@@ -262,6 +262,15 @@ enum ModalState {
     Settings {
         info: Vec<(String, String)>,
     },
+    /// UX overhaul phase 4: scrollable daemon-log overlay. Opens on
+    /// `Ctrl-L`. `lines` is a snapshot of the tail of ~/.onyx/onyx.log
+    /// captured when the modal opens; `scroll` is lines-from-bottom
+    /// (0 = newest pinned to the bottom). PgUp/PgDn/Home/End scroll;
+    /// Esc or any other key closes. Color-coded by log level.
+    Logs {
+        lines: Vec<String>,
+        scroll: u16,
+    },
 }
 
 /// UX overhaul: actions runnable from the command palette (`Ctrl-K`).
@@ -739,6 +748,15 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             });
             return false;
         }
+        // UX phase 4: Ctrl-L opens the daemon-log overlay (tail of
+        // ~/.onyx/onyx.log), color-coded by level + scrollable.
+        (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(ModalState::Logs {
+                lines: read_log_tail(500),
+                scroll: 0,
+            });
+            return false;
+        }
         // UX overhaul: Ctrl-E builds + shows + copies the invite link.
         (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
             open_invite_modal(app).await;
@@ -801,10 +819,41 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
     };
     let submit_intent: Option<ModalState>;
     match (&mut modal, key.code) {
-        // Esc closes any modal without submitting. Help + Invite are
-        // read-only overlays, so ANY key dismisses them too.
+        // UX phase 4: log-overlay scrolling. MUST precede the read-only
+        // close arm below, or those keys would dismiss the overlay
+        // instead of scrolling. `scroll` is lines-from-bottom; the
+        // render clamps an over-large value to the top.
+        (ModalState::Logs { scroll, .. }, KeyCode::PageUp) => {
+            *scroll = scroll.saturating_add(10);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::Logs { scroll, .. }, KeyCode::PageDown) => {
+            *scroll = scroll.saturating_sub(10);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::Logs { scroll, lines }, KeyCode::Home) => {
+            *scroll = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::Logs { scroll, .. }, KeyCode::End) => {
+            *scroll = 0;
+            app.modal = Some(modal);
+            return;
+        }
+        // Esc closes any modal without submitting. Help + Invite +
+        // Settings + Logs are read-only overlays, so ANY (non-scroll)
+        // key dismisses them too.
         (_, KeyCode::Esc)
-        | (ModalState::Help | ModalState::Invite { .. } | ModalState::Settings { .. }, _) => {
+        | (
+            ModalState::Help
+            | ModalState::Invite { .. }
+            | ModalState::Settings { .. }
+            | ModalState::Logs { .. },
+            _,
+        ) => {
             return;
         }
         // UX overhaul: command palette navigation + filtering.
@@ -1014,7 +1063,8 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             ModalState::Help
             | ModalState::CommandPalette { .. }
             | ModalState::Invite { .. }
-            | ModalState::Settings { .. } => None,
+            | ModalState::Settings { .. }
+            | ModalState::Logs { .. } => None,
         };
         if let Some(req) = req {
             match client::one_shot(&app.socket_path, &req).await {
@@ -1798,6 +1848,9 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         }
         ModalState::Invite { .. } => 11,
         ModalState::Settings { info } => u16::try_from(info.len() + 4).unwrap_or(14),
+        // UX phase 4: the log overlay takes most of the height — reading
+        // logs benefits from vertical room (capped at 30).
+        ModalState::Logs { .. } => area.height.saturating_sub(2).min(30),
     };
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -1975,7 +2028,76 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         }
         ModalState::Invite { url, copied } => render_invite_modal(frame, rect, url, *copied),
         ModalState::Settings { info } => render_settings_modal(frame, rect, info),
+        ModalState::Logs { lines, scroll } => render_logs_modal(frame, rect, lines, *scroll),
     }
+}
+
+/// UX overhaul phase 4: read the tail of the daemon log file
+/// (~/.onyx/onyx.log) for the `Ctrl-L` overlay. Returns up to `max`
+/// most-recent lines (oldest first). Best-effort: a missing/unreadable
+/// log yields an explanatory line rather than an error, since the
+/// overlay is a convenience, not a critical path.
+fn read_log_tail(max: usize) -> Vec<String> {
+    let path = onyx_daemon::default_data_dir().join("onyx.log");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(max);
+            let tail: Vec<String> = all[start..].iter().map(|s| (*s).to_string()).collect();
+            if tail.is_empty() {
+                vec![format!("(log is empty: {})", path.display())]
+            } else {
+                tail
+            }
+        }
+        Err(e) => vec![
+            format!("(could not read {}: {e})", path.display()),
+            "the daemon writes logs here only in TUI / combined mode.".to_string(),
+        ],
+    }
+}
+
+/// UX overhaul phase 4: render the scrollable, level-colored daemon-log
+/// overlay. `scroll` is lines-from-bottom (0 = newest pinned to the
+/// bottom edge). Lines are colored by the level token tracing emits.
+fn render_logs_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, lines: &[String], scroll: u16) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_active())
+        .title(Span::styled(
+            " daemon logs  (PgUp/PgDn scroll · Esc close) ",
+            theme::header(),
+        ));
+    let inner_h = rect.height.saturating_sub(2) as usize;
+
+    let styled: Vec<Line<'static>> = lines
+        .iter()
+        .map(|l| {
+            let style = if l.contains("ERROR") {
+                theme::error()
+            } else if l.contains("WARN") {
+                theme::warn()
+            } else if l.contains("DEBUG") || l.contains("TRACE") {
+                theme::muted()
+            } else if l.contains("INFO") {
+                theme::ok()
+            } else {
+                theme::text()
+            };
+            Line::from(Span::styled(l.clone(), style))
+        })
+        .collect();
+
+    // Bottom-anchored: show the last `inner_h` lines, offset up by
+    // `scroll`. Clamp so scrolling past the top just pins to the top.
+    let total = styled.len();
+    let max_scroll = total.saturating_sub(inner_h);
+    let scroll = (scroll as usize).min(max_scroll);
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(inner_h);
+    let view: Vec<Line<'static>> = styled[start..end].to_vec();
+
+    frame.render_widget(Paragraph::new(view).block(block), rect);
 }
 
 /// Task 324: read-only settings / identity panel.
