@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.10 — 2026-05-30 — TUI UX overhaul
+
+A user-facing polish release — the daemon/protocol code is unchanged from v0.1.9; this reworks the terminal UI and onboarding.
+
+**New look — "hacker green"**
+- Centralized theme (`crates/onyx/src/theme.rs`): one phosphor-green palette (green primary, cyan structure, amber attention, magenta security alerts, red errors), replacing ~117 hard-coded colours.
+- **Stacked left rail**: an ASCII Tor-onion logo + `O N Y X` wordmark at the top, the Peers & Rooms list in the middle, and a live **daemon-status box** at the bottom (Tor state · link health · version) — so you can see the auto-started daemon is alive at a glance.
+
+**Onboarding**
+- Branded first-run passphrase wizard: onion banner, coloured prompts, a non-blocking strength hint (weak/ok/strong), and a clear "no recovery" warning. (`onyx` with no subcommand still auto-starts the embedded daemon + TUI in one process — no separate `onyxd` needed.)
+
+**New in the TUI**
+- **`Ctrl-L`** — scrollable, colour-coded daemon-log overlay reading `~/.onyx/onyx.log` (ERROR red / WARN amber / INFO green); PgUp/PgDn/Home/End scroll, Esc closes.
+- **Tor bootstrap progress** scaffolding: a `TorState::Bootstrapping { percent }` state with a 10-cell progress bar in the daemon box and `tor bootstrapping NN%` in the status bar. (Rendering is live; wiring the daemon to *emit* the live percentage during startup is the next step — until then you see ready/off as before.)
+
+**Project hygiene**
+- Opt-in `pre-push` git hook (`scripts/git-hooks/`) mirroring CI (fmt + clippy `-D warnings` + test) so a red tree can't reach `main`. Enable with `git config core.hooksPath scripts/git-hooks`.
+- Earlier in the cycle: the post-v0.1.9 audit response (MED-1 identity-log demote, HS/private-mode doc fix) and the A1.3 vanguard-transcript automation in `real_tor_smoke.sh`.
+
+Gate: `cargo test --workspace` green; clippy `-D warnings` 0/0; fmt clean (enforced by both CI and the new pre-push hook).
+
 ## 2026-05-30 — audit response: MED-1 identity-log demote + HS/private-mode doc fix
 
 Response to the post-v0.1.9 comprehensive audit (no CRITICAL/HIGH found; prior fixes re-verified holding). Two safe, do-now items:
