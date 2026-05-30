@@ -6,6 +6,38 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — A0.3: block outbound sends to a key-changed (compromised) pin
+
+T-1 pins a peer's identity key on first contact and *warns* on a later change; the T-2 accept path *cross-checks* at first contact. Neither stopped **ongoing** sends to a contact whose key had since changed (possible MITM / key rotation). A0.3 closes that on **every send path**.
+
+- **`Vault::is_pin_compromised(identity_id, fingerprint)`** (commit `0207aac`): single-row predicate, `true` only when a pin exists AND its `key_changed` flag is set. Unit-tested (unpinned=false / match=false / post-change=true / other-fp=false).
+- **`api_server::pin_block(state, fingerprint)`** (commit `0590c1f`): shared async guard returning `Some(Error)` to refuse, `None` to proceed. Skips unverified `(peer/<x25519>)` placeholders (never pinned, T-3). **Fails OPEN** on a vault read error (with a `warn!`) — bricking all messaging on a transient DB hiccup is a worse failure than the residual; the key-change detection already happened at pin time.
+- **Wired into all four send paths**: `Send` (DM text), `SendRoom` (text), `SendFileToPeer`, `SendFileToRoom`. DM/file-to-peer use the conversation handle's fingerprint; room paths check **every** member and fail closed for the whole send if any one is compromised.
+- Refusal message points the user at `onyx contact list` + OOB verification.
+
+**Honest testing note:** the *predicate* is unit-tested; the four wiring sites are verified by code-read + compile + clippy, **not** by an integration test — forcing a `key_changed` state through the TCP smoke harness needs a pin-injection API that doesn't exist yet. An e2e is a tracked follow-up, not claimed done.
+
+Gate: `cargo test --workspace` = 519 passed (single-threaded); clippy `-D warnings` 0/0; fmt clean.
+
+## 2026-05-30 — A1.2: no-clearnet-leak guard (refuse accidental NO-TOR transport)
+
+Every plain-TCP transport (`--no-tor`, `--listen-tcp`, `--dial-tcp`, `--hub-tcp`) bypasses Tor and exposes the user's IP. Previously each only emitted a log `warn!` — easy to miss, so a `--hub-tcp` typed where `--hub` was meant would silently de-anonymize the user. (Commit `b8d4444`.)
+
+- **`Config.allow_clearnet`** + CLI `--allow-clearnet` / `ONYX_ALLOW_CLEARNET` on both `onyx` and `onyxd`. Default `false`.
+- **`lib.rs::clearnet_guard`** (pure, unit-tested): at the top of `run()` — before vault open / Tor bootstrap — the daemon **refuses to start** if any clearnet flag is set without `allow_clearnet`, naming the offending flags and pointing at `--hub` vs `--hub-tcp`. Acknowledged runs proceed with one unmissable "Tor is OFF, NO ANONYMITY, your IP is exposed" `warn!`.
+- Safe-by-default: losing anonymity now requires an explicit written opt-in. The smoke harness sets `allow_clearnet: true` deliberately.
+- Tests: `all_tor_when_no_clearnet_flags`, `refuses_clearnet_without_ack`, `acknowledged_clearnet_proceeds`.
+- Honest scope: a config guard against *accidental* clearnet selection; it cannot detect a Tor-layer leak within Tor mode (arti's responsibility).
+
+## 2026-05-30 — A1.3: enable + pin Full Tor vanguards (guard-discovery defense)
+
+Step 1 verified (not assumed): vanguards was **NOT** compiled into `onyxd` — `cargo tree` showed `tor-guardmgr` with no `vanguards` feature, so the published v3 HS ran with no L2/L3 guard-discovery protection. (Commit `d48b4a9`.)
+
+- **`Cargo.toml`:** added `"vanguards"` to `arti-client` features (+ `tor-guardmgr`/`tor-config` direct deps to name `VanguardMode`). Re-verified the graph flipped on. Without the feature `VanguardMode` collapses to `Disabled`-only, so naming `Full` wouldn't compile — a build-time tripwire.
+- **`tor.rs::build_tor_config`** (factored from `bootstrap_with`): builds `TorClientConfig` via the builder in BOTH branches (the old default branch used `TorClientConfig::default()`, which couldn't carry a pin) and sets `vanguards().mode(ExplicitOrAuto::Explicit(VanguardMode::Full))`. Explicit = hard pin so a hostile consensus can't silently downgrade. Startup `info!` logs the effective mode (config, not identity — D-3 safe).
+- Tests: `tor_config_pins_full_vanguards` (Full on both branches), `vanguards_feature_is_compiled_in` (CI tripwire).
+- **Honest framing:** vanguards SLOW guard discovery, they don't eliminate it; the private default (D-1, no HS) has near-zero surface, so A1.3 protects reachable-mode users; did NOT widen the entry-guard set. **Still owed (step 4):** a real-Tor transcript (`RUST_LOG=tor_guardmgr=debug,tor_circmgr=debug`) proving L2+L3 sets are used on live HS circuits — the config pin is unit-verified, live behaviour is not, so A1.3 is not "fully done" until that transcript exists.
+
 ## 2026-05-30 — A6.4: correct the onion≠identity overclaim (remove a false security claim)
 
 DESIGN.md §4.1 asserted, as present-tense fact, that a user's `.onion`

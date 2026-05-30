@@ -210,6 +210,24 @@ Each hub connection and each direct peer dial runs through its own **circuit-iso
 
 ---
 
+### 3.12 Guard-discovery defense — Full vanguards (A1.3) — in place (config-verified)
+
+A long-running onion service repeatedly builds circuits; an adversary who can correlate those circuits over time can mount a *guard-discovery* attack to learn the service's entry guard, then attack/coerce it to deanonymize the host. Tor's mitigation is **vanguards**: slow-rotating L2 (and, for HS, L3) guard layers that drastically raise the time/cost of discovering the guard.
+
+  * **What we do (A1.3):** the `vanguards` arti feature is compiled in (verified absent before this change — the HS previously ran with `VanguardMode::Disabled`), and `tor.rs::build_tor_config` **pins** the mode to `Full` via `ExplicitOrAuto::Explicit(VanguardMode::Full)` — an explicit pin so a hostile consensus can't silently downgrade us. Regression-tested (`tor_config_pins_full_vanguards`) + a compile tripwire (`vanguards_feature_is_compiled_in`).
+  * **Scope (honest):**
+    1. Vanguards **slow** guard discovery, they don't **eliminate** it.
+    2. The **private default** (D-1: no published HS, ephemeral keys) has near-zero guard-discovery surface — A1.3 matters for **reachable-mode** users who publish a v3 HS.
+    3. We did **not** widen the entry-guard set or add guards to outbound *client* circuits — Full is the whole-client mode arti exposes (general L2; HS additionally L3).
+    4. **Not unit-verifiable end-to-end.** The config pin is unit-tested; that L2+L3 guard sets are actually used on live HS circuits is confirmed only against real Tor (`RUST_LOG=tor_guardmgr=debug,tor_circmgr=debug`) — that transcript is still owed before calling A1.3 "fully done."
+
+### 3.13 No-clearnet-leak guard (A1.2) — in place
+
+Every transport that bypasses Tor is a test/dev mode: `--no-tor`, `--listen-tcp`, `--dial-tcp`, `--hub-tcp` (plain-TCP hub). The danger is silent: a user who types `--hub-tcp` where they meant `--hub` loses *all* anonymity (IP exposed) with nothing but a log `warn!` — easy to miss.
+
+  * **What we do (A1.2):** the daemon **refuses to start** if any clearnet flag is set unless the operator *explicitly acknowledges* it with `--allow-clearnet` (`ONYX_ALLOW_CLEARNET=1`). Safe-by-default — the only way to lose anonymity is to ask for it in writing. When acknowledged, a single unmissable startup `warn!` states "Tor is OFF, NO ANONYMITY, your IP is exposed." Decision logic is a pure, unit-tested function (`clearnet_guard`).
+  * **Scope (honest):** a *configuration* guard — it prevents accidentally entering a clearnet mode. It does not, and cannot, detect a Tor-layer bug that leaks clearnet *while in Tor mode* (arti's responsibility); the test/dev clearnet modes still exist by design (the smoke harness sets the ack deliberately).
+
 ## 4. Practical recommendations
 
 Match Onyx to your actual threat model. The right tool depends on which adversary you are realistically facing.
