@@ -1787,6 +1787,16 @@ async fn handle_send_file_to_room(
         .filter(|s| *s != our_fp)
         .map(str::to_owned)
         .collect();
+    // A0.3: same fail-closed rule as handle_send_room — a room file
+    // fans out to every member, so refuse the whole send if ANY
+    // member's pinned identity key has changed (possible MITM). Done
+    // BEFORE chunking/encrypting so we don't waste work on a send we
+    // will refuse. (`members` already excludes our own fingerprint.)
+    for member_fp in &members {
+        if let Some(block) = pin_block(state, member_fp).await {
+            return block;
+        }
+    }
     let total_members = u32::try_from(members.len()).unwrap_or(u32::MAX);
 
     // Encrypt each plaintext message through the room's MLS group
@@ -2314,6 +2324,20 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
+    // A0.3: a room message fans out to every member, so refuse the whole
+    // send if ANY member's pinned identity key has changed since first
+    // contact (possible MITM / key rotation) — fail closed rather than
+    // deliver to a peer we can no longer authenticate. The user clears
+    // the offending pin (`onyx contact list` flags it) before the room
+    // works again.
+    for member_fp in &members {
+        if member_fp == &our_fp {
+            continue;
+        }
+        if let Some(block) = pin_block(state, member_fp).await {
+            return block;
+        }
+    }
     // 2. Wrap the user-typed text in a structured RoomAppMessage
     //    (T6.3.h) so the plaintext format is forward-compatible
     //    with the KEM-advertisement variant. Then encrypt once in

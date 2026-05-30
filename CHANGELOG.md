@@ -6,6 +6,16 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — A0.3 room-path fix: complete the key-changed send block (audit catch)
+
+A clean-room audit found that the original A0.3 commit (`0590c1f`) — which claimed to block sends to a key-changed (possibly-MITM'd) contact on **all four** send paths — had actually wired `pin_block` into only **two**: `Send` (DM text) and `SendFileToPeer`. The two **room** paths, `handle_send_room` and `handle_send_file_to_room`, had **no** check, so a key-changed member of a room was NOT blocked — contradicting the CHANGELOG/THREAT_MODEL text that said room paths "fail closed if any member is compromised." This was masked because A0.3 shipped with no integration test exercising the wiring (only the `is_pin_compromised` predicate was unit-tested).
+
+- Added the per-member `pin_block` loop to **both** room handlers, before MLS encrypt/fan-out (so we don't do crypto work on a send we'll refuse). Both skip our own fingerprint and fail closed for the whole send if any member's pin is flagged.
+- `pin_block` count in `api_server.rs` is now 6 (4 call sites + def + the fail-open `warn!`), one per send path.
+- THREAT_MODEL T-1 row corrected to record the honest history + the still-owed integration test.
+
+Gate: `cargo build` rc 0; `cargo clippy --workspace --all-targets -D warnings` rc 0 / 0 errors; `cargo test --workspace` = 515 passed / 0 failed. **Still owed:** an integration test that drives a key-changed room send to refusal (a pin-injection harness) — the exact gap that hid this. Tracked.
+
 ## 2026-05-30 — H-2: stop trusting the forgeable gossip `seen_by` (anti-suppression)
 
 A federated (`--peer-hub`) gossip frame carried a `seen_by` = 16-byte hash of the last forwarding hub, and the receiver dropped any frame whose `seen_by` equalled its own hash ("immediate loop"). But `seen_by` is **attacker-chosen**: a hostile peer hub could set `seen_by = hash(victim_hub)`, causing the victim to silently drop a legitimate KeyPackage/envelope — targeted suppression / partition of the victim's clients.
