@@ -109,22 +109,19 @@ struct Args {
     #[arg(long, env = "ONYX_CONSTANT_RATE_MS")]
     constant_rate_ms: Option<u64>,
 
-    /// **D-1, anonymity opt-in.** Per-connection ephemeral X25519 as
-    /// the Noise XK static so the hub no longer learns the long-term
-    /// identity from the transport. Necessary but not sufficient for
-    /// §3.2 — compose with `--no-intro-inbox-subscribe` and avoid
-    /// publishing a KP on this connection for full closure (see
-    /// `ANONYMITY.md` §3.2).
-    #[arg(long, env = "ONYX_EPHEMERAL_NOISE_STATIC")]
-    ephemeral_noise_static: bool,
-
-    /// **Privacy opt-out.** Skip subscribing to your fingerprint-
-    /// derived introduction inbox on every configured hub. You
-    /// lose first-contact reachability via the hub. Rooms still
-    /// work (they route via per-(room, epoch) session tokens).
-    /// See `ROTATION.md` for the full analysis.
-    #[arg(long, env = "ONYX_NO_INTRO_INBOX_SUBSCRIBE")]
-    no_intro_inbox_subscribe: bool,
+    /// **D-1 — opt IN to first-contact reachability via the hub
+    /// (default OFF = private).** Single master switch. Off (default):
+    /// fresh per-connection ephemeral Noise static + ephemeral
+    /// SUBSCRIBE-signing key, no `introduction_inbox(fp)` subscription,
+    /// no KeyPackage publish — the hub cannot link the connection to
+    /// your long-term identity (existing rooms + direct onion dials
+    /// still work; you are just not reachable for first contact via
+    /// this hub). On: long-term keys + intro-inbox + KP publish, so
+    /// anyone with your fingerprint can reach you, at the cost of the
+    /// hub linking all your activity on it to you. See `ANONYMITY.md`
+    /// §3.2.
+    #[arg(long, env = "ONYX_FIRST_CONTACT_REACHABLE")]
+    first_contact_reachable: bool,
 }
 
 impl TryFrom<Args> for Config {
@@ -168,8 +165,7 @@ impl TryFrom<Args> for Config {
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,
             constant_rate_ms: a.constant_rate_ms,
-            ephemeral_noise_static: a.ephemeral_noise_static,
-            subscribe_intro_inbox: !a.no_intro_inbox_subscribe,
+            first_contact_reachable: a.first_contact_reachable,
         })
     }
 }

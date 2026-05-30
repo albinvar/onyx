@@ -169,6 +169,25 @@ where
     let handshake_hash = session.handshake_hash();
     info!("hub: Noise XK complete; sending SUBSCRIBE");
 
+    // D-1 (the real fix): generate an ephemeral Ed25519 signing key
+    // ALONGSIDE the ephemeral Noise static, and use it for the
+    // SUBSCRIBE proof. Without this, the previous "ephemeral" mode
+    // was theatre — the SUBSCRIBE proof shipped the long-term Ed25519
+    // public key (signer_pk), which IS the fingerprint (`crypto.rs`
+    // pins them to the same 32 bytes), so the hub re-linked the user
+    // on every connection. With this, the hub sees a fresh signer
+    // pubkey per session that is uncorrelated with the long-term id.
+    // HIGH-1 ownership-check still applies for KNOWN intro inboxes —
+    // but in privacy mode the caller (lib.rs) doesn't subscribe to
+    // any fp-derived inbox, only to per-(room, epoch) session tokens
+    // which are NOT known inboxes, so the check is a no-op.
+    let ephemeral_signing = if ephemeral_noise {
+        Some(SigningKey::generate())
+    } else {
+        None
+    };
+    let subscribe_signer: &SigningKey = ephemeral_signing.as_ref().unwrap_or(our_signing);
+
     // T-rotation.a: skip the SUBSCRIBE frame entirely when the
     // subscription list is empty. The hub would log a warn and
     // ignore it otherwise; that warn is now correct ("client
@@ -182,7 +201,7 @@ where
         write_subscribe(
             &mut stream,
             &mut session,
-            our_signing,
+            subscribe_signer,
             &handshake_hash,
             subscribe_to,
         )
@@ -205,7 +224,7 @@ where
     serve_session(
         &mut stream,
         &mut session,
-        our_signing,
+        subscribe_signer,
         &handshake_hash,
         outbound_rx,
         on_deliver,
@@ -264,11 +283,21 @@ where
         .map_err(|e| anyhow::anyhow!("hub-tcp Noise handshake failed: {e}"))?;
     let handshake_hash = session.handshake_hash();
 
+    // D-1: ephemeral SUBSCRIBE-signing key in privacy mode (mirrors
+    // run_hub_session). Without it the SUBSCRIBE proof would carry the
+    // long-term Ed25519 pubkey (= fingerprint).
+    let ephemeral_signing = if ephemeral_noise {
+        Some(SigningKey::generate())
+    } else {
+        None
+    };
+    let subscribe_signer: &SigningKey = ephemeral_signing.as_ref().unwrap_or(our_signing);
+
     if !subscribe_to.is_empty() {
         write_subscribe(
             &mut stream,
             &mut session,
-            our_signing,
+            subscribe_signer,
             &handshake_hash,
             subscribe_to,
         )
@@ -286,7 +315,7 @@ where
     serve_session(
         &mut stream,
         &mut session,
-        our_signing,
+        subscribe_signer,
         &handshake_hash,
         outbound_rx,
         on_deliver,
@@ -421,7 +450,12 @@ where
 async fn serve_session<S, F, Fut>(
     stream: &mut S,
     session: &mut Session,
-    our_signing: &SigningKey,
+    // D-1: the key used to sign mid-session incremental SUBSCRIBE
+    // frames (room session-token joins). In privacy mode this is the
+    // per-connection EPHEMERAL signing key, NOT the long-term identity
+    // key — so a room join after connect doesn't re-leak the
+    // fingerprint the way the initial SUBSCRIBE no longer does.
+    subscribe_signer: &SigningKey,
     handshake_hash: &[u8; 32],
     outbound_rx: &mut mpsc::Receiver<HubOutbound>,
     mut on_deliver: F,
@@ -533,7 +567,7 @@ where
                         write_incremental_subscribe(
                             stream,
                             session,
-                            our_signing,
+                            subscribe_signer,
                             handshake_hash,
                             &ids,
                         )

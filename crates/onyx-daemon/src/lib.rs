@@ -138,115 +138,33 @@ pub struct HubConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vault: PathBuf,
-    /// Vault passphrase. Wrapped in [`Zeroizing`] so the bytes get
-    /// scrubbed when the Config (or any clone of it) is dropped —
-    /// not just deallocated. T-zeroize-audit.
     pub passphrase: Zeroizing<String>,
     pub no_tor: bool,
     pub tor_state_dir: Option<PathBuf>,
     pub dial_onion: Option<String>,
     pub dial_pubkey: Option<String>,
     pub api_socket: String,
-    /// Zero or more hubs the daemon should connect to. Empty list ==
-    /// no hub-relayed messaging (only direct peer-to-peer dials).
-    /// Multiple entries == publish-to-all-subscribe-to-all multi-hub
-    /// mode (T8.1+). The recipient's `EnvelopeReplayGuard` handles
-    /// the resulting duplicates transparently.
     pub hubs: Vec<HubConfig>,
-    /// **TEST-ONLY.** Same shape as `hubs` but the daemon dials the
-    /// hub over plain TCP instead of Tor. Used by the smoke harness
-    /// in `crates/onyx-daemon/tests/rooms_smoke.rs`. Each entry is
-    /// the (addr_with_port, base32_pubkey) of a hub running with
-    /// `--listen-tcp`. No Tor, no anonymity.
     pub hub_tcp_addrs: Vec<HubConfig>,
     pub listen_tcp: Option<String>,
     pub dial_tcp: Option<String>,
-    /// T-cover.3: mean interval (in seconds) between client → hub
-    /// FRAME_PAD cover-traffic frames, on each configured hub.
-    /// `None` disables (the v0 default — opt-in until real-Tor
-    /// smoke verifies the cadence doesn't itself leak).
-    ///
-    /// Honest framing: cover traffic raises a hub-watching
-    /// adversary's cost to fingerprint "alice is actively chatting
-    /// vs idling" by injecting indistinguishable PAD frames at
-    /// exponentially-distributed (Poisson-process) intervals. It
-    /// does NOT defeat a sophisticated traffic-analysis adversary
-    /// — see `ANONYMITY.md` §3.1 for the full caveat. Mean values
-    /// below 5s burn bandwidth without proportional gain; values
-    /// above 60s mean the gap between cover frames is long enough
-    /// that real-traffic bursts still stand out.
     pub cover_traffic_mean_secs: Option<u64>,
-    /// T-cover.const ("high mode"): when `Some(ms)`, route **all**
-    /// client → hub outbound through a constant-rate pacer that emits
-    /// exactly one frame every `ms` milliseconds — a queued real frame
-    /// if one is ready at the slot boundary, otherwise a `FRAME_PAD`.
-    ///
-    /// Unlike the Poisson [`cover_traffic_mean_secs`] emitter (which
-    /// adds dummy frames *on top of* real traffic, so real bursts
-    /// still ride above the noise floor), constant-rate makes the
-    /// observable upstream cadence **invariant**: a hub-watching
-    /// observer sees one frame per slot whether you are actively
-    /// chatting or idle, so the inter-frame timing distribution no
-    /// longer distinguishes the two.
-    ///
-    /// **Honest scope.** This covers the **client → hub (upstream)**
-    /// direction only. The hub → client (downstream) direction still
-    /// uses the hub's own (Poisson) cover, so the full bidirectional
-    /// guarantee also needs a constant-rate hub. It is per-connection
-    /// and does NOT defeat a global adversary correlating Tor entry/
-    /// exit, nor TCP open/close ("alice connected") events. It costs
-    /// up to one slot of added latency on every real frame plus a
-    /// steady `bucket::SMALL`/slot of bandwidth. Mutually exclusive
-    /// with [`cover_traffic_mean_secs`]. See `ANONYMITY.md` §3.1.
     pub constant_rate_ms: Option<u64>,
-    /// D-1 (`--ephemeral-noise-static`): when `true`, the daemon's
-    /// **Noise XK static key** to the hub is a freshly-generated
-    /// X25519 keypair on every handshake — the hub no longer learns
-    /// the long-term identity X25519 from the Noise layer. The
-    /// long-term identity is still used by HIGH-2 sealed-sender
-    /// envelopes (which run end-to-end *inside* Noise frames), so DMs
-    /// and rooms keep working; only the transport identifier changes.
-    ///
-    /// **Necessary but not sufficient for §3.2.** The hub still
-    /// learns your identity through (a) `SUBSCRIBE` to
-    /// `introduction_inbox(fp)` and (b) `FRAME_KP_PUBLISH` — see
-    /// `ANONYMITY.md` §3.2. To actually close §3.2 you need to
-    /// compose ephemeral Noise with `--no-intro-inbox-subscribe`
-    /// AND not publish a KP on this connection. Useful profile:
-    /// "I'm in established rooms only, never accepting first contact
-    /// via this hub" — the hub then cannot identify you on this
-    /// connection at all.
-    ///
-    /// **Trade-off.** The per-static-key rate limiter (HIGH-3,
-    /// `--max-frames-per-minute` on the hub) becomes effectively
-    /// per-connection in this mode — a reconnect gets a fresh
-    /// bucket. The user accepts this for the anonymity gain; per-
-    /// connection frame caps still bound resource use.
-    pub ephemeral_noise_static: bool,
-    /// T-rotation.a: when `true` (the v0 default), the daemon
-    /// subscribes to its own `introduction_inbox(fingerprint)` on
-    /// every configured hub so it can receive first-contact
-    /// envelopes (msg/v1, mls/v1 bootstraps).
-    ///
-    /// When `false`, the daemon skips that subscription — it can
-    /// still **send** first-contact envelopes and still receives
-    /// in-room messages (which route via T6.3.g per-(room, epoch)
-    /// session tokens, NOT via intro_inbox), but anyone trying to
-    /// reach this identity for the first time over the hub will
-    /// have their envelope queued indefinitely.
-    ///
-    /// **Privacy trade.** The hub-watching adversary loses one
-    /// observable: "alice is subscribed to introduction_inbox of
-    /// fingerprint F." That subscription, by itself, was a strong
-    /// "alice is online" signal (the routing id is fingerprint-
-    /// derived; anyone with alice's fingerprint can probe it). See
-    /// `ROTATION.md` for the full structural analysis of what this
-    /// closes and what remains.
-    ///
-    /// This is an OPT-OUT for users who've established all their
-    /// peer relationships and prefer maximum unlinkability over
-    /// first-contact reachability.
-    pub subscribe_intro_inbox: bool,
+    /// D-1: single master switch for the hub-linkage / first-contact
+    /// reachability trade. **Default `false` = private.** When false,
+    /// the daemon uses a fresh per-connection ephemeral Noise static
+    /// AND ephemeral SUBSCRIBE-signing key, does NOT subscribe to
+    /// `introduction_inbox(fp)`, and does NOT publish a KeyPackage —
+    /// so the hub cannot link the connection to the long-term
+    /// identity (existing rooms still work via session tokens; direct
+    /// onion dials still work; you are just not reachable for *first
+    /// contact* via this hub). When true, restores the pre-D-1
+    /// behaviour (long-term Noise + signing + intro-inbox + KP),
+    /// making you reachable but linkable. The long-term identity is
+    /// ALWAYS used by the end-to-end sealed-sender layer (HIGH-2),
+    /// which runs inside Noise frames, so peer authentication is
+    /// unaffected. See ANONYMITY.md §3.2.
+    pub first_contact_reachable: bool,
 }
 
 /// Bundle of state every handler needs.
@@ -625,8 +543,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         &args.hub_tcp_addrs,
         tor_hub_count,
         args.cover_traffic_mean_secs,
-        args.subscribe_intro_inbox,
-        args.ephemeral_noise_static,
+        args.first_contact_reachable,
+        !args.first_contact_reachable,
         &mut hub_tcp_rxs,
     ) {
         warn!(error = %e, "failed to spawn TCP-hub tasks; continuing without them");
@@ -755,8 +673,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             let our_signing_bytes_task = our_signing_bytes.clone();
             let mut outbound_rx = hub_tor_rxs.remove(0);
             let host = host.clone();
-            let subscribe_intro_inbox_task = args.subscribe_intro_inbox;
-            let ephemeral_noise_static = args.ephemeral_noise_static;
+            let subscribe_intro_inbox_task = args.first_contact_reachable;
+            let ephemeral_noise_static = !args.first_contact_reachable;
             let span = info_span!("hub", idx, host = %host, port);
 
             hub_tasks.push(tokio::spawn(async move {
