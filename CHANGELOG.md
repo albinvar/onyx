@@ -6,6 +6,17 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — H-2: stop trusting the forgeable gossip `seen_by` (anti-suppression)
+
+A federated (`--peer-hub`) gossip frame carried a `seen_by` = 16-byte hash of the last forwarding hub, and the receiver dropped any frame whose `seen_by` equalled its own hash ("immediate loop"). But `seen_by` is **attacker-chosen**: a hostile peer hub could set `seen_by = hash(victim_hub)`, causing the victim to silently drop a legitimate KeyPackage/envelope — targeted suppression / partition of the victim's clients.
+
+- **Fix:** `handle_gossip_publish` / `handle_gossip_deliver` no longer branch on `seen_by` at all. That check never caught a real loop anyway — the genuine immediate forwarder is the **Noise-authenticated `source_pubkey`** (always a remote peer, so it could never equal our own hash). Loop bounding is the TTL (depth ≤ `GOSSIP_TTL_DEFAULT`) + the source-skip on re-fanout, neither of which trusts `seen_by`.
+- Removed the now-dead `HubState::self_hub_hash_for_test` accessor (its only callers were the two deleted drop checks — proof the checks are gone, since the crate would not compile otherwise).
+- **Test:** the old `gossip_publish_self_seen_by_drops` (which asserted the vulnerable drop) is replaced by `gossip_publish_forged_self_seen_by_is_not_dropped`, asserting a frame with `seen_by = hash(us)` is now **accepted + re-fanned-out**.
+- **Residual (cleanliness, not security):** the now-inert `seen_by` field is still on the gossip wire format (written, read by nothing). Removing it from `GossipFrame` is a tracked follow-up wire-format change — deliberately deferred rather than bundled here.
+
+Gate: `cargo test -p onyx-hub` = 100 passed / 0 failed; clippy `-D warnings` 0/0; fmt clean. Docs: THREAT_MODEL H-2 row + §8.5 update.
+
 ## 2026-05-30 — A0.3: block outbound sends to a key-changed (compromised) pin
 
 T-1 pins a peer's identity key on first contact and *warns* on a later change; the T-2 accept path *cross-checks* at first contact. Neither stopped **ongoing** sends to a contact whose key had since changed (possible MITM / key rotation). A0.3 closes that on **every send path**.

@@ -197,16 +197,17 @@ async fn handle_gossip_publish(
         return;
     };
 
-    // Loop check. If the sender claims a `seen_by` that equals our
-    // own hub hash, this frame has already traversed us — dropping
-    // is the correct behaviour (avoids amplification storms).
-    {
-        let s = state.lock().await;
-        if frame.seen_by == s.self_hub_hash_for_test() {
-            tracing::debug!("hub: gossip loop detected (seen_by == our hash); dropping");
-            return;
-        }
-    }
+    // H-2: we intentionally do NOT drop on `frame.seen_by`. That field
+    // is attacker-chosen (any peer can set it to any value) and gating a
+    // DROP on it is a targeted-suppression vector: a hostile peer hub
+    // sends us a frame with `seen_by = hash(us)` and we'd silently drop a
+    // legitimate KeyPackage, censoring it for all of our clients. The
+    // check also never caught a real loop: the genuine "last forwarder"
+    // is the Noise-authenticated `source_pubkey`, which is always a
+    // remote peer and so could never equal our own hash. Real loops are
+    // bounded by the TTL (depth) and the source-skip on re-fanout
+    // (no immediate bounce-back) below — neither of which trusts
+    // `seen_by`. See THREAT_MODEL H-2.
 
     // Per T7.3-sec: the KP's embedded Ed25519 signing key MUST
     // derive the claimed routing id. Same ownership check we apply
@@ -290,15 +291,12 @@ async fn handle_gossip_deliver(
         return;
     };
 
-    // Loop check: dropping a frame we already forwarded keeps the
-    // mesh from amplifying. Same logic as the KP path.
-    {
-        let s = state.lock().await;
-        if frame.seen_by == s.self_hub_hash_for_test() {
-            tracing::debug!("hub: gossip envelope loop detected; dropping");
-            return;
-        }
-    }
+    // H-2: as in the KP path, we do NOT drop on `frame.seen_by` — it is
+    // attacker-chosen and gating a drop on it lets a hostile peer
+    // suppress a recipient's envelopes by forging `seen_by = hash(us)`.
+    // Loop bounding is the TTL + source-skip on re-fanout below; the
+    // genuine immediate forwarder is the Noise-authenticated
+    // `source_pubkey`, not the self-asserted `seen_by`. See THREAT_MODEL H-2.
 
     // Deliver locally. The deliver() method tries live subscribers
     // first; falls back to queueing when none accept. We bypass
@@ -1540,18 +1538,26 @@ mod tests {
         (kp, rid)
     }
 
-    /// T8.3.d: a gossip frame whose `seen_by` equals our own hub
-    /// hash is dropped silently — no local store, no re-fanout.
-    /// Defends against an immediate-loop attack.
+    /// H-2: a gossip frame whose `seen_by` is forged to equal our own
+    /// hub hash must NOT be dropped. Pre-H-2 the hub dropped such a
+    /// frame as an "immediate loop", which let any hostile peer suppress
+    /// a legitimate KeyPackage (and thus first-contact reachability) for
+    /// every client on the victim hub simply by setting
+    /// `seen_by = hash(victim)`. The fix: ignore the attacker-controlled
+    /// `seen_by` entirely. This test asserts the frame is now ACCEPTED
+    /// (stored locally + re-fanned-out to the other peers), proving the
+    /// suppression vector is closed. Real loop bounding is TTL +
+    /// source-skip, exercised by the tests below.
     #[tokio::test]
-    async fn gossip_publish_self_seen_by_drops() {
+    async fn gossip_publish_forged_self_seen_by_is_not_dropped() {
         use onyx_core::wire::{GOSSIP_TTL_DEFAULT, GossipFrame};
         let our_hash = [0xAA; 16];
         let (state, mut peer_rxs) = fed_state(our_hash, 2);
         let state = Arc::new(Mutex::new(state));
 
         let (kp_bytes, rid) = fresh_kp_and_routing_id();
-        // Forge a frame as if WE had already sent it (seen_by = us).
+        // Attacker forges `seen_by = our hash` to try to trigger the old
+        // self-loop drop and suppress this KeyPackage.
         let frame = GossipFrame {
             ttl: GOSSIP_TTL_DEFAULT,
             seen_by: our_hash,
@@ -1560,20 +1566,25 @@ mod tests {
         };
         let payload = frame.encode();
 
-        // Source pubkey can be anything; we won't reach the re-fanout.
+        // Source is a real (distinct) peer, as it always is post-Noise.
         let source_pk = [0x99; 32];
         handle_gossip_publish(&payload, &state, &source_pk).await;
 
-        // Nothing should have been stored locally.
+        // The KP MUST have been accepted locally (not suppressed).
         {
             let s = state.lock().await;
-            assert_eq!(s.keypackage_count(), 0, "loop drop must skip local store");
+            assert_eq!(
+                s.keypackage_count(),
+                1,
+                "forged seen_by must NOT suppress a valid KeyPackage (H-2)"
+            );
         }
-        // No peer channel received a re-fanout.
+        // And it MUST be re-fanned-out to the (non-source) peers — the
+        // frame is not treated as a loop.
         for (_pk, rx) in &mut peer_rxs {
             assert!(
-                rx.try_recv().is_err(),
-                "loop drop must NOT trigger re-fanout"
+                rx.try_recv().is_ok(),
+                "forged seen_by must NOT prevent re-fanout (H-2)"
             );
         }
     }
