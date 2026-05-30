@@ -373,6 +373,9 @@ enum ClearnetDecision {
 
 /// A1.2: classify a run as Tor-protected, acknowledged-clearnet, or
 /// refuse. Pure so it's unit-testable without standing up `run()`.
+// A1.2: four transport bools + the ack flag; a struct wrapper would
+// only obscure the (already pure, unit-tested) call site.
+#[allow(clippy::fn_params_excessive_bools)]
 fn clearnet_guard(
     no_tor: bool,
     listen_tcp: bool,
@@ -400,7 +403,42 @@ fn clearnet_guard(
     }
 }
 
+// Main daemon orchestration entry point; long by nature (consistent
+// with the other #[allow(too_many_lines)] functions in this file).
+#[allow(clippy::too_many_lines)]
 pub async fn run(args: Config) -> anyhow::Result<()> {
+    // ── A1.2: no-clearnet-leak guard ────────────────────────────────────
+    // Refuse to start ANY clearnet (non-Tor) transport unless the operator
+    // explicitly acknowledged it. Runs FIRST — before vault open / Tor
+    // bootstrap / any side effect — so a mistyped `--hub-tcp` (for `--hub`)
+    // can't silently expose the user's IP. Safe-by-default: losing
+    // anonymity requires an explicit written opt-in. See THREAT_MODEL A1.2.
+    match clearnet_guard(
+        args.no_tor,
+        args.listen_tcp.is_some(),
+        args.dial_tcp.is_some(),
+        !args.hub_tcp_addrs.is_empty(),
+        args.allow_clearnet,
+    ) {
+        ClearnetDecision::AllTor => {}
+        ClearnetDecision::AcknowledgedClearnet(modes) => {
+            warn!(
+                modes = %modes,
+                "CLEARNET MODE ACKNOWLEDGED (--allow-clearnet): Tor is OFF, there is NO \
+                 ANONYMITY, your IP is exposed. Test/dev only."
+            );
+        }
+        ClearnetDecision::Refuse(modes) => {
+            anyhow::bail!(
+                "REFUSING TO START: clearnet transport requested ({modes}) but not \
+                 acknowledged. These modes disable Tor and ALL anonymity — your IP is \
+                 exposed. If this is a deliberate test/dev run, re-launch with \
+                 --allow-clearnet (ONYX_ALLOW_CLEARNET=1). If you meant to use Tor, drop \
+                 the flag(s) above (e.g. use --hub, not --hub-tcp)."
+            );
+        }
+    }
+
     // ── Ensure parent directories exist (vault + socket) ────────────────
     // Default paths live under ~/.onyx/; create that with mode 0700 so
     // the on-disk vault + UDS aren't world-accessible. If the user
