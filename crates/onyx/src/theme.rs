@@ -16,6 +16,15 @@
 //! Everything here is `const fn` or returns `Style`, so it's zero-cost
 //! and usable in `const` contexts where helpful.
 
+// Phase 1 of a multi-phase UX overhaul: this module defines the full
+// palette + semantic helpers up front, but the later phases (left-rail
+// restructure, onboarding, log panel) wire most of them in. Allow
+// not-yet-used items here so each phase stays a clean, green commit
+// rather than forcing the whole overhaul into one. Every item is
+// exercised by the time the overhaul lands; the unit tests below already
+// touch the core ones.
+#![allow(dead_code)]
+
 use ratatui::style::{Color, Modifier, Style};
 
 // ── Raw palette ─────────────────────────────────────────────────────────
@@ -171,10 +180,10 @@ pub fn selection() -> Style {
 /// line below the art carries the brand if the art is clipped.
 pub const ONION_ART: &[&str] = &[
     r#"   .-"""""-.   "#,
-    r#"  / _     _ \  "#,
-    r#" |  o)   (o  | "#,
-    r#"  \   ._.   /  "#,
-    r#"   '-.....-'   "#,
+    "  / _     _ \\  ",
+    " |  o)   (o  | ",
+    "  \\   ._.   /  ",
+    "   '-.....-'   ",
 ];
 
 /// The wordmark shown under the onion art.
