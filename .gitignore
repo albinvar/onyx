@@ -14,3 +14,5 @@ demo/
 onyx-state.db
 onyx-hub.db
 onyxd.sock
+# Local agent state (Claude Code scheduling lock, etc.) — never project code.
+.claude/
