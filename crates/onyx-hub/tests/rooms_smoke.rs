@@ -604,29 +604,21 @@ async fn rooms_e2e_hub_cover_traffic_does_not_break_flow() {
     assert_eq!(event, "hello despite cover traffic");
 }
 
-/// T-rotation.a: pins the privacy/reachability trade of
-/// `--no-intro-inbox-subscribe`. Bob runs with the opt-out — his
-/// daemon publishes his KP to the hub directory (so senders can
-/// find him) but does NOT subscribe to `introduction_inbox(bob_fp)`.
-/// Alice tries first-contact via `SendBootstrapMls`; her envelope
-/// goes to bob's intro_inbox, the hub QUEUES it (no live subscriber),
-/// and bob doesn't see it on his tail.
+/// D-1: a daemon in the default **private** mode
+/// (`first_contact_reachable = false`) is, by design, **unreachable
+/// for first contact via the hub** — it publishes no KeyPackage, so a
+/// peer cannot fetch the KP needed to bootstrap an MLS group with it.
+/// That is the deliberate tradeoff for hub-unlinkability: the hub
+/// never sees the private daemon's identity, and the cost is
+/// first-contact discoverability (the user opts back in with
+/// `--first-contact-reachable`).
 ///
-/// **Then** bob reconnects with `subscribe_intro_inbox = true` (the
-/// default) — simulating "I went online for first-contact." His
-/// next hub session SUBSCRIBES to intro_inbox, which drains the
-/// queued envelope. Bob's daemon processes it; the room appears
-/// in his ListRooms.
-///
-/// This proves:
-///   * Opt-out blocks live first-contact (the queue grows).
-///   * Hub durably queues by routing_id regardless of subscription
-///     state (existing T8.0 property, but the new opt-out makes it
-///     load-bearing for the operator's flow).
-///   * Switching back to subscribe restores reachability without
-///     losing the queued messages.
+/// Replaces the old `rooms_e2e_no_intro_inbox_opt_out_queues_first_contact`,
+/// whose premise — "the opt-out daemon still publishes its KP, so the
+/// envelope merely queues until it resubscribes" — is exactly what D-1
+/// removed: private mode now publishes nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn rooms_e2e_no_intro_inbox_opt_out_queues_first_contact() {
+async fn rooms_e2e_private_mode_unreachable_for_first_contact() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
         .with_test_writer()
@@ -634,98 +626,41 @@ async fn rooms_e2e_no_intro_inbox_opt_out_queues_first_contact() {
 
     let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
     let (alice_sock, _alice_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "alice_ni").await;
-    // Bob with the opt-out.
+    // Bob in the default PRIVATE mode (first_contact_reachable = false).
     let (bob_sock, bob_dir) =
         spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_ni", false, None).await;
 
     let _ = one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
     let bob_id = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob ready").await;
-    let (bob_fp, bob_kem_b32) = match bob_id {
-        ApiResponse::IdentityOk {
-            fingerprint,
-            identity_kem_pub_b32,
-            ..
-        } => (fingerprint, identity_kem_pub_b32),
+    let bob_fp = match bob_id {
+        ApiResponse::IdentityOk { fingerprint, .. } => fingerprint,
         other => panic!("bob Identity: {other:?}"),
     };
 
-    // alice can still find bob in the directory because his daemon
-    // publishes its KP regardless of subscription state.
-    let bob_kp_b64 = match one_shot_until_ok(
+    // Give bob's hub session time to connect and (not) publish.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // alice tries to fetch bob's KP. Private-mode bob published none,
+    // so the hub directory has nothing -> the daemon returns an error.
+    // Use `one_shot` (single attempt) because we EXPECT failure;
+    // `one_shot_until_ok` would spin to the harness timeout.
+    let resp = one_shot(
         &alice_sock,
         &ApiRequest::FetchPeerKeyPackage {
             peer_fingerprint: bob_fp.clone(),
         },
-        "alice fetch bob KP",
     )
-    .await
-    {
-        ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
-        other => panic!("fetch bob KP: {other:?}"),
-    };
-
-    // alice's bootstrap envelope: should be queued at the hub
-    // because bob isn't subscribed to his intro_inbox. The send
-    // succeeds (hub accepts the DELIVER) — but bob doesn't see it
-    // live. Subscribe to bob's tail first so we can prove no
-    // EventMessage arrives during the queueing window.
-    let mut bob_tail = open_tail(&bob_sock).await;
-    match one_shot(
-        &alice_sock,
-        &ApiRequest::SendBootstrapMls {
-            peer_fingerprint: bob_fp.clone(),
-            peer_kem_pub_b32: bob_kem_b32.clone(),
-            peer_kp_b64: bob_kp_b64,
-            initial_text: Some("hi from alice".to_string()),
-        },
-    )
-    .await
-    {
-        ApiResponse::SendBootstrapMlsOk { .. } => {}
-        other => panic!("SendBootstrapMls: {other:?}"),
+    .await;
+    match resp {
+        ApiResponse::Error { .. } => { /* expected: no KP published in private mode */ }
+        ApiResponse::FetchPeerKeyPackageOk { .. } => panic!(
+            "private-mode bob must NOT be reachable for first contact — his KP \
+             should not be in the hub directory, but the fetch succeeded"
+        ),
+        other => panic!("unexpected FetchPeerKeyPackage response: {other:?}"),
     }
 
-    // Wait briefly to give the hub a chance to deliver if it could
-    // — it can't (bob isn't subscribed) but we want to be sure the
-    // negative assertion isn't just a timing artifact.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    // Poll bob's tail: nothing should arrive. We do a non-blocking
-    // peek by racing against a short timeout.
-    let nothing = tokio::time::timeout(Duration::from_millis(300), async {
-        let mut buf = String::new();
-        let _ = bob_tail.read_line(&mut buf).await;
-        buf
-    })
-    .await;
-    assert!(
-        nothing.is_err() || nothing.as_ref().unwrap().trim().is_empty(),
-        "bob with opt-out should NOT have received the bootstrap envelope live; got: {nothing:?}"
-    );
-
-    // ── Now bob "switches back on" — kill his current daemon,
-    //    start a new one against the SAME vault with the default
-    //    subscribe_intro_inbox = true. The hub still has the
-    //    envelope queued under his intro_inbox routing id.
-    drop(bob_tail);
-    // Daemon is still running in the background — for this test
-    // we'll just spawn a SECOND daemon against the same vault dir
-    // and have it open a connection. Both can't subscribe to the
-    // same intro_inbox cleanly (hub would queue + replay), so the
-    // proper test is: start a fresh "bob_on" daemon on a fresh
-    // vault that mimics what bob would do after toggling.
-    //
-    // For simplicity here, we spawn an entirely new daemon with
-    // the same fingerprint isn't possible (vault is fingerprint-
-    // tied), so we test the milder property: a NEW client that
-    // happens to subscribe to bob's intro_inbox would receive the
-    // queued envelope. We exercise this via alice opening a tail
-    // and just asserting the hub DID accept the envelope (which we
-    // already saw in the SendBootstrapMlsOk response).
     let _bob_dir = bob_dir; // keep tempdir alive
-    // The full "toggle" round-trip is hard to express without
-    // restarting the daemon process — left as an operator drill
-    // for now. The two key properties (opt-out blocks live
-    // delivery; hub queues the envelope) are pinned above.
 }
 
 /// T-files.d end-to-end: alice creates a room, invites bob,
@@ -1399,9 +1334,9 @@ async fn rooms_e2e_private_mode_leaks_no_identity_to_hub() {
     // Sanity counter-check: a REACHABLE daemon DOES publish a KP, so
     // the same hub then sees exactly one. Proves the assertion above
     // is testing the mode, not a dead code path.
-    let (_bob_sock, _bob_dir) =
+    let (bob_sock, _bob_dir) =
         spawn_daemon_with_opts(&hub_addr, &hub_pub_b32, "bob_reach", true, None).await;
-    let _ = one_shot_until_ok(&_bob_sock, &ApiRequest::Identity, "bob_reach ready").await;
+    let _ = one_shot_until_ok(&bob_sock, &ApiRequest::Identity, "bob_reach ready").await;
     // Poll up to ~6s for the KP to land (KP publish happens on hub
     // session connect, which races daemon startup).
     let mut saw_kp = false;
