@@ -6,6 +6,38 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — A6.4: correct the onion≠identity overclaim (remove a false security claim)
+
+DESIGN.md §4.1 asserted, as present-tense fact, that a user's `.onion`
+address and their fingerprint are "mathematically equivalent" (onion
+derived from the signing key). **That is not true today** — the code
+(`tor.rs::publish_hidden_service`) uses `OnionServiceConfigBuilder::default()`,
+so Arti generates a random, keystore-managed HS key with no link to the
+identity. A user who trusted the doc could have authenticated a peer by
+onion address — a real false-assurance bug, the most dangerous kind for
+this project.
+
+Corrected the claim everywhere it appeared, with an explicit "do NOT
+authenticate by onion; verify the fingerprint" warning:
+  * DESIGN.md §4.1 (the source claim) — now flagged ⚠ NOT IMPLEMENTED.
+  * ANONYMITY.md §2 capability table (the "your address *is* the onion
+    key" row).
+  * `tor.rs::publish_hidden_service` doc-comment (so the next code
+    reader sees the truth + the security consequence).
+  * THREAT_MODEL.md D-4 row → "overclaim corrected; code path still
+    open."
+
+The *feature* (derive the HS key from the identity via an arti `KeyMgr`
+`HsIdKeypair` importer, making the equivalence true + verifiable)
+remains open and is tracked as A6.4 in ANONYMITY_ROADMAP.md. Until it
+lands, the honest posture is: onion and fingerprint are independent
+keys; only the fingerprint is authenticated (sealed-sender + MLS).
+
+Docs + one doc-comment only; no behaviour change. `cargo check`
+clean, fmt clean.
+
+---
+
 ## 2026-05-30 — D-1 redone: privacy-by-default hub connections (supersedes the earlier opt-in)
 
 A re-audit correctly called the earlier `--ephemeral-noise-static` opt-in (the "D-1: ephemeral Noise static (opt-in)" entry further down) **theatre**: off by default, and even when on it still leaked the long-term identity to the hub because the signed SUBSCRIBE proof carried the long-term Ed25519 signing key (= fingerprint), the daemon still subscribed to `introduction_inbox(fp)`, and it still published a KeyPackage. The hub re-linked the user on every connection regardless. This entry supersedes that one.

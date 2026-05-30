@@ -59,7 +59,7 @@ Concrete defences with file pointers, in approximate order of how much they buy 
 | Defence | What it does | Code |
 |---|---|---|
 | **Tor (Arti) for all transport** | Hides your IP from peers and hubs; hides peer onions from your local network | `crates/onyx-core/src/tor.rs`, `arti-client = "0.42"` |
-| **v3 hidden services** | You're contactable without ever exposing your IP. Your "address" *is* the onion key | `tor-hsservice = "0.42"` |
+| **v3 hidden services** | You're contactable without ever exposing your IP. Your "address" is a per-node onion key. **NOT identity-derived today (A6.4/D-4)** — the `.onion` is an independent random key, *not* a function of your fingerprint, so don't authenticate a peer by their onion; use the fingerprint. | `tor-hsservice = "0.42"` |
 | **Sealed-sender envelopes (PQ-hybrid)** | Hub can't see who sent a first-contact message | `crates/onyx-core/src/routing.rs::seal_bootstrap` |
 | **Routing-id == hash(fingerprint)** | Hub indexes you by a one-way hash; can't enumerate fingerprints | `routing::introduction_inbox` |
 | **Per-epoch MLS session tokens** | In-group traffic uses rotating routing ids; hub can't link your group messages across epochs | `routing::session_token` |
