@@ -1692,6 +1692,10 @@ fn run_keyboard_pump(tx: &mpsc::Sender<KeyEvent>) {
 
 // ── Rendering ────────────────────────────────────────────────────────────
 
+// The top-level frame compositor: builds the rail/chat/details layout
+// and dispatches to every sub-renderer. Long by nature (it's the layout
+// map of the whole UI); same #[allow] the other render_* fns carry.
+#[allow(clippy::too_many_lines)]
 fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let area = frame.area();
 
@@ -1737,7 +1741,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     // The logo box is fixed; the status box is fixed; peers takes the
     // rest. On a very short terminal the logo is the first to yield
     // (its Length collapses gracefully and the art clips to the box).
-    let logo_h: u16 = (theme::ONION_ART.len() as u16 + 4).min(left_rail.height / 2);
+    let art_lines = u16::try_from(theme::ONION_ART.len()).unwrap_or(5);
+    let logo_h: u16 = (art_lines + 4).min(left_rail.height / 2);
     let rail = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
