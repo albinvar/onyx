@@ -44,7 +44,12 @@
 #
 # See RELEASES.md and INSTALL.md for the full story.
 
-set -euo pipefail
+# POSIX sh compatible: `pipefail` is a bash-ism that dash/ash (Debian's
+# `sh`, BusyBox) reject with "Illegal option -o pipefail", which broke
+# `curl … | sh`. We don't rely on pipefail anyway — every curl in a
+# pipe is buffered + exit-checked explicitly (see resolve_version). Keep
+# errexit + nounset, which are POSIX.
+set -eu
 
 # ── Config ────────────────────────────────────────────────────────────
 
