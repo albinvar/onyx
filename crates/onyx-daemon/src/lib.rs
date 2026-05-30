@@ -480,10 +480,18 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
 
     let fingerprint = identity.fingerprint();
     let identity_pub_b32 = encode_b32(&identity.identity_key().public().to_bytes());
-    info!(
+    // D-3: the fingerprint + identity pubkey are long-term-identity
+    // surfaces. In the combined `onyx` binary INFO logs are appended to
+    // ~/.onyx/onyx.log, so logging them at info would persist the user's
+    // identity in cleartext on disk (a seized-device leak). Keep a
+    // no-identity milestone at info; put the identity only at debug —
+    // the same split already used for the intro-inbox / onion / dial /
+    // pin lines.
+    info!("vault unlocked, identity loaded");
+    debug!(
         fingerprint = %fingerprint,
         identity_pub_b32 = %identity_pub_b32,
-        "vault unlocked, identity loaded"
+        "vault identity (debug-only: D-3 identity surface)"
     );
 
     // Load or create the persistent MLS party.

@@ -6,6 +6,17 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — audit response: MED-1 identity-log demote + HS/private-mode doc fix
+
+Response to the post-v0.1.9 comprehensive audit (no CRITICAL/HIGH found; prior fixes re-verified holding). Two safe, do-now items:
+
+- **MED-1 (D-3 regression) — fixed.** `run()` logged the user's `fingerprint` + `identity_pub_b32` at `info!` on every vault unlock (`lib.rs`). In the combined `onyx` binary, INFO logs are appended to `~/.onyx/onyx.log`, so a seized device yielded the long-term identity in cleartext — every *other* identity line was already demoted to `debug` (intro-inbox, onion, dial, pin); this one was missed. Now `info!("vault unlocked, identity loaded")` (no identity) + a `debug!` carrying the fingerprint/pubkey, matching the existing HS-publish pattern (`lib.rs:906-910`).
+- **HS-in-private-mode doc contradiction — corrected.** ANONYMITY.md §3.12 claimed the private default publishes "no HS"; the accept loop (`run_accept_mode`) publishes the onion service unconditionally — intentional (D-1 removes *hub* linkage, not direct onion reachability; the onion key is random per A6.4 so it leaks no fingerprint, but it is a presence + guard-discovery surface). Doc now states both modes publish a v3 HS and both get Full-vanguard protection, and flags the open product question (should the private default gate the HS publish, trading away direct dialability?).
+
+Deferred from the audit with reasons (tracked in tasks + memory): G-2 admin/authority model (design-level), hybrid-combiner all-zero X25519 check (LOW defense-in-depth; auditor confirms safe as-is — not touching crypto decap unsupervised), `is_pin_compromised` fail-open (judgment trade-off), SendBootstrap pin cross-check (bounded), P-3 (architectural).
+
+Gate: `cargo test --workspace` = 521 passed / 0 failed; clippy `-D warnings` 0/0; fmt clean.
+
 ## v0.1.9 — 2026-05-30 — security hardening release
 
 Ships the deep-pass security arc accumulated since v0.1.8. All items below are individually detailed in the dated entries that follow; this is the consolidated release summary. Every change landed on a `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt` green tree; the security-critical guards (A1.2, A0.3) carry mutation-proven regression tests.
