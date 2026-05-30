@@ -99,6 +99,16 @@ struct Args {
     #[arg(long, env = "ONYX_DIAL_TCP", global = true)]
     dial_tcp: Option<String>,
 
+    /// Peer-to-peer: dial a peer's hidden service **directly** over Tor
+    /// (no hub). Value is `<onion>` or `<onion>:<port>` (default port is
+    /// the Onyx HS port). Requires `--dial-pubkey` (the peer's X25519
+    /// identity key, base32). This is the hub-less direct path: the two
+    /// daemons speak Noise XK end-to-end over a dedicated, circuit-
+    /// isolated Tor stream. Both peers must be running; there is no
+    /// store-and-forward, so the dialled peer has to be online.
+    #[arg(long, env = "ONYX_DIAL_ONION", global = true)]
+    dial_onion: Option<String>,
+
     /// X25519 identity public key of the peer to dial (base32).
     /// Required by `--dial-tcp` / `--dial-onion`.
     #[arg(long, global = true)]
@@ -582,6 +592,70 @@ async fn main() -> ExitCode {
 
 /// Build a daemon `Config` from the global `Args`. Used by both the
 /// no-subcommand path (`onyx`) and the explicit `onyx daemon` form.
+/// v0.1.12: persisted, TUI-managed settings. Lives at
+/// `~/.onyx/config.json` (JSON so we reuse the `serde_json` we already
+/// depend on — no new crate). Every field is optional/defaulted so an
+/// older or hand-edited file never fails to load. CLI flags always win
+/// over the file (the file is the *default*, the flag is the override),
+/// so power users and scripts keep their behaviour.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+struct FileConfig {
+    /// Each entry is `onion:port,b32pubkey` — same grammar as `--hub`.
+    #[serde(default)]
+    hubs: Vec<String>,
+    /// P2P direct-dial target onion (`onion` or `onion:port`).
+    #[serde(default)]
+    dial_onion: Option<String>,
+    /// Peer X25519 identity pubkey (base32) for the dial target.
+    #[serde(default)]
+    dial_pubkey: Option<String>,
+    /// D-1 reachability switch (default off = private).
+    #[serde(default)]
+    first_contact_reachable: bool,
+    /// Optional Poisson cover-traffic mean interval, seconds.
+    #[serde(default)]
+    cover_traffic_mean_secs: Option<u64>,
+}
+
+/// Path to the persisted config: `~/.onyx/config.json`.
+fn config_file_path() -> std::path::PathBuf {
+    onyx_daemon::default_data_dir().join("config.json")
+}
+
+/// Load `~/.onyx/config.json` if present. A missing file is `None`
+/// (first run); a malformed file is a hard error so the operator finds
+/// out instead of silently running with default (less-private) settings.
+fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
+    let path = config_file_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let cfg: FileConfig = serde_json::from_str(&s)
+                .map_err(|e| anyhow::anyhow!("malformed {}: {e}", path.display()))?;
+            Ok(Some(cfg))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Persist `cfg` to `~/.onyx/config.json` (pretty JSON, mode 0600 —
+/// it can hold a dial target / hub list, low-sensitivity but still the
+/// user's social graph). Creates `~/.onyx` if needed.
+fn save_file_config(cfg: &FileConfig) -> anyhow::Result<()> {
+    let dir = onyx_daemon::default_data_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+    let path = config_file_path();
+    let json = serde_json::to_string_pretty(cfg)?;
+    std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 fn build_daemon_config(
     args: &Args,
     socket: &std::path::Path,
@@ -593,6 +667,9 @@ fn build_daemon_config(
              show up in `ps`."
         );
     };
+    // v0.1.12: load persisted TUI-managed settings. CLI flags win, so
+    // this only *fills in* what the flags didn't set.
+    let file_cfg = load_file_config()?.unwrap_or_default();
     // Parse repeatable --hub "onion:port,b32pubkey" args into a
     // Vec<HubConfig>. Each --hub is one hub; the embedded daemon
     // publishes/subscribes to all of them in parallel (T8.1+).
@@ -608,6 +685,27 @@ fn build_daemon_config(
             onion: onion.to_string(),
             pubkey: pubkey.to_string(),
         });
+    }
+    // v0.1.12: if no --hub was passed on the CLI, fall back to the
+    // hubs persisted in ~/.onyx/config.json (TUI-managed). CLI wins:
+    // passing even one --hub ignores the file list entirely, so a
+    // script's explicit hub set is never silently merged with stale
+    // persisted state.
+    if hubs.is_empty() {
+        for raw in &file_cfg.hubs {
+            let (onion, pubkey) = raw.split_once(',').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config.json hub entry must be `onion:port,b32pubkey` (missing comma): {raw}"
+                )
+            })?;
+            if onion.is_empty() || pubkey.is_empty() {
+                anyhow::bail!("config.json hub entry has empty field: {raw}");
+            }
+            hubs.push(onyx_daemon::HubConfig {
+                onion: onion.to_string(),
+                pubkey: pubkey.to_string(),
+            });
+        }
     }
     // TEST-ONLY: parse repeatable --hub-tcp "addr,b32pubkey" the same
     // way, into hub_tcp_addrs. Mirrors --hub but the daemon dials it
@@ -625,6 +723,34 @@ fn build_daemon_config(
             pubkey: pubkey.to_string(),
         });
     }
+    // v0.1.12: resolve dial / reachability / cover-traffic with CLI
+    // winning over the persisted file. Onion dial: a CLI flag overrides
+    // the file outright; otherwise use the file's saved target.
+    let dial_onion = args
+        .dial_onion
+        .clone()
+        .or_else(|| file_cfg.dial_onion.clone());
+    let dial_pubkey = args
+        .dial_pubkey
+        .clone()
+        .or_else(|| file_cfg.dial_pubkey.clone());
+    // Reachability is a privacy toggle — OR the two so "on" from either
+    // source wins (you opted in somewhere). Cover-traffic: CLI value or
+    // the file's.
+    let first_contact_reachable = args.first_contact_reachable || file_cfg.first_contact_reachable;
+    let cover_traffic_mean_secs = args
+        .cover_traffic_mean_secs
+        .or(file_cfg.cover_traffic_mean_secs);
+    // A peer dial (Tor onion or test TCP) needs the peer's identity key,
+    // or the daemon would silently fall back to accept mode (lib.rs:878).
+    // Fail loudly so a half-typed P2P dial doesn't look like "nothing
+    // happened." Checks the *resolved* dial target (CLI or file).
+    if (dial_onion.is_some() || args.dial_tcp.is_some()) && dial_pubkey.is_none() {
+        anyhow::bail!(
+            "a dial target (--dial-onion / config.json / --dial-tcp) requires a peer \
+             X25519 identity key (--dial-pubkey or config.json dial_pubkey)"
+        );
+    }
     Ok(onyx_daemon::Config {
         vault: args
             .vault
@@ -637,17 +763,20 @@ fn build_daemon_config(
             || args.dial_tcp.is_some()
             || (!args.hub_tcp.is_empty() && args.hubs.is_empty()),
         tor_state_dir: None,
-        dial_onion: None,
-        dial_pubkey: args.dial_pubkey.clone(),
+        // P2P: direct onion dial needs Tor (never a no-Tor path), so it
+        // doesn't appear in the `no_tor` condition above — it just wires
+        // the target through to `run_dial_mode`. Resolved CLI-over-file.
+        dial_onion,
+        dial_pubkey,
         api_socket: socket.to_string_lossy().into_owned(),
         hubs,
         hub_tcp_addrs,
         listen_tcp: args.listen_tcp.clone(),
         dial_tcp: args.dial_tcp.clone(),
-        cover_traffic_mean_secs: args.cover_traffic_mean_secs,
+        cover_traffic_mean_secs,
         constant_rate_ms: args.constant_rate_ms,
         // D-1: single master switch; default false = private.
-        first_contact_reachable: args.first_contact_reachable,
+        first_contact_reachable,
         // A1.2: must explicitly opt in to clearnet (no-Tor) transport.
         allow_clearnet: args.allow_clearnet,
     })
@@ -751,6 +880,8 @@ fn first_run_wizard(vault_path: &std::path::Path) -> anyhow::Result<String> {
 // nothing on a non-tty (the codes are only emitted when stderr is a tty).
 
 const ANSI_GREEN: &str = "1;32";
+// Tor-purple truecolor, matching theme::PURPLE = Rgb(0xa9,0x6c,0xe6).
+const ANSI_PURPLE: &str = "1;38;2;169;108;230";
 const ANSI_DIM: &str = "2";
 const ANSI_AMBER: &str = "1;33";
 const ANSI_RED: &str = "1;31";
@@ -769,18 +900,20 @@ fn paint(s: &str, sgr: &str) -> String {
 /// The onyx onion banner shown at the top of the first-run / unlock
 /// wizard — a small branded welcome before the TUI takes over.
 fn print_brand_banner(fresh: bool) {
+    // Layered Tor *onion* (sprout + concentric layers + bulb), matching
+    // the in-TUI `theme::ONION_ART`. NOT a face. Painted Tor-purple.
     let art = [
-        r#"   .-"""""-.   "#,
-        "  / _     _ \\  ",
-        " |  o)   (o  | ",
-        "  \\   ._.   /  ",
-        "   '-.....-'   ",
+        "      \\|/      ",
+        "    .-===-.    ",
+        "   /(  (  )\\   ",
+        "   \\ )  ) (/   ",
+        "    '-===-'    ",
     ];
     eprintln!();
     for line in art {
-        eprintln!("  {}", paint(line, ANSI_GREEN));
+        eprintln!("  {}", paint(line, ANSI_PURPLE));
     }
-    eprintln!("       {}", paint("O N Y X", ANSI_GREEN));
+    eprintln!("       {}", paint("O N Y X", ANSI_PURPLE));
     eprintln!("   {}", paint("anonymous · e2e · tor", ANSI_DIM));
     eprintln!();
     if fresh {

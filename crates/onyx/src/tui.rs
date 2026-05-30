@@ -271,6 +271,32 @@ enum ModalState {
         lines: Vec<String>,
         scroll: u16,
     },
+    /// v0.1.12: paste a peer's `onyx://invite/v…` URL and accept it
+    /// in-app — the TUI equivalent of `onyx accept <url>`. Opens on
+    /// `Ctrl-A` or via the command palette. `input` is the single
+    /// text field; `Enter` dispatches `ApiRequest::SendInvite` (the
+    /// daemon re-parses + re-verifies the URL, cross-checks the pin
+    /// store, and picks the tier). `Esc` closes without sending.
+    AcceptInvite {
+        input: String,
+    },
+    /// v0.1.12: TUI-managed hub / dial / reachability editor. Reads
+    /// `~/.onyx/config.json` on open and writes it back on save (Ctrl-S).
+    /// Changes apply on the next `onyx` launch (the embedded daemon
+    /// reads config at boot — live apply is a later follow-up). `focus`
+    /// selects the active control: 0 = add-hub input, 1 = dial onion,
+    /// 2 = dial pubkey, 3 = reachability toggle, 4.. = an existing hub
+    /// row (Enter/Del removes it). Tab / ↑↓ move focus.
+    ManageHubs {
+        hubs: Vec<String>,
+        add_input: String,
+        dial_onion: String,
+        dial_pubkey: String,
+        reachable: bool,
+        focus: usize,
+        /// Set after a successful save so the render can show a hint.
+        saved: bool,
+    },
 }
 
 /// UX overhaul: actions runnable from the command palette (`Ctrl-K`).
@@ -282,6 +308,8 @@ enum PaletteAction {
     InvitePeer,
     SendFile,
     CopyInvite,
+    AcceptInvite,
+    ManageHubs,
     Settings,
     Help,
     Quit,
@@ -289,11 +317,13 @@ enum PaletteAction {
 
 impl PaletteAction {
     /// All actions, in palette display order.
-    const ALL: [PaletteAction; 7] = [
+    const ALL: [PaletteAction; 9] = [
         PaletteAction::CreateRoom,
         PaletteAction::InvitePeer,
         PaletteAction::SendFile,
         PaletteAction::CopyInvite,
+        PaletteAction::AcceptInvite,
+        PaletteAction::ManageHubs,
         PaletteAction::Settings,
         PaletteAction::Help,
         PaletteAction::Quit,
@@ -306,6 +336,8 @@ impl PaletteAction {
             PaletteAction::InvitePeer => "Invite peer to room",
             PaletteAction::SendFile => "Send file (room or DM peer)",
             PaletteAction::CopyInvite => "Copy my invite link",
+            PaletteAction::AcceptInvite => "Accept invite link (paste)",
+            PaletteAction::ManageHubs => "Manage hubs / dial / reachability",
             PaletteAction::Settings => "Settings / identity",
             PaletteAction::Help => "Show keyboard help",
             PaletteAction::Quit => "Quit Onyx",
@@ -319,6 +351,8 @@ impl PaletteAction {
             PaletteAction::InvitePeer => "^I",
             PaletteAction::SendFile => "^F",
             PaletteAction::CopyInvite => "^E",
+            PaletteAction::AcceptInvite => "^A",
+            PaletteAction::ManageHubs => "^G",
             PaletteAction::Settings => "",
             PaletteAction::Help => "F1",
             PaletteAction::Quit => "^C",
@@ -762,6 +796,21 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             open_invite_modal(app).await;
             return false;
         }
+        // v0.1.12: Ctrl-A opens the accept-invite modal — paste a peer's
+        // onyx:// URL to start a conversation in-app (no CLI needed).
+        (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(ModalState::AcceptInvite {
+                input: String::new(),
+            });
+            return false;
+        }
+        // v0.1.12: Ctrl-G opens the hub / dial / reachability manager,
+        // reading ~/.onyx/config.json so the user can configure transport
+        // from inside the TUI instead of CLI flags.
+        (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(open_manage_hubs_modal());
+            return false;
+        }
         (KeyCode::Esc, _) => return true,
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return true,
         (KeyCode::Up, _) => app.move_selection(-1),
@@ -1012,6 +1061,168 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             }
             submit_intent = Some(modal.clone());
         }
+        (ModalState::AcceptInvite { input }, KeyCode::Backspace) => {
+            input.pop();
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::AcceptInvite { input }, KeyCode::Char(c)) => {
+            input.push(c);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::AcceptInvite { input }, KeyCode::Enter) => {
+            // Reject empty / obviously-wrong input before bothering the
+            // daemon. The daemon does the real parse + signature verify.
+            if !input.trim().starts_with("onyx://invite/") {
+                app.last_send_result = Some(Err(
+                    "paste a full onyx://invite/v… link to accept".to_string()
+                ));
+                app.modal = Some(modal);
+                return;
+            }
+            submit_intent = Some(modal.clone());
+        }
+        // ── v0.1.12: hub / dial / reachability manager ──────────────
+        // Ctrl-S persists to ~/.onyx/config.json. Guard must precede the
+        // generic Char arm so typing 's' into a field isn't a save.
+        (ModalState::ManageHubs { .. }, KeyCode::Char('s'))
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let ModalState::ManageHubs {
+                hubs,
+                dial_onion,
+                dial_pubkey,
+                reachable,
+                saved,
+                ..
+            } = &mut modal
+            {
+                match save_manage_hubs(hubs, dial_onion, dial_pubkey, *reachable) {
+                    Ok(()) => {
+                        *saved = true;
+                        app.last_send_result = Some(Ok(()));
+                    }
+                    Err(e) => {
+                        app.last_send_result = Some(Err(format!("save config: {e}")));
+                    }
+                }
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::ManageHubs { hubs, focus, .. }, KeyCode::Tab | KeyCode::Down) => {
+            // Controls: 0=add-hub, 1=dial onion, 2=dial pubkey,
+            // 3=reachable toggle, 4..=existing hub rows.
+            let n = 4 + hubs.len();
+            *focus = (*focus + 1) % n;
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::ManageHubs { hubs, focus, .. }, KeyCode::Up) => {
+            let n = 4 + hubs.len();
+            *focus = (*focus + n - 1) % n;
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::ManageHubs {
+                hubs,
+                add_input,
+                reachable,
+                focus,
+                saved,
+                ..
+            },
+            KeyCode::Enter,
+        ) => {
+            *saved = false;
+            match *focus {
+                // Add-hub: must look like `onion:port,b32pubkey`.
+                0 => {
+                    let v = add_input.trim();
+                    if v.contains(',') && !v.starts_with(',') && !v.ends_with(',') {
+                        hubs.push(v.to_string());
+                        add_input.clear();
+                    } else {
+                        app.last_send_result =
+                            Some(Err("hub must be onion:port,b32pubkey".to_string()));
+                    }
+                }
+                3 => *reachable = !*reachable,
+                // A focused hub row: Enter removes it.
+                i if i >= 4 && (i - 4) < hubs.len() => {
+                    hubs.remove(i - 4);
+                    if *focus >= 4 + hubs.len() {
+                        *focus = (4 + hubs.len()).saturating_sub(1);
+                    }
+                }
+                _ => {}
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::ManageHubs { hubs, focus, .. }, KeyCode::Delete) => {
+            if *focus >= 4 && (*focus - 4) < hubs.len() {
+                hubs.remove(*focus - 4);
+                if *focus >= 4 + hubs.len() {
+                    *focus = (4 + hubs.len()).saturating_sub(1);
+                }
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::ManageHubs {
+                add_input,
+                dial_onion,
+                dial_pubkey,
+                reachable,
+                focus,
+                saved,
+                ..
+            },
+            KeyCode::Char(c),
+        ) => {
+            *saved = false;
+            match *focus {
+                0 => add_input.push(c),
+                1 => dial_onion.push(c),
+                2 => dial_pubkey.push(c),
+                // Space toggles reachability when that row is focused.
+                3 if c == ' ' => *reachable = !*reachable,
+                _ => {}
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::ManageHubs {
+                add_input,
+                dial_onion,
+                dial_pubkey,
+                focus,
+                saved,
+                ..
+            },
+            KeyCode::Backspace,
+        ) => {
+            *saved = false;
+            match *focus {
+                0 => {
+                    add_input.pop();
+                }
+                1 => {
+                    dial_onion.pop();
+                }
+                2 => {
+                    dial_pubkey.pop();
+                }
+                _ => {}
+            }
+            app.modal = Some(modal);
+            return;
+        }
         _ => {
             app.modal = Some(modal);
             return;
@@ -1057,6 +1268,16 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                     keep_metadata,
                 },
             }),
+            // v0.1.12: accept a pasted invite link — the TUI twin of
+            // `onyx accept <url>`. The daemon re-parses + re-verifies the
+            // URL, cross-checks the pin store, and picks the tier. We
+            // refuse unsigned (v1) by default here too (no in-TUI danger
+            // override — re-issue a signed link instead).
+            ModalState::AcceptInvite { input } => Some(ApiRequest::SendInvite {
+                url: input.trim().to_string(),
+                text: String::new(),
+                insecure_accept_unsigned: false,
+            }),
             // Help / CommandPalette / Invite / Settings never set
             // submit_intent (handled inline above), so they can't
             // reach here.
@@ -1064,7 +1285,10 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             | ModalState::CommandPalette { .. }
             | ModalState::Invite { .. }
             | ModalState::Settings { .. }
-            | ModalState::Logs { .. } => None,
+            | ModalState::Logs { .. }
+            // ManageHubs is handled inline (saves a file, no API call), so
+            // it never sets submit_intent — but the match must cover it.
+            | ModalState::ManageHubs { .. } => None,
         };
         if let Some(req) = req {
             match client::one_shot(&app.socket_path, &req).await {
@@ -1154,6 +1378,13 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                     app.last_activity_ms.insert(peer_short, now);
                     app.last_send_result = Some(Ok(()));
                 }
+                // v0.1.12: in-TUI accept-invite result. The daemon shipped
+                // the first-contact bootstrap; the peer surfaces as a real
+                // conversation on its next status tick.
+                Ok(ApiResponse::SendInviteOk { tier, was_signed }) => {
+                    app.last_send_result = Some(Ok(()));
+                    tracing::info!(%tier, was_signed, "invite accepted via TUI modal");
+                }
                 Ok(ApiResponse::Error { message, .. }) => {
                     app.last_send_result = Some(Err(message));
                 }
@@ -1215,6 +1446,14 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
             }
         }
         PaletteAction::CopyInvite => open_invite_modal(app).await,
+        PaletteAction::AcceptInvite => {
+            app.modal = Some(ModalState::AcceptInvite {
+                input: String::new(),
+            });
+        }
+        PaletteAction::ManageHubs => {
+            app.modal = Some(open_manage_hubs_modal());
+        }
         PaletteAction::Settings => open_settings_modal(app).await,
         PaletteAction::Help => app.modal = Some(ModalState::Help),
         PaletteAction::Quit => app.quit_requested = true,
@@ -1286,6 +1525,48 @@ async fn open_settings_modal(app: &mut AppState) {
         "cover-traffic / intro-inbox set at daemon launch".into(),
     ));
     app.modal = Some(ModalState::Settings { info });
+}
+
+/// v0.1.12: build the hub-manager modal seeded from the persisted
+/// `~/.onyx/config.json`. A missing/malformed file just yields an empty
+/// editor (we don't block the UI on a bad file — the daemon's own load
+/// surfaces parse errors at launch).
+fn open_manage_hubs_modal() -> ModalState {
+    let cfg = crate::load_file_config().ok().flatten().unwrap_or_default();
+    ModalState::ManageHubs {
+        hubs: cfg.hubs,
+        add_input: String::new(),
+        dial_onion: cfg.dial_onion.unwrap_or_default(),
+        dial_pubkey: cfg.dial_pubkey.unwrap_or_default(),
+        reachable: cfg.first_contact_reachable,
+        focus: 0,
+        saved: false,
+    }
+}
+
+/// v0.1.12: persist the hub-manager modal's fields to
+/// `~/.onyx/config.json`. Returns a user-facing message.
+fn save_manage_hubs(
+    hubs: &[String],
+    dial_onion: &str,
+    dial_pubkey: &str,
+    reachable: bool,
+) -> Result<(), String> {
+    let trim_opt = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+    // Preserve fields the modal doesn't edit (e.g. cover traffic).
+    let mut cfg = crate::load_file_config().ok().flatten().unwrap_or_default();
+    cfg.hubs = hubs.to_vec();
+    cfg.dial_onion = trim_opt(dial_onion);
+    cfg.dial_pubkey = trim_opt(dial_pubkey);
+    cfg.first_contact_reachable = reachable;
+    crate::save_file_config(&cfg).map_err(|e| format!("{e:#}"))
 }
 
 /// UX overhaul: assemble an `onyx://invite/v1?…` URL from the daemon's
@@ -1852,6 +2133,12 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         // UX phase 4: the log overlay takes most of the height — reading
         // logs benefits from vertical room (capped at 30).
         ModalState::Logs { .. } => area.height.saturating_sub(2).min(30),
+        // v0.1.12: paste-an-invite text input.
+        ModalState::AcceptInvite { .. } => 9,
+        // v0.1.12: hub manager grows with the hub list (+ fixed controls).
+        ModalState::ManageHubs { hubs, .. } => u16::try_from(hubs.len() + 12)
+            .unwrap_or(20)
+            .min(area.height.saturating_sub(2)),
     };
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
@@ -2030,6 +2317,158 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::Invite { url, copied } => render_invite_modal(frame, rect, url, *copied),
         ModalState::Settings { info } => render_settings_modal(frame, rect, info),
         ModalState::Logs { lines, scroll } => render_logs_modal(frame, rect, lines, *scroll),
+        // v0.1.12: paste a peer's onyx:// invite link and accept it
+        // in-app — the TUI twin of `onyx accept <url>`.
+        ModalState::AcceptInvite { input } => {
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Accept Invite  (Esc=cancel, Enter=accept) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            // Show a bounded tail so a ~1500-char invite URL doesn't
+            // overflow the box; the daemon receives the full string.
+            let shown: String = {
+                let n = input.chars().count();
+                if n > 50 {
+                    let tail: String = input.chars().skip(n - 47).collect();
+                    format!("…{tail}")
+                } else {
+                    input.clone()
+                }
+            };
+            let body = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Paste a peer's onyx://invite/v2 link: ",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(vec![
+                    Span::styled(" › ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        shown,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Unsigned (v1) links are refused — ask for a fresh `onyx invite`. ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+        // v0.1.12: hub / dial / reachability manager.
+        ModalState::ManageHubs {
+            hubs,
+            add_input,
+            dial_onion,
+            dial_pubkey,
+            reachable,
+            focus,
+            saved,
+        } => {
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Manage Transport  (Tab=move, ^S=save, Esc=close) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let cur = *focus;
+            let foc = move |idx: usize| -> Style {
+                if cur == idx {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                }
+            };
+            let mark = move |idx: usize| -> &'static str { if cur == idx { "▶ " } else { "  " } };
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                " Hubs (store-and-forward relays):",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if hubs.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   (none — add one below; needed for rooms + offline DM)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for (i, h) in hubs.iter().enumerate() {
+                let idx = 4 + i;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {}{}", mark(idx), truncate_for_display(h, 56)),
+                        foc(idx),
+                    ),
+                    Span::styled(
+                        if *focus == idx {
+                            "  [Del/Enter removes]"
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}add hub: ", mark(0)), foc(0)),
+                Span::styled(add_input.clone(), Style::default().fg(Color::White)),
+                if *focus == 0 {
+                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK))
+                } else {
+                    Span::raw("")
+                },
+            ]));
+            lines.push(Line::from(Span::styled(
+                "   format: onion:port,b32pubkey  (Enter adds)",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}dial onion: ", mark(1)), foc(1)),
+                Span::styled(
+                    truncate_for_display(dial_onion, 48),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}dial pubkey: ", mark(2)), foc(2)),
+                Span::styled(
+                    truncate_for_display(dial_pubkey, 48),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}first-contact reachable: ", mark(3)), foc(3)),
+                Span::styled(
+                    if *reachable { "[x] on" } else { "[ ] off" },
+                    Style::default().fg(if *reachable {
+                        Color::Green
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+                Span::styled("  (Space toggles)", Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                if *saved {
+                    " ✓ saved to ~/.onyx/config.json — restart onyx to apply"
+                } else {
+                    " ^S saves to ~/.onyx/config.json (applies on next launch)"
+                },
+                Style::default().fg(if *saved {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }),
+            )));
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
+        }
     }
 }
 
@@ -2177,6 +2616,8 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         key("Ctrl-I", "invite a peer to the selected room"),
         key("Ctrl-F", "send a file to the selected room"),
         key("Ctrl-E", "copy my invite link to clipboard"),
+        key("Ctrl-A", "accept an invite link (paste)"),
+        key("Ctrl-G", "manage hubs / dial / reachability"),
         Line::from(""),
         head("General"),
         key("F1", "this help · Esc/any key closes overlays"),
@@ -2275,7 +2716,7 @@ fn render_invite_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, url: &str, co
         )),
         Line::from(""),
         Line::from(Span::styled(
-            " Share with a friend; they run:  onyx accept '<url>'  (quotes!)",
+            " Share it; they paste it via ^A (Accept invite) — or:  onyx accept '<url>'",
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -2483,7 +2924,7 @@ fn render_logo(frame: &mut ratatui::Frame<'_>, area: Rect) {
         let pad = inner_w.saturating_sub(len) / 2;
         Line::from(Span::styled(
             format!("{}{}", " ".repeat(pad), s),
-            theme::ok(),
+            theme::logo(),
         ))
     };
     let mut lines: Vec<Line<'static>> = theme::ONION_ART.iter().map(|l| center(l)).collect();

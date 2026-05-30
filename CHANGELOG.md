@@ -6,6 +6,48 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.12 — 2026-05-30 — everything in the TUI + peer-to-peer dial
+
+Makes every capability reachable from the TUI (the user's ask: "wire it
+all up, even the hubs"), ships the long-missing hub-less peer-to-peer
+path, and fixes two onion-logo regressions.
+
+**Peer-to-peer direct dial (no hub)**
+- The daemon always had a direct onion→onion path (Noise XK over a
+  circuit-isolated Tor stream, `run_dial_mode`), but the `onyx` CLI never
+  exposed it — `dial_onion` was hardcoded `None` and there was no flag.
+  That's why "I ran both and nothing connected" — first contact only ever
+  went through a hub. Added `--dial-onion <onion[:port]>` (env
+  `ONYX_DIAL_ONION`) paired with `--dial-pubkey`. One peer runs `onyx`
+  normally (accept mode, publishes its onion); the other runs
+  `onyx --dial-onion <their_onion> --dial-pubkey <their_x25519_b32>`.
+  Both must be online (no store-and-forward on the direct path). A dial
+  target without a pubkey now fails loudly instead of silently dropping
+  back to accept mode.
+
+**Everything reachable from the TUI**
+- **`^A` accept an invite** — paste a peer's `onyx://invite/v2?…` link and
+  accept it in-app (also in the command palette). Routes through the same
+  trust-anchored `SendInvite` verb as the CLI (daemon re-parses, verifies
+  the signature, cross-checks the pin store, picks the tier). Unsigned v1
+  links refused, same as CLI.
+- **`^G` manage transport** — add/remove hubs, set the P2P dial target,
+  and toggle first-contact reachability from inside the TUI. Persists to
+  `~/.onyx/config.json` (mode 0600); `build_daemon_config` reads it and
+  merges with CLI flags (CLI always wins). Changes apply on the next
+  `onyx` launch — the daemon reads config at boot. Live runtime apply
+  (no restart) is a planned follow-up.
+
+**Fixed**
+- The pre-passphrase wizard banner was a cartoon face, not an onion — now
+  the layered Tor onion in Tor-purple (`#a96ce6`), matching the TUI logo.
+- The in-TUI onion logo rendered green, not purple: `render_logo` used the
+  generic "ok" (green) style; it now uses the dedicated purple
+  `theme::logo()` as intended.
+
+Gate: `cargo build -p onyx` clean; clippy `-D warnings` 0/0; fmt clean;
+`cargo test -p onyx` = 26 passed / 0 failed. Daemon/protocol unchanged.
+
 ## v0.1.11 — 2026-05-30 — install fix + UX polish
 
 Bug-fix release on top of v0.1.10. The headline is the installer fix — the v0.1.10 one-liner failed on Termux / Debian / anything where `/bin/sh` is dash.

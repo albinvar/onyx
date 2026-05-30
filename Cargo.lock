@@ -3256,6 +3256,7 @@ dependencies = [
  "onyx-core",
  "onyx-daemon",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
