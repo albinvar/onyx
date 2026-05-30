@@ -303,15 +303,6 @@ impl HubState {
         self.peer_outbounds.contains_key(peer_pubkey)
     }
 
-    /// Expose our own hub hash for the gossip loop-detection check
-    /// in `handler::handle_gossip_publish`. Named `_for_test` to
-    /// keep the public surface clearly internal; not actually
-    /// test-only — it's called from the handler too.
-    #[must_use]
-    pub fn self_hub_hash_for_test(&self) -> [u8; GOSSIP_SEEN_BY_LEN] {
-        self.self_hub_hash
-    }
-
     /// Set our own hub-pubkey hash for gossip `seen_by` purposes
     /// (T8.3.b.2+). Compute once at startup from
     /// `blake2b_128(our_hub_pubkey.to_bytes())`, low 16 bytes.
