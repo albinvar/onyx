@@ -1362,12 +1362,23 @@ where
     let peer_pub_b32 = encode_b32(&peer_pub);
     // Derive the peer's *real* fingerprint by walking the established
     // MLS group's member list and Blake2-hashing whichever member
-    // signing key isn't ours. Falls back to the X25519 b32 if the
-    // group isn't a tidy 2-party one (e.g. multi-party room) or the
-    // bytes don't decode as a valid Ed25519 point.
-    let fingerprint = derive_peer_fingerprint(&group, &state, &peer_pub_b32).await;
+    // signing key isn't ours.
+    //
+    // NEW-3: pass an EXPLICIT `(peer/<x25519-short>)` placeholder as
+    // the fallback rather than the raw X25519 b32. The previous form
+    // returned `peer_pub_b32` (a string that LOOKS like a real
+    // fingerprint), which then sailed past `pin_check_peer`'s
+    // `starts_with("(peer/")` skip → junk rows got pinned into the
+    // contacts table and surfaced as "unverified key" entries in
+    // `onyx contact list`. With this placeholder, the skip applies
+    // correctly: when MLS attribution is unavailable, NOTHING is
+    // pinned (right answer — there's no real identity to pin yet).
+    let fallback = format!("(peer/{})", short_id_of_peer_pub(&peer_pub));
+    let fingerprint = derive_peer_fingerprint(&group, &state, &fallback).await;
 
     // T-1: pin/verify this peer's identity key before registering.
+    // (No-op for the placeholder fallback above — `pin_check_peer`
+    // detects the leading "(peer/" and skips, which is intentional.)
     pin_check_peer(&state, &fingerprint, &peer_pub).await;
 
     let (handle, mut outbound_rx) = {

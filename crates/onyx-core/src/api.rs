@@ -225,6 +225,28 @@ pub enum ApiRequest {
         with_hubs: bool,
         ttl_secs: Option<u64>,
     },
+    /// T-2: send a first-contact message addressed by an invite URL,
+    /// with **daemon-side** trust gates. The daemon parses the URL,
+    /// verifies the v2 signature (or refuses unsigned v1 unless
+    /// `insecure_accept_unsigned` is true), cross-checks the
+    /// fingerprint against the TOFU pin store (T-1), and dispatches
+    /// internally to either the MLS-tier (when the invite carries a
+    /// KeyPackage) or the msg/v1 (PFS-only) path.
+    ///
+    /// **This is the trust-anchored entry point.** Direct callers of
+    /// the lower-level `SendBootstrap` / `SendBootstrapMls` verbs
+    /// pass individual fields and therefore bypass the signature +
+    /// pin checks; new code MUST use `SendInvite` so a malicious
+    /// local process speaking to the API socket cannot strip the
+    /// signature by hand.
+    SendInvite {
+        url: String,
+        text: String,
+        /// **DANGEROUS, default off.** Accept an unsigned v1 invite;
+        /// otherwise the daemon refuses (see CLI doc for the same
+        /// flag on `onyx accept`).
+        insecure_accept_unsigned: bool,
+    },
     /// Invite `peer` into the existing room identified by
     /// `group_id_b32` (T6.3.c). The daemon loads the persisted MLS
     /// group, calls `MlsGroupState::invite` against the peer's
@@ -460,6 +482,13 @@ pub enum ApiResponse {
         exp_ms: u64,
         hubs_attached: usize,
     },
+    /// Reply to [`ApiRequest::SendInvite`]. `tier` is `"mls/v1"` when
+    /// the daemon used MLS-tier bootstrap (invite had a KP), or
+    /// `"msg/v1"` for the PFS-only path. `was_signed` lets the CLI
+    /// surface the trust-gate result without having to re-parse the
+    /// URL (true = v2 signature verified; false = unsigned v1
+    /// accepted under `insecure_accept_unsigned`).
+    SendInviteOk { tier: String, was_signed: bool },
     /// Reply to [`ApiRequest::InviteToRoom`] on success. `group_id_b32`
     /// echoes the room's stable identifier; `members` is the room's
     /// refreshed member-fingerprint list AFTER the invite commit

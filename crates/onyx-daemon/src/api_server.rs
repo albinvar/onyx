@@ -345,6 +345,11 @@ async fn dispatch_one_shot(
             with_hubs,
             ttl_secs,
         } => handle_build_invite(state, *with_kp, *with_hubs, *ttl_secs).await,
+        ApiRequest::SendInvite {
+            url,
+            text,
+            insecure_accept_unsigned,
+        } => handle_send_invite(state, url, text, *insecure_accept_unsigned).await,
         ApiRequest::InviteToRoom {
             group_id_b32,
             peer_fingerprint,
@@ -652,14 +657,37 @@ async fn handle_build_invite(
         }
     }
 
-    // exp_ms = now + ttl. `saturating_add` everywhere so an absurd TTL
-    // can't underflow / panic; the signed `exp_ms` is just u64 ms.
-    let now_ms: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0);
-    let ttl = ttl_secs.unwrap_or(DEFAULT_INVITE_TTL_SECS);
+    // exp_ms = now + ttl. NEW-2 hardening:
+    //   * a broken / pre-epoch clock is a HARD ERROR rather than
+    //     `unwrap_or(0)` — `now_ms = 0` would silently produce an
+    //     invite that's been "expired" for 56 years and break every
+    //     verifier (we'd rather fail loudly at mint than ship junk);
+    //   * the caller-provided `ttl_secs` is clamped to
+    //     [`MAX_INVITE_TTL_SECS`] so we don't *ourselves* mint
+    //     absurd-future invites by accident. The verifier ALSO
+    //     enforces the same clamp (defence in depth).
+    let now_ms: u64 = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => match u64::try_from(d.as_millis()) {
+            Ok(ms) => ms,
+            Err(_) => {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: "system clock value exceeds u64 ms — refusing to mint invite".into(),
+                };
+            }
+        },
+        Err(e) => {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!(
+                    "system clock is set before unix epoch ({e}) — refusing to mint invite"
+                ),
+            };
+        }
+    };
+    let ttl = ttl_secs
+        .unwrap_or(DEFAULT_INVITE_TTL_SECS)
+        .min(onyx_core::invite::MAX_INVITE_TTL_SECS);
     let exp_ms = now_ms.saturating_add(ttl.saturating_mul(1000));
     let nonce: [u8; 16] = onyx_core::crypto::random_array();
     let hubs_attached = inv.hubs.len();
@@ -668,6 +696,115 @@ async fn handle_build_invite(
         url: signed.to_url(),
         exp_ms,
         hubs_attached,
+    }
+}
+
+/// T-2: trust-anchored accept-invite path. The daemon (not the CLI)
+/// is the trust boundary — a malicious local process speaking to the
+/// API socket cannot strip the v2 signature, claim a fake key was
+/// pinned, or hand-craft fields that bypass first-contact safety.
+///
+/// Gates, in order:
+///   1. **v1 (unsigned) is refused** unless `insecure_accept_unsigned`.
+///   2. **v2 signature must verify** (Ed25519 over the canonical
+///      field set, including the `MAX_INVITE_TTL_SECS` expiry clamp
+///      that lives inside `verify_signature`).
+///   3. **Pin-store cross-check** (T-1): if we've already pinned a
+///      DIFFERENT key for this fingerprint, refuse — re-pinning a
+///      changed key has to be an explicit, separate user action.
+///   4. Dispatch internally to `handle_send_bootstrap_mls` (if the
+///      invite carried a KP) or `handle_send_bootstrap` (msg/v1).
+async fn handle_send_invite(
+    state: &DaemonState,
+    url: &str,
+    text: &str,
+    insecure_accept_unsigned: bool,
+) -> ApiResponse {
+    use base64::Engine;
+    let invite = match onyx_core::invite::Invite::parse(url) {
+        Ok(i) => i,
+        Err(e) => {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: format!("invite URL did not parse: {e}"),
+            };
+        }
+    };
+
+    // Gate 1+2: signature or refusal.
+    let was_signed = invite.is_signed();
+    if was_signed {
+        let Some(now_ms) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
+        else {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: "system clock unreadable — refusing to verify invite signature".into(),
+            };
+        };
+        if let Err(e) = invite.verify_signature(now_ms) {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: format!("invite signature did not verify: {e}"),
+            };
+        }
+    } else if !insecure_accept_unsigned {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "refusing unsigned (v1) invite; pass insecure_accept_unsigned=true to opt \
+                      in (DANGEROUS — side-channel could have substituted any field)"
+                .into(),
+        };
+    }
+
+    // Gate 3: pin-store cross-check (T-1).
+    let invite_fp = invite.fingerprint.to_string();
+    {
+        let vault = state.vault.lock().await;
+        if let Ok(contacts) = vault.list_pinned(state.identity_id) {
+            for c in &contacts {
+                if c.fingerprint == invite_fp && c.key_changed {
+                    return ApiResponse::Error {
+                        code: ApiErrorCode::Malformed,
+                        message: format!(
+                            "fingerprint {invite_fp} is already pinned AND its identity key has \
+                             changed since first contact (T-1). Refusing — verify out of band \
+                             and clear the pin before re-accepting."
+                        ),
+                    };
+                }
+            }
+        }
+    }
+
+    // Gate 4: dispatch to the right tier and translate the response.
+    let kem_b32 = invite.kem_pub_b32.clone();
+    if let Some(kp_bytes) = invite.key_package {
+        let kp_b64 = base64::engine::general_purpose::STANDARD.encode(&kp_bytes);
+        match handle_send_bootstrap_mls(&invite_fp, &kem_b32, &kp_b64, Some(text), state).await {
+            ApiResponse::SendBootstrapMlsOk { .. } => ApiResponse::SendInviteOk {
+                tier: "mls/v1".into(),
+                was_signed,
+            },
+            other => other,
+        }
+    } else {
+        match handle_send_bootstrap(
+            &invite_fp,
+            &kem_b32,
+            text,
+            state.identity.signing(),
+            state.identity.identity_key(),
+            &state.hub_outbounds,
+        ) {
+            ApiResponse::SendBootstrapOk => ApiResponse::SendInviteOk {
+                tier: "msg/v1".into(),
+                was_signed,
+            },
+            other => other,
+        }
     }
 }
 

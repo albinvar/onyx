@@ -321,7 +321,8 @@ enum Command {
     /// queued for a follow-up phase; for now use `fetch-keypackage` +
     /// `send-bootstrap-mls` if you need MLS PCS on first contact.
     Accept {
-        /// The `onyx://invite/v1?…` URL.
+        /// The `onyx://invite/v2?…` URL (v1 unsigned URLs are refused
+        /// by default — see `--insecure-accept-unsigned`).
         url: String,
         /// Plaintext message to deliver alongside the introduction.
         /// Required — a sealed-sender envelope always carries a
@@ -329,6 +330,15 @@ enum Command {
         /// exist at the protocol level.
         #[arg(long)]
         text: String,
+        /// **DANGEROUS, default OFF.** Accept an unsigned (v1) invite.
+        /// v1 URLs carry no signature, so a side-channel MITM could
+        /// have substituted any field (KEM, KP, hubs) without
+        /// detection. Default behaviour now is to **refuse** v1 — the
+        /// caller must pass this flag to opt in. Even with v2, a full
+        /// MITM minting their own fully-valid invite is undetectable
+        /// without out-of-band fingerprint verification.
+        #[arg(long, default_value_t = false)]
+        insecure_accept_unsigned: bool,
     },
     /// Multi-party room (channel) operations (T6.3.b-e). One MLS
     /// group per room, owned end-to-end; the daemon persists the
@@ -833,7 +843,11 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
         Some(Command::Invite { with_kp, with_hubs }) => {
             run_invite(&socket, with_kp, with_hubs).await
         }
-        Some(Command::Accept { url, text }) => run_accept(&socket, &url, text).await,
+        Some(Command::Accept {
+            url,
+            text,
+            insecure_accept_unsigned,
+        }) => run_accept(&socket, &url, text, insecure_accept_unsigned).await,
         Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
         Some(Command::Files { cmd }) => dispatch_files(&socket, cmd).await,
         Some(Command::Contact { cmd }) => dispatch_contact(&socket, cmd).await,
@@ -1068,35 +1082,98 @@ fn humanize_remaining_ms(exp_ms: u64) -> String {
 /// to avoid bumping the sealed envelope from the MEDIUM wire-size
 /// bucket into LARGE — a length-leak signal observable to anyone
 /// watching the daemon↔hub Noise channel.
-async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow::Result<ExitCode> {
+// Trust-gate, hub-intersection, daemon dispatch, error printing — all
+// linear and read-top-to-bottom; splitting each gate into a helper
+// would just rename the work.
+#[allow(clippy::too_many_lines)]
+async fn run_accept(
+    socket: &std::path::Path,
+    url: &str,
+    text: String,
+    insecure_accept_unsigned: bool,
+) -> anyhow::Result<ExitCode> {
     let invite = onyx_core::invite::Invite::parse(url)
         .map_err(|e| anyhow::anyhow!("invalid invite URL: {e}"))?;
 
-    // T-2: signed (v2) invites get their signature verified here BEFORE
-    // we send anything — a tampered-but-still-parseable URL must be
-    // rejected at the boundary. Unsigned (v1) invites still work for
-    // backward compat but the operator gets a loud warning that the
-    // side-channel could have substituted any of the fields (the
-    // attacker would still need to substitute the WHOLE invite, so
-    // the OOB-fingerprint check is the user-level defense — T-2's
-    // signing only catches PARTIAL tampering).
+    // T-2 trust gates, in order of how badly they bite:
+    //
+    //   (a) v1 (unsigned) is refused outright unless the operator
+    //       explicitly opts in with `--insecure-accept-unsigned`. The
+    //       previous "warn + send anyway" turned the entire v2 work
+    //       into a downgrade target — an attacker rewriting `/v2 → /v1`
+    //       and stripping the sig fields would get a warning + a sent
+    //       envelope. No more.
+    //   (b) Wall-clock failure is a hard error, not a silent 0. With
+    //       `unwrap_or(0)`, a broken / backward-skewed clock would
+    //       silently bypass the expiry check (every signed invite
+    //       would "not yet" be expired).
+    //   (c) The v2 signature is verified. Honest framing: this proves
+    //       the invite is *internally consistent* (nobody flipped
+    //       individual fields between mint and accept). It does NOT
+    //       prove the invite came from the human you think it did —
+    //       it's self-signed by whoever holds the fingerprint *in*
+    //       the invite. A full-invite MITM mints their own valid v2
+    //       under their own keys and still passes here.
+    //   (d) TOFU cross-check: if we've already pinned a DIFFERENT key
+    //       for this fingerprint, refuse rather than silently
+    //       overwriting the pin. The user has to investigate.
+    //
+    // The OOB-fingerprint compare against what your peer told you over
+    // a trusted channel (voice / Signal / in person) remains the only
+    // real anti-MITM defence at first contact. T-2 narrows the
+    // attacker's options; it does not eliminate them.
     if invite.is_signed() {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| u64::try_from(d.as_millis()).ok())
-            .unwrap_or(0);
+        let now_ms: u64 = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| anyhow::anyhow!("system clock is set before unix epoch: {e}"))?
+                .as_millis(),
+        )
+        .map_err(|_| anyhow::anyhow!("system clock value exceeds u64 ms — refusing to accept"))?;
         invite
             .verify_signature(now_ms)
             .map_err(|e| anyhow::anyhow!("invite signature did not verify: {e}"))?;
-        eprintln!("onyx: invite v2 signature verified ✓");
-    } else {
         eprintln!(
-            "onyx: WARNING — this is an unsigned (v1) invite; the side-channel could have \
-             substituted any field (KEM, KP, hubs). Verify the recipient's fingerprint out \
-             of band before sending anything sensitive. Re-issue with `onyx invite` from a \
-             current daemon to get a signed (v2) URL."
+            "onyx: invite signature is internally consistent (self-signed by the fingerprint \
+             inside the invite — this is NOT a check that the invite came from the human you \
+             think it did; verify the fingerprint out of band before trusting)"
         );
+    } else if insecure_accept_unsigned {
+        eprintln!(
+            "onyx: WARNING — accepting an unsigned (v1) invite because \
+             --insecure-accept-unsigned was passed. The side-channel could have substituted \
+             any field. Re-verify the fingerprint OOB and ask for a v2 URL."
+        );
+    } else {
+        anyhow::bail!(
+            "refusing to accept an unsigned (v1) invite. v1 invites carry no signature, so a \
+             side-channel MITM could have substituted any field (KEM / KP / hubs) without \
+             detection. Ask the inviter to re-issue with `onyx invite` from a current daemon \
+             (produces a signed v2 URL), or pass `--insecure-accept-unsigned` to opt in to \
+             the historical (unsafe) behaviour."
+        );
+    }
+
+    // TOFU cross-check (pairs with T-1). If we already have a pinned
+    // key for this fingerprint AND it differs from the one in the
+    // invite, refuse — a key change at accept-time is exactly the
+    // signal `onyx contact list` was built to surface, and silently
+    // re-pinning here would defeat the whole point.
+    {
+        let contacts = client::one_shot(socket, &ApiRequest::ListContacts).await?;
+        if let ApiResponse::ListContactsOk { contacts } = contacts {
+            let invite_fp = invite.fingerprint.to_string();
+            for c in &contacts {
+                if c.fingerprint == invite_fp && c.key_changed {
+                    anyhow::bail!(
+                        "the fingerprint in this invite ({invite_fp}) is already pinned, \
+                         AND its identity key has changed since first contact (T-1). Run \
+                         `onyx contact list` and verify out of band before sending. Refusing \
+                         to send."
+                    );
+                }
+            }
+        }
     }
 
     // T8.2 transparency + T8.2-check intersection: if the inviter
@@ -1155,22 +1232,41 @@ async fn run_accept(socket: &std::path::Path, url: &str, text: String) -> anyhow
         }
     }
 
-    let peer_fingerprint = invite.fingerprint.to_string();
-    let req = if let Some(peer_kp_b64) = invite.kp_standard_b64() {
-        ApiRequest::SendBootstrapMls {
-            peer_fingerprint,
-            peer_kem_pub_b32: invite.kem_pub_b32,
-            peer_kp_b64,
-            initial_text: Some(text),
-        }
-    } else {
-        ApiRequest::SendBootstrap {
-            peer_fingerprint,
-            peer_kem_pub_b32: invite.kem_pub_b32,
+    // T-2: dispatch through the trust-anchored `SendInvite` API verb.
+    // The daemon re-parses + re-verifies the URL (so a malicious local
+    // process bypassing this CLI can't strip the signature), cross-
+    // checks the pin store, and picks the tier (msg/v1 vs mls/v1)
+    // based on whether the invite carries a KP. We pass the URL
+    // through verbatim — the CLI is intentionally a thin wrapper
+    // here, no per-tier dispatch logic on this side.
+    let resp = client::one_shot(
+        socket,
+        &ApiRequest::SendInvite {
+            url: url.to_string(),
             text,
+            insecure_accept_unsigned,
+        },
+    )
+    .await?;
+    match &resp {
+        ApiResponse::SendInviteOk { tier, was_signed } => {
+            eprintln!(
+                "onyx: sent via {tier} ({})",
+                if *was_signed {
+                    "signed invite, sig verified daemon-side"
+                } else {
+                    "unsigned v1, accepted under --insecure-accept-unsigned"
+                }
+            );
         }
-    };
-    one_shot_print(socket, req).await
+        ApiResponse::Error { .. } => {}
+        other => eprintln!("onyx: unexpected response shape: {other:?}"),
+    }
+    println!("{}", serde_json::to_string_pretty(&resp)?);
+    Ok(match resp {
+        ApiResponse::Error { .. } => ExitCode::from(1),
+        _ => ExitCode::SUCCESS,
+    })
 }
 
 /// Send `req`, pretty-print the response as JSON on stdout, return
@@ -1378,9 +1474,17 @@ mod tests {
         ])
         .expect("parses");
         match args.cmd {
-            Some(Command::Accept { url, text }) => {
+            Some(Command::Accept {
+                url,
+                text,
+                insecure_accept_unsigned,
+            }) => {
                 assert_eq!(url, "onyx://invite/v1?fp=abcd&kem=efgh");
                 assert_eq!(text, "hi from accept");
+                assert!(
+                    !insecure_accept_unsigned,
+                    "default must be false — opting into unsigned v1 is dangerous"
+                );
             }
             other => panic!("expected Accept, got {other:?}"),
         }

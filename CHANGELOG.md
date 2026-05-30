@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — T-2 batch: kill the misleading ✓, refuse v1 by default, daemon-side verify, pin cross-check, NEW-1/2/3
+
+Acting on a re-audit's correct finding that the previous T-2 ship was partial: signed invites caught partial tampering but the green "invite v2 signature verified ✓" UX *lied* about full-invite-MITM, the daemon trusted the CLI for signature verification, and three corner cases (v1 downgrade by path rewrite, attacker-chosen unbounded `exp`, junk-pin from raw-X25519 fallback) were live.
+
+  * **No more "✓ verified"** — accept now prints "*invite signature is internally consistent (self-signed by the fingerprint inside the invite — this is NOT a check that the invite came from the human you think it did; verify the fingerprint out of band before trusting)*". Self-signing proves internal consistency, nothing about authenticity; the message now says so.
+  * **v1 unsigned refused by default** — both `onyx accept` and the daemon's new `SendInvite` verb refuse unless the caller opts in with `--insecure-accept-unsigned` / `insecure_accept_unsigned: true`. The previous "warn + send anyway" was a downgrade-attack target.
+  * **Daemon-side verification (`SendInvite`)** — new API verb that takes the URL, re-parses, re-verifies, cross-checks the pin store, and dispatches internally to `handle_send_bootstrap*`. The CLI is now a thin pass-through; a malicious local process speaking to the API socket cannot strip the signature by calling `SendBootstrap*` directly. Existing `SendBootstrap*` verbs stay for compat but skip the trust gates (documented).
+  * **Pin-store cross-check on accept** — if the invite's fp is already pinned and `key_changed` is set (T-1), the daemon refuses with "verify out of band and clear the pin." Stops a known-changed key from being silently re-pinned via an invite.
+  * **NEW-1 v1 downgrade** — closed by the refuse-v1-default above (path rewrite + sig strip now hits a hard refuse). The v2 path is also bound into the signed blob via `SIGN_CONTEXT_V2 = b"onyx/invite/v2"`, so the keep-sig-flip-path variant also fails verification.
+  * **NEW-2 clock skew + `exp` clamp** — `verify_signature` now rejects `exp > now + MAX_INVITE_TTL_SECS` (90 d). Both `run_accept` and `handle_build_invite` / `handle_send_invite` **hard-error** on a broken / pre-epoch wall-clock rather than `unwrap_or(0)`-ing into a never-expired state. Sender-side `ttl_secs` is also clamped to the ceiling. Test: `v2_exp_too_far_in_future_is_rejected`.
+  * **NEW-3 fallback placeholder** — `derive_peer_fingerprint`'s direct-session caller now passes `format!("(peer/{x25519-short})")` as the fallback, so `pin_check_peer`'s `starts_with("(peer/")` skip applies and nothing gets pinned when MLS attribution is unavailable.
+
+**Honest residual** (kept in THREAT_MODEL): full-invite substitution by a MITM minting their own fully-valid v2 (their fp/keys/sig) remains indistinguishable on an unauthenticated channel — that's the *fundamental* limit of any invite system, mitigated only by OOB-fingerprint verification or T-1's later key-change detection. This batch closes everything *short* of that limit.
+
+Gate: clippy `-D warnings` clean; `cargo test --workspace` = **512 passed** (+1 max-future-clamp).
+
+D-1 (the deanonymization-by-default finding) is next.
+
+---
+
 ## 2026-05-30 — Release v0.1.8 — fresh-install-friendly daemon-unreachable error
 
 **CLI / help-text-only release.** Binary logic is byte-identical to v0.1.7. Triggered by a real install report: a new user ran `onyx tui` (the natural guess for "open the chat UI"), the embedded daemon wasn't running because that subcommand doesn't start one, and the error said "is onyxd running?" — useless if you don't already know `onyxd` exists.

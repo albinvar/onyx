@@ -78,6 +78,15 @@ const PATH_V2: &str = "invite/v2";
 /// invite signature.
 const SIGN_CONTEXT_V2: &[u8] = b"onyx/invite/v2";
 
+/// T-2 NEW-2: hard ceiling on how far in the future a v2 invite's
+/// `exp_ms` is allowed to be. `exp` is set by the inviter — without a
+/// verifier-side clamp, a malicious sender can claim `exp = year 3000`
+/// and use the invite forever. 90 days is plenty for any reasonable
+/// invite + leaves room for time-zone slop and legitimately offline
+/// recipients; anything beyond it is more likely a bug or an attack
+/// than a real use case.
+pub const MAX_INVITE_TTL_SECS: u64 = 90 * 86_400;
+
 /// T-2: signature material attached to a v2 invite. Binds every other
 /// field of the invite (fingerprint, KEM, optional KP, hubs, exp,
 /// nonce) into a single Ed25519 signature by the inviter's identity
@@ -336,6 +345,16 @@ impl Invite {
         ))?;
         if now_ms >= sig_info.exp_ms {
             return Err(Error::InvalidEncoding("invite: expired"));
+        }
+        // NEW-2: verifier-side max-future clamp. `exp_ms` is set by the
+        // inviter; without this a malicious sender can mint an invite
+        // claiming `exp = year 3000` and use it forever. Bound is
+        // [`MAX_INVITE_TTL_SECS`].
+        let max_exp_ms = now_ms.saturating_add(MAX_INVITE_TTL_SECS.saturating_mul(1000));
+        if sig_info.exp_ms > max_exp_ms {
+            return Err(Error::InvalidEncoding(
+                "invite: exp is further in the future than MAX_INVITE_TTL_SECS allows",
+            ));
         }
         let vk = VerifyingKey::from_bytes(*self.fingerprint.as_bytes()).map_err(|_| {
             Error::InvalidEncoding("invite: fingerprint is not a valid Ed25519 key")
@@ -864,6 +883,41 @@ mod tests {
         let url = format!("onyx://invite/v2?fp={fp}&kem=k");
         let err = Invite::parse(&url).unwrap_err();
         assert!(matches!(err, Error::InvalidEncoding(_)));
+    }
+
+    #[test]
+    fn v2_exp_too_far_in_future_is_rejected() {
+        // T-2 NEW-2: even a perfectly-valid signature is refused if
+        // the inviter set `exp` further than MAX_INVITE_TTL_SECS in
+        // the future. Without this, a malicious sender could mint an
+        // invite claiming year-3000 expiry and have it stay valid
+        // forever.
+        let signing = SigningKey::generate();
+        let fp = signing.verifying_key().fingerprint();
+        // 200 days in ms — well past the 90-day cap.
+        let now_ms: u64 = 1_700_000_000_000;
+        let exp_ms: u64 = now_ms + 200 * 86_400 * 1000;
+        let inv = Invite::new(fp, "k".into()).sign(&signing, exp_ms, [0u8; 16]);
+        let parsed = Invite::parse(&inv.to_url()).expect("parse");
+        let err = parsed
+            .verify_signature(now_ms)
+            .expect_err("verify must refuse exp beyond MAX_INVITE_TTL_SECS");
+        // Sanity: the error message mentions the clamp by name (so
+        // operators can tell this is the clamp tripping, not "expired").
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("future"),
+            "error should mention 'future'-clamp: {msg}"
+        );
+
+        // And the same invite WITHIN the cap (60 days) verifies fine.
+        let exp_ms_ok: u64 = now_ms + 60 * 86_400 * 1000;
+        let inv_ok = Invite::new(signing.verifying_key().fingerprint(), "k".into())
+            .sign(&signing, exp_ms_ok, [0u8; 16]);
+        Invite::parse(&inv_ok.to_url())
+            .unwrap()
+            .verify_signature(now_ms)
+            .expect("60-day invite must verify");
     }
 
     #[test]
