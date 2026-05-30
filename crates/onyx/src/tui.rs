@@ -1569,34 +1569,27 @@ fn save_manage_hubs(
     crate::save_file_config(&cfg).map_err(|e| format!("{e:#}"))
 }
 
-/// UX overhaul: assemble an `onyx://invite/v1?…` URL from the daemon's
-/// Identity + a fresh KeyPackage + the configured hub list — the same
-/// bundle `onyx invite --with-kp --with-hubs` produces on the CLI.
+/// Ask the daemon to build a **signed (v2)** invite URL — the same
+/// `onyx://invite/v2?…` the CLI's `onyx invite --with-kp --with-hubs`
+/// produces. The signing key lives in the daemon, so we MUST go through
+/// `BuildInvite` rather than assembling the URL here: a client-side
+/// `Invite::to_url()` yields an *unsigned v1* link, which the accepting
+/// peer refuses by default (v1 carries no signature → undetectable MITM).
 async fn build_invite_url(socket: &Path) -> anyhow::Result<String> {
-    let id = client::one_shot(socket, &ApiRequest::Identity).await?;
-    let (fingerprint, kem, hubs) = match id {
-        ApiResponse::IdentityOk {
-            fingerprint,
-            identity_kem_pub_b32,
-            hubs,
-            ..
-        } => (fingerprint, identity_kem_pub_b32, hubs),
-        other => anyhow::bail!("unexpected Identity response: {other:?}"),
-    };
-    let fp = onyx_core::crypto::Fingerprint::parse(&fingerprint)?;
-    let kp = client::one_shot(socket, &ApiRequest::ExportKeyPackage).await?;
-    let mut invite = match kp {
-        ApiResponse::ExportKeyPackageOk { kp_b64 } => {
-            let kp_bytes = base64::engine::general_purpose::STANDARD.decode(kp_b64)?;
-            onyx_core::invite::Invite::with_key_package(fp, kem, kp_bytes)
-        }
-        // No KP available → fall back to a PFS-only (msg/v1) invite.
-        _ => onyx_core::invite::Invite::new(fp, kem),
-    };
-    if !hubs.is_empty() {
-        invite = invite.with_hubs(hubs);
+    let resp = client::one_shot(
+        socket,
+        &ApiRequest::BuildInvite {
+            with_kp: true,
+            with_hubs: true,
+            ttl_secs: None,
+        },
+    )
+    .await?;
+    match resp {
+        ApiResponse::BuildInviteOk { url, .. } => Ok(url),
+        ApiResponse::Error { message, .. } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected BuildInvite response: {other:?}"),
     }
-    Ok(invite.to_url())
 }
 
 /// UX overhaul: copy `text` to the terminal's clipboard via the OSC52

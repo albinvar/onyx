@@ -6,6 +6,24 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.13 — 2026-05-31 — fix: in-TUI "copy invite" produced an unsigned (v1) link
+
+**Bug fix.** The `^E` "copy my invite link" action in the TUI assembled
+the URL client-side via `Invite::to_url()`, which produces an **unsigned
+`onyx://invite/v1?…`** link. The accepting side (CLI `onyx accept` and
+the new `^A` modal) refuses v1 by default — so a link copied from the TUI
+failed with *"refusing unsigned (v1) invite"* and the headline invite
+flow looked broken.
+
+The signing key lives in the daemon, so the TUI cannot sign locally.
+Fixed `build_invite_url` to go through the daemon's `BuildInvite` API
+verb (the same path the CLI's `onyx invite` uses), which returns a
+**signed v2** URL with the KeyPackage + hubs attached. `^E` now produces
+an acceptable link; no `--insecure-accept-unsigned` needed.
+
+Gate: `cargo build` clean; clippy `--workspace -D warnings` 0/0; fmt
+clean; `cargo test -p onyx` 26 passed / 0 failed.
+
 ## v0.1.12 — 2026-05-30 — everything in the TUI + peer-to-peer dial
 
 Makes every capability reachable from the TUI (the user's ask: "wire it
