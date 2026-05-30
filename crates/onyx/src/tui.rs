@@ -108,6 +108,7 @@ use zeroize::Zeroize;
 use base64::Engine as _;
 
 use crate::client;
+use crate::theme;
 
 const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -2636,29 +2637,21 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let line = match &app.last_status {
-        None => Line::from(Span::styled(
-            " connecting to daemon… ",
-            Style::default().fg(Color::Yellow),
-        )),
+        None => Line::from(Span::styled(" connecting to daemon… ", theme::warn())),
         Some(Err(e)) => Line::from(vec![
-            Span::styled(
-                " daemon unreachable: ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(e.clone()),
-            Span::styled("  · Esc to quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" daemon unreachable: ", theme::error()),
+            Span::styled(e.clone(), theme::text()),
+            Span::styled("  · Esc to quit", theme::muted()),
         ]),
         Some(Ok(s)) => {
             let tor = match s.tor_state {
-                TorState::Ready => Span::styled("tor ready", Style::default().fg(Color::Green)),
-                TorState::Disabled => {
-                    Span::styled("tor disabled", Style::default().fg(Color::Yellow))
-                }
+                TorState::Ready => Span::styled("tor ready", theme::ok()),
+                TorState::Disabled => Span::styled("tor disabled", theme::warn()),
             };
             let live = if app.tail_active {
-                Span::styled("● live", Style::default().fg(Color::Green))
+                Span::styled("● live", theme::ok())
             } else {
-                Span::styled("○ no tail", Style::default().fg(Color::Red))
+                Span::styled("○ no tail", theme::error())
             };
             let live_count = app.peers.iter().filter(|p| p.connected).count();
             Line::from(vec![
@@ -2667,38 +2660,30 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 Span::raw("  ·  "),
                 live,
                 Span::raw("  ·  "),
-                Span::styled("you ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    short_id(&s.fingerprint),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("you ", theme::muted()),
+                Span::styled(short_id(&s.fingerprint), theme::you()),
                 Span::raw("  ·  "),
                 Span::styled(
                     format!(
                         "{live_count} peer{}",
                         if live_count == 1 { "" } else { "s" }
                     ),
-                    Style::default().fg(Color::Gray),
+                    theme::muted(),
                 ),
                 Span::raw("  ·  "),
-                Span::styled(
-                    format!("v{}", s.daemon_version),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("v{}", s.daemon_version), theme::muted()),
                 Span::raw("   "),
                 // UX overhaul: colored, always-visible keybind hints.
                 kb("F1"),
-                Span::styled("help ", Style::default().fg(Color::Gray)),
+                Span::styled("help ", theme::keylabel()),
                 kb("^K"),
-                Span::styled("palette ", Style::default().fg(Color::Gray)),
+                Span::styled("palette ", theme::keylabel()),
                 kb("^N"),
-                Span::styled("room ", Style::default().fg(Color::Gray)),
+                Span::styled("room ", theme::keylabel()),
                 kb("^F"),
-                Span::styled("file ", Style::default().fg(Color::Gray)),
+                Span::styled("file ", theme::keylabel()),
                 kb("^E"),
-                Span::styled("invite", Style::default().fg(Color::Gray)),
+                Span::styled("invite", theme::keylabel()),
             ])
         }
     };

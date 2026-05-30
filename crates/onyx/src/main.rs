@@ -52,6 +52,7 @@
 //!   * `2` — could not connect to the daemon.
 
 mod client;
+mod theme;
 mod tui;
 
 use std::path::PathBuf;
