@@ -163,6 +163,9 @@ async fn spawn_daemon_with_opts(
         cover_traffic_mean_secs: None,
         constant_rate_ms,
         first_contact_reachable,
+        // A1.2: the smoke harness deliberately uses clearnet (--hub-tcp
+        // + listen_tcp) — acknowledge it so the guard lets it start.
+        allow_clearnet: true,
     };
 
     tokio::spawn(async move {

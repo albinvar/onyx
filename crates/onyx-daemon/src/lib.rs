@@ -165,6 +165,12 @@ pub struct Config {
     /// which runs inside Noise frames, so peer authentication is
     /// unaffected. See ANONYMITY.md §3.2.
     pub first_contact_reachable: bool,
+    /// A1.2: explicit acknowledgement that the operator WANTS a
+    /// clearnet (NO-TOR, NO-ANONYMITY) transport. Gates every clearnet
+    /// flag via `clearnet_guard`. Default `false` ⇒ the daemon refuses
+    /// to start a clearnet mode without it, so a mistyped flag can't
+    /// silently expose the user's IP.
+    pub allow_clearnet: bool,
 }
 
 /// Bundle of state every handler needs.

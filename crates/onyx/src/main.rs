@@ -160,6 +160,13 @@ struct Args {
     #[arg(long, env = "ONYX_FIRST_CONTACT_REACHABLE", global = true)]
     first_contact_reachable: bool,
 
+    /// A1.2: acknowledge clearnet (NO TOR, NO ANONYMITY). Required to
+    /// use any plain-TCP transport (--no-tor / --listen-tcp /
+    /// --dial-tcp / --hub-tcp); without it the daemon refuses those
+    /// modes so a mistyped flag can't silently expose your IP.
+    #[arg(long, env = "ONYX_ALLOW_CLEARNET", global = true)]
+    allow_clearnet: bool,
+
     #[command(subcommand)]
     cmd: Option<Command>,
 }
@@ -640,6 +647,8 @@ fn build_daemon_config(
         constant_rate_ms: args.constant_rate_ms,
         // D-1: single master switch; default false = private.
         first_contact_reachable: args.first_contact_reachable,
+        // A1.2: must explicitly opt in to clearnet (no-Tor) transport.
+        allow_clearnet: args.allow_clearnet,
     })
 }
 
