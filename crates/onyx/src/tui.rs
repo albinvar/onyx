@@ -1717,7 +1717,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(24),
+                Constraint::Length(26),
                 Constraint::Min(0),
                 Constraint::Length(32),
             ])
@@ -1725,12 +1725,30 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(22), Constraint::Min(0)])
+            .constraints([Constraint::Length(24), Constraint::Min(0)])
             .split(main_area)
     };
-    let peers_area = cols[0];
+    let left_rail = cols[0];
     let chat_col = cols[1];
     let details_area = if wide { Some(cols[2]) } else { None };
+
+    // UX overhaul phase 2: the left rail is a stack —
+    //   logo (brand)  ·  peers & rooms (flexible)  ·  daemon status.
+    // The logo box is fixed; the status box is fixed; peers takes the
+    // rest. On a very short terminal the logo is the first to yield
+    // (its Length collapses gracefully and the art clips to the box).
+    let logo_h: u16 = (theme::ONION_ART.len() as u16 + 4).min(left_rail.height / 2);
+    let rail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(logo_h),
+            Constraint::Min(3),
+            Constraint::Length(4),
+        ])
+        .split(left_rail);
+    let logo_area = rail[0];
+    let peers_area = rail[1];
+    let daemon_area = rail[2];
 
     let chat_rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1739,7 +1757,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let messages_area = chat_rows[0];
     let composer_area = chat_rows[1];
 
+    render_logo(frame, logo_area);
     render_peers(frame, peers_area, app);
+    render_daemon_status(frame, daemon_area, app);
     render_messages(frame, messages_area, app);
     render_composer(frame, composer_area, app);
     if let Some(d) = details_area {
@@ -2320,6 +2340,78 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 // Linear render fn: empty-state branch + grouped DM/Channels item
 // build + visual-row mapping. Over the 100-line budget but cohesive
 // (same rationale as the other render_* helpers).
+/// UX overhaul phase 2: the brand box at the top of the left rail —
+/// the Tor "onion" motif in phosphor green with the ONYX wordmark and
+/// a one-line tagline. Centered; clips gracefully in a short box.
+fn render_logo(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border())
+        .title(Span::styled(" onyx ", theme::header()));
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let center = |s: &str| -> Line<'static> {
+        let len = s.chars().count();
+        let pad = inner_w.saturating_sub(len) / 2;
+        Line::from(Span::styled(
+            format!("{}{}", " ".repeat(pad), s),
+            theme::ok(),
+        ))
+    };
+    let mut lines: Vec<Line<'static>> = theme::ONION_ART.iter().map(|l| center(l)).collect();
+    lines.push(center(theme::WORDMARK));
+    lines.push(Line::from(Span::styled(
+        {
+            let len = theme::TAGLINE.chars().count();
+            let pad = inner_w.saturating_sub(len) / 2;
+            format!("{}{}", " ".repeat(pad), theme::TAGLINE)
+        },
+        theme::muted(),
+    )));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// UX overhaul phase 2: the daemon-status box at the bottom of the left
+/// rail — a compact dashboard line for Tor + tail health + version, so
+/// the user can see the embedded daemon is alive at a glance (it starts
+/// automatically, so this is the only place that visibly confirms it).
+fn render_daemon_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border())
+        .title(Span::styled(" daemon ", theme::header()));
+
+    let lines: Vec<Line<'static>> = match &app.last_status {
+        None => vec![Line::from(Span::styled("◌ starting…", theme::warn()))],
+        Some(Err(_)) => vec![
+            Line::from(Span::styled("✗ unreachable", theme::error())),
+            Line::from(Span::styled("reconnecting…", theme::muted())),
+        ],
+        Some(Ok(s)) => {
+            let (glyph, label, style) = match s.tor_state {
+                TorState::Ready => ("◉", "tor ready", theme::ok()),
+                TorState::Disabled => ("○", "tor off (clearnet)", theme::warn()),
+            };
+            let tail = if app.tail_active {
+                Span::styled("● live", theme::ok())
+            } else {
+                Span::styled("○ reconnecting", theme::warn())
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(label.to_string(), style),
+                ]),
+                Line::from(vec![
+                    Span::styled("link ", theme::muted()),
+                    tail,
+                    Span::styled(format!("   v{}", s.daemon_version), theme::muted()),
+                ]),
+            ]
+        }
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let block = Block::default()
@@ -2841,6 +2933,18 @@ mod snapshot_tests {
         // copy changed from "(no peers yet)" to "(nothing yet)".
         assert!(snap.contains("Peers"));
         assert!(snap.contains("(nothing yet)"));
+        // UX overhaul phase 2: the stacked left rail must render the
+        // brand box (wordmark + tagline) and the daemon-status box.
+        assert!(snap.contains("O N Y X"), "logo wordmark missing:\n{snap}");
+        assert!(snap.contains("anonymous"), "tagline missing:\n{snap}");
+        assert!(
+            snap.contains("daemon"),
+            "daemon status box missing:\n{snap}"
+        );
+        assert!(
+            snap.contains("tor ready"),
+            "daemon box should show tor state:\n{snap}"
+        );
     }
 
     #[test]
