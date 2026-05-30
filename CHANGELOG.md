@@ -6,6 +6,18 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — A0.3: tests proving handle_send_room refuses a key-changed member
+
+The A0.3 room-path fix (blocking sends to a key-changed / possibly-MITM'd room member) had no test exercising the wiring — the same class of gap that previously let the room paths ship UNWIRED until a code audit caught it (commit 7e039c4). This adds that coverage.
+
+- Two unit tests in `api_server::tests` drive the real `handle_send_room` against an in-memory vault + `DaemonState`:
+  - `send_room_refuses_key_changed_member` — a room whose member has a `key_changed` pin ⇒ `handle_send_room` returns `Error(Malformed, "… has CHANGED …")` naming the compromised member.
+  - `send_room_clean_roster_passes_guard_and_hits_mls` — a clean pin passes the guard and falls through to the MLS-layer error (NOT the pin refusal). This negative is the teeth: if the `pin_block` loop were removed, both tests would land on the MLS error and the refusal test would fail.
+- **Mutation-verified (actually run this time):** removing the `pin_block` call from the `handle_send_room` loop makes `send_room_refuses_key_changed_member` **FAIL** (1 passed / 1 failed) while the clean-roster test still passes; restoring it makes both pass. Confirmed, then reverted.
+- The guard runs after room-row lookup but before MLS `load_group`, so the test needs no real MLS group — clean and deterministic.
+
+Gate: `cargo test --workspace` = 520 passed / 0 failed (+2); clippy `-D warnings` 0/0; fmt clean. (`handle_send_file_to_room` shares the identical loop; a dedicated test for it stays tracked, but this proves the pattern + the predicate.)
+
 ## 2026-05-30 — A1.2: integration test proving run() actually invokes the clearnet guard
 
 The A1.2 clearnet guard shipped with only *unit* tests of the pure `clearnet_guard` classifier — nothing proved `run()` calls it. That exact gap let the wiring silently fail to apply for several commits (the daemon accepted clearnet transport with no acknowledgement while unit tests stayed green; `main` was even briefly non-compiling). This adds the missing integration test.

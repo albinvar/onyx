@@ -3299,4 +3299,128 @@ mod tests {
             other => panic!("expected NotReady, got {other:?}"),
         }
     }
+
+    // ── A0.3: room send refuses a key-changed (compromised) member ──────
+    //
+    // Exercises the `pin_block` loop in `handle_send_room` end to end
+    // against a real in-memory vault + DaemonState. The loop runs AFTER
+    // the room-row lookup but BEFORE MLS `load_group`, so no real MLS
+    // group is needed: a compromised member → pin refusal; a clean roster
+    // → falls THROUGH to the MLS "no group" error. The difference is the
+    // test's teeth (mutation-verified during development: neutering the
+    // loop makes the compromised case fall through and the `has CHANGED`
+    // assert fail).
+
+    use onyx_core::crypto::Argon2Params;
+    use onyx_core::mls::MlsParty;
+    use onyx_core::storage::Vault;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    /// Minimal DaemonState over an in-memory vault that already has a
+    /// `rooms` row for `group_id` listing `members_b32`. Returns the
+    /// state + the base32 group id the API expects.
+    fn room_state_with_members(
+        members_b32: &str,
+        group_id: &[u8; 32],
+    ) -> (Arc<DaemonState>, String) {
+        let mut vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+        let (identity_id, identity) = vault.create_identity("me").expect("identity");
+        vault
+            .save_room(identity_id, group_id, "general", members_b32, 1_000)
+            .expect("save_room");
+        let mls_party = MlsParty::from_identity(&identity).expect("mls party");
+        let state = Arc::new(DaemonState {
+            identity,
+            identity_id,
+            mls_party: Arc::new(Mutex::new(mls_party)),
+            vault: Arc::new(Mutex::new(vault)),
+            conversations: crate::conversations::new_shared(),
+            hub_outbounds: Vec::new(),
+            hub_fetch_lock: Arc::new(Mutex::new(())),
+            seen_envelopes: Arc::new(Mutex::new(crate::replay_guard::EnvelopeReplayGuard::new())),
+            configured_hubs: Vec::new(),
+            pending_room_frames: Arc::new(Mutex::new(HashMap::new())),
+            inflight_files: Arc::new(Mutex::new(HashMap::new())),
+            files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
+        });
+        (state, encode_b32(group_id))
+    }
+
+    /// A fresh, valid-looking fingerprint string for a fictional member.
+    fn fresh_fp() -> String {
+        SigningKey::generate()
+            .verifying_key()
+            .fingerprint()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn send_room_refuses_key_changed_member() {
+        let group_id = [7u8; 32];
+        let victim = fresh_fp();
+        let (state, group_id_b32) = room_state_with_members(&victim, &group_id);
+
+        // Force the victim's pin into key_changed (TOFU mismatch).
+        {
+            let vault = state.vault.lock().await;
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[1u8; 32], 1_000)
+                .expect("first pin");
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[2u8; 32], 2_000)
+                .expect("mismatching pin sets key_changed");
+            assert!(
+                vault
+                    .is_pin_compromised(state.identity_id, &victim)
+                    .expect("is_pin_compromised"),
+                "test setup: victim pin must be flagged key_changed"
+            );
+        }
+
+        let resp = handle_send_room(&group_id_b32, "hello room", &state).await;
+        match resp {
+            ApiResponse::Error { code, message } => {
+                assert_eq!(code, ApiErrorCode::Malformed, "got message: {message}");
+                assert!(
+                    message.contains("has CHANGED"),
+                    "must be the A0.3 pin refusal, got: {message}"
+                );
+                assert!(
+                    message.contains(&victim),
+                    "refusal must name the compromised member, got: {message}"
+                );
+            }
+            other => panic!("expected pin-change refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_room_clean_roster_passes_guard_and_hits_mls() {
+        // TEETH: a CLEAN pin must NOT fire the guard — the call falls
+        // through to the MLS layer (no group → error). The assertion is
+        // the negative: NOT the pin refusal. If the pin_block loop were
+        // removed, both tests land here and the compromised one fails.
+        let group_id = [9u8; 32];
+        let member = fresh_fp();
+        let (state, group_id_b32) = room_state_with_members(&member, &group_id);
+        {
+            let vault = state.vault.lock().await;
+            vault
+                .pin_or_verify(state.identity_id, &member, &[1u8; 32], 1_000)
+                .expect("clean pin");
+        }
+
+        let resp = handle_send_room(&group_id_b32, "hello room", &state).await;
+        match resp {
+            ApiResponse::Error { message, .. } => {
+                assert!(
+                    !message.contains("has CHANGED"),
+                    "clean roster must pass the pin guard; got pin refusal: {message}"
+                );
+            }
+            other => panic!("expected an MLS-layer error (no group), got {other:?}"),
+        }
+    }
 }
