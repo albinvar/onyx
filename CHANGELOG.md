@@ -6,6 +6,14 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — Release v0.1.7 — install.sh resolver fix (macOS)
+
+**install-script-only release.** Binary code is byte-identical to v0.1.6 (the daemon/client/hub Rust hasn't moved); the sole purpose is to ship the `install.sh` `resolve_version` fix to users so the default one-liner from the README works on macOS again. The release artifact attached to `releases/latest/download/install.sh` becomes the fixed copy.
+
+See the entry below for the bug analysis + fix.
+
+---
+
 ## 2026-05-30 — install.sh: `resolve_version` silently failed on macOS (set -e + pipefail + `grep -m1` SIGPIPE)
 
 Surfaced by running the full install-verification one-liner against the v0.1.6 release. Pinned install (`ONYX_VERSION=v0.1.6 …`) succeeded end-to-end (download → SHA256 → cosign signature verifies → `onyx --version` correctly reports `0.1.6`, confirming the version-stamping fix), but the **default** path (no `ONYX_VERSION` set, the form the README's one-liner uses) silently exited 1 right after `resolve_version` set `tag=v0.1.6` — the function then returned with an empty value to its caller.
