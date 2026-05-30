@@ -2469,8 +2469,9 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 // build + visual-row mapping. Over the 100-line budget but cohesive
 // (same rationale as the other render_* helpers).
 /// UX overhaul phase 2: the brand box at the top of the left rail —
-/// the Tor "onion" motif in phosphor green with the ONYX wordmark and
-/// a one-line tagline. Centered; clips gracefully in a short box.
+/// the layered Tor onion in brand purple, the ONYX wordmark (also
+/// purple), and a muted tagline. Centered; clips gracefully in a short
+/// box.
 fn render_logo(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)

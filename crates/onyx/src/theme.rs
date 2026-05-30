@@ -47,6 +47,11 @@ pub const RED: Color = Color::Rgb(0xff, 0x5f, 0x5f);
 pub const TEXT: Color = Color::Rgb(0xc8, 0xd0, 0xc8);
 /// Muted meta text (timestamps, version, secondary labels).
 pub const MUTED: Color = Color::Rgb(0x6b, 0x7a, 0x6b);
+/// Tor brand purple — the onion logo. Tor's identity colour (#7D4698
+/// family), brightened slightly for terminal contrast on black.
+pub const PURPLE: Color = Color::Rgb(0xa9, 0x6c, 0xe6);
+/// Dim purple — the onion's inner/lower layers, for a little depth.
+pub const PURPLE_DIM: Color = Color::Rgb(0x6f, 0x45, 0x9c);
 
 // ── Semantic styles ─────────────────────────────────────────────────────
 //
@@ -161,6 +166,12 @@ pub fn muted() -> Style {
     Style::default().fg(MUTED)
 }
 
+/// The onion logo — Tor brand purple, bold.
+#[must_use]
+pub fn logo() -> Style {
+    Style::default().fg(PURPLE).add_modifier(Modifier::BOLD)
+}
+
 /// Selection highlight (the highlighted row in a list).
 #[must_use]
 pub fn selection() -> Style {
@@ -172,18 +183,19 @@ pub fn selection() -> Style {
 
 // ── Brand / ASCII art ───────────────────────────────────────────────────
 
-/// The ONYX onion logo for the left-rail top box. Rendered as the Tor
-/// "onion" motif with the centre highlighted. Six lines, designed to fit
-/// inside a box ~22 cols wide (the left rail). Caller styles it green.
+/// The ONYX onion logo for the left-rail top box — a layered Tor
+/// *onion* (teardrop bulb + concentric layer lines + a sprout on top),
+/// NOT a face. Five lines, designed to fit inside a box ~20 cols wide
+/// (the left rail). Caller styles it Tor-purple.
 ///
 /// Kept deliberately small so it survives a short terminal; the wordmark
 /// line below the art carries the brand if the art is clipped.
 pub const ONION_ART: &[&str] = &[
-    r#"   .-"""""-.   "#,
-    "  / _     _ \\  ",
-    " |  o)   (o  | ",
-    "  \\   ._.   /  ",
-    "   '-.....-'   ",
+    "      \\|/      ",
+    "    .-===-.    ",
+    "   /(  (  )\\   ",
+    "   \\ )  ) (/   ",
+    "    '-===-'    ",
 ];
 
 /// The wordmark shown under the onion art.
