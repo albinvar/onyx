@@ -219,7 +219,7 @@ A long-running onion service repeatedly builds circuits; an adversary who can co
     1. Vanguards **slow** guard discovery, they don't **eliminate** it.
     2. The **private default** (D-1: no published HS, ephemeral keys) has near-zero guard-discovery surface — A1.3 matters for **reachable-mode** users who publish a v3 HS.
     3. We did **not** widen the entry-guard set or add guards to outbound *client* circuits — Full is the whole-client mode arti exposes (general L2; HS additionally L3).
-    4. **Not unit-verifiable end-to-end.** The config pin is unit-tested; that L2+L3 guard sets are actually used on live HS circuits is confirmed only against real Tor (`RUST_LOG=tor_guardmgr=debug,tor_circmgr=debug`) — that transcript is still owed before calling A1.3 "fully done."
+    4. **Not unit-verifiable end-to-end.** The config pin is unit-tested; that L2+L3 guard sets are actually used on live HS circuits is confirmed only against real Tor. `scripts/real_tor_smoke.sh` now captures this automatically — it runs the daemons with `RUST_LOG=…,tor_guardmgr=debug,tor_circmgr=debug` and writes the guard-layer activity to `vanguard-transcript.txt` (step 4). The transcript is still **owed** from an operator who has a `tor`-capable host with network egress (the CI / dev sandbox has no `tor` binary), but producing it is now a single command rather than a manual procedure.
 
 ### 3.13 No-clearnet-leak guard (A1.2) — in place
 

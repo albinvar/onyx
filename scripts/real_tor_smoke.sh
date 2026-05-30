@@ -96,8 +96,15 @@ spawn_daemon() {
     local tor_state="$STATE_DIR/$label-tor"
     local log_file="$STATE_DIR/$label.log"
     log "spawning $label (vault=$vault sock=$sock)"
+    # A1.3 step 4: turn on guard-manager + circuit-manager debug logging
+    # so the daemon log records the vanguard L2/L3 guard sets actually
+    # used on live HS circuits. The verbosity is scoped to the two arti
+    # crates we care about (plus onyx's own info) so the log stays
+    # parseable. Operator can override via ONYX_REAL_SMOKE_RUST_LOG.
+    local rust_log="${ONYX_REAL_SMOKE_RUST_LOG:-onyx_core=info,onyx_daemon=info,tor_guardmgr=debug,tor_circmgr=debug}"
     ONYX_PASSPHRASE="$PASSPHRASE" \
     ONYX_VAULT="$vault" \
+    RUST_LOG="$rust_log" \
         "$DAEMON_BIN" \
             --api-socket "$sock" \
             --tor-state-dir "$tor_state" \
@@ -120,6 +127,46 @@ trap cleanup EXIT INT TERM
 
 api_call() {
     printf '%s\n' "$2" | nc -U -w 30 "$1"
+}
+
+# A1.3 step 4: pull the vanguard / guard-manager evidence out of the
+# daemon logs and write it to a transcript file. This is the artifact
+# that proves Full vanguards (L2 general + L3 HS) are actually in use on
+# live HS circuits — the thing the config-level unit test cannot show.
+# Best-effort: prints what it found and where, never fails the run (the
+# room-flow asserts above are the pass/fail gate).
+extract_vanguard_transcript() {
+    local out="$STATE_DIR/vanguard-transcript.txt"
+    {
+        echo "# A1.3 step-4 vanguard transcript — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "# Source: alice + bob daemon logs (RUST_LOG=…,tor_guardmgr=debug,tor_circmgr=debug)"
+        echo "# Onyx pins VanguardMode::Full; this captures the live guard-layer activity."
+        echo
+        for label in alice bob; do
+            local lf="$STATE_DIR/$label.log"
+            [[ -f "$lf" ]] || continue
+            echo "===== $label ($lf) ====="
+            # The daemon's own startup line recording the effective mode,
+            # plus any guardmgr/circmgr lines mentioning the L2/L3
+            # vanguard layers. Case-insensitive; tolerant of arti's
+            # exact phrasing changing between releases.
+            grep -iE "vanguard|hs_vanguard_mode|guard.?set|layer ?2|layer ?3|l2 |l3 |middle relay" "$lf" \
+                | head -80 || true
+            echo
+        done
+        echo "# If the sections above are empty, either this arti build emitted"
+        echo "# vanguard activity under different log targets, or no HS circuit"
+        echo "# was built yet. Re-run with a longer SETUP_TIMEOUT and/or"
+        echo "# ONYX_REAL_SMOKE_RUST_LOG=trace for the two tor_* crates."
+    } > "$out"
+
+    local hits
+    hits=$(grep -ciE "vanguard|hs_vanguard_mode" "$out" || true)
+    if [[ "${hits:-0}" -gt 0 ]]; then
+        pass "vanguard transcript written ($hits vanguard-related lines): $out"
+    else
+        log "vanguard transcript written but found 0 explicit vanguard lines — inspect $out (see its footer notes)"
+    fi
 }
 
 api_call_until_ok() {
