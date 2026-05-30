@@ -20,8 +20,14 @@ use tokio::net::UnixStream;
 ///   * the response was not valid JSON for an [`ApiResponse`].
 pub async fn one_shot(socket_path: &Path, req: &ApiRequest) -> anyhow::Result<ApiResponse> {
     let stream = UnixStream::connect(socket_path).await.with_context(|| {
+        // Fresh-install UX: most users who hit this typed `onyx tui` or
+        // `onyx room list` expecting the binary to do everything, not
+        // realising those subcommands talk to a *running* daemon. Steer
+        // them to the all-in-one (`onyx` with no subcommand) first; the
+        // `onyxd` path is for headless / advanced setups.
         format!(
-            "connect API socket {} — is onyxd running?",
+            "daemon not running at {} — run `onyx` (no subcommand) for the all-in-one \
+             daemon+TUI, or start `onyxd` first for headless setups",
             socket_path.display()
         )
     })?;

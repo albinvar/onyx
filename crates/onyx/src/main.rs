@@ -199,9 +199,13 @@ enum Command {
     Status,
     /// Print the daemon's identity public key + fingerprint as JSON.
     Identity,
-    /// Open the interactive multi-pane TUI against an already-running
-    /// daemon (does NOT start one). For the all-in-one experience
-    /// (daemon + TUI), run `onyx` with no subcommand.
+    /// Open the interactive multi-pane TUI against a daemon that is
+    /// ALREADY RUNNING (this subcommand does NOT start one).
+    ///
+    /// **Most users want `onyx` with no subcommand instead** — it
+    /// launches the daemon + TUI together in one process. `onyx tui` is
+    /// for advanced cases where you've already started `onyxd`
+    /// separately (e.g. headless deployment under a process supervisor).
     Tui,
     /// Run the daemon without a TUI (foreground). Useful for headless
     /// deployments or running under a process supervisor. Same as the
