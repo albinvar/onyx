@@ -284,6 +284,10 @@ async fn dispatch_one_shot(
                     message: format!("no live conversation with peer {peer_short}"),
                 };
             };
+            // A0.3: refuse if this peer's pinned key has changed.
+            if let Some(block) = pin_block(state, &handle.fingerprint).await {
+                return block;
+            }
             match handle
                 .outbound_tx
                 .try_send(crate::conversations::PeerOutbound::Dm(text.clone()))
@@ -696,6 +700,47 @@ async fn handle_build_invite(
         url: signed.to_url(),
         exp_ms,
         hubs_attached,
+    }
+}
+
+/// A0.3: refuse to send to a peer whose pinned identity key has
+/// changed since first contact (a possible MITM / key rotation). T-1
+/// pins + warns; the T-2 accept path cross-checks at first contact;
+/// A0.3 closes the loop by blocking **every ongoing send** to a
+/// compromised contact, not just the initial accept.
+///
+/// Returns `Some(Error)` (the response the caller should return
+/// immediately) when the contact is flagged; `None` when the send may
+/// proceed. A vault read error fails OPEN with a `warn!` rather than
+/// blocking all sends on a transient DB hiccup — the key-change
+/// detection itself already happened at pin time (T-1); this is the
+/// belt-and-suspenders enforcement layer, and bricking messaging on a
+/// read error would be a worse failure than the residual it guards.
+async fn pin_block(state: &DaemonState, fingerprint: &str) -> Option<ApiResponse> {
+    // Unverified `(peer/<x25519>)` placeholders are never pinned (T-3),
+    // so they can't be "compromised"; skip the lookup.
+    if fingerprint.starts_with("(peer/") {
+        return None;
+    }
+    let compromised = {
+        let vault = state.vault.lock().await;
+        vault.is_pin_compromised(state.identity_id, fingerprint)
+    };
+    match compromised {
+        Ok(true) => Some(ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: format!(
+                "refusing to send: the pinned identity key for {fingerprint} has CHANGED \
+                 since first contact (possible MITM or key rotation). Verify the fingerprint \
+                 out of band; clear the pin only if you trust the new key. \
+                 (`onyx contact list` shows the flag.)"
+            ),
+        }),
+        Ok(false) => None,
+        Err(e) => {
+            warn!(error = %e, fingerprint = %fingerprint, "pin_block: vault read failed; failing open");
+            None
+        }
     }
 }
 
@@ -1854,6 +1899,10 @@ async fn handle_send_file_to_peer(
             ),
         };
     };
+    // A0.3: refuse if this peer's pinned key has changed.
+    if let Some(block) = pin_block(state, &handle.fingerprint).await {
+        return block;
+    }
 
     // 2. Sanitize (strip metadata + sniff MIME).
     let cleaned = match sanitize_file(std::path::Path::new(path), SanitizeOpts { keep_metadata }) {
