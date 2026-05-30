@@ -6,6 +6,16 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.11 — 2026-05-30 — install fix + UX polish
+
+Bug-fix release on top of v0.1.10. The headline is the installer fix — the v0.1.10 one-liner failed on Termux / Debian / anything where `/bin/sh` is dash.
+
+- **`install.sh` is now POSIX-sh compatible** (`83602c3`). `set -euo pipefail` is a bash-ism; piping into `sh` (`curl … | sh`, the default on Termux/Debian) made dash abort with `sh: set: Illegal option -o pipefail` (and a confusing `curl: (23)`). Changed to `set -eu` — we never relied on pipefail (every curl-in-a-pipe is buffered + exit-checked). The fixed `install.sh` was also clobber-uploaded onto the v0.1.10 release so existing one-liners work immediately. Verified `dash -n` clean.
+- **Wrong passphrase no longer drops you into a dead TUI** (`70a211c`). The passphrase is now verified *before* the daemon + TUI launch: an interactive unlock re-prompts on a wrong passphrase (Esc cancels); a wrong `--passphrase`/`ONYX_PASSPHRASE` fails fast with a clear message. Previously the background daemon failed at vault-open while the TUI launched anyway and hung on "connecting to daemon…". (Reminder: there is NO passphrase recovery — a forgotten passphrase means deleting `~/.onyx/vault.db` and starting fresh.)
+- **The logo is an actual onion in Tor purple** (`95e160a`), not a green face. Redesigned the left-rail ASCII art to a layered onion (sprout + concentric layers) and added the Tor brand-purple palette colour for the onion + ONYX wordmark.
+
+Gate: `cargo test --workspace` green; clippy `-D warnings` 0/0; fmt clean (CI + pre-push hook). Daemon/protocol unchanged from v0.1.9.
+
 ## v0.1.10 — 2026-05-30 — TUI UX overhaul
 
 A user-facing polish release — the daemon/protocol code is unchanged from v0.1.9; this reworks the terminal UI and onboarding.
