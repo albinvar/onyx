@@ -663,7 +663,34 @@ fn first_run_wizard(vault_path: &std::path::Path) -> anyhow::Result<String> {
     let fresh = !vault_path.exists();
     if !fresh {
         print_brand_banner(false);
-        return read_hidden_line(&paint("  Unlock your vault — passphrase: ", ANSI_GREEN));
+        // Verify the passphrase HERE, before the daemon spawns and the
+        // TUI launches. Previously a wrong passphrase was returned
+        // as-is: the background daemon then failed at vault-open, printed
+        // a cryptic error, and the TUI launched anyway into a dead
+        // "connecting to daemon…" state. Instead we open the vault to
+        // check the passphrase and re-prompt on a mismatch — a wrong
+        // unlock should ask again, not drop you into a broken UI.
+        loop {
+            let p = read_hidden_line(&paint("  Unlock your vault — passphrase: ", ANSI_GREEN))?;
+            match onyx_core::storage::Vault::open(vault_path, p.as_bytes()) {
+                Ok(_vault) => {
+                    // Drop immediately — the daemon reopens it. We only
+                    // needed to confirm the passphrase unlocks the vault.
+                    return Ok(p);
+                }
+                Err(onyx_core::error::Error::VerificationFailed) => {
+                    eprintln!(
+                        "  {}",
+                        paint("wrong passphrase — try again (Esc to cancel).", ANSI_RED)
+                    );
+                }
+                Err(e) => {
+                    // Not a wrong-passphrase case (corrupt vault, schema
+                    // mismatch, I/O). Re-prompting won't help — surface it.
+                    anyhow::bail!("could not open vault at {}: {e}", vault_path.display());
+                }
+            }
+        }
     }
     print_brand_banner(true);
     eprintln!(
@@ -824,6 +851,10 @@ fn read_hidden_line(prompt: &str) -> anyhow::Result<String> {
     result
 }
 
+// The top-level subcommand dispatcher: one arm per CLI verb. Long by
+// nature (it's the command table), consistent with the other
+// #[allow(too_many_lines)] functions in this crate.
+#[allow(clippy::too_many_lines)]
 async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
     // Resolve the optional --socket once so every arm sees the same
     // path. Defaulting to `~/.onyx/onyx.sock` matches the daemon's
@@ -842,13 +873,21 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
             // "unlock". A new user is no longer blocked by the
             // --passphrase wall. Non-interactive (piped) falls through
             // to build_daemon_config's helpful error.
+            // The wizard verifies the passphrase against the vault as it
+            // prompts, so we don't need to re-check that path. A
+            // passphrase supplied via --passphrase / ONYX_PASSPHRASE
+            // skips the wizard, so we pre-flight-verify it below.
+            let mut passphrase_verified = false;
             if args.passphrase.is_none() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 let vault_path = args
                     .vault
                     .clone()
                     .unwrap_or_else(onyx_daemon::default_vault_path);
                 match first_run_wizard(&vault_path) {
-                    Ok(p) => args.passphrase = Some(p),
+                    Ok(p) => {
+                        args.passphrase = Some(p);
+                        passphrase_verified = true;
+                    }
                     Err(e) => {
                         eprintln!("onyx: {e:#}");
                         return Ok(ExitCode::from(2));
@@ -856,6 +895,21 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
                 }
             }
             let config = build_daemon_config(&args, &socket)?;
+            // Fail fast on a wrong --passphrase / ONYX_PASSPHRASE for an
+            // existing vault, instead of spawning a daemon that dies at
+            // vault-open and a TUI that then hangs on "connecting…".
+            if !passphrase_verified && config.vault.exists() {
+                if let Err(onyx_core::error::Error::VerificationFailed) =
+                    onyx_core::storage::Vault::open(&config.vault, config.passphrase.as_bytes())
+                {
+                    eprintln!(
+                        "onyx: wrong passphrase for vault at {} — \
+                         check --passphrase / ONYX_PASSPHRASE.",
+                        config.vault.display()
+                    );
+                    return Ok(ExitCode::from(2));
+                }
+            }
             // Spawn the daemon work in a background task.
             let daemon_handle = tokio::spawn(async move {
                 if let Err(e) = onyx_daemon::run(config).await {
