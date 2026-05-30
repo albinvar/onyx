@@ -3423,4 +3423,61 @@ mod tests {
             other => panic!("expected an MLS-layer error (no group), got {other:?}"),
         }
     }
+
+    /// A0.3: the file-room path shares the same per-member pin guard as
+    /// the text path. `handle_send_file_to_room` sanitizes the file
+    /// first, then runs the `pin_block` loop before chunking/encrypting,
+    /// so a key-changed member must refuse the whole send.
+    ///
+    /// We pass `keep_metadata = true` so `sanitize_file` takes the
+    /// pass-through branch and accepts arbitrary bytes (otherwise a
+    /// plain-bytes file sniffs as `application/octet-stream` and
+    /// `sanitize_file` rejects it with `UnknownFormat` *before* the pin
+    /// guard — a different error that wouldn't test A0.3).
+    #[tokio::test]
+    async fn send_file_to_room_refuses_key_changed_member() {
+        let group_id = [11u8; 32];
+        let victim = fresh_fp();
+        let (state, group_id_b32) = room_state_with_members(&victim, &group_id);
+
+        // Poison the victim's pin (TOFU mismatch → key_changed).
+        {
+            let vault = state.vault.lock().await;
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[1u8; 32], 1_000)
+                .expect("first pin");
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[2u8; 32], 2_000)
+                .expect("mismatching pin sets key_changed");
+        }
+
+        // A real on-disk file so sanitize_file (which reads the path)
+        // succeeds and execution reaches the pin guard.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("note.bin");
+        std::fs::write(&file_path, b"some innocuous attachment bytes").expect("write temp file");
+
+        let resp = handle_send_file_to_room(
+            &group_id_b32,
+            file_path.to_str().expect("utf8 path"),
+            false, // keep_filename
+            true,  // keep_metadata → pass-through sanitize so we reach the guard
+            &state,
+        )
+        .await;
+        match resp {
+            ApiResponse::Error { code, message } => {
+                assert_eq!(code, ApiErrorCode::Malformed, "got message: {message}");
+                assert!(
+                    message.contains("has CHANGED"),
+                    "file-room send must hit the A0.3 pin refusal, got: {message}"
+                );
+                assert!(
+                    message.contains(&victim),
+                    "refusal must name the compromised member, got: {message}"
+                );
+            }
+            other => panic!("expected pin-change refusal, got {other:?}"),
+        }
+    }
 }
