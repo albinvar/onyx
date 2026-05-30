@@ -544,7 +544,6 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         tor_hub_count,
         args.cover_traffic_mean_secs,
         args.first_contact_reachable,
-        !args.first_contact_reachable,
         &mut hub_tcp_rxs,
     ) {
         warn!(error = %e, "failed to spawn TCP-hub tasks; continuing without them");
@@ -749,7 +748,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                             }
                         },
                         self_publish.as_ref(),
-                        ephemeral_noise_static,
+                        !first_contact_reachable,
                     )
                     .await;
                     match result {
@@ -1980,7 +1979,7 @@ fn spawn_tcp_hub_tasks(
                             }
                         },
                         self_publish.as_ref(),
-                        ephemeral_noise_static,
+                        !first_contact_reachable,
                     )
                     .await;
                     match result {
