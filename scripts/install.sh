@@ -155,17 +155,29 @@ resolve_version() {
   # Resolve the latest release tag from the GitHub API's
   # `releases/latest` endpoint, which returns the most recent
   # published (non-prerelease, non-draft) release. We parse
-  # `"tag_name": "vX.Y.Z"` with grep+sed (no jq dependency).
+  # `"tag_name": "vX.Y.Z"` with sed (no jq dependency).
   #
   # An earlier version parsed the `/releases/latest` *browser*
   # redirect for `/tag/<v>`, but GitHub doesn't always redirect there
   # (it fell back to the releases-list page, yielding a garbage
   # "version" = the whole URL and a broken download path). The API's
   # tag_name is the reliable source.
-  local tag
-  tag="$(curl -fsSL "https://api.github.com/repos/${ONYX_REPO}/releases/latest" 2>/dev/null \
-        | grep -m1 '"tag_name"' \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+  #
+  # **macOS shell footgun (don't undo this).** We deliberately buffer
+  # the curl response into a variable before parsing, instead of
+  # piping curl directly into a tag-extraction filter. The previous
+  # `curl | grep -m1 | sed` form silently fails under `set -e -o
+  # pipefail` on BSD shells: `grep -m1`'s early exit closes the pipe,
+  # curl gets SIGPIPE → non-zero pipeline exit → assignment "fails"
+  # under set -e → the function returns mid-way *with `tag` already
+  # set* and the caller sees an empty `version`. Buffering breaks
+  # the pipeline so SIGPIPE cannot propagate.
+  local resp tag
+  resp="$(curl -fsSL "https://api.github.com/repos/${ONYX_REPO}/releases/latest" 2>/dev/null \
+          || printf '')"
+  tag="$(printf '%s' "$resp" \
+        | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+        | sed -n '1p')"
   # Sanity-check the shape: a real tag starts with a digit or `v`.
   # Anything else (empty, an HTML error body, a stray URL) is a
   # resolution failure, not a usable version.

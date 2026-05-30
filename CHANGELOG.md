@@ -6,6 +6,18 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — install.sh: `resolve_version` silently failed on macOS (set -e + pipefail + `grep -m1` SIGPIPE)
+
+Surfaced by running the full install-verification one-liner against the v0.1.6 release. Pinned install (`ONYX_VERSION=v0.1.6 …`) succeeded end-to-end (download → SHA256 → cosign signature verifies → `onyx --version` correctly reports `0.1.6`, confirming the version-stamping fix), but the **default** path (no `ONYX_VERSION` set, the form the README's one-liner uses) silently exited 1 right after `resolve_version` set `tag=v0.1.6` — the function then returned with an empty value to its caller.
+
+  * **Root cause.** `curl … | grep -m1 '"tag_name"' | sed …` under `set -e -o pipefail`. BSD `grep -m1` exits the moment it finds a match; closing the pipe SIGPIPEs `curl` upstream; `pipefail` propagates that as a non-zero pipeline exit; the `tag=$(…)` assignment thus exits non-zero (even though `tag` was correctly assigned the captured value); `set -e` then exits the function silently. Linux CI never hit this because GNU `grep -m1` either drains or the SIGPIPE happens after curl is done.
+  * **Fix.** Buffer the curl response into a variable, then parse it without a pipeline that has an early-exit consumer: `resp="$(curl … || printf '')"` then `tag="$(printf '%s' "$resp" | sed -nE 's/…/p' | sed -n '1p')"`. Breaks the SIGPIPE chain by construction. Inline rustdoc-style comment in the function explains why the previous form was wrong, so a future "simplify the parse back to `grep -m1`" diff catches itself.
+  * **Verified locally**: patched script (no `ONYX_VERSION` set) → resolves to v0.1.6 → cosign signature verifies → `onyx --version` = `0.1.6`. The actual v0.1.6 release artifacts and signatures are healthy; only the resolver path was broken.
+
+This fix lives on `main`; users currently curling the v0.1.6 install one-liner on macOS still hit the bug. To get the fix to users, either cut a v0.1.7 (which will be served from `releases/latest/download/install.sh`) or `gh release upload --clobber install.sh` onto v0.1.6.
+
+---
+
 ## 2026-05-30 — Release v0.1.6 — audit-hardening + all five deep-pass HIGHs
 
 A large security-hardening release. Bundles everything landed since v0.1.5: the first 2026-05-29 internal audit's full triage (M-1, A-1…A-9 with honest dispositions) **plus** the deeper review pass's full HIGH list. **All five deep-pass HIGHs are now resolved.**
