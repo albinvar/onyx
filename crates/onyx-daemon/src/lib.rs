@@ -673,8 +673,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             let our_signing_bytes_task = our_signing_bytes.clone();
             let mut outbound_rx = hub_tor_rxs.remove(0);
             let host = host.clone();
-            let subscribe_intro_inbox_task = args.first_contact_reachable;
-            let ephemeral_noise_static = !args.first_contact_reachable;
+            // D-1: the single master switch. `false` (default) = the
+            // private mode (ephemeral Noise + ephemeral SUBSCRIBE
+            // signing + no intro-inbox subscription + no KP publish).
+            let first_contact_reachable = args.first_contact_reachable;
             let span = info_span!("hub", idx, host = %host, port);
 
             hub_tasks.push(tokio::spawn(async move {
@@ -689,7 +691,12 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                 let our_kem_for_cb = our_kem.clone();
                 let mut backoff = std::time::Duration::from_millis(500);
                 loop {
-                    let self_publish = {
+                    // D-1: publishing a KeyPackage is one of the three
+                    // hub-linkage leaks (the KP carries our signing key
+                    // = fingerprint). Only publish in first-contact-
+                    // reachable mode; in the private default we skip it
+                    // entirely so the hub never sees our identity.
+                    let self_publish = if first_contact_reachable {
                         let party = state_for_hub_task.mls_party.lock().await;
                         match party.key_package_bytes() {
                             Ok(kp_bytes) => Some(hub_client::SelfPublish {
@@ -701,19 +708,20 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                                 None
                             }
                         }
+                    } else {
+                        None
                     };
-                    // T6.3.g: subscribe to our intro_inbox AND every
-                    // current room's per-epoch session token.
-                    // Computed per (re)connect so vault state at
-                    // connect time wins; mid-session room changes
-                    // are picked up via incremental
-                    // `HubOutbound::Subscribe` pushes from
-                    // handle_invite_to_room / refresh_room_roster.
-                    // T-rotation.a: subscribe_intro_inbox=false skips
-                    // the fingerprint-derived intro_inbox; rooms
-                    // still subscribe normally.
+                    // T6.3.g: subscribe to every current room's
+                    // per-epoch session token, computed per (re)connect
+                    // so vault state at connect time wins; mid-session
+                    // room changes arrive via incremental
+                    // `HubOutbound::Subscribe` pushes.
+                    // D-1: the fingerprint-derived intro_inbox is added
+                    // ONLY in first-contact-reachable mode — it's an
+                    // identity leak otherwise. Room session tokens carry
+                    // no identity, so they subscribe in both modes.
                     let mut subscriptions: Vec<onyx_core::routing::RoutingId> = Vec::new();
-                    if subscribe_intro_inbox_task {
+                    if first_contact_reachable {
                         subscriptions.push(our_inbox);
                     }
                     subscriptions.extend(
@@ -721,7 +729,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                     );
                     info!(
                         sub_count = subscriptions.len(),
-                        intro_inbox = subscribe_intro_inbox_task,
+                        first_contact_reachable,
                         "hub: connect subscriptions (intro + room session tokens)"
                     );
                     let result = hub_client::run_hub_session(
@@ -1895,8 +1903,7 @@ fn spawn_tcp_hub_tasks(
     hub_tcp_addrs: &[HubConfig],
     tor_hub_count: usize,
     cover_traffic_mean_secs: Option<u64>,
-    subscribe_intro_inbox: bool,
-    ephemeral_noise_static: bool,
+    first_contact_reachable: bool,
     hub_tcp_rxs: &mut Vec<mpsc::Receiver<hub_client::HubOutbound>>,
 ) -> anyhow::Result<()> {
     if hub_tcp_addrs.is_empty() {
@@ -1930,7 +1937,10 @@ fn spawn_tcp_hub_tasks(
                 let state_for_hub_cb = state_for_hub_task.clone();
                 let mut backoff = std::time::Duration::from_millis(500);
                 loop {
-                    let self_publish = {
+                    // D-1: KP publish + intro-inbox subscription are
+                    // identity leaks; gate both on first_contact_reachable
+                    // (same as the Tor path).
+                    let self_publish = if first_contact_reachable {
                         let party = state_for_hub_task.mls_party.lock().await;
                         party
                             .key_package_bytes()
@@ -1939,9 +1949,11 @@ fn spawn_tcp_hub_tasks(
                                 routing_id: our_inbox,
                                 kp_bytes,
                             })
+                    } else {
+                        None
                     };
                     let mut subscriptions: Vec<onyx_core::routing::RoutingId> = Vec::new();
-                    if subscribe_intro_inbox {
+                    if first_contact_reachable {
                         subscriptions.push(our_inbox);
                     }
                     subscriptions.extend(current_room_session_tokens(&state_for_hub_task).await);
