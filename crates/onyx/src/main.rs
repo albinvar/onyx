@@ -662,29 +662,131 @@ fn build_daemon_config(
 fn first_run_wizard(vault_path: &std::path::Path) -> anyhow::Result<String> {
     let fresh = !vault_path.exists();
     if !fresh {
-        return read_hidden_line("Unlock your Onyx vault — passphrase: ");
+        print_brand_banner(false);
+        return read_hidden_line(&paint("  Unlock your vault — passphrase: ", ANSI_GREEN));
     }
-    eprintln!("Welcome to Onyx 🖤");
+    print_brand_banner(true);
     eprintln!(
-        "Setting up your encrypted vault at {}.",
-        vault_path.display()
+        "  {}",
+        paint(
+            &format!(
+                "Setting up your encrypted vault at {}.",
+                vault_path.display()
+            ),
+            ANSI_DIM
+        )
     );
-    eprintln!("Choose a passphrase — it protects your identity keys at rest (Argon2id).");
-    eprintln!("There is NO recovery if you forget it. Store it in a password manager.\n");
+    eprintln!(
+        "  {}",
+        paint(
+            "Choose a passphrase — it protects your identity keys at rest (Argon2id).",
+            ANSI_DIM
+        )
+    );
+    eprintln!(
+        "  {}\n",
+        paint(
+            "There is NO recovery if you forget it. Store it in a password manager.",
+            ANSI_AMBER
+        )
+    );
     loop {
-        let p1 = read_hidden_line("  New passphrase (min 8 chars): ")?;
+        let p1 = read_hidden_line(&paint("  New passphrase (min 8 chars): ", ANSI_GREEN))?;
         if p1.chars().count() < 8 {
-            eprintln!("  too short — try again.");
+            eprintln!(
+                "  {}",
+                paint("too short (need 8+ chars) — try again.", ANSI_RED)
+            );
             continue;
         }
-        let p2 = read_hidden_line("  Confirm passphrase: ")?;
+        // A friendly, non-blocking strength hint. We never reject a
+        // long-enough passphrase (the user owns the trade-off), we just
+        // nudge — Argon2id does the real heavy lifting at rest.
+        eprintln!("  {}", passphrase_strength_hint(&p1));
+        let p2 = read_hidden_line(&paint("  Confirm passphrase: ", ANSI_GREEN))?;
         if p1 != p2 {
-            eprintln!("  passphrases didn't match — try again.");
+            eprintln!(
+                "  {}",
+                paint("passphrases didn't match — try again.", ANSI_RED)
+            );
             continue;
         }
-        eprintln!("  ✓ vault passphrase set.\n");
+        eprintln!("  {}\n", paint("✓ vault passphrase set.", ANSI_GREEN));
         return Ok(p1);
     }
+}
+
+// ── First-run banner / ANSI helpers ──────────────────────────────────────
+//
+// The wizard runs on stderr BEFORE the ratatui TUI takes the terminal,
+// so it can't use the `theme` module (that's ratatui `Color`). Plain
+// ANSI SGR codes give the same phosphor-green vibe here. They degrade to
+// nothing on a non-tty (the codes are only emitted when stderr is a tty).
+
+const ANSI_GREEN: &str = "1;32";
+const ANSI_DIM: &str = "2";
+const ANSI_AMBER: &str = "1;33";
+const ANSI_RED: &str = "1;31";
+const ANSI_CYAN: &str = "1;36";
+
+/// Wrap `s` in an ANSI SGR colour, but only when stderr is a real
+/// terminal (so piping / logging stays clean plain text).
+fn paint(s: &str, sgr: &str) -> String {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        format!("\x1b[{sgr}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// The onyx onion banner shown at the top of the first-run / unlock
+/// wizard — a small branded welcome before the TUI takes over.
+fn print_brand_banner(fresh: bool) {
+    let art = [
+        r#"   .-"""""-.   "#,
+        "  / _     _ \\  ",
+        " |  o)   (o  | ",
+        "  \\   ._.   /  ",
+        "   '-.....-'   ",
+    ];
+    eprintln!();
+    for line in art {
+        eprintln!("  {}", paint(line, ANSI_GREEN));
+    }
+    eprintln!("       {}", paint("O N Y X", ANSI_GREEN));
+    eprintln!("   {}", paint("anonymous · e2e · tor", ANSI_DIM));
+    eprintln!();
+    if fresh {
+        eprintln!(
+            "  {}",
+            paint("Welcome to Onyx — let's set up your vault.", ANSI_CYAN)
+        );
+    } else {
+        eprintln!("  {}", paint("Welcome back.", ANSI_CYAN));
+    }
+}
+
+/// A friendly, non-blocking strength read on a passphrase (length +
+/// rough character-class variety). Returns a coloured one-liner; it
+/// never rejects (the 8-char minimum is the only hard floor).
+fn passphrase_strength_hint(p: &str) -> String {
+    let len = p.chars().count();
+    let lower = p.chars().any(|c| c.is_ascii_lowercase());
+    let upper = p.chars().any(|c| c.is_ascii_uppercase());
+    let digit = p.chars().any(|c| c.is_ascii_digit());
+    let other = p.chars().any(|c| !c.is_ascii_alphanumeric());
+    let classes = u8::from(lower) + u8::from(upper) + u8::from(digit) + u8::from(other);
+
+    // Length dominates entropy for passphrases; classes are a secondary
+    // nudge. These thresholds are a UX hint, not a security guarantee.
+    let (label, sgr) = if len >= 20 || (len >= 14 && classes >= 3) {
+        ("strong", ANSI_GREEN)
+    } else if len >= 12 || classes >= 3 {
+        ("ok", ANSI_AMBER)
+    } else {
+        ("weak — consider a longer phrase", ANSI_AMBER)
+    };
+    paint(&format!("strength: {label}"), sgr)
 }
 
 /// Read a line from the terminal without echoing it, using crossterm
@@ -1262,6 +1364,26 @@ async fn one_shot_print(socket: &std::path::Path, req: ApiRequest) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
+    // UX phase 3: the passphrase strength hint is a pure function; its
+    // thresholds are a UX nudge, so we just pin the buckets so a future
+    // tweak is deliberate. In `cargo test` stderr isn't a tty, so
+    // `paint` returns plain text → substring asserts are stable.
+    #[test]
+    fn passphrase_strength_buckets() {
+        use super::passphrase_strength_hint as h;
+        assert!(h("abcdefgh").contains("weak"), "short all-lower → weak");
+        assert!(h("abcdefghijkl").contains("ok"), "12 lower → ok");
+        assert!(h("Abcdef12!xyz").contains("ok"), "12 chars, 4 classes → ok");
+        assert!(
+            h("correct horse battery staple").contains("strong"),
+            "long passphrase → strong"
+        );
+        assert!(
+            h("Abcdefgh12!xyz").contains("strong"),
+            "14 chars + 4 classes → strong"
+        );
+    }
+
     use super::*;
     use clap::Parser;
 
