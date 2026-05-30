@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Onyx pre-push gate — mirrors .github/workflows/ci.yml so a red tree
+# can never reach `main`.
+#
+# This exists because pushing clippy-/test-RED to main happened
+# repeatedly when commit+push were batched with the gates in one step
+# and the push ran before the gate result was read. A machine check is
+# the durable fix for a human(/agent) discipline failure.
+#
+# Install (once per clone):
+#   git config core.hooksPath scripts/git-hooks
+#
+# Bypass for a genuine emergency (use sparingly, you own the result):
+#   git push --no-verify
+#
+# Skip the slow test step for a docs-only push:
+#   ONYX_PREPUSH_SKIP_TESTS=1 git push
+
+set -uo pipefail
+
+say()  { printf '\033[1;36m[pre-push] %s\033[0m\n' "$*"; }
+fail() { printf '\033[1;31m[pre-push] BLOCKED: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Only gate pushes that include the default branch. A feature-branch
+# push can be WIP; main must always be green.
+pushing_main=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main) pushing_main=1 ;;
+  esac
+done
+# If git fed us nothing on stdin (some push forms), gate anyway — safer.
+[ -z "${pushing_main:-}" ] && pushing_main=1
+
+if [ "$pushing_main" -ne 1 ]; then
+  say "not pushing main; skipping the full gate (CI still runs)."
+  exit 0
+fi
+
+say "gating push to main — mirroring CI (fmt · clippy · test)…"
+
+say "1/3 cargo fmt --all -- --check"
+cargo fmt --all -- --check || fail "rustfmt: run \`cargo fmt\` and re-commit."
+
+say "2/3 cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings \
+  || fail "clippy found warnings/errors. Fix them (this is the exact gate that kept shipping red)."
+
+if [ "${ONYX_PREPUSH_SKIP_TESTS:-0}" = "1" ]; then
+  say "3/3 tests SKIPPED (ONYX_PREPUSH_SKIP_TESTS=1) — docs-only push."
+else
+  say "3/3 cargo test --workspace"
+  cargo test --workspace || fail "tests failed. Do not push red to main."
+fi
+
+say "all gates green ✓ — pushing."
+exit 0
