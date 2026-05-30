@@ -52,10 +52,25 @@ openmls_traits   = "0.5"
 arti-client      = { version = "0.42", features = [
     "onion-service-service", # for publishing our v3 HS
     "onion-service-client",  # for dialing other peers' .onion addresses
+    # A1.3: vanguards (guard-discovery defense). NOT in arti's default
+    # feature set, and our published v3 HS is the surface most exposed
+    # to guard-discovery attacks, so we MUST enable it explicitly.
+    # Without this feature `VanguardMode` collapses to `Disabled` and
+    # the HS runs with no L2/L3 guard layers — verified absent before
+    # this change (cargo tree showed tor-guardmgr=default, no vanguards).
+    # `tor.rs::bootstrap_with` then pins the mode to Full.
+    "vanguards",
 ] }
 tor-rtcompat     = "0.42"
 tor-hsservice    = "0.42"
 tor-hscrypto     = "0.42"
+# A1.3: direct dep so we can name `VanguardMode` (arti-client only
+# re-exports VanguardConfig/Builder, not the mode enum). Used to pin
+# Full vanguards in tor.rs. The `vanguards` feature on arti-client
+# already pulls this crate's vanguards code in transitively; we just
+# need the type name in scope.
+tor-guardmgr     = { version = "0.42", features = ["vanguards"] }
+tor-config       = "0.42"
 # Needed to construct the `Connected` relay-cell reply when accepting
 # an inbound onion-service stream.
 tor-cell         = "0.42"

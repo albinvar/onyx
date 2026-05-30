@@ -3297,6 +3297,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tor-cell",
+ "tor-config",
+ "tor-guardmgr",
  "tor-hscrypto",
  "tor-hsservice",
  "tor-rtcompat",

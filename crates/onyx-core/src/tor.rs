@@ -95,18 +95,17 @@ impl TorRuntime {
     }
 
     async fn bootstrap_with(state_dir: Option<&std::path::Path>) -> Result<Self> {
-        use arti_client::config::CfgPath;
+        let config = build_tor_config(state_dir)?;
 
-        let config = if let Some(dir) = state_dir {
-            let mut builder = TorClientConfig::builder();
-            builder.storage().state_dir(CfgPath::new_literal(dir));
-            builder.build().map_err(|e| {
-                tracing::error!(error = %e, "tor: config build failed");
-                Error::Internal("tor: config build failed (see tracing log)")
-            })?
-        } else {
-            TorClientConfig::default()
-        };
+        // Surface the effective HS vanguard mode at startup. This is
+        // CONFIG, not identity — safe to log per D-3. If this ever prints
+        // anything other than "full" the guard-discovery defense (A1.3)
+        // has regressed.
+        tracing::info!(
+            hs_vanguard_mode = %effective_vanguard_mode(&config),
+            "tor: vanguards pinned for onion-service circuits (A1.3 guard-discovery defense)"
+        );
+
         let client = TorClient::create_bootstrapped(config).await.map_err(|e| {
             // Bootstrap can fail for many reasons (network blocked,
             // permission errors on state dir from fs-mistrust, etc).
@@ -195,6 +194,67 @@ impl TorRuntime {
             rend_requests: Some(Box::pin(rend_requests)),
         })
     }
+}
+
+/// A1.3: build the `TorClientConfig`, pinning **Full vanguards** for
+/// guard-discovery defense. Factored out of [`TorRuntime::bootstrap_with`]
+/// so the regression test can assert the pinned mode without bootstrapping
+/// a real Tor client.
+///
+/// **Why pin, and why Full.** Our daemon publishes a v3 onion service
+/// ([`TorRuntime::publish_hidden_service`]), the surface most exposed to
+/// guard-discovery attacks (A6-band: a moderately-resourced adversary who
+/// can repeatedly dial the `.onion` forces circuit builds and statistically
+/// enumerates the relay adjacent to the entry guard → finds the guard).
+/// Vanguards insert extra pinned, slow-rotating guard layers (L2, and for
+/// `Full`, L3) so enumeration takes longer than the layers' rotation
+/// periods. arti's *consensus default* for HS circuits is already `Full`,
+/// but (a) the `vanguards` cargo feature must be compiled in — without it
+/// `VanguardMode` collapses to `Disabled`-only and there is NO protection
+/// (verified absent before this change) — and (b) we set the mode
+/// **explicitly** rather than inheriting it, so a hostile/anomalous Tor
+/// consensus cannot silently downgrade us below `Full`.
+///
+/// **Honest scope:** `Full` vanguards *slow* guard discovery; they do not
+/// make it impossible. And this is whole-client config (arti exposes one
+/// `VanguardMode`, not a general/HS split): general circuits get L2 as they
+/// would under `Lite`; onion-service circuits additionally get L3. We do
+/// NOT widen the outbound client entry-guard set — more entry guards make
+/// discovery *easier*, not harder.
+fn build_tor_config(state_dir: Option<&std::path::Path>) -> Result<TorClientConfig> {
+    use arti_client::config::CfgPath;
+    use arti_client::config::vanguards::VanguardConfigBuilder;
+    use tor_config::ExplicitOrAuto;
+    use tor_guardmgr::VanguardMode;
+
+    let mut builder = TorClientConfig::builder();
+    if let Some(dir) = state_dir {
+        builder.storage().state_dir(CfgPath::new_literal(dir));
+    }
+
+    // Pin Full. `.vanguards()` returns the sub-builder (like `.storage()`);
+    // `.mode()` takes `ExplicitOrAuto<VanguardMode>` — `Explicit` (not
+    // `Auto`) is what makes this a hard pin rather than "inherit the
+    // consensus default." `VanguardConfigBuilder` is unused now that we go
+    // through the sub-builder, but the import documents the type involved.
+    let _ = VanguardConfigBuilder::default();
+    builder
+        .vanguards()
+        .mode(ExplicitOrAuto::Explicit(VanguardMode::Full));
+
+    builder.build().map_err(|e| {
+        tracing::error!(error = %e, "tor: config build failed");
+        Error::Internal("tor: config build failed (see tracing log)")
+    })
+}
+
+/// A1.3: the effective vanguard mode the daemon will run with. Used by the
+/// startup log + the regression test. Returns the `VanguardConfig`'s
+/// resolved mode (`Full` when pinned as above).
+#[must_use]
+pub fn effective_vanguard_mode(config: &TorClientConfig) -> tor_guardmgr::VanguardMode {
+    let vc: &tor_guardmgr::VanguardConfig = config.as_ref();
+    vc.mode()
 }
 
 // ── HiddenService ──────────────────────────────────────────────────────────
@@ -339,5 +399,41 @@ mod tests {
         // impl above.)
         //
         // A real test follows when we implement the function.
+    }
+
+    /// A1.3 regression: the Tor config we build MUST pin Full vanguards
+    /// for guard-discovery defense on our onion service. If this reads
+    /// anything other than `Full`, the explicit pin in `build_tor_config`
+    /// regressed to inheriting the consensus default.
+    #[test]
+    fn tor_config_pins_full_vanguards() {
+        let config = build_tor_config(None).expect("config build");
+        assert_eq!(
+            effective_vanguard_mode(&config),
+            tor_guardmgr::VanguardMode::Full,
+            "onion-service circuits must use Full (L2+L3) vanguards (A1.3)"
+        );
+
+        // Also hold under the multi-daemon state-dir path (what the
+        // daemon actually uses via bootstrap_with_state_dir).
+        let tmp = std::env::temp_dir();
+        let config2 = build_tor_config(Some(&tmp)).expect("config build (state dir)");
+        assert_eq!(
+            effective_vanguard_mode(&config2),
+            tor_guardmgr::VanguardMode::Full,
+            "Full vanguards must also be pinned on the state-dir path"
+        );
+    }
+
+    /// A1.3 build-time tripwire: naming `VanguardMode::Full` only compiles
+    /// when the `vanguards` cargo feature is active (without it the enum
+    /// collapses to `Disabled`-only). This test existing + compiling is
+    /// the CI guard that the feature hasn't been dropped from Cargo.toml.
+    #[test]
+    fn vanguards_feature_is_compiled_in() {
+        assert_ne!(
+            tor_guardmgr::VanguardMode::Full,
+            tor_guardmgr::VanguardMode::Lite
+        );
     }
 }

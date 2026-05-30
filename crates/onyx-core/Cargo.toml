@@ -31,6 +31,8 @@ tor-rtcompat     = { workspace = true }
 tor-hsservice    = { workspace = true }
 tor-hscrypto     = { workspace = true }
 tor-cell         = { workspace = true }
+tor-guardmgr     = { workspace = true }
+tor-config       = { workspace = true }
 safelog          = { workspace = true }
 tokio            = { workspace = true }
 futures          = { workspace = true }
