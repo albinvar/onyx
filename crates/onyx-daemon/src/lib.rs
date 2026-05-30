@@ -358,6 +358,48 @@ impl FilesConfig {
 // Splitting for line count would just trade one readable function
 // for a fan of context-free helpers each doing 10 lines of setup.
 #[allow(clippy::too_many_lines)]
+/// A1.2: outcome of the no-clearnet-leak guard.
+#[derive(Debug, PartialEq, Eq)]
+enum ClearnetDecision {
+    /// No clearnet flags set — fully Tor-protected. Proceed.
+    AllTor,
+    /// Clearnet flags set AND acknowledged. Proceed with a loud warning.
+    /// Carries a comma-separated list of the active clearnet modes.
+    AcknowledgedClearnet(String),
+    /// Clearnet flags set but NOT acknowledged — refuse to start.
+    /// Carries the comma-separated list for the error message.
+    Refuse(String),
+}
+
+/// A1.2: classify a run as Tor-protected, acknowledged-clearnet, or
+/// refuse. Pure so it's unit-testable without standing up `run()`.
+fn clearnet_guard(
+    no_tor: bool,
+    listen_tcp: bool,
+    dial_tcp: bool,
+    hub_tcp: bool,
+    allow_clearnet: bool,
+) -> ClearnetDecision {
+    let active: Vec<&str> = [
+        ("--no-tor", no_tor),
+        ("--listen-tcp", listen_tcp),
+        ("--dial-tcp", dial_tcp),
+        ("--hub-tcp", hub_tcp),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(name, _)| name)
+    .collect();
+
+    if active.is_empty() {
+        ClearnetDecision::AllTor
+    } else if allow_clearnet {
+        ClearnetDecision::AcknowledgedClearnet(active.join(", "))
+    } else {
+        ClearnetDecision::Refuse(active.join(", "))
+    }
+}
+
 pub async fn run(args: Config) -> anyhow::Result<()> {
     // ── Ensure parent directories exist (vault + socket) ────────────────
     // Default paths live under ~/.onyx/; create that with mode 0700 so

@@ -122,6 +122,14 @@ struct Args {
     /// §3.2.
     #[arg(long, env = "ONYX_FIRST_CONTACT_REACHABLE")]
     first_contact_reachable: bool,
+
+    /// **A1.2 — acknowledge clearnet (NO TOR, NO ANONYMITY).** Required
+    /// to use any plain-TCP transport (`--no-tor`, `--listen-tcp`,
+    /// `--dial-tcp`, `--hub-tcp`). Without it the daemon refuses to start
+    /// those modes, so a mistyped flag can't silently expose your IP.
+    /// Test/dev only.
+    #[arg(long, env = "ONYX_ALLOW_CLEARNET")]
+    allow_clearnet: bool,
 }
 
 impl TryFrom<Args> for Config {
@@ -166,6 +174,7 @@ impl TryFrom<Args> for Config {
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,
             constant_rate_ms: a.constant_rate_ms,
             first_contact_reachable: a.first_contact_reachable,
+            allow_clearnet: a.allow_clearnet,
         })
     }
 }
