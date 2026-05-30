@@ -6,6 +6,25 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.9 — 2026-05-30 — security hardening release
+
+Ships the deep-pass security arc accumulated since v0.1.8. All items below are individually detailed in the dated entries that follow; this is the consolidated release summary. Every change landed on a `cargo test --workspace` + `cargo clippy -D warnings` + `cargo fmt` green tree; the security-critical guards (A1.2, A0.3) carry mutation-proven regression tests.
+
+**Anonymity / transport**
+- **A1.2 — no-clearnet-leak guard.** The daemon refuses to start any clearnet (non-Tor) transport (`--no-tor` / `--listen-tcp` / `--dial-tcp` / `--hub-tcp`) unless the operator explicitly sets `--allow-clearnet`, so a mistyped flag can't silently expose the user's IP. Mutation-proven `run()`-level test.
+- **A1.3 — Full Tor vanguards.** The published v3 onion service now pins `VanguardMode::Full` (L2 + L3 slow-rotating guard layers) against guard-discovery attacks. *Owed before "fully done": a live-Tor transcript proving L2+L3 on real HS circuits — config pin is unit-verified, live behaviour is not.*
+
+**Trust / key handling**
+- **A0.3 — block sends to a key-changed pin.** A TOFU pin flagged `key_changed` (possible MITM / rotation) now BLOCKS outbound on all four send paths (DM text, DM file, room text, room file); room paths fail closed if any member is compromised. Mutation-proven tests on the room paths; the predicate is unit-tested.
+- **A6.4 — corrected the onion≠identity overclaim** (removed a false security claim from the docs; no behaviour change).
+
+**Federation**
+- **H-2 — gossip `seen_by` no longer trusted for drops.** A hostile peer hub could forge `seen_by = hash(victim)` to make a victim silently drop legitimate KeyPackages/envelopes (targeted suppression). The handlers now ignore the attacker-chosen field; loop bounding relies on TTL + source-skip + the Noise-authenticated peer identity.
+
+**Honest non-claims (unchanged):** no external audit has been performed (README §0 disclaimer stands); A1.3's live-Tor transcript is still owed; the formal external audit remains the single biggest open item.
+
+---
+
 ## 2026-05-30 — A0.3: tests proving handle_send_room refuses a key-changed member
 
 The A0.3 room-path fix (blocking sends to a key-changed / possibly-MITM'd room member) had no test exercising the wiring — the same class of gap that previously let the room paths ship UNWIRED until a code audit caught it (commit 7e039c4). This adds that coverage.
@@ -16,7 +35,7 @@ The A0.3 room-path fix (blocking sends to a key-changed / possibly-MITM'd room m
 - **Mutation-verified (actually run this time):** removing the `pin_block` call from the `handle_send_room` loop makes `send_room_refuses_key_changed_member` **FAIL** (1 passed / 1 failed) while the clean-roster test still passes; restoring it makes both pass. Confirmed, then reverted.
 - The guard runs after room-row lookup but before MLS `load_group`, so the test needs no real MLS group — clean and deterministic.
 
-Gate: `cargo test --workspace` = 520 passed / 0 failed (+2); clippy `-D warnings` 0/0; fmt clean. (`handle_send_file_to_room` shares the identical loop; a dedicated test for it stays tracked, but this proves the pattern + the predicate.)
+Gate: `cargo test --workspace` = 520 passed / 0 failed (+2); clippy `-D warnings` 0/0; fmt clean. (Follow-up `ca9f783` added the third test, `send_file_to_room_refuses_key_changed_member`, giving `handle_send_file_to_room` the same mutation-proven coverage — A0.3 is now tested on all four send paths.)
 
 ## 2026-05-30 — A1.2: integration test proving run() actually invokes the clearnet guard
 
