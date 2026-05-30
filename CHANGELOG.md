@@ -6,6 +6,17 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## 2026-05-30 — Release v0.1.8 — fresh-install-friendly daemon-unreachable error
+
+**CLI / help-text-only release.** Binary logic is byte-identical to v0.1.7. Triggered by a real install report: a new user ran `onyx tui` (the natural guess for "open the chat UI"), the embedded daemon wasn't running because that subcommand doesn't start one, and the error said "is onyxd running?" — useless if you don't already know `onyxd` exists.
+
+  * **Error rewritten** in `client.rs` to lead with the actionable fix: "*daemon not running at <path> — run `onyx` (no subcommand) for the all-in-one daemon+TUI, or start `onyxd` first for headless setups*". The path stays in for diagnostic; both modes are mentioned so advanced users aren't pushed off the split-process workflow.
+  * **`onyx tui --help`** restructured so the first sentence after the summary says "**Most users want `onyx` with no subcommand instead**." `onyx tui` keeps its strict semantics — it attaches to an existing daemon and does NOT auto-start one (deliberate; auto-fall-back would surprise headless operators with misconfigured socket paths).
+
+No behaviour change beyond the message + help text.
+
+---
+
 ## 2026-05-30 — Release v0.1.7 — install.sh resolver fix (macOS)
 
 **install-script-only release.** Binary code is byte-identical to v0.1.6 (the daemon/client/hub Rust hasn't moved); the sole purpose is to ship the `install.sh` `resolve_version` fix to users so the default one-liner from the README works on macOS again. The release artifact attached to `releases/latest/download/install.sh` becomes the fixed copy.
