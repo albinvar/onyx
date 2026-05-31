@@ -229,6 +229,8 @@ async fn dispatch_one_shot(
             fingerprint: state.identity.fingerprint().to_string(),
             tor_state,
             identity_kem_pub_b32: encode_b32(&state.identity.kem_public().to_bytes()),
+            // v0.1.16: our own onion, once the HS has published.
+            onion: state.self_onion.get().cloned(),
         },
         ApiRequest::Identity => ApiResponse::IdentityOk {
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
@@ -3373,6 +3375,7 @@ mod tests {
             inflight_files: Arc::new(Mutex::new(HashMap::new())),
             files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
             tor: std::sync::OnceLock::new(),
+            self_onion: std::sync::OnceLock::new(),
         });
         (state, encode_b32(group_id))
     }

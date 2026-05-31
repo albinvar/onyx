@@ -153,6 +153,11 @@ struct AppState {
     /// otherwise produce no visible conversation (accept-invite) still
     /// give the user clear feedback. Shown in the status bar.
     last_notice: Option<String>,
+    /// v0.1.16: cached `first_contact_reachable` from `~/.onyx/config.json`,
+    /// loaded once at live-loop start. Drives the persistent "not addable by
+    /// invite" banner. Defaults false so snapshot tests (which build
+    /// `AppState` directly and never call `run()`) stay deterministic.
+    first_contact_reachable: bool,
     /// Visual indicator of whether the tail connection is alive.
     tail_active: bool,
     /// Set of `short_id`s we've already fetched History for. Prevents
@@ -287,6 +292,19 @@ enum ModalState {
     AcceptInvite {
         input: String,
     },
+    /// v0.1.16 (easy-connect): read-only "your connect code" screen
+    /// (Ctrl-Y). Shows the `onyx://connect/v1?…` code (onion + identity
+    /// key) a peer pastes to dial you directly, no hub. Any key closes.
+    ConnectCode {
+        code: String,
+        copied: bool,
+    },
+    /// v0.1.16 (easy-connect): paste-a-peer's-connect-code input
+    /// (Ctrl-D). On Enter, parse the code and `DialPeer` that peer
+    /// directly over Tor — one-step add-a-contact, no hub.
+    AddByCode {
+        input: String,
+    },
     /// v0.1.12: TUI-managed hub / dial / reachability editor. Reads
     /// `~/.onyx/config.json` on open and writes it back on save (Ctrl-S).
     /// Changes apply on the next `onyx` launch (the embedded daemon
@@ -413,10 +431,14 @@ impl SelectedEntry<'_> {
 #[derive(Debug, Clone)]
 struct StatusSnapshot {
     daemon_version: String,
-    #[allow(dead_code)] // surfaced via the API; not currently shown in the bar
+    /// v0.1.16: used to build the user's connect code (with `onion`).
     identity_pub_b32: String,
     fingerprint: String,
     tor_state: TorState,
+    /// v0.1.16: our own published `.onion`, or `None` until the hidden
+    /// service publishes (still bootstrapping) / no-Tor build. Used to
+    /// build the user's connect code for direct P2P.
+    onion: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -445,6 +467,7 @@ impl AppState {
             composer: String::new(),
             last_send_result: None,
             last_notice: None,
+            first_contact_reachable: false,
             tail_active: false,
             backfilled: HashSet::new(),
             backfilled_rooms: HashSet::new(),
@@ -659,6 +682,13 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     }));
 
     let mut app = AppState::new(socket_path.clone());
+    // v0.1.16: load the persisted reachability flag so the TUI can warn
+    // when the user isn't addable by invite (and point them at ^Y / ^G).
+    app.first_contact_reachable = crate::load_file_config()
+        .ok()
+        .flatten()
+        .map(|c| c.first_contact_reachable)
+        .unwrap_or(false);
 
     // Background: tail subscription (reconnects automatically).
     let (tail_tx, tail_rx) = mpsc::channel::<ApiResponse>(256);
@@ -815,6 +845,22 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             });
             return false;
         }
+        // v0.1.16: Ctrl-Y shows YOUR connect code (onion + identity key)
+        // so a peer can add you directly. Needs the onion, which only
+        // exists once Tor has published the hidden service — the helper
+        // shows a clear placeholder until then.
+        (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(open_connect_code_modal(app));
+            return false;
+        }
+        // v0.1.16: Ctrl-D opens "add by connect code" — paste a peer's
+        // code to dial them directly over Tor (no hub needed).
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+            app.modal = Some(ModalState::AddByCode {
+                input: String::new(),
+            });
+            return false;
+        }
         // v0.1.12: Ctrl-G opens the hub / dial / reachability manager,
         // reading ~/.onyx/config.json so the user can configure transport
         // from inside the TUI instead of CLI flags.
@@ -911,7 +957,9 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             ModalState::Help
             | ModalState::Invite { .. }
             | ModalState::Settings { .. }
-            | ModalState::Logs { .. },
+            | ModalState::Logs { .. }
+            // v0.1.16: the connect-code screen is read-only too.
+            | ModalState::ConnectCode { .. },
             _,
         ) => {
             return;
@@ -1088,6 +1136,27 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             if !input.trim().starts_with("onyx://invite/") {
                 app.last_send_result = Some(Err(
                     "paste a full onyx://invite/v… link to accept".to_string()
+                ));
+                app.modal = Some(modal);
+                return;
+            }
+            submit_intent = Some(modal.clone());
+        }
+        (ModalState::AddByCode { input }, KeyCode::Backspace) => {
+            input.pop();
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::AddByCode { input }, KeyCode::Char(c)) => {
+            input.push(c);
+            app.modal = Some(modal);
+            return;
+        }
+        (ModalState::AddByCode { input }, KeyCode::Enter) => {
+            // Cheap guard; the daemon re-parses the connect code.
+            if !input.trim().starts_with("onyx://connect/") {
+                app.last_send_result = Some(Err(
+                    "paste a full onyx://connect/v1?\u{2026} connect code".to_string(),
                 ));
                 app.modal = Some(modal);
                 return;
@@ -1309,14 +1378,30 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 text: String::new(),
                 insecure_accept_unsigned: false,
             }),
-            // Help / CommandPalette / Invite / Settings never set
-            // submit_intent (handled inline above), so they can't
-            // reach here.
+            // v0.1.16: add a peer by their connect code → dial them
+            // directly over Tor (no hub). Parse here; a bad code surfaces
+            // an error and dispatches nothing.
+            ModalState::AddByCode { input } => {
+                match onyx_core::connect::ConnectCode::parse(&input) {
+                    Ok(c) => Some(ApiRequest::DialPeer {
+                        onion: c.onion,
+                        pubkey_b32: c.identity_pub_b32,
+                    }),
+                    Err(e) => {
+                        app.last_send_result = Some(Err(format!("bad connect code: {e}")));
+                        None
+                    }
+                }
+            }
+            // Help / CommandPalette / Invite / Settings / ConnectCode never
+            // set submit_intent (handled inline above / read-only), so they
+            // can't reach here.
             ModalState::Help
             | ModalState::CommandPalette { .. }
             | ModalState::Invite { .. }
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
+            | ModalState::ConnectCode { .. }
             // ManageHubs is handled inline (saves a file, no API call), so
             // it never sets submit_intent — but the match must cover it.
             | ModalState::ManageHubs { .. } => None,
@@ -1427,6 +1512,16 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 }
                 Ok(ApiResponse::Error { message, .. }) => {
                     app.last_send_result = Some(Err(message));
+                }
+                Ok(ApiResponse::DialPeerOk) => {
+                    // v0.1.16: feedback for the ^D add-by-connect-code
+                    // flow (and the v0.1.15 dial action). The dial runs
+                    // in the background; the peer surfaces once the Tor
+                    // circuit + Noise handshake complete.
+                    app.last_send_result = Some(Ok(()));
+                    app.last_notice = Some(
+                        "dialing peer over Tor — they'll appear here once connected".to_string(),
+                    );
                 }
                 Ok(other) => {
                     app.last_send_result = Some(Err(format!("unexpected response: {other:?}")));
@@ -1565,6 +1660,38 @@ async fn open_settings_modal(app: &mut AppState) {
         "cover-traffic / intro-inbox set at daemon launch".into(),
     ));
     app.modal = Some(ModalState::Settings { info });
+}
+
+/// v0.1.16 (easy-connect): build the "your connect code" modal from the
+/// cached Status snapshot (our own onion + identity key) and copy the
+/// code to the clipboard via OSC52. If the onion isn't known yet (Tor
+/// still bootstrapping, or a no-Tor build), show a clear placeholder
+/// instead of a broken code.
+fn open_connect_code_modal(app: &AppState) -> ModalState {
+    let snap = match &app.last_status {
+        Some(Ok(s)) => s,
+        _ => {
+            return ModalState::ConnectCode {
+                code: "(connecting to daemon… try again in a moment)".to_string(),
+                copied: false,
+            };
+        }
+    };
+    match &snap.onion {
+        Some(onion) if !onion.is_empty() => {
+            let code =
+                onyx_core::connect::ConnectCode::new(onion.clone(), snap.identity_pub_b32.clone())
+                    .to_url();
+            let copied = osc52_copy(&code).is_ok();
+            ModalState::ConnectCode { code, copied }
+        }
+        _ => ModalState::ConnectCode {
+            code: "(your .onion isn't ready yet — wait for Tor to finish \
+                   bootstrapping, then press Ctrl-Y again)"
+                .to_string(),
+            copied: false,
+        },
+    }
 }
 
 /// v0.1.12: build the hub-manager modal seeded from the persisted
@@ -1774,6 +1901,7 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
             identity_pub_b32,
             fingerprint,
             tor_state,
+            onion,
             ..
         }) => {
             app.last_status = Some(Ok(StatusSnapshot {
@@ -1781,6 +1909,7 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
                 identity_pub_b32,
                 fingerprint,
                 tor_state,
+                onion,
             }));
         }
         Ok(ApiResponse::Error { code, message }) => {
@@ -2171,6 +2300,9 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::Logs { .. } => area.height.saturating_sub(2).min(30),
         // v0.1.12: paste-an-invite text input.
         ModalState::AcceptInvite { .. } => 9,
+        // v0.1.16: connect-code screens.
+        ModalState::ConnectCode { .. } => 11,
+        ModalState::AddByCode { .. } => 9,
         // v0.1.12: hub manager grows with the hub list (+ fixed controls).
         ModalState::ManageHubs { hubs, .. } => u16::try_from(hubs.len() + 12)
             .unwrap_or(20)
@@ -2390,6 +2522,84 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
                 Line::from(""),
                 Line::from(Span::styled(
                     " Unsigned (v1) links are refused — ask for a fresh `onyx invite`. ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+        // v0.1.16: "your connect code" — share this so a friend can add
+        // you directly over Tor (no hub, no reachability toggle).
+        ModalState::ConnectCode { code, copied } => {
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Your Connect Code  (press any key to close) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let copy_line = if *copied {
+                Span::styled(
+                    " ✓ copied to clipboard (OSC52) ",
+                    Style::default().fg(Color::Green),
+                )
+            } else {
+                Span::styled(
+                    " select the text below to copy ",
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let body = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Share this — a friend pastes it into Add-by-code (Ctrl-D): ",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(" {code} "),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(copy_line),
+            ])
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+        // v0.1.16: paste a peer's connect code → dial them directly.
+        ModalState::AddByCode { input } => {
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                " Add by Connect Code  (Esc=cancel, Enter=connect) ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            let shown: String = {
+                let n = input.chars().count();
+                if n > 50 {
+                    let tail: String = input.chars().skip(n - 47).collect();
+                    format!("…{tail}")
+                } else {
+                    input.clone()
+                }
+            };
+            let body = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Paste a peer's onyx://connect/v1?… code: ",
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(vec![
+                    Span::styled(" › ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        shown,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Connects directly over Tor — no hub needed. ",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -3430,6 +3640,23 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             ])
         }
     };
+    // v0.1.16: persistent "you're not addable by invite" banner. When
+    // first_contact_reachable is off (the privacy default), strangers
+    // can't reach you via a hub — so surface the two ways to connect
+    // anyway: share your connect code (^Y) for direct P2P, or turn on
+    // reachability (^G). Only while the daemon is actually up, so we
+    // don't mask the connecting / unreachable messages.
+    let line = if !app.first_contact_reachable && matches!(app.last_status, Some(Ok(_))) {
+        Line::from(vec![
+            Span::styled(" ⚠ not addable by invite ", theme::warn()),
+            Span::styled("— share your code ", theme::text()),
+            kb("^Y"),
+            Span::styled("or enable reachability ", theme::text()),
+            kb("^G"),
+        ])
+    } else {
+        line
+    };
     // v0.1.15: a sticky notice (e.g. accept-invite confirmation) takes
     // over the status line so flows that produce no visible conversation
     // still give unmistakable feedback. Cleared on the next keystroke.
@@ -3501,6 +3728,7 @@ mod snapshot_tests {
             fingerprint: "6dzx yrut hgez rucw js3g fpdu xggt jn7r 53on aowq iop5 nvmx fk7q"
                 .to_string(),
             tor_state,
+            onion: Some("examplepublishedonionaddressforsnapshottests.onion".to_string()),
         }));
         app
     }
