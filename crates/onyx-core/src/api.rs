@@ -377,6 +377,20 @@ pub enum ApiRequest {
     /// (Re-sending wastes a ratchet step; caller is expected to
     /// surface the count and let the user decide.)
     SendRoom { group_id_b32: String, text: String },
+    /// v0.1.15 (P2P): dial a peer's hidden service **directly** over Tor
+    /// and establish a live conversation — the runtime equivalent of
+    /// launching with `--dial-onion`/`--dial-pubkey`, but on demand and
+    /// concurrent with the accept loop (the daemon keeps listening). The
+    /// new session registers in the conversation registry like any other
+    /// peer, so subsequent `Send` works against it.
+    ///
+    /// `onion` is `<onion>` or `<onion>:<port>`; `pubkey_b32` is the
+    /// peer's X25519 identity public key (base32) — the same pair you'd
+    /// pass to the CLI flags. Returns [`ApiResponse::DialPeerOk`] once the
+    /// dial is spawned (the handshake completes asynchronously; watch for
+    /// the peer to appear via `Tail`/`Peers`), or an error if the daemon
+    /// has no Tor runtime (e.g. a no-Tor/TCP-test build).
+    DialPeer { onion: String, pubkey_b32: String },
 }
 
 /// One response line on the wire (daemon → client).
@@ -430,6 +444,11 @@ pub enum ApiResponse {
     PeersOk { entries: Vec<PeerInfo> },
     /// Reply to [`ApiRequest::Send`].
     SendOk,
+    /// v0.1.15 (P2P): the outbound dial was accepted and spawned
+    /// (reply to [`ApiRequest::DialPeer`]). The Noise/MLS handshake
+    /// proceeds asynchronously; the peer surfaces via `Tail`/`Peers`
+    /// once connected.
+    DialPeerOk,
     /// Reply to [`ApiRequest::History`]. Messages are ordered oldest
     /// → newest. May be shorter than `limit` if fewer messages exist
     /// (or empty if the peer has no exchanged messages yet).

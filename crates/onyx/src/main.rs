@@ -269,6 +269,24 @@ enum Command {
         #[arg(long)]
         peer_fingerprint: String,
     },
+    /// v0.1.15 (P2P): dial a peer's hidden service **directly** over Tor
+    /// — no hub. The running daemon keeps listening for inbound peers AND
+    /// opens this outbound conversation concurrently, so you no longer
+    /// have to relaunch in a dedicated dial mode. The peer appears in the
+    /// TUI once the Noise/MLS handshake completes.
+    ///
+    /// Both peers must be online (direct dial has no store-and-forward).
+    /// `--onion` is `<onion>` or `<onion>:<port>`; `--pubkey` is the
+    /// peer's X25519 identity public key (base32), printed by
+    /// `onyx identity` on their machine.
+    Dial {
+        /// The peer's `.onion` (optionally `:port`).
+        #[arg(long)]
+        onion: String,
+        /// The peer's X25519 identity public key, base32.
+        #[arg(long)]
+        pubkey: String,
+    },
     /// Print a shareable `onyx://invite/v1?…` URL bundling our
     /// fingerprint and KEM public key. Hand it to a peer (over Signal,
     /// in person, whatever channel you trust to authenticate them) and
@@ -1294,6 +1312,16 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
             text,
             insecure_accept_unsigned,
         }) => run_accept(&socket, &url, text, insecure_accept_unsigned).await,
+        Some(Command::Dial { onion, pubkey }) => {
+            one_shot_print(
+                &socket,
+                ApiRequest::DialPeer {
+                    onion,
+                    pubkey_b32: pubkey,
+                },
+            )
+            .await
+        }
         Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
         Some(Command::Files { cmd }) => dispatch_files(&socket, cmd).await,
         Some(Command::Contact { cmd }) => dispatch_contact(&socket, cmd).await,

@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.15 — 2026-05-31 — peer-to-peer in the TUI + accept-invite feedback
+
+### Added
+- **Concurrent listen + dial (real P2P).** The daemon no longer picks a
+  single mode at launch: it now **always listens** (publishes its onion,
+  accepts inbound peers) AND can open outbound direct dials at the same
+  time, sharing one conversation registry. A `--dial-onion` startup target
+  becomes an additive background dial instead of the daemon's only job.
+- **`DialPeer` API verb + `onyx dial`.** New `ApiRequest::DialPeer`
+  (handled live, concurrent with the accept loop) and a CLI front door:
+  `onyx dial --onion <onion[:port]> --pubkey <peer_x25519_b32>` starts a
+  hub-less, end-to-end (Noise XK + MLS) conversation with a peer while the
+  daemon keeps running. Both peers must be online (no store-and-forward on
+  the direct path). Requires Tor — returns `NotReady` in no-Tor builds.
+
+### Fixed
+- **Accept-invite was silent.** Accepting an invite (`^A` / `onyx accept`)
+  ships a sealed bootstrap to the peer via the hub but creates no local
+  conversation yet, so it looked like "nothing happened, no error." The
+  TUI now shows an explicit sticky notice — *"invite accepted (tier,
+  signed) — sent to peer via hub. They'll appear here once they come
+  online and reply."* — instead of a blank/terse status.
+
+Gate: `cargo build` clean; clippy `--workspace -D warnings` 0/0; fmt
+clean; `cargo test -p onyx-daemon` green (incl. new
+`dial_peer_without_tor_runtime_is_not_ready`).
+
 ## v0.1.14 — 2026-05-31 — opt-in public hubs (signed, verified at install)
 
 New users couldn't reach anyone without first standing up or being handed
