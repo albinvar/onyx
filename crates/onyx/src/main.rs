@@ -615,11 +615,76 @@ struct FileConfig {
     /// Optional Poisson cover-traffic mean interval, seconds.
     #[serde(default)]
     cover_traffic_mean_secs: Option<u64>,
+    /// v0.1.14: opt IN to the public hub list. **Default `false`.** When
+    /// true (and no explicit `--hub`/config hub is set), the daemon also
+    /// uses the hubs in `~/.onyx/public-hubs.json` — a list that
+    /// `install.sh` fetched from the signed release artifact and
+    /// **cosign-verified** before writing. Off by default because an
+    /// anonymity tool must not silently route first contact through a
+    /// central relay; the user (or installer prompt) opts in.
+    #[serde(default)]
+    use_public_hubs: bool,
 }
 
 /// Path to the persisted config: `~/.onyx/config.json`.
 fn config_file_path() -> std::path::PathBuf {
     onyx_daemon::default_data_dir().join("config.json")
+}
+
+/// Path to the install-time-verified public hub list:
+/// `~/.onyx/public-hubs.json`. Written by `install.sh` ONLY after a
+/// successful cosign signature check of the release's `hubs.json`, so by
+/// the time the daemon reads it the signature has already been verified
+/// out-of-band. The daemon never fetches this itself (no runtime network
+/// / no metadata leak); it just reads the locally-cached, pre-verified
+/// copy. Shape mirrors the repo's `hubs.json`.
+fn public_hubs_file_path() -> std::path::PathBuf {
+    onyx_daemon::default_data_dir().join("public-hubs.json")
+}
+
+/// One entry in the signed public hub list.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PublicHubEntry {
+    /// Human-friendly label (e.g. "onyx-community-1"). Display only.
+    #[serde(default)]
+    name: String,
+    /// `.onion` address of the hub's hidden service.
+    onion: String,
+    /// Virtual port (defaults to the Onyx HS port, 1).
+    #[serde(default = "default_hub_port")]
+    port: u16,
+    /// X25519 identity public key of the hub, base32.
+    pubkey: String,
+}
+
+fn default_hub_port() -> u16 {
+    1
+}
+
+/// The signed public hub list (`hubs.json` / `~/.onyx/public-hubs.json`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PublicHubsFile {
+    /// Schema version; bump if the shape changes.
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    hubs: Vec<PublicHubEntry>,
+}
+
+/// Load `~/.onyx/public-hubs.json` if present. Missing → `None` (no list
+/// installed / user never opted in). Malformed → hard error so a
+/// corrupted list is noticed rather than silently ignored.
+fn load_public_hubs() -> anyhow::Result<Option<PublicHubsFile>> {
+    let path = public_hubs_file_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let f: PublicHubsFile = serde_json::from_str(&s)
+                .map_err(|e| anyhow::anyhow!("malformed {}: {e}", path.display()))?;
+            Ok(Some(f))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    }
 }
 
 /// Load `~/.onyx/config.json` if present. A missing file is `None`
@@ -656,6 +721,7 @@ fn save_file_config(cfg: &FileConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_daemon_config(
     args: &Args,
     socket: &std::path::Path,
@@ -705,6 +771,45 @@ fn build_daemon_config(
                 onion: onion.to_string(),
                 pubkey: pubkey.to_string(),
             });
+        }
+    }
+    // v0.1.14: opt-in public hubs. If the user enabled `use_public_hubs`
+    // and STILL has no explicit hub (neither --hub nor a config.json
+    // hub), append the install-time-verified public list from
+    // ~/.onyx/public-hubs.json. Same precedence rule: any explicit hub
+    // wins outright, so this only ever fills an otherwise-empty list.
+    if hubs.is_empty() && file_cfg.use_public_hubs {
+        match load_public_hubs()? {
+            Some(list) if !list.hubs.is_empty() => {
+                for h in &list.hubs {
+                    if h.onion.is_empty() || h.pubkey.is_empty() {
+                        anyhow::bail!("public-hubs.json entry has empty onion/pubkey: {}", h.name);
+                    }
+                    hubs.push(onyx_daemon::HubConfig {
+                        onion: format!("{}:{}", h.onion, h.port),
+                        pubkey: h.pubkey.clone(),
+                    });
+                }
+                eprintln!(
+                    "onyx: using {} public hub(s) from ~/.onyx/public-hubs.json \
+                     (install-time cosign-verified). Disable in Settings (^G) or \
+                     set use_public_hubs=false in config.json.",
+                    hubs.len()
+                );
+            }
+            Some(_) => {
+                eprintln!(
+                    "onyx: use_public_hubs is on but ~/.onyx/public-hubs.json has no \
+                     hubs. Re-run install.sh, or add a hub manually (^G)."
+                );
+            }
+            None => {
+                eprintln!(
+                    "onyx: use_public_hubs is on but ~/.onyx/public-hubs.json is \
+                     missing. Re-run install.sh to fetch + verify it, or add a hub \
+                     manually (^G)."
+                );
+            }
         }
     }
     // TEST-ONLY: parse repeatable --hub-tcp "addr,b32pubkey" the same
@@ -868,7 +973,80 @@ fn first_run_wizard(vault_path: &std::path::Path) -> anyhow::Result<String> {
             continue;
         }
         eprintln!("  {}\n", paint("✓ vault passphrase set.", ANSI_GREEN));
+        // v0.1.14: offer the opt-in public hub list on a fresh vault, but
+        // ONLY if install.sh actually verified + dropped one AND the user
+        // hasn't already written a config.json. Default is NO — an
+        // anonymity tool must not auto-join a central relay. A "yes" just
+        // sets use_public_hubs=true; the hubs themselves are the
+        // cosign-verified ~/.onyx/public-hubs.json that install.sh wrote.
+        maybe_offer_public_hubs();
         return Ok(p1);
+    }
+}
+
+/// v0.1.14: first-run public-hub opt-in. No-op unless a verified
+/// `~/.onyx/public-hubs.json` exists and there's no `config.json` yet
+/// (so we never override a returning user or offer hubs we don't have).
+/// Default answer is NO. Errors are non-fatal — the user can always
+/// toggle later in the TUI (^G then ^P).
+fn maybe_offer_public_hubs() {
+    // Only offer if install.sh left a verified list AND no config yet.
+    if load_public_hubs().ok().flatten().is_none() {
+        return;
+    }
+    if config_file_path().exists() {
+        return;
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return;
+    }
+    eprintln!(
+        "  {}",
+        paint(
+            "A verified public hub list is installed. Use it so you can reach",
+            ANSI_DIM
+        )
+    );
+    eprintln!(
+        "  {}",
+        paint(
+            "others out of the box? Routes first contact through a community",
+            ANSI_DIM
+        )
+    );
+    let Ok(ans) = read_hidden_line(&paint(
+        "  relay (you can change this later: ^G then ^P). [y/N]: ",
+        ANSI_GREEN,
+    )) else {
+        return;
+    };
+    let enable = matches!(ans.trim(), "y" | "Y" | "yes" | "YES");
+    if enable {
+        let cfg = FileConfig {
+            use_public_hubs: true,
+            ..Default::default()
+        };
+        match save_file_config(&cfg) {
+            Ok(()) => eprintln!(
+                "  {}\n",
+                paint(
+                    "✓ public hubs enabled (toggle later with ^G / ^P).",
+                    ANSI_GREEN
+                )
+            ),
+            Err(e) => eprintln!(
+                "  {}",
+                paint(&format!("could not save config: {e}"), ANSI_AMBER)
+            ),
+        }
+    } else {
+        eprintln!(
+            "  {}\n",
+            paint(
+                "public hubs left off — enable later with ^G then ^P.",
+                ANSI_DIM
+            )
+        );
     }
 }
 
