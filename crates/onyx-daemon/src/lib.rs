@@ -666,6 +666,27 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // `snapshot_is_deterministic_when_state_unchanged` test).
     spawn_replay_snapshot_task(state.clone());
 
+    // v0.1.17: revive persisted dial targets so the reconnect supervisor
+    // can re-dial peers we had open before the last shutdown — reliability
+    // across daemon restarts, not just dropped circuits. Best-effort: a
+    // read failure just means no auto-revive this run.
+    {
+        let revived = {
+            let vault = state.vault.lock().await;
+            vault.list_peer_dials(state.identity_id).unwrap_or_default()
+        };
+        if !revived.is_empty() {
+            let mut targets = state.dial_targets.lock().await;
+            for (peer_pub, onion, pubkey_b32) in revived {
+                targets.insert(peer_pub, DialTarget { onion, pubkey_b32 });
+            }
+            info!(
+                count = targets.len(),
+                "revived persisted dial targets for reconnect"
+            );
+        }
+    }
+
     let api_socket_path = PathBuf::from(&args.api_socket);
 
     // **TEST-ONLY** spawn the TCP-hub client tasks BEFORE the
@@ -937,6 +958,9 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         let onion = onion.clone();
         let pubkey_b32 = pubkey_b32.clone();
         tokio::spawn(async move {
+            // v0.1.17: remember this target so reconnect (and restart
+            // revive) can re-dial it after a dropped circuit.
+            record_dial_target(&state_dial, &onion, &pubkey_b32).await;
             if let Err(e) = run_dial_mode(&tor_dial, &state_dial, &onion, &pubkey_b32).await {
                 warn!(error = %e, "startup --dial-onion task ended with error");
             }
@@ -1184,6 +1208,37 @@ async fn run_tcp_dial_mode(
 }
 
 #[allow(clippy::too_many_lines)]
+/// v0.1.17: remember how to re-dial this peer. Records the dial address
+/// both in the in-memory `dial_targets` map (read by the reconnect
+/// supervisor) and, best-effort, in the vault's `peer_dial` table so the
+/// mapping survives a daemon restart. Called from every place we
+/// initiate an outbound dial (`handle_dial_peer`, startup `--dial-onion`).
+/// A bad pubkey is logged and skipped — recording is an optimization,
+/// never a reason to refuse the dial itself.
+async fn record_dial_target(state: &DaemonState, onion: &str, pubkey_b32: &str) {
+    let Ok(peer_pub) = decode_b32_32(pubkey_b32) else {
+        warn!("record_dial_target: peer pubkey did not decode to 32 bytes; not persisting");
+        return;
+    };
+    {
+        let mut targets = state.dial_targets.lock().await;
+        targets.insert(
+            peer_pub,
+            DialTarget {
+                onion: onion.to_string(),
+                pubkey_b32: pubkey_b32.to_string(),
+            },
+        );
+    }
+    // Mirror to the vault (best-effort: a write failure just means we
+    // won't auto-revive this peer after a restart — the in-memory entry
+    // still drives reconnect within this process lifetime).
+    let vault = state.vault.lock().await;
+    if let Err(e) = vault.record_peer_dial(state.identity_id, &peer_pub, onion, pubkey_b32) {
+        warn!(error = %e, "record_dial_target: vault persist failed (reconnect still works this session)");
+    }
+}
+
 async fn run_dial_mode(
     tor: &TorRuntime,
     state: &Arc<DaemonState>,

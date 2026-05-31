@@ -2310,6 +2310,10 @@ fn handle_dial_peer(onion: &str, pubkey_b32: &str, state: &Arc<DaemonState>) -> 
     let onion = onion.to_string();
     let pubkey_b32 = pubkey_b32.to_string();
     tokio::spawn(async move {
+        // v0.1.17: remember this target so reconnect (and restart revive)
+        // can re-dial it after the circuit drops. Done before the dial so
+        // even a dial that fails immediately is retryable.
+        crate::record_dial_target(&state, &onion, &pubkey_b32).await;
         if let Err(e) = crate::run_dial_mode(&tor, &state, &onion, &pubkey_b32).await {
             warn!(error = %e, "DialPeer task ended with error");
         }
@@ -3376,6 +3380,7 @@ mod tests {
             files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
+            dial_targets: Arc::new(Mutex::new(HashMap::new())),
         });
         (state, encode_b32(group_id))
     }

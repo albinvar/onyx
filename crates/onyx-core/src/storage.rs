@@ -640,13 +640,7 @@ impl Vault {
                    onion = excluded.onion, \
                    pubkey_b32 = excluded.pubkey_b32, \
                    updated_at = excluded.updated_at",
-                params![
-                    identity_id,
-                    peer_x25519.as_slice(),
-                    onion,
-                    pubkey_b32,
-                    now
-                ],
+                params![identity_id, peer_x25519.as_slice(), onion, pubkey_b32, now],
             )
             .map_err(map_db_err)?;
         Ok(())
@@ -676,10 +670,7 @@ impl Vault {
     /// as `(peer_x25519, onion, pubkey_b32)`. The daemon calls this at
     /// startup to revive supervised reconnect loops for peers we had
     /// dialed before the last shutdown.
-    pub fn list_peer_dials(
-        &self,
-        identity_id: i64,
-    ) -> Result<Vec<([u8; 32], String, String)>> {
+    pub fn list_peer_dials(&self, identity_id: i64) -> Result<Vec<([u8; 32], String, String)>> {
         let mut stmt = self
             .conn
             .prepare(
