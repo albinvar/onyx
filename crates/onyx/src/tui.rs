@@ -146,6 +146,13 @@ struct AppState {
     /// The most recent `Send` outcome, surfaced as a transient
     /// banner in the composer pane until the next keystroke.
     last_send_result: Option<Result<(), String>>,
+    /// v0.1.15: a sticky, explicit one-line notice (e.g. "invite
+    /// accepted — waiting for peer to come online"). Unlike
+    /// `last_send_result`'s terse "sent ✓", this carries a full
+    /// sentence and survives until the next action, so flows that
+    /// otherwise produce no visible conversation (accept-invite) still
+    /// give the user clear feedback. Shown in the status bar.
+    last_notice: Option<String>,
     /// Visual indicator of whether the tail connection is alive.
     tail_active: bool,
     /// Set of `short_id`s we've already fetched History for. Prevents
@@ -437,6 +444,7 @@ impl AppState {
             scrollback: HashMap::new(),
             composer: String::new(),
             last_send_result: None,
+            last_notice: None,
             tail_active: false,
             backfilled: HashSet::new(),
             backfilled_rooms: HashSet::new(),
@@ -1406,6 +1414,15 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 // conversation on its next status tick.
                 Ok(ApiResponse::SendInviteOk { tier, was_signed }) => {
                     app.last_send_result = Some(Ok(()));
+                    // Accept produces NO local conversation yet — the
+                    // Welcome/bootstrap is en route to the peer via the
+                    // hub. Without an explicit notice this looks like
+                    // "nothing happened", so spell it out.
+                    let sig = if was_signed { "signed" } else { "UNSIGNED" };
+                    app.last_notice = Some(format!(
+                        "invite accepted ({tier}, {sig}) — sent to peer via hub. \
+                         They'll appear here once they come online and reply.",
+                    ));
                     tracing::info!(%tier, was_signed, "invite accepted via TUI modal");
                 }
                 Ok(ApiResponse::Error { message, .. }) => {
@@ -3412,6 +3429,18 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 Span::styled("invite", theme::keylabel()),
             ])
         }
+    };
+    // v0.1.15: a sticky notice (e.g. accept-invite confirmation) takes
+    // over the status line so flows that produce no visible conversation
+    // still give unmistakable feedback. Cleared on the next keystroke.
+    let line = if let Some(notice) = &app.last_notice {
+        Line::from(vec![
+            Span::styled(" ✓ ", theme::ok()),
+            Span::styled(notice.clone(), theme::text()),
+            Span::styled("  · any key dismisses", theme::muted()),
+        ])
+    } else {
+        line
     };
     frame.render_widget(Paragraph::new(line), area);
 }

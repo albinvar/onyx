@@ -251,6 +251,14 @@ pub struct DaemonState {
     /// quota). Defaults from `Config::default_files()` honor the
     /// `FILES.md §4` defaults; operator overrides via CLI.
     pub files_config: FilesConfig,
+    /// v0.1.15 (P2P): the bootstrapped Tor runtime, set once after
+    /// `run()` finishes Tor bootstrap. Lets the API server's
+    /// `DialPeer` handler start a NEW outbound peer dial on demand
+    /// (concurrent with the accept loop) without tearing the daemon
+    /// down. `None` in no-Tor / TCP-test modes (where `DialPeer` over
+    /// Tor isn't available). A `OnceLock` because `DaemonState` is
+    /// constructed before Tor finishes bootstrapping.
+    pub tor: std::sync::OnceLock<Arc<TorRuntime>>,
 }
 
 /// T6.3.i: per-group out-of-order room-frame retry buffer. Map
@@ -610,6 +618,9 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         ),
+        // Populated after Tor bootstrap (below) so the DialPeer API
+        // handler can start outbound dials concurrently with accept.
+        tor: std::sync::OnceLock::new(),
     });
 
     drop(args.passphrase);
@@ -696,6 +707,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     };
     info!("Tor bootstrap complete");
     let tor = Arc::new(tor);
+    // v0.1.15 (P2P): publish the bootstrapped runtime into shared state
+    // so the API server's DialPeer handler can dial peers on demand.
+    // Ignore the Err (only fails if already set — it isn't).
+    let _ = state.tor.set(tor.clone());
 
     // Bring the API server up before the mode-specific logic so that a
     // long-running --dial-mode session is still observable via `onyx status`.
@@ -875,12 +890,26 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         }
     }
 
-    let mode_result = if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey)
-    {
-        run_dial_mode(&tor, &state, onion, pubkey_b32).await
-    } else {
-        run_accept_mode(&tor, state.clone()).await
-    };
+    // v0.1.15 (P2P): the daemon now ALWAYS listens (accept mode) so it
+    // can receive inbound peers AND dial outbound peers concurrently. A
+    // `--dial-onion` startup target becomes an ADDITIVE background dial
+    // (it used to be the daemon's only mode), and the `DialPeer` API verb
+    // can start more dials on demand at runtime — all sharing the one
+    // conversation registry. Each dial gets its own circuit-isolated
+    // task; a dial ending (peer disconnect) no longer tears the daemon
+    // down — accept mode keeps it alive.
+    if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey) {
+        let tor_dial = tor.clone();
+        let state_dial = state.clone();
+        let onion = onion.clone();
+        let pubkey_b32 = pubkey_b32.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_dial_mode(&tor_dial, &state_dial, &onion, &pubkey_b32).await {
+                warn!(error = %e, "startup --dial-onion task ended with error");
+            }
+        });
+    }
+    let mode_result = run_accept_mode(&tor, state.clone()).await;
 
     // Final replay-guard snapshot before we abort the API task — the
     // periodic snapshot task may have died mid-tick. T7.3-sec.2-persist.

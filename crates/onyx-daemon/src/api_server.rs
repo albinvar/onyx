@@ -218,7 +218,7 @@ async fn send_one(
 #[allow(clippy::too_many_lines)]
 async fn dispatch_one_shot(
     req: &ApiRequest,
-    state: &DaemonState,
+    state: &Arc<DaemonState>,
     tor_state: TorState,
 ) -> ApiResponse {
     match req {
@@ -372,6 +372,7 @@ async fn dispatch_one_shot(
         ApiRequest::SendRoom { group_id_b32, text } => {
             handle_send_room(group_id_b32, text, state).await
         }
+        ApiRequest::DialPeer { onion, pubkey_b32 } => handle_dial_peer(onion, pubkey_b32, state),
         ApiRequest::DeleteRoom { group_id_b32 } => handle_delete_room(group_id_b32, state).await,
         ApiRequest::RenameRoom {
             group_id_b32,
@@ -2287,6 +2288,33 @@ async fn fanout_room_mls_bytes(
 // fan-out path with several short-circuit error branches; per-step
 // extraction would yield helpers that each carry their own typed
 // error response with no net readability win.
+/// v0.1.15 (P2P): start an outbound direct dial to a peer's onion on
+/// demand, concurrent with the accept loop. Spawns `run_dial_mode` as a
+/// detached task (the Noise/MLS handshake + long-lived session run in
+/// the background and register in the conversation registry); returns
+/// immediately. Requires the Tor runtime — `None` in no-Tor / TCP-test
+/// builds, surfaced as `NotReady`.
+fn handle_dial_peer(onion: &str, pubkey_b32: &str, state: &Arc<DaemonState>) -> ApiResponse {
+    let Some(tor) = state.tor.get() else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::NotReady,
+            message: "this daemon has no Tor runtime (no-tor / TCP-test build); \
+                      DialPeer needs Tor"
+                .to_string(),
+        };
+    };
+    let tor = tor.clone();
+    let state = state.clone();
+    let onion = onion.to_string();
+    let pubkey_b32 = pubkey_b32.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = crate::run_dial_mode(&tor, &state, &onion, &pubkey_b32).await {
+            warn!(error = %e, "DialPeer task ended with error");
+        }
+    });
+    ApiResponse::DialPeerOk
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -> ApiResponse {
     // 1. Parse + look up room row + own fingerprint.
@@ -3344,6 +3372,7 @@ mod tests {
             pending_room_frames: Arc::new(Mutex::new(HashMap::new())),
             inflight_files: Arc::new(Mutex::new(HashMap::new())),
             files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
+            tor: std::sync::OnceLock::new(),
         });
         (state, encode_b32(group_id))
     }
@@ -3478,6 +3507,32 @@ mod tests {
                 );
             }
             other => panic!("expected pin-change refusal, got {other:?}"),
+        }
+    }
+
+    // ── v0.1.15 P2P: DialPeer requires a Tor runtime ────────────────────
+    //
+    // In a no-Tor / TCP-test daemon, `DaemonState.tor` is never set, so a
+    // `DialPeer` request must fail closed with `NotReady` rather than
+    // panic or silently no-op. (A real concurrent listen+dial needs a live
+    // Tor runtime, so the happy path is covered by the manual real-Tor
+    // smoke, not this unit test.)
+    #[tokio::test]
+    async fn dial_peer_without_tor_runtime_is_not_ready() {
+        let group_id = [7u8; 32];
+        let (state, _gid_b32) = room_state_with_members(&fresh_fp(), &group_id);
+        // `room_state_with_members` builds a DaemonState with
+        // `tor: OnceLock::new()` (unset) — exactly the no-Tor case.
+        let resp = handle_dial_peer("abc.onion:1", "deadbeef", &state);
+        match resp {
+            ApiResponse::Error { code, message } => {
+                assert_eq!(code, ApiErrorCode::NotReady, "got message: {message}");
+                assert!(
+                    message.contains("Tor"),
+                    "error should explain the missing Tor runtime, got: {message}"
+                );
+            }
+            other => panic!("expected NotReady without a Tor runtime, got {other:?}"),
         }
     }
 }
