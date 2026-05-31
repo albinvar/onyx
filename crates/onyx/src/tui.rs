@@ -293,6 +293,9 @@ enum ModalState {
         dial_onion: String,
         dial_pubkey: String,
         reachable: bool,
+        /// v0.1.14: use the install-time-verified public hub list.
+        /// Toggled with Ctrl-P inside this modal.
+        use_public_hubs: bool,
         focus: usize,
         /// Set after a successful save so the render can show a hint.
         saved: bool,
@@ -1094,11 +1097,13 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 dial_onion,
                 dial_pubkey,
                 reachable,
+                use_public_hubs,
                 saved,
                 ..
             } = &mut modal
             {
-                match save_manage_hubs(hubs, dial_onion, dial_pubkey, *reachable) {
+                match save_manage_hubs(hubs, dial_onion, dial_pubkey, *reachable, *use_public_hubs)
+                {
                     Ok(()) => {
                         *saved = true;
                         app.last_send_result = Some(Ok(()));
@@ -1107,6 +1112,24 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                         app.last_send_result = Some(Err(format!("save config: {e}")));
                     }
                 }
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        // v0.1.14: Ctrl-P toggles the public-hub opt-in (a dedicated key,
+        // not a focus row, to avoid disturbing the existing focus
+        // arithmetic). Applies on save (Ctrl-S) + next launch.
+        (ModalState::ManageHubs { .. }, KeyCode::Char('p'))
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let ModalState::ManageHubs {
+                use_public_hubs,
+                saved,
+                ..
+            } = &mut modal
+            {
+                *use_public_hubs = !*use_public_hubs;
+                *saved = false;
             }
             app.modal = Some(modal);
             return;
@@ -1539,6 +1562,7 @@ fn open_manage_hubs_modal() -> ModalState {
         dial_onion: cfg.dial_onion.unwrap_or_default(),
         dial_pubkey: cfg.dial_pubkey.unwrap_or_default(),
         reachable: cfg.first_contact_reachable,
+        use_public_hubs: cfg.use_public_hubs,
         focus: 0,
         saved: false,
     }
@@ -1551,6 +1575,7 @@ fn save_manage_hubs(
     dial_onion: &str,
     dial_pubkey: &str,
     reachable: bool,
+    use_public_hubs: bool,
 ) -> Result<(), String> {
     let trim_opt = |s: &str| {
         let t = s.trim();
@@ -1566,6 +1591,7 @@ fn save_manage_hubs(
     cfg.dial_onion = trim_opt(dial_onion);
     cfg.dial_pubkey = trim_opt(dial_pubkey);
     cfg.first_contact_reachable = reachable;
+    cfg.use_public_hubs = use_public_hubs;
     crate::save_file_config(&cfg).map_err(|e| format!("{e:#}"))
 }
 
@@ -2360,6 +2386,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             dial_onion,
             dial_pubkey,
             reachable,
+            use_public_hubs,
             focus,
             saved,
         } => {
@@ -2446,6 +2473,25 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
                     }),
                 ),
                 Span::styled("  (Space toggles)", Style::default().fg(Color::DarkGray)),
+            ]));
+            // v0.1.14: public-hub opt-in (toggled with Ctrl-P, not a
+            // focus row). Uses the install-time cosign-verified list in
+            // ~/.onyx/public-hubs.json when on and no explicit hub is set.
+            lines.push(Line::from(vec![
+                Span::styled("   use public hubs: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    if *use_public_hubs {
+                        "[x] on"
+                    } else {
+                        "[ ] off"
+                    },
+                    Style::default().fg(if *use_public_hubs {
+                        Color::Green
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+                Span::styled("  (^P toggles)", Style::default().fg(Color::DarkGray)),
             ]));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

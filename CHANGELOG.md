@@ -6,6 +6,43 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.14 — 2026-05-31 — opt-in public hubs (signed, verified at install)
+
+New users couldn't reach anyone without first standing up or being handed
+a hub. v0.1.14 ships an **opt-in, signature-verified public hub list** so
+a fresh install can talk to others out of the box — without weakening the
+privacy posture.
+
+### Added
+- **Public hub list (`hubs.json`), cosign-signed and shipped with each
+  release.** The release workflow signs it (keyless OIDC, same as the
+  binaries) and publishes `hubs.json` + `hubs.json.cosign-bundle` as
+  release assets. The first entry is the project's bootstrap hub.
+- **Install-time fetch + verify (`install.sh`).** The installer downloads
+  `hubs.json`, **cosign-verifies the signature**, and only on success
+  writes it to `~/.onyx/public-hubs.json` (mode 0600). If the signature
+  can't be verified (cosign absent, or no bundle), it refuses to install
+  the list rather than trust an unverified one. The daemon never fetches
+  anything itself — no runtime network, no metadata leak; it just reads
+  the locally-cached, pre-verified copy.
+- **Opt-in, default OFF.** Both the installer and the first-run wizard
+  *offer* public hubs (default no); the daemon only uses them when
+  `use_public_hubs` is set AND no explicit `--hub`/config hub exists (an
+  explicit hub always wins). Rationale: an anonymity tool must not
+  silently route first contact through a central relay.
+- **TUI toggle.** In the hub manager (`^G`), **`^P`** flips
+  "use public hubs" on/off; `^S` saves it to `~/.onyx/config.json`.
+  Applies on next launch.
+
+### Notes
+- Changes apply on the next `onyx` launch (the daemon reads config at
+  boot). The public hubs are a convenience/availability trust, not a
+  secrecy one: a hub sees connection timing, never message contents, and
+  in private mode can't link you to your long-term identity.
+
+Gate: `cargo build` clean; clippy `--workspace -D warnings` 0/0; fmt
+clean; `cargo test -p onyx` green; `dash -n install.sh` clean.
+
 ## v0.1.13 — 2026-05-31 — fix: in-TUI "copy invite" produced an unsigned (v1) link
 
 **Bug fix.** The `^E` "copy my invite link" action in the TUI assembled

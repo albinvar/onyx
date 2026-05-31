@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hubs": [
+    {
+      "name": "onyx-pi-1",
+      "onion": "gqaiiwjuhvryo477zdcmoeadae7v346pbzgdp7vzm6b32f66mmwhrbqd.onion",
+      "port": 1,
+      "pubkey": "d3pupg3jddc3rw3ozx76vpvmmngxk3xwnpwx6iekuesyzjdbsndq"
+    }
+  ]
+}
