@@ -953,18 +953,25 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // task; a dial ending (peer disconnect) no longer tears the daemon
     // down — accept mode keeps it alive.
     if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey) {
-        let tor_dial = tor.clone();
-        let state_dial = state.clone();
-        let onion = onion.clone();
-        let pubkey_b32 = pubkey_b32.clone();
-        tokio::spawn(async move {
-            // v0.1.17: remember this target so reconnect (and restart
-            // revive) can re-dial it after a dropped circuit.
-            record_dial_target(&state_dial, &onion, &pubkey_b32).await;
-            if let Err(e) = run_dial_mode(&tor_dial, &state_dial, &onion, &pubkey_b32).await {
-                warn!(error = %e, "startup --dial-onion task ended with error");
-            }
-        });
+        // v0.1.17: record the explicit startup target so it joins the
+        // supervised set below (and persists for restart-revive).
+        record_dial_target(&state, onion, pubkey_b32).await;
+    }
+    // v0.1.17: spawn a reconnect supervisor for EVERY known dial target —
+    // the explicit `--dial-onion` arg just recorded AND any peers revived
+    // from the vault's `peer_dial` table. Each supervisor keeps its
+    // peer's direct session alive across dropped circuits. Handles are
+    // collected so daemon shutdown can abort them cleanly (Step 5).
+    let mut dial_supervisors: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    {
+        let targets: Vec<[u8; 32]> = state.dial_targets.lock().await.keys().copied().collect();
+        for peer_pub in targets {
+            let tor_sup = tor.clone();
+            let state_sup = state.clone();
+            dial_supervisors.push(tokio::spawn(async move {
+                supervise_dial(tor_sup, state_sup, peer_pub).await;
+            }));
+        }
     }
     let mode_result = run_accept_mode(&tor, state.clone()).await;
 
@@ -1237,6 +1244,131 @@ async fn record_dial_target(state: &DaemonState, onion: &str, pubkey_b32: &str) 
     if let Err(e) = vault.record_peer_dial(state.identity_id, &peer_pub, onion, pubkey_b32) {
         warn!(error = %e, "record_dial_target: vault persist failed (reconnect still works this session)");
     }
+}
+
+/// v0.1.17: supervise a direct DM dial — keep it alive across dropped
+/// Tor circuits. Wraps [`run_dial_mode`] in a reconnect loop so that
+/// when a circuit dies (and `run_dial_mode`/`peer_session` returns) we
+/// re-dial the same peer instead of the conversation silently going
+/// dead. This is what turns "messages just stop arriving" into
+/// "messages resume after a short reconnect."
+///
+/// Design points:
+/// - **MLS continuity is free.** Re-dialing the same `peer_pub` makes
+///   `run_dial_session` find the persisted peer→group mapping and send
+///   `FRAME_MLS_RESUME` rather than bootstrapping a new group, so the
+///   conversation (and its history) continues seamlessly.
+/// - **No duplicate sessions.** Before each dial we check the registry:
+///   if the peer is already `is_connected` (e.g. they dialed *us*, or
+///   another path reconnected first) we idle and re-check instead of
+///   opening a redundant circuit. The `try_register` guard in
+///   `peer_session` is the hard backstop.
+/// - **Fresh circuit isolation per attempt (D-2).** `run_dial_mode`
+///   calls `tor.isolated()` each time, so every reconnect rides its own
+///   circuit and never shares with the hub or another peer.
+/// - **Anti-MITM stop.** If the peer's pinned identity key has changed
+///   (`is_pin_compromised`), we STOP re-dialing and forget the target —
+///   we will not keep reaching out to a possibly-impersonated peer. The
+///   user must re-verify out of band (`onyx contact list` flags it).
+/// - **Backoff.** 500ms, doubling to a 30s cap (mirrors the hub
+///   reconnect loop). A session that stayed up a while resets the
+///   backoff so a long-lived link that finally drops reconnects fast.
+pub(crate) async fn supervise_dial(
+    tor: Arc<TorRuntime>,
+    state: Arc<DaemonState>,
+    peer_pub: [u8; 32],
+) {
+    const BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(500);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+    // A session that survived at least this long is treated as "healthy"
+    // — its drop resets the backoff so we reconnect promptly rather than
+    // inheriting a large delay from earlier failures.
+    const HEALTHY_SESSION: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut backoff = BACKOFF_START;
+    let peer_short = short_id_of_peer_pub(&peer_pub);
+
+    loop {
+        // Look up the current dial address (it can be updated if the user
+        // re-dials the peer at a new onion). Absent → nothing to do.
+        let Some(target) = state.dial_targets.lock().await.get(&peer_pub).cloned() else {
+            debug!(peer = %peer_short, "supervise_dial: no dial target; supervisor exiting");
+            return;
+        };
+
+        // Don't open a redundant circuit if the peer is already live
+        // (they dialed us, or another path reconnected first).
+        if state.conversations.lock().await.is_connected(&peer_pub) {
+            tokio::time::sleep(BACKOFF_START).await;
+            continue;
+        }
+
+        // Anti-MITM: if this peer's identity key has changed since we
+        // pinned it, stop reaching out. derive the fingerprint we pinned
+        // from the vault by way of is_pin_compromised on the b32 pubkey?
+        // We pin by Ed25519 fingerprint, which we only learn AFTER a
+        // handshake; so the per-attempt pin check inside peer_session
+        // (pin_check_peer) is the authoritative gate. Here we additionally
+        // bail if a prior attempt already recorded a compromise for this
+        // peer's fingerprint (cheap, avoids hammering a MITM'd peer).
+        // (Handled post-session below where we know the fingerprint.)
+
+        let attempt_start = tokio::time::Instant::now();
+        match run_dial_mode(&tor, &state, &target.onion, &target.pubkey_b32).await {
+            Ok(()) => {
+                debug!(peer = %peer_short, "supervise_dial: session ended; will reconnect");
+            }
+            Err(e) => {
+                debug!(peer = %peer_short, error = %e, "supervise_dial: dial attempt failed");
+            }
+        }
+
+        // If the session was healthy for a while, reset backoff.
+        if attempt_start.elapsed() >= HEALTHY_SESSION {
+            backoff = BACKOFF_START;
+        }
+
+        // Anti-MITM stop: after a session we know the peer's pinned
+        // fingerprint (peer_session ran pin_check_peer). If it is now
+        // flagged compromised, stop the supervisor and forget the target
+        // so we don't keep dialing a possibly-impersonated peer.
+        if pin_compromised_for_peer(&state, &peer_pub).await {
+            warn!(
+                peer = %peer_short,
+                "supervise_dial: peer identity key is flagged CHANGED (possible MITM) — \
+                 stopping auto-reconnect. Re-verify out of band, then re-add the contact."
+            );
+            let vault = state.vault.lock().await;
+            let _ = vault.forget_peer_dial(state.identity_id, &peer_pub);
+            return;
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(BACKOFF_CAP);
+    }
+}
+
+/// v0.1.17: has this peer's pinned identity key been flagged as changed?
+/// We pin by Ed25519 fingerprint (learned during the MLS handshake), so
+/// we resolve the peer's fingerprint from the registry (populated by the
+/// last session) and consult the vault's `key_changed` flag. Best-effort:
+/// any lookup failure returns `false` (don't block reconnect on a
+/// transient vault error — the per-session `pin_check_peer` still warns).
+async fn pin_compromised_for_peer(state: &DaemonState, peer_pub: &[u8; 32]) -> bool {
+    let fingerprint = {
+        let reg = state.conversations.lock().await;
+        reg.fingerprint_for_peer(peer_pub)
+    };
+    let Some(fingerprint) = fingerprint else {
+        return false;
+    };
+    if fingerprint.starts_with("(peer/") {
+        return false; // never had a real verified identity to compromise
+    }
+    let vault = state.vault.lock().await;
+    vault
+        .is_pin_compromised(state.identity_id, &fingerprint)
+        .unwrap_or(false)
 }
 
 async fn run_dial_mode(
@@ -1519,9 +1651,26 @@ where
     // detects the leading "(peer/" and skips, which is intentional.)
     pin_check_peer(&state, &fingerprint, &peer_pub).await;
 
+    // v0.1.17: atomic register-if-not-live. If a connected session for
+    // this peer already exists (an inbound accept, a user DialPeer, and
+    // the reconnect supervisor's redial can all land near-together), this
+    // task yields: we close our freshly-handshaked stream and return,
+    // leaving the existing live session — and its MLS ratchet — untouched.
+    // Two live sessions to one peer would desync the group.
     let (handle, mut outbound_rx) = {
         let mut reg = state.conversations.lock().await;
-        reg.register(peer_pub, &peer_pub_b32, fingerprint)
+        match reg.try_register(peer_pub, &peer_pub_b32, fingerprint) {
+            Some(pair) => pair,
+            None => {
+                drop(reg);
+                debug!(
+                    peer = %short_id_of_peer_pub(&peer_pub),
+                    "duplicate session for an already-connected peer; yielding (closing this stream)"
+                );
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+        }
     };
     let short_id = handle.short_id.clone();
     info!(peer = %short_id, "conversation registered with registry");
@@ -2972,7 +3121,7 @@ pub(crate) fn members_b32_from_group(group: &onyx_core::mls::MlsGroupState) -> S
     out.join(",")
 }
 
-fn decode_b32_32(s: &str) -> anyhow::Result<[u8; 32]> {
+pub(crate) fn decode_b32_32(s: &str) -> anyhow::Result<[u8; 32]> {
     let cleaned: String = s
         .chars()
         .filter(|c| !c.is_whitespace())

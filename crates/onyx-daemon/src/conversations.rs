@@ -257,9 +257,18 @@ impl ConversationRegistry {
     /// reconnected).
     #[must_use]
     pub fn is_connected(&self, peer_pub: &[u8; 32]) -> bool {
+        self.by_peer.get(peer_pub).is_some_and(|s| s.connected)
+    }
+
+    /// v0.1.17: the Ed25519 fingerprint we last recorded for this peer
+    /// (from the most recent session's MLS attribution), or `None` if we
+    /// have no row. Used by the reconnect supervisor's anti-MITM check to
+    /// resolve the fingerprint → consult the vault's `key_changed` flag.
+    #[must_use]
+    pub fn fingerprint_for_peer(&self, peer_pub: &[u8; 32]) -> Option<String> {
         self.by_peer
             .get(peer_pub)
-            .is_some_and(|s| s.connected)
+            .map(|s| s.handle.fingerprint.clone())
     }
 
     /// Register (or no-op if already present) a peer we've only
