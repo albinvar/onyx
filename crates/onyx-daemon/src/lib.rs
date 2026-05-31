@@ -267,6 +267,26 @@ pub struct DaemonState {
     /// address. `None` until the HS is published. D-3 keeps it out of the
     /// on-disk log; the API is a separate, deliberate surface.
     pub self_onion: std::sync::OnceLock<String>,
+    /// v0.1.17 (reliable DMs): in-memory cache of the direct-dial address
+    /// we last reached each peer at, keyed by their X25519 identity key.
+    /// Populated when WE dial a peer (`handle_dial_peer` / startup
+    /// `--dial-onion`); inbound peers who dialed US are absent (we never
+    /// learned an onion for them). The reconnect supervisor reads this to
+    /// re-dial after a dropped circuit. Mirrored to the vault's
+    /// `peer_dial` table so it survives a daemon restart. Leaf lock —
+    /// never held across `mls_party`/`vault` (lock-order policy above).
+    pub dial_targets: Arc<Mutex<std::collections::HashMap<[u8; 32], DialTarget>>>,
+}
+
+/// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
+/// data a connect code carries. `onion` may include an optional `:port`
+/// suffix (parsed at dial time); `pubkey_b32` is the peer's X25519
+/// identity key, base32 (kept for cross-checking + re-deriving the
+/// `[u8; 32]` map key on a vault-revive).
+#[derive(Debug, Clone)]
+pub struct DialTarget {
+    pub onion: String,
+    pub pubkey_b32: String,
 }
 
 /// T6.3.i: per-group out-of-order room-frame retry buffer. Map
@@ -631,6 +651,9 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         tor: std::sync::OnceLock::new(),
         // Populated by run_accept_mode once the hidden service publishes.
         self_onion: std::sync::OnceLock::new(),
+        // v0.1.17: populated when we dial a peer (handle_dial_peer /
+        // startup --dial-onion) and revived from the vault below.
+        dial_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
 
     drop(args.passphrase);
