@@ -173,6 +173,30 @@ CREATE TABLE IF NOT EXISTS room_member_kems (
 );
 ";
 
+/// Additive extension for v0.1.17 — persistent direct-dial targets.
+/// Maps a peer's X25519 identity key to the `.onion` (+ base32 pubkey,
+/// stored for convenience/cross-check) we last dialed them at, so the
+/// reconnect supervisor can re-dial across circuit drops AND daemon
+/// restarts instead of forgetting the address the moment `handle_dial_peer`
+/// returns. Same `CREATE TABLE IF NOT EXISTS` pattern as the other
+/// additive tables; no `SCHEMA_VERSION` bump.
+///
+/// Privacy note: this records a slice of the user's contact graph at
+/// rest — but it lives inside the already-encrypted vault (the onion is
+/// the only sensitive column; the pubkey is public-by-nature like the
+/// `mls_peer_groups` / `room_member_kems` blobs). It is no more exposed
+/// than the MLS group mapping we already persist for the same peers.
+const SCHEMA_PEER_DIAL_ADD: &str = "
+CREATE TABLE IF NOT EXISTS peer_dial (
+  identity_id   INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  peer_x25519   BLOB NOT NULL,
+  onion         TEXT NOT NULL,
+  pubkey_b32    TEXT NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  PRIMARY KEY (identity_id, peer_x25519)
+);
+";
+
 /// Additive extension for T-files.b — manifest of received files.
 /// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
 /// tables; no `SCHEMA_VERSION` bump.
@@ -437,6 +461,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -454,6 +480,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_RECEIVED_FILES_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
             .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
@@ -585,6 +613,113 @@ impl Vault {
             )
             .optional()
             .map_err(map_db_err)
+    }
+
+    /// v0.1.17: persist the direct-dial address (`.onion` + base32
+    /// pubkey) we last reached this peer at, so the reconnect supervisor
+    /// can re-dial after a dropped Tor circuit OR a daemon restart.
+    /// UPSERT keyed on `(identity_id, peer_x25519)` — re-dialing the same
+    /// peer at a new onion rotates the stored address cleanly.
+    pub fn record_peer_dial(
+        &self,
+        identity_id: i64,
+        peer_x25519: &[u8; 32],
+        onion: &str,
+        pubkey_b32: &str,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO peer_dial (identity_id, peer_x25519, onion, pubkey_b32, updated_at) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(identity_id, peer_x25519) DO UPDATE SET \
+                   onion = excluded.onion, \
+                   pubkey_b32 = excluded.pubkey_b32, \
+                   updated_at = excluded.updated_at",
+                params![
+                    identity_id,
+                    peer_x25519.as_slice(),
+                    onion,
+                    pubkey_b32,
+                    now
+                ],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// v0.1.17: look up the dial address previously recorded for this
+    /// peer. Returns `None` if we have never dialed them (e.g. they
+    /// dialed us — inbound peers have no stored onion). Result is
+    /// `(onion, pubkey_b32)`.
+    pub fn lookup_peer_dial(
+        &self,
+        identity_id: i64,
+        peer_x25519: &[u8; 32],
+    ) -> Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT onion, pubkey_b32 FROM peer_dial \
+                 WHERE identity_id = ? AND peer_x25519 = ?",
+                params![identity_id, peer_x25519.as_slice()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_db_err)
+    }
+
+    /// v0.1.17: list every persisted dial target for this identity,
+    /// as `(peer_x25519, onion, pubkey_b32)`. The daemon calls this at
+    /// startup to revive supervised reconnect loops for peers we had
+    /// dialed before the last shutdown.
+    pub fn list_peer_dials(
+        &self,
+        identity_id: i64,
+    ) -> Result<Vec<([u8; 32], String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT peer_x25519, onion, pubkey_b32 FROM peer_dial \
+                 WHERE identity_id = ?",
+            )
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(map_db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (peer_vec, onion, pubkey_b32) = row.map_err(map_db_err)?;
+            // Skip any malformed row (wrong key length) defensively
+            // rather than failing the whole startup revive.
+            if let Ok(peer_arr) = <[u8; 32]>::try_from(peer_vec.as_slice()) {
+                out.push((peer_arr, onion, pubkey_b32));
+            }
+        }
+        Ok(out)
+    }
+
+    /// v0.1.17: delete a stored dial target. Used when the user forgets
+    /// a contact, or when a redial hits a permanent error (e.g. a TOFU
+    /// pin mismatch) and the supervisor should stop trying. Idempotent.
+    pub fn forget_peer_dial(&self, identity_id: i64, peer_x25519: &[u8; 32]) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM peer_dial \
+                 WHERE identity_id = ? AND peer_x25519 = ?",
+                params![identity_id, peer_x25519.as_slice()],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
     }
 
     /// T-1: trust-on-first-use pin/verify of a peer's X25519 identity
@@ -1712,6 +1847,49 @@ mod tests {
         let got = v.lookup_room_member_kem(id, group_id, fp).unwrap();
         // Upsert: second call's bytes win.
         assert_eq!(got, Some(vec![2u8; 10]));
+    }
+
+    #[test]
+    fn peer_dial_record_lookup_list_forget() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let peer = [3u8; 32];
+        // Unknown peer → None.
+        assert!(v.lookup_peer_dial(id, &peer).unwrap().is_none());
+        // Record + look up.
+        v.record_peer_dial(id, &peer, "abc.onion", "pubkeyb32aaa")
+            .unwrap();
+        assert_eq!(
+            v.lookup_peer_dial(id, &peer).unwrap(),
+            Some(("abc.onion".to_string(), "pubkeyb32aaa".to_string()))
+        );
+        // UPSERT: re-dialing the same peer at a new onion rotates it.
+        v.record_peer_dial(id, &peer, "def.onion", "pubkeyb32bbb")
+            .unwrap();
+        assert_eq!(
+            v.lookup_peer_dial(id, &peer).unwrap(),
+            Some(("def.onion".to_string(), "pubkeyb32bbb".to_string()))
+        );
+        // A second peer, then list returns both.
+        let peer2 = [4u8; 32];
+        v.record_peer_dial(id, &peer2, "ghi.onion", "pubkeyb32ccc")
+            .unwrap();
+        let mut listed = v.list_peer_dials(id).unwrap();
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0],
+            (peer, "def.onion".to_string(), "pubkeyb32bbb".to_string())
+        );
+        assert_eq!(
+            listed[1],
+            (peer2, "ghi.onion".to_string(), "pubkeyb32ccc".to_string())
+        );
+        // Forget is idempotent and clears the lookup.
+        v.forget_peer_dial(id, &peer).unwrap();
+        assert!(v.lookup_peer_dial(id, &peer).unwrap().is_none());
+        v.forget_peer_dial(id, &peer).unwrap(); // no-op, still Ok
+        assert_eq!(v.list_peer_dials(id).unwrap().len(), 1);
     }
 
     #[test]
