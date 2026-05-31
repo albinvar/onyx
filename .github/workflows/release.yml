@@ -225,6 +225,20 @@ jobs:
             --bundle dist/install.sh.cosign-bundle \
             dist/install.sh
 
+      - name: Copy + sign public hub list
+        # v0.1.14: ship the public hub list (hubs.json) alongside the
+        # release, cosign-signed like install.sh. install.sh fetches +
+        # cosign-verifies it, then (with the user's opt-in) writes it to
+        # ~/.onyx/public-hubs.json. Signing it means a compromised GitHub
+        # release tab can't silently substitute a malicious hub list — the
+        # signature is OIDC-bound to this workflow, same as the binaries.
+        run: |
+          cp hubs.json dist/hubs.json
+          cosign sign-blob \
+            --yes \
+            --bundle dist/hubs.json.cosign-bundle \
+            dist/hubs.json
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         # The action intermittently hits an asset-metadata race
@@ -252,6 +266,8 @@ jobs:
             dist/SHA256SUMS.txt.cosign-bundle
             dist/install.sh
             dist/install.sh.cosign-bundle
+            dist/hubs.json
+            dist/hubs.json.cosign-bundle
           generate_release_notes: true
           body: |
             ## Install (one-liner)

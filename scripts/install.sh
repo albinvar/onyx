@@ -280,6 +280,77 @@ fetch_and_install() {
   ok "installed ${bin_name} → ${ONYX_INSTALL_DIR}/${bin_name}"
 }
 
+# ── Public hubs (v0.1.14) ─────────────────────────────────────────────
+#
+# Download the release's signed `hubs.json`, cosign-verify it (same trust
+# path as the binaries), and — ONLY on a clean verify — write it to
+# ~/.onyx/public-hubs.json. Then OFFER (default NO) to enable it in
+# config.json. Default-off is deliberate: an anonymity tool must not
+# silently route first contact through a central relay. The daemon never
+# fetches anything itself; it just reads this locally-cached, pre-verified
+# copy when the user has opted in.
+fetch_public_hubs() {
+  local version="$1" tmpdir="$2"
+  local base="https://github.com/${ONYX_REPO}/releases/download/${version}"
+  local cfg_dir="${HOME}/.onyx"
+
+  info "fetching public hub list (hubs.json)..."
+  if ! curl -fsSL "${base}/hubs.json" -o "${tmpdir}/hubs.json" 2>/dev/null; then
+    warn "no hubs.json in ${version} — skipping public hubs (add a hub manually with ^G)."
+    return 0
+  fi
+  curl -fsSL "${base}/hubs.json.cosign-bundle" \
+       -o "${tmpdir}/hubs.json.cosign-bundle" 2>/dev/null \
+    || warn "no hubs.json.cosign-bundle (was the release signed?)"
+
+  # Verify the signature. If cosign is present and the signature does NOT
+  # verify, verify_sigstore() calls die — we must NOT install an unverified
+  # hub list. If cosign is absent, verify_sigstore warns + returns 0 (same
+  # policy as the binaries); we then refuse to write the list, because an
+  # unverified hub list is exactly the substitution attack we care about.
+  if [ ! -f "${tmpdir}/hubs.json.cosign-bundle" ]; then
+    warn "hubs.json has no signature bundle — refusing to install it."
+    return 0
+  fi
+  if [ "$ONYX_NO_VERIFY" != "1" ] && ! command -v cosign >/dev/null 2>&1; then
+    warn "cosign not installed — cannot verify hubs.json; refusing to install"
+    warn "the public hub list (install cosign + re-run, or add a hub via ^G)."
+    return 0
+  fi
+  verify_sigstore "${tmpdir}/hubs.json" "${tmpdir}/hubs.json.cosign-bundle" "$ONYX_REPO"
+
+  install -d "$cfg_dir"
+  install -m 0600 "${tmpdir}/hubs.json" "${cfg_dir}/public-hubs.json"
+  ok "verified public hub list → ${cfg_dir}/public-hubs.json"
+
+  # Offer to enable. Read from /dev/tty because stdin is the piped script
+  # body in the `curl … | sh` install path. If there's no tty (fully
+  # non-interactive), leave it OFF — the user can flip it later with ^P.
+  if [ ! -t 0 ] && [ ! -r /dev/tty ]; then
+    info "public hubs installed but left OFF (non-interactive). Enable in the TUI: ^G then ^P."
+    return 0
+  fi
+  # Don't clobber an existing config.json (a returning user's settings win).
+  if [ -f "${cfg_dir}/config.json" ]; then
+    info "existing config.json found — leaving use_public_hubs as-is. Toggle with ^G/^P."
+    return 0
+  fi
+  printf "  %sUse the public hub list so you can reach others out of the box?%s\n" "$C_DIM" "$C_RESET"
+  printf "  %s(routes first-contact through a community relay; default no)%s " "$C_DIM" "$C_RESET"
+  local ans=""
+  read -r ans </dev/tty 2>/dev/null || ans=""
+  case "$ans" in
+    y | Y | yes | YES)
+      printf '{\n  "use_public_hubs": true\n}\n' > "${cfg_dir}/config.json"
+      chmod 600 "${cfg_dir}/config.json"
+      ok "public hubs ENABLED (config.json). Disable anytime: ^G then ^P."
+      ;;
+    *)
+      info "public hubs left OFF. Enable later in the TUI: ^G then ^P."
+      ;;
+  esac
+}
+
 # ── PATH hint ─────────────────────────────────────────────────────────
 
 print_path_hint() {
@@ -326,6 +397,10 @@ main() {
     esac
     fetch_and_install "$bin" "$version" "$target" "$tmpdir"
   done
+
+  # v0.1.14: optional public hub list (signed + verified, opt-in).
+  printf "\n"
+  fetch_public_hubs "$version" "$tmpdir"
 
   printf "\n"
   ok "Onyx ${version} installed."
