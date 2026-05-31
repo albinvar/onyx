@@ -214,6 +214,54 @@ impl ConversationRegistry {
         (handle, outbound_rx)
     }
 
+    /// v0.1.17: atomic "register only if not already live". Returns
+    /// `None` when a **connected** direct session already exists for
+    /// `peer_pub` — the caller (a freshly-handshaked `peer_session`
+    /// task) must then yield: close its stream and exit, leaving the
+    /// existing session untouched. Returns `Some((handle, rx))` and
+    /// registers exactly like [`Self::register`] otherwise.
+    ///
+    /// This closes the duplicate-session race that the reconnect
+    /// supervisor (v0.1.17) introduces: an inbound accept, a user
+    /// `DialPeer`, and the supervisor's redial can all complete a
+    /// handshake for the same peer near-simultaneously. Because the
+    /// whole check-and-insert runs under the single registry lock the
+    /// caller already holds for `register`, there is no TOCTOU window —
+    /// at most one of the racers sees "not connected" and wins. Two live
+    /// MLS sessions to one peer would both advance the same group's
+    /// ratchet and desync it, so this guard is a correctness
+    /// requirement, not just tidiness.
+    ///
+    /// A row that exists but is **disconnected** (e.g. a hub-only
+    /// registration, or a prior session that ended) is NOT a live
+    /// session — we proceed and overwrite it, taking over as the live
+    /// transport.
+    pub fn try_register(
+        &mut self,
+        peer_pub: [u8; 32],
+        pubkey_b32: &str,
+        fingerprint: String,
+    ) -> Option<(ConversationHandle, mpsc::Receiver<PeerOutbound>)> {
+        if let Some(existing) = self.by_peer.get(&peer_pub)
+            && existing.connected
+        {
+            return None;
+        }
+        Some(self.register(peer_pub, pubkey_b32, fingerprint))
+    }
+
+    /// v0.1.17: is there a live (connected) direct session for this
+    /// peer right now? The reconnect supervisor polls this before
+    /// dialing so it doesn't open a redundant circuit to a peer who
+    /// has meanwhile connected to us (or whom another path already
+    /// reconnected).
+    #[must_use]
+    pub fn is_connected(&self, peer_pub: &[u8; 32]) -> bool {
+        self.by_peer
+            .get(peer_pub)
+            .is_some_and(|s| s.connected)
+    }
+
     /// Register (or no-op if already present) a peer we've only
     /// observed via the hub — no direct Noise session, no
     /// `peer_session` task, no transport to reply on. The returned
