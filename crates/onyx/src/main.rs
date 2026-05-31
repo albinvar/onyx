@@ -1010,6 +1010,17 @@ fn first_run_wizard(vault_path: &std::path::Path) -> anyhow::Result<String> {
 fn maybe_offer_public_hubs() {
     // Only offer if install.sh left a verified list AND no config yet.
     if load_public_hubs().ok().flatten().is_none() {
+        // v0.1.16: no public-hub list to offer — but still write an
+        // explicit default config.json (when none exists yet) so the
+        // daemon's settings are visible + editable in the TUI (^G)
+        // instead of the old invisible "no file → silent defaults"
+        // state that left fresh installs unable to work out why first
+        // contact didn't work. Reachability stays OFF (the privacy
+        // default); the connect code (^Y) is the no-hub way to connect
+        // and the TUI banner now points the user at it.
+        if load_file_config().ok().flatten().is_none() {
+            let _ = save_file_config(&FileConfig::default());
+        }
         return;
     }
     if config_file_path().exists() {

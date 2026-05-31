@@ -424,6 +424,14 @@ pub enum ApiResponse {
         /// Used by senders to address sealed-sender envelopes to
         /// this identity. Safe to publish.
         identity_kem_pub_b32: String,
+        /// v0.1.16 (easy-connect): this node's own published `.onion`
+        /// address, or `None` if the hidden service hasn't published yet
+        /// (still bootstrapping) or this is a no-Tor build. Lets the TUI
+        /// show the user's "connect code" (onion + identity key) for
+        /// direct peer-to-peer dial. `#[serde(default)]` for wire
+        /// back-compat with older daemons that didn't send it.
+        #[serde(default)]
+        onion: Option<String>,
     },
     /// Reply to [`ApiRequest::Identity`].
     IdentityOk {
@@ -845,6 +853,7 @@ mod tests {
             fingerprint: "deadbeef".into(),
             tor_state: TorState::Ready,
             identity_kem_pub_b32: "long-b32-string-stand-in".into(),
+            onion: Some("abc.onion".into()),
         };
         let line = encode_response_line(&r).unwrap();
         let parsed = decode_response(line.trim_end_matches('\n')).unwrap();

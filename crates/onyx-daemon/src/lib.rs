@@ -259,6 +259,14 @@ pub struct DaemonState {
     /// Tor isn't available). A `OnceLock` because `DaemonState` is
     /// constructed before Tor finishes bootstrapping.
     pub tor: std::sync::OnceLock<Arc<TorRuntime>>,
+    /// v0.1.16 (easy-connect): this node's own published `.onion`
+    /// address, set once `run_accept_mode` publishes the hidden service.
+    /// Surfaced to the local TUI via the Status API so the user can show
+    /// their "connect code" (onion + identity key) for direct P2P dial.
+    /// Safe over the authenticated local socket — it's the user's own
+    /// address. `None` until the HS is published. D-3 keeps it out of the
+    /// on-disk log; the API is a separate, deliberate surface.
+    pub self_onion: std::sync::OnceLock<String>,
 }
 
 /// T6.3.i: per-group out-of-order room-frame retry buffer. Map
@@ -621,6 +629,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         // Populated after Tor bootstrap (below) so the DialPeer API
         // handler can start outbound dials concurrently with accept.
         tor: std::sync::OnceLock::new(),
+        // Populated by run_accept_mode once the hidden service publishes.
+        self_onion: std::sync::OnceLock::new(),
     });
 
     drop(args.passphrase);
@@ -937,14 +947,16 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
     if let Some(addr) = hs.onion_address() {
         // D-3: the node's own .onion is a self-identifier; keep the full
         // address at debug so it doesn't persist in the default on-disk
-        // log. Operators who need it for direct-dial can run with debug
-        // logging (a Status-API field is the cleaner follow-up). The
-        // info line confirms publication without the address.
+        // log. The info line confirms publication without the address.
         info!(
             port = ONYX_HS_PORT,
             "hidden service published (run with debug logging to print the .onion address)"
         );
         debug!(onion = %addr, port = ONYX_HS_PORT, "hidden service onion address");
+        // v0.1.16 (easy-connect): publish our own onion into shared state
+        // so the Status API can surface it to the local TUI for the
+        // user's connect code. Safe — own address, local socket only.
+        let _ = state.self_onion.set(addr.to_string());
     } else {
         warn!("hidden service has no address yet — Arti will produce one shortly");
     }

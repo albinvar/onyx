@@ -6,6 +6,54 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.16 — 2026-06-01 — connect codes: one-step, hub-free contact add
+
+### Added
+- **Connect codes.** A connect code
+  (`onyx://connect/v1?onion=<your-onion>&id=<your-identity-key>`) bundles
+  your hidden-service address and identity public key into one shareable
+  string. A peer pastes it to dial you **directly over Tor** — no hub, no
+  `first_contact_reachable` toggle, no introduction inbox. It is at once
+  the *easiest* path (one paste) and the *most private* (no third party
+  ever sees the contact happen). Signature-free by design: Noise XK
+  authenticates the peer's identity key on dial, so a tampered code just
+  fails to connect rather than connecting to the wrong party.
+  - **`Ctrl-Y` — "Your connect code."** Renders your code and copies it
+    to the clipboard (OSC52). Shows a clear placeholder until Tor has
+    actually published your hidden service (no broken half-code).
+  - **`Ctrl-D` — "Add by connect code."** Paste a peer's code; Onyx
+    parses it and dials them directly (`ApiRequest::DialPeer`). Replaces
+    the old two-field raw onion+pubkey dial prompt with a single paste.
+- **Own `.onion` exposed on the Status API** (`status.onion`), so the TUI
+  can build your connect code without another round-trip.
+- **Persistent "not addable" banner.** While `first_contact_reachable` is
+  off (the privacy default), the status bar permanently shows
+  `⚠ not addable by invite — share your code ^Y or enable reachability ^G`
+  instead of silently leaving first contact non-functional.
+
+### Changed
+- **Fresh installs always write a visible `~/.onyx/config.json`.** First
+  run now persists an explicit default config even when no public-hub
+  list was installed, so the daemon's settings are discoverable and
+  editable from the TUI (`^G`) rather than hidden behind "no file →
+  silent defaults." Reachability stays **off** by default (privacy); the
+  connect code is the no-hub way to connect and the banner says so.
+
+### Verified
+- **Connect-code logic over loopback (no Tor)** —
+  `scripts/connectcode-tcp-test.sh`. Daemon A `--listen-tcp`, daemon B
+  `--dial-tcp --dial-pubkey <A's identity key>` (the connect-code
+  payload). Both complete the Noise XK handshake + MLS round-trip and
+  register the conversation on each side. `VERDICT=PASS`.
+- **Full real-Tor two-daemon dial** — `scripts/tor-p2p-test.sh`. A
+  published a real hidden service; B (separate Tor instance) dialed it
+  using only the connect-code coordinates, built a Tor circuit, completed
+  the Noise XK handshake + MLS round-trip, and both sides registered the
+  peer — ~14 s end-to-end. `VERDICT=PASS_REAL_TOR_P2P`. (Test harnesses
+  must keep arti's state dir at mode 0700; arti's `fs-mistrust` refuses a
+  world-writable `/tmp` — this is a test-rig constraint, not an app one,
+  since the app uses `~/.onyx` at 0700.)
+
 ## v0.1.15 — 2026-05-31 — peer-to-peer in the TUI + accept-invite feedback
 
 ### Added
