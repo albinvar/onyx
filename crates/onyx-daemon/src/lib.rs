@@ -1675,6 +1675,42 @@ where
     let short_id = handle.short_id.clone();
     info!(peer = %short_id, "conversation registered with registry");
 
+    // v0.1.17 (send-queue): flush any messages queued while this peer was
+    // disconnected (reconnect window). FIFO order, and BEFORE the select
+    // loop so they precede any live send. The mailbox is bounded
+    // (OUTBOUND_MAILBOX) and the pending queue is capped to the same size,
+    // so this can't overflow the channel. A0.3: re-check the pin here so a
+    // message queued before a key-change isn't delivered to a now-flagged
+    // peer after reconnect.
+    {
+        let pending = state.conversations.lock().await.take_pending(&peer_pub);
+        if !pending.is_empty() {
+            let compromised = {
+                let vault = state.vault.lock().await;
+                vault
+                    .is_pin_compromised(state.identity_id, &handle.fingerprint)
+                    .unwrap_or(false)
+            };
+            if compromised {
+                warn!(
+                    peer = %short_id,
+                    dropped = pending.len(),
+                    "send-queue: peer key is flagged CHANGED — dropping queued messages \
+                     rather than delivering to a possibly-impersonated peer"
+                );
+            } else {
+                let n = pending.len();
+                for item in pending {
+                    if handle.outbound_tx.try_send(item).is_err() {
+                        warn!(peer = %short_id, "send-queue: flush dropped a message (mailbox full)");
+                        break;
+                    }
+                }
+                info!(peer = %short_id, flushed = n, "send-queue: flushed queued messages on reconnect");
+            }
+        }
+    }
+
     let session_result = drive_peer_session(
         &mut stream,
         &mut session,
