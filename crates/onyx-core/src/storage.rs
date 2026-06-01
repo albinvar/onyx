@@ -197,6 +197,27 @@ CREATE TABLE IF NOT EXISTS peer_dial (
 );
 ";
 
+/// Additive extension for v0.1.18 — per-DM-peer hybrid KEM public keys.
+/// Maps a peer's X25519 *identity* key (the value the Noise XK handshake
+/// authenticates, and the same key we key `peer_dial`/`mls_peer_groups`
+/// on) to their sealed-sender hybrid KEM public key (X25519+ML-KEM-768),
+/// learned in-session via a `RoomAppMessage::KemAdvertisement`. This is
+/// what lets the opt-in DM hub-fallback seal a message to a peer who is
+/// currently offline — connect codes carry no KEM, so we acquire it over
+/// the live direct session instead. Same `CREATE TABLE IF NOT EXISTS`
+/// pattern; no `SCHEMA_VERSION` bump. The bytes are a public key (no
+/// confidentiality requirement of their own — same property as
+/// `room_member_kems`); they live in the encrypted vault regardless.
+const SCHEMA_PEER_KEM_ADD: &str = "
+CREATE TABLE IF NOT EXISTS peer_kem (
+  identity_id   INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  peer_x25519   BLOB NOT NULL,
+  kem_pub       BLOB NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  PRIMARY KEY (identity_id, peer_x25519)
+);
+";
+
 /// Additive extension for T-files.b — manifest of received files.
 /// Same `CREATE TABLE IF NOT EXISTS` pattern as the other additive
 /// tables; no `SCHEMA_VERSION` bump.
@@ -463,6 +484,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PEER_KEM_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -482,6 +505,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PEER_KEM_ADD)
             .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
@@ -702,6 +727,54 @@ impl Vault {
     /// v0.1.17: delete a stored dial target. Used when the user forgets
     /// a contact, or when a redial hits a permanent error (e.g. a TOFU
     /// pin mismatch) and the supervisor should stop trying. Idempotent.
+    /// v0.1.18: record a DM peer's hybrid KEM public key (learned via a
+    /// `KemAdvertisement` over the live session). UPSERT keyed on
+    /// `(identity_id, peer_x25519)` so a key rotation overwrites cleanly.
+    pub fn record_peer_kem(
+        &self,
+        identity_id: i64,
+        peer_x25519: &[u8; 32],
+        kem_pub: &[u8],
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO peer_kem (identity_id, peer_x25519, kem_pub, updated_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(identity_id, peer_x25519) DO UPDATE SET \
+                   kem_pub = excluded.kem_pub, \
+                   updated_at = excluded.updated_at",
+                params![identity_id, peer_x25519.as_slice(), kem_pub, now],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// v0.1.18: look up a DM peer's stored hybrid KEM public key, or
+    /// `None` if we have never received their advertisement (e.g. they
+    /// only ever connected on an older build, or never came online).
+    /// `None` means the opt-in hub fallback can't seal to this peer and
+    /// the message stays queued/undeliverable (mirrors room `skipped_no_kem`).
+    pub fn lookup_peer_kem(
+        &self,
+        identity_id: i64,
+        peer_x25519: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT kem_pub FROM peer_kem \
+                 WHERE identity_id = ? AND peer_x25519 = ?",
+                params![identity_id, peer_x25519.as_slice()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(map_db_err)
+    }
+
     pub fn forget_peer_dial(&self, identity_id: i64, peer_x25519: &[u8; 32]) -> Result<()> {
         self.conn
             .execute(
@@ -1838,6 +1911,23 @@ mod tests {
         let got = v.lookup_room_member_kem(id, group_id, fp).unwrap();
         // Upsert: second call's bytes win.
         assert_eq!(got, Some(vec![2u8; 10]));
+    }
+
+    #[test]
+    fn peer_kem_record_and_lookup() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let peer = [9u8; 32];
+        // Unknown → None.
+        assert!(v.lookup_peer_kem(id, &peer).unwrap().is_none());
+        // Record + look up.
+        v.record_peer_kem(id, &peer, &[1u8; 1184]).unwrap();
+        assert_eq!(v.lookup_peer_kem(id, &peer).unwrap(), Some(vec![1u8; 1184]));
+        // UPSERT: rotate.
+        v.record_peer_kem(id, &peer, &[2u8; 1184]).unwrap();
+        assert_eq!(v.lookup_peer_kem(id, &peer).unwrap(), Some(vec![2u8; 1184]));
+        // A different peer is independent + still unknown.
+        assert!(v.lookup_peer_kem(id, &[8u8; 32]).unwrap().is_none());
     }
 
     #[test]
