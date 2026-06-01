@@ -171,6 +171,18 @@ struct Args {
     #[arg(long, env = "ONYX_FIRST_CONTACT_REACHABLE", global = true)]
     first_contact_reachable: bool,
 
+    /// **v0.1.18 — opt IN to relaying direct messages via a hub when a
+    /// peer is offline (default OFF = private).** Off: an undeliverable
+    /// DM stays queued and flushes on reconnect; nothing is sent to a
+    /// hub. On (and a hub is configured): a DM you send while the peer is
+    /// offline is sealed to their KEM and relayed via the hub on the DM's
+    /// per-epoch session token — the hub sees a sealed envelope on an
+    /// unlinkable token, never content or identities, and the recipient
+    /// marks it `[hub]`. Trades a little metadata (timing/presence to the
+    /// hub) for guaranteed delivery. See `ANONYMITY.md`.
+    #[arg(long, env = "ONYX_DM_HUB_FALLBACK", global = true)]
+    dm_hub_fallback: bool,
+
     /// A1.2: acknowledge clearnet (NO TOR, NO ANONYMITY). Required to
     /// use any plain-TCP transport (--no-tor / --listen-tcp /
     /// --dial-tcp / --hub-tcp); without it the daemon refuses those
@@ -630,6 +642,9 @@ struct FileConfig {
     /// D-1 reachability switch (default off = private).
     #[serde(default)]
     first_contact_reachable: bool,
+    /// v0.1.18: opt IN to DM hub fallback (default off = private).
+    #[serde(default)]
+    dm_hub_fallback: bool,
     /// Optional Poisson cover-traffic mean interval, seconds.
     #[serde(default)]
     cover_traffic_mean_secs: Option<u64>,
@@ -902,6 +917,9 @@ fn build_daemon_config(
         first_contact_reachable,
         // A1.2: must explicitly opt in to clearnet (no-Tor) transport.
         allow_clearnet: args.allow_clearnet,
+        // v0.1.18: opt-in DM hub fallback; OR the two sources so "on"
+        // from CLI or config.json wins. Default false = private.
+        dm_hub_fallback: args.dm_hub_fallback || file_cfg.dm_hub_fallback,
     })
 }
 

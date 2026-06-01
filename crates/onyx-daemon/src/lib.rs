@@ -135,7 +135,13 @@ pub struct HubConfig {
 /// `Args` clap struct used to carry, minus the clap conflicts/requires
 /// constraints — those are enforced by whichever binary is parsing
 /// CLI args (`onyxd` or `onyx daemon`). The library trusts its caller.
+///
+/// (clippy `struct_excessive_bools`: these are independent operator
+/// toggles — `no_tor`, `first_contact_reachable`, `allow_clearnet`,
+/// `dm_hub_fallback` — not a state machine that would read better as an
+/// enum. Each maps 1:1 to a CLI flag / config field.)
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     pub vault: PathBuf,
     pub passphrase: Zeroizing<String>,
@@ -171,6 +177,17 @@ pub struct Config {
     /// to start a clearnet mode without it, so a mistyped flag can't
     /// silently expose the user's IP.
     pub allow_clearnet: bool,
+    /// v0.1.18: opt IN to relaying a **direct message** through a hub when
+    /// the peer's direct session is down. **Default `false` = private.**
+    /// Off: an undeliverable DM stays queued (flushed on reconnect) and is
+    /// never sealed to a hub — no DM metadata reaches a third party. On
+    /// (and a hub is configured + the peer's KEM is known from an
+    /// in-session advertisement): the DM is sealed to the peer's hybrid
+    /// KEM and relayed via the hub on the DM group's per-epoch session
+    /// token (NOT the identity-linked intro inbox). The hub sees a sealed
+    /// envelope on an unlinkable token, never content or identities; the
+    /// recipient tags such messages `[hub]`. See `ANONYMITY.md` §3.2.
+    pub dm_hub_fallback: bool,
 }
 
 /// Bundle of state every handler needs.
@@ -276,6 +293,12 @@ pub struct DaemonState {
     /// `peer_dial` table so it survives a daemon restart. Leaf lock —
     /// never held across `mls_party`/`vault` (lock-order policy above).
     pub dial_targets: Arc<Mutex<std::collections::HashMap<[u8; 32], DialTarget>>>,
+    /// v0.1.18: opt-in DM hub fallback (default false = private). Read by
+    /// the `Send` handler / send-queue to decide whether an undeliverable
+    /// DM may be sealed and relayed via a hub. Copied from [`Config`] at
+    /// construction so the API server (which only holds `DaemonState`)
+    /// can see it without threading `Config` through.
+    pub dm_hub_fallback: bool,
 }
 
 /// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
@@ -654,6 +677,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         // v0.1.17: populated when we dial a peer (handle_dial_peer /
         // startup --dial-onion) and revived from the vault below.
         dial_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        // v0.1.18: opt-in DM hub fallback, copied from Config.
+        dm_hub_fallback: args.dm_hub_fallback,
     });
 
     drop(args.passphrase);
@@ -1716,6 +1741,50 @@ where
         }
     }
 
+    // v0.1.18: advertise our hybrid KEM public key to the peer over the
+    // live session, so they can seal a DM to us via a hub if we go offline
+    // (the opt-in hub fallback). Connect codes carry no KEM, so this
+    // in-session exchange is how peers learn each other's. Best-effort: a
+    // send failure just means the peer won't have our KEM yet; it'll be
+    // re-advertised on the next (re)connect. Queued ahead of the select
+    // loop so it precedes any user traffic.
+    {
+        let our_kem = state.identity.kem_public().to_bytes();
+        let our_fp = state.identity.fingerprint().to_string();
+        let ad = onyx_core::room::RoomAppMessage::KemAdvertisement {
+            fingerprint: our_fp,
+            kem_pub: serde_bytes::ByteBuf::from(our_kem),
+        };
+        match ad.to_cbor() {
+            Ok(cbor) => {
+                let ct = {
+                    let party = state.mls_party.lock().await;
+                    group.encrypt_application(&party, &cbor)
+                };
+                match ct {
+                    Ok(ct) => {
+                        if let Err(e) = write_frame(
+                            &mut stream,
+                            &mut session,
+                            &InnerFrame {
+                                frame_type: FRAME_MLS_APP,
+                                payload: ct,
+                            },
+                        )
+                        .await
+                        {
+                            debug!(peer = %short_id, error = %e, "kem-ad: send failed (will retry next connect)");
+                        } else {
+                            debug!(peer = %short_id, "kem-ad: advertised our KEM to peer");
+                        }
+                    }
+                    Err(e) => debug!(error = %e, "kem-ad: encrypt failed; skipping"),
+                }
+            }
+            Err(e) => debug!(error = %e, "kem-ad: cbor encode failed; skipping"),
+        }
+    }
+
     let session_result = drive_peer_session(
         &mut stream,
         &mut session,
@@ -2099,8 +2168,28 @@ async fn handle_dm_app_frame(
                 info!(path = %path.display(), "dm file received + persisted");
             }
         }
-        onyx_core::room::RoomAppMessage::KemAdvertisement { .. } => {
-            debug!("dm: KemAdvertisement is room-only; ignoring on DM channel");
+        onyx_core::room::RoomAppMessage::KemAdvertisement { kem_pub, .. } => {
+            // v0.1.18: on the DM channel, a KemAdvertisement tells us the
+            // peer's sealed-sender hybrid KEM public key. Persist it keyed
+            // by the peer's X25519 identity (the Noise-authenticated key)
+            // so the opt-in DM hub fallback can seal to this peer when
+            // they're offline. Connect codes carry no KEM, so this
+            // in-session exchange is how we acquire it. Validate it parses
+            // as a hybrid KEM key before storing (don't persist garbage).
+            if onyx_core::crypto::HybridKemPublic::from_bytes(kem_pub.as_ref()).is_ok() {
+                let vault = state.vault.lock().await;
+                if let Err(e) = vault.record_peer_kem(state.identity_id, peer_pub, kem_pub.as_ref())
+                {
+                    warn!(error = %e, "dm: failed to persist peer KEM advertisement");
+                } else {
+                    debug!(
+                        peer_short = %short_id_of_peer_pub(peer_pub),
+                        "dm: stored peer KEM advertisement (enables hub fallback to this peer)"
+                    );
+                }
+            } else {
+                debug!("dm: KemAdvertisement payload is not a valid hybrid KEM key; ignoring");
+            }
         }
     }
 }
@@ -2775,6 +2864,26 @@ async fn current_room_session_tokens(
         };
         tokens.push(onyx_core::routing::session_token(&secret, 0));
     }
+    // v0.1.18: also subscribe to each DM (2-party) group's session token,
+    // so an opt-in hub-fallback DM — sealed and routed on that token —
+    // is actually received. Without this the recipient would never see a
+    // fallback DM (it's addressed to the DM session token, not the
+    // identity-linked intro inbox). Same derivation as rooms.
+    let dm_group_ids = {
+        let vault = state.vault.lock().await;
+        vault
+            .list_peer_group_ids(state.identity_id)
+            .unwrap_or_default()
+    };
+    for gid in &dm_group_ids {
+        let Ok(Some(group)) = party.load_group(gid) else {
+            continue;
+        };
+        let Ok(secret) = group.export_routing_secret(&party) else {
+            continue;
+        };
+        tokens.push(onyx_core::routing::session_token(&secret, 0));
+    }
     tokens
 }
 
@@ -2963,6 +3072,26 @@ async fn process_hub_mls_app(
     sender_fingerprint: &str,
     state: &Arc<DaemonState>,
 ) {
+    // v0.1.18: an MlsApp envelope can be a room frame OR a hub-relayed
+    // DM (opt-in fallback). They share the same wire shape, so we
+    // disambiguate by group_id: if it maps to a known DM peer, surface it
+    // under that DM conversation with the [hub] tier; otherwise it's a
+    // room frame. (A 2-party DM group_id maps to exactly one peer.)
+    let dm_peer = {
+        let vault = state.vault.lock().await;
+        vault
+            .lookup_peer_by_group(state.identity_id, group_id)
+            .unwrap_or(None)
+    };
+    if let Some(peer_pub) = dm_peer {
+        handle_hub_dm_app_frame(group_id, ciphertext, &peer_pub, state).await;
+        info!(
+            from_fingerprint = %sender_fingerprint,
+            ciphertext_bytes = ciphertext.len(),
+            "hub: mlsapp/v1 DM frame processed (via_hub)"
+        );
+        return;
+    }
     handle_room_app_frame(group_id, ciphertext, sender_x25519, state).await;
     info!(
         from_fingerprint = %sender_fingerprint,
@@ -2970,6 +3099,60 @@ async fn process_hub_mls_app(
         ciphertext_bytes = ciphertext.len(),
         "hub: mlsapp/v1 room frame processed"
     );
+}
+
+/// v0.1.18: decrypt + surface a hub-relayed DM (opt-in fallback). Mirrors
+/// the direct-DM decrypt path in `drive_peer_session`, but tags the
+/// message `via_hub` (weaker `[hub]` tier — sealed-sender transport, not
+/// a live MLS session). Decrypts against the peer's DM group, advancing
+/// + persisting its ratchet like any DM frame.
+async fn handle_hub_dm_app_frame(
+    group_id: &[u8],
+    ciphertext: &[u8],
+    peer_pub: &[u8; 32],
+    state: &Arc<DaemonState>,
+) {
+    let plaintext = {
+        let party = state.mls_party.lock().await;
+        match party.load_group(group_id) {
+            Ok(Some(mut group)) => match group.decrypt_application(&party, ciphertext) {
+                Ok(pt) => Some(pt),
+                Err(e) => {
+                    debug!(error = %e, "hub DM: decrypt failed; dropping");
+                    None
+                }
+            },
+            _ => {
+                debug!("hub DM: no matching DM group; dropping");
+                None
+            }
+        }
+    };
+    let Some(plaintext) = plaintext else { return };
+    // Persist the advanced ratchet.
+    let snap = {
+        let party = state.mls_party.lock().await;
+        party.snapshot_state().ok()
+    };
+    if let Some(snap) = snap {
+        let vault = state.vault.lock().await;
+        let _ = vault.save_mls_state(state.identity_id, &snap);
+    }
+    let Ok(msg) = onyx_core::room::RoomAppMessage::from_cbor(&plaintext) else {
+        debug!("hub DM: RoomAppMessage decode failed; dropping");
+        return;
+    };
+    // Only Text is surfaced over the hub-DM path; files/KEM-ads are
+    // direct-session concerns. Tag via_hub so the [hub] tier shows.
+    if let onyx_core::room::RoomAppMessage::Text { text } = msg {
+        state.conversations.lock().await.push_message_via_hub(
+            peer_pub,
+            onyx_core::api::MessageDirection::Incoming,
+            text,
+        );
+    } else {
+        debug!("hub DM: non-Text RoomAppMessage on hub path; ignoring");
+    }
 }
 
 // ── Vault helpers ──────────────────────────────────────────────────────────
