@@ -280,10 +280,49 @@ async fn dispatch_one_shot(
                 .lock()
                 .await
                 .handle_for_short(peer_short);
+
+            // v0.1.17 (send-queue across reconnect): a peer whose direct
+            // session is momentarily down (circuit dropped, supervisor
+            // reconnecting) is no longer a hard failure. We queue the
+            // message and flush it FIFO when the session comes back, so a
+            // `Send` during a reconnect window isn't lost. Only a
+            // genuinely-unknown short_id is an error.
             let Some(handle) = handle_opt else {
+                // Known peer but not currently connected → enqueue.
+                let peer_pub_opt = state
+                    .conversations
+                    .lock()
+                    .await
+                    .peer_pub_for_short(peer_short);
+                let Some(peer_pub) = peer_pub_opt else {
+                    return ApiResponse::Error {
+                        code: ApiErrorCode::NotReady,
+                        message: format!("unknown peer {peer_short}"),
+                    };
+                };
+                // A0.3: even when queueing, refuse a peer whose pinned key
+                // has changed (the flush also re-checks).
+                let fingerprint = state
+                    .conversations
+                    .lock()
+                    .await
+                    .fingerprint_for_peer(&peer_pub);
+                if let Some(fp) = fingerprint
+                    && let Some(block) = pin_block(state, &fp).await
+                {
+                    return block;
+                }
+                let mut reg = state.conversations.lock().await;
+                if reg.enqueue_pending(
+                    &peer_pub,
+                    crate::conversations::PeerOutbound::Dm(text.clone()),
+                ) {
+                    reg.push_message(&peer_pub, MessageDirection::Outgoing, text.clone());
+                    return ApiResponse::SendOk;
+                }
                 return ApiResponse::Error {
                     code: ApiErrorCode::NotReady,
-                    message: format!("no live conversation with peer {peer_short}"),
+                    message: format!("could not queue message for peer {peer_short}"),
                 };
             };
             // A0.3: refuse if this peer's pinned key has changed.
@@ -302,14 +341,26 @@ async fn dispatch_one_shot(
                     );
                     ApiResponse::SendOk
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ApiResponse::Error {
-                    code: ApiErrorCode::NotReady,
-                    message: format!("outbound queue full for peer {peer_short}"),
-                },
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ApiResponse::Error {
-                    code: ApiErrorCode::NotReady,
-                    message: format!("peer {peer_short} disconnected before send"),
-                },
+                // v0.1.17: a full or just-closed live mailbox also queues
+                // rather than failing — the supervisor will flush it on
+                // the next (re)connect.
+                Err(tokio::sync::mpsc::error::TrySendError::Full(item))
+                | Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
+                    let mut reg = state.conversations.lock().await;
+                    if reg.enqueue_pending(&handle.peer_pub, item) {
+                        reg.push_message(
+                            &handle.peer_pub,
+                            MessageDirection::Outgoing,
+                            text.clone(),
+                        );
+                        ApiResponse::SendOk
+                    } else {
+                        ApiResponse::Error {
+                            code: ApiErrorCode::NotReady,
+                            message: format!("could not queue message for peer {peer_short}"),
+                        }
+                    }
+                }
             }
         }
         ApiRequest::SendBootstrap {
@@ -2310,8 +2361,15 @@ fn handle_dial_peer(onion: &str, pubkey_b32: &str, state: &Arc<DaemonState>) -> 
     let onion = onion.to_string();
     let pubkey_b32 = pubkey_b32.to_string();
     tokio::spawn(async move {
-        if let Err(e) = crate::run_dial_mode(&tor, &state, &onion, &pubkey_b32).await {
-            warn!(error = %e, "DialPeer task ended with error");
+        // v0.1.17: remember this target so the reconnect supervisor (and
+        // restart revive) can re-dial it after the circuit drops. Recorded
+        // before the dial so even an immediate failure is retryable.
+        crate::record_dial_target(&state, &onion, &pubkey_b32).await;
+        // Decode the peer key to drive the supervised reconnect loop. A
+        // bad key can't be dialed anyway — log and stop.
+        match crate::decode_b32_32(&pubkey_b32) {
+            Ok(peer_pub) => crate::supervise_dial(tor, state, peer_pub).await,
+            Err(e) => warn!(error = %e, "DialPeer: --dial-pubkey did not decode; not dialing"),
         }
     });
     ApiResponse::DialPeerOk
@@ -3376,6 +3434,7 @@ mod tests {
             files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
+            dial_targets: Arc::new(Mutex::new(HashMap::new())),
         });
         (state, encode_b32(group_id))
     }

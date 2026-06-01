@@ -101,6 +101,14 @@ struct ConversationState {
     connected: bool,
     ring: VecDeque<ChatLine>,
     last_active_unix_ms: u64,
+    /// v0.1.17: outbound messages accepted while the direct session was
+    /// down (circuit dropped, reconnecting). Drained in FIFO order into
+    /// the live `outbound_tx` when a session (re)registers, so a `Send`
+    /// during a reconnect window isn't lost or rejected — it flushes once
+    /// the link is back. Bounded at [`OUTBOUND_MAILBOX`]; on overflow the
+    /// OLDEST queued message is dropped (a stale backlog is less useful
+    /// than recent messages, and an unbounded queue is a memory-DoS).
+    pending: VecDeque<PeerOutbound>,
 }
 
 /// One line in a conversation's ring buffer. Mirrors the
@@ -193,11 +201,20 @@ impl ConversationRegistry {
             outbound_tx,
         };
         self.insert_short_id(short_id, peer_pub);
+        // v0.1.17: preserve any messages queued while this peer was
+        // disconnected, so a reconnect flushes them instead of dropping
+        // them. A brand-new peer has none.
+        let pending = self
+            .by_peer
+            .get_mut(&peer_pub)
+            .map(|s| std::mem::take(&mut s.pending))
+            .unwrap_or_default();
         let state = ConversationState {
             handle: handle.clone(),
             connected: true,
             ring: VecDeque::with_capacity(RING_CAPACITY),
             last_active_unix_ms: now_unix_ms(),
+            pending,
         };
         self.by_peer.insert(peer_pub, state);
 
@@ -212,6 +229,63 @@ impl ConversationRegistry {
             .send(ApiResponse::EventPeerConnected { peer: info });
 
         (handle, outbound_rx)
+    }
+
+    /// v0.1.17: atomic "register only if not already live". Returns
+    /// `None` when a **connected** direct session already exists for
+    /// `peer_pub` — the caller (a freshly-handshaked `peer_session`
+    /// task) must then yield: close its stream and exit, leaving the
+    /// existing session untouched. Returns `Some((handle, rx))` and
+    /// registers exactly like [`Self::register`] otherwise.
+    ///
+    /// This closes the duplicate-session race that the reconnect
+    /// supervisor (v0.1.17) introduces: an inbound accept, a user
+    /// `DialPeer`, and the supervisor's redial can all complete a
+    /// handshake for the same peer near-simultaneously. Because the
+    /// whole check-and-insert runs under the single registry lock the
+    /// caller already holds for `register`, there is no TOCTOU window —
+    /// at most one of the racers sees "not connected" and wins. Two live
+    /// MLS sessions to one peer would both advance the same group's
+    /// ratchet and desync it, so this guard is a correctness
+    /// requirement, not just tidiness.
+    ///
+    /// A row that exists but is **disconnected** (e.g. a hub-only
+    /// registration, or a prior session that ended) is NOT a live
+    /// session — we proceed and overwrite it, taking over as the live
+    /// transport.
+    pub fn try_register(
+        &mut self,
+        peer_pub: [u8; 32],
+        pubkey_b32: &str,
+        fingerprint: String,
+    ) -> Option<(ConversationHandle, mpsc::Receiver<PeerOutbound>)> {
+        if let Some(existing) = self.by_peer.get(&peer_pub)
+            && existing.connected
+        {
+            return None;
+        }
+        Some(self.register(peer_pub, pubkey_b32, fingerprint))
+    }
+
+    /// v0.1.17: is there a live (connected) direct session for this
+    /// peer right now? The reconnect supervisor polls this before
+    /// dialing so it doesn't open a redundant circuit to a peer who
+    /// has meanwhile connected to us (or whom another path already
+    /// reconnected).
+    #[must_use]
+    pub fn is_connected(&self, peer_pub: &[u8; 32]) -> bool {
+        self.by_peer.get(peer_pub).is_some_and(|s| s.connected)
+    }
+
+    /// v0.1.17: the Ed25519 fingerprint we last recorded for this peer
+    /// (from the most recent session's MLS attribution), or `None` if we
+    /// have no row. Used by the reconnect supervisor's anti-MITM check to
+    /// resolve the fingerprint → consult the vault's `key_changed` flag.
+    #[must_use]
+    pub fn fingerprint_for_peer(&self, peer_pub: &[u8; 32]) -> Option<String> {
+        self.by_peer
+            .get(peer_pub)
+            .map(|s| s.handle.fingerprint.clone())
     }
 
     /// Register (or no-op if already present) a peer we've only
@@ -255,6 +329,7 @@ impl ConversationRegistry {
             connected: false,
             ring: VecDeque::with_capacity(RING_CAPACITY),
             last_active_unix_ms: now_unix_ms(),
+            pending: VecDeque::new(),
         };
         self.by_peer.insert(peer_pub, state);
 
@@ -408,6 +483,47 @@ impl ConversationRegistry {
         } else {
             None
         }
+    }
+
+    /// v0.1.17: resolve a short_id to its `peer_pub` regardless of
+    /// connection state — used by the `Send` handler to queue a message
+    /// for a known-but-currently-disconnected peer (reconnect in
+    /// progress) rather than rejecting it. Returns `None` only for a
+    /// genuinely unknown short_id.
+    #[must_use]
+    pub fn peer_pub_for_short(&self, short_id: &str) -> Option<[u8; 32]> {
+        self.by_short.get(short_id).copied()
+    }
+
+    /// v0.1.17: queue an outbound message for a peer whose direct session
+    /// is currently down, to be flushed (FIFO) when it reconnects. Bounded
+    /// at [`OUTBOUND_MAILBOX`]; on overflow the OLDEST queued item is
+    /// dropped (logged by the caller). Returns `false` if the peer is
+    /// unknown (nothing to attach the queue to — caller should surface an
+    /// error), `true` if queued.
+    pub fn enqueue_pending(&mut self, peer_pub: &[u8; 32], item: PeerOutbound) -> bool {
+        let Some(state) = self.by_peer.get_mut(peer_pub) else {
+            return false;
+        };
+        if state.pending.len() >= OUTBOUND_MAILBOX {
+            state.pending.pop_front();
+            warn!("conversations: pending queue full for peer; dropping oldest queued message");
+        }
+        state.pending.push_back(item);
+        state.last_active_unix_ms = now_unix_ms();
+        true
+    }
+
+    /// v0.1.17: take (and clear) the pending-message queue for a peer.
+    /// Called by `peer_session` right after a (re)connect registers, to
+    /// flush messages that were queued while the session was down. FIFO
+    /// order preserved. Empty (and no allocation churn) for the common
+    /// no-backlog case.
+    pub fn take_pending(&mut self, peer_pub: &[u8; 32]) -> Vec<PeerOutbound> {
+        self.by_peer
+            .get_mut(peer_pub)
+            .map(|s| std::mem::take(&mut s.pending).into())
+            .unwrap_or_default()
     }
 
     /// Snapshot of every peer the registry knows about, live or not.
@@ -803,5 +919,54 @@ mod tests {
         assert_eq!(hist[0].text, "saved");
         // But Send-lookup is blocked.
         assert!(reg.handle_for_short(&handle.short_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_queue_enqueues_while_down_and_flushes_on_reconnect() {
+        let peer = [13u8; 32];
+        let mut reg = ConversationRegistry::new();
+        // Register, then mark disconnected (the reconnect window).
+        let (handle, _rx) = reg.register(peer, &b32(), "fpr".into());
+        reg.mark_disconnected(&peer);
+        // Queue two messages while down — FIFO order matters.
+        assert!(reg.enqueue_pending(&peer, PeerOutbound::Dm("first".into())));
+        assert!(reg.enqueue_pending(&peer, PeerOutbound::Dm("second".into())));
+        // A re-register (reconnect) must PRESERVE the pending queue so the
+        // session task can flush it.
+        let (_h2, _rx2) = reg.register(peer, &b32(), "fpr".into());
+        let drained = reg.take_pending(&peer);
+        assert_eq!(
+            drained,
+            vec![
+                PeerOutbound::Dm("first".into()),
+                PeerOutbound::Dm("second".into())
+            ],
+            "queued messages must survive reconnect and flush in FIFO order"
+        );
+        // Drained once → now empty.
+        assert!(reg.take_pending(&peer).is_empty());
+        // Unknown peer can't be queued.
+        assert!(!reg.enqueue_pending(&[99u8; 32], PeerOutbound::Dm("x".into())));
+        let _ = handle;
+    }
+
+    #[tokio::test]
+    async fn pending_queue_is_bounded_dropping_oldest() {
+        let peer = [14u8; 32];
+        let mut reg = ConversationRegistry::new();
+        let (_h, _rx) = reg.register(peer, &b32(), "fpr".into());
+        reg.mark_disconnected(&peer);
+        // Overfill past OUTBOUND_MAILBOX; oldest are dropped.
+        for i in 0..(OUTBOUND_MAILBOX + 5) {
+            assert!(reg.enqueue_pending(&peer, PeerOutbound::Dm(format!("m{i}"))));
+        }
+        let drained = reg.take_pending(&peer);
+        assert_eq!(drained.len(), OUTBOUND_MAILBOX, "queue must stay bounded");
+        // The first 5 were dropped; newest survive in order.
+        assert_eq!(drained[0], PeerOutbound::Dm("m5".into()));
+        assert_eq!(
+            drained[OUTBOUND_MAILBOX - 1],
+            PeerOutbound::Dm(format!("m{}", OUTBOUND_MAILBOX + 4))
+        );
     }
 }

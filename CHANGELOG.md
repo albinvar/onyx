@@ -6,6 +6,67 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.17 — 2026-06-02 — reliable direct messages (auto-reconnect, keepalive, send-queue)
+
+The problem this fixes: a 1:1 DM ran over a single long-lived Noise+MLS
+session on **one** Tor circuit. When that circuit died (relay churn,
+rotation, idle timeout) there was no auto-redial, no liveness check, and
+no buffering — so messages silently stopped arriving and the next send
+failed with "no live conversation with peer …", even though the TUI
+still showed the peer as connected. Direct messages are now resilient to
+dropped circuits.
+
+### Added
+- **Auto-reconnect supervisor.** Every outbound dial (`Ctrl-D` /
+  `onyx dial` / startup `--dial-onion`) is now wrapped in a supervisor
+  that re-dials the peer when the session ends, with exponential backoff
+  (500 ms → ×2 → 30 s cap, reset after a healthy session). Re-dialing the
+  same peer **resumes the existing MLS group** (`FRAME_MLS_RESUME`) — no
+  re-bootstrap, the conversation and its ratchet continue seamlessly.
+  Each attempt rides a **fresh isolated Tor circuit** (D-2).
+- **Persistent dial targets.** The peer's dial address (onion + identity
+  key — exactly a connect code) is recorded in memory and the vault
+  (`peer_dial` table), so reconnect survives not just a dropped circuit
+  but a **daemon restart**: supervisors are revived for every known peer
+  at startup.
+- **Adaptive keepalive.** The direct session sends a PING after ~20 s
+  idle (reusing the existing wire PING/PONG frames — no new frame type,
+  and they pad to the same size bucket so they're indistinguishable from
+  a real app frame on the wire). A 50 s read deadline (> 2× the ping
+  interval) declares a silent circuit dead and triggers reconnect. Effect:
+  a dead circuit is detected in tens of seconds instead of never, and the
+  TUI's connected/offline indicator now reflects **real** stream liveness.
+- **Send-queue across reconnect.** A `Send` issued while the session is
+  momentarily down is queued (bounded, FIFO, drop-oldest on overflow) and
+  flushed in order when the link returns — instead of being rejected.
+  "no live conversation" is gone for a known peer.
+
+### Security
+- **No duplicate sessions.** An atomic `try_register` guard means at most
+  one live session per peer even when an inbound accept, a user dial, and
+  the supervisor's redial race — two live sessions would desync the shared
+  MLS ratchet, so this is a correctness requirement.
+- **Anti-MITM on reconnect.** The TOFU pin is re-checked on every redial
+  (and again at queue-flush time): if a peer's identity key is flagged
+  changed, the supervisor **stops re-dialing and forgets the target**, and
+  any queued messages are dropped rather than delivered to a possibly-
+  impersonated peer. Re-verify out of band (`onyx contact list` flags it).
+- No new wire format, no clearnet surface (supervisor is Tor-only), no
+  metadata regression to the privacy default. Keepalive is on the direct
+  peer path only (hub cover-traffic is separate; no double-emit).
+
+### Verified
+- Unit tests: dup-session guard, send-queue FIFO + bound + survive-
+  reconnect, pin re-check on flush (`onyx-daemon`, 70 tests).
+- Real-Tor reconnect soak (`scripts/tor-reconnect-test.sh`): two daemons
+  over real Tor establish a direct session; one is killed and restarted;
+  the other's supervisor re-dials and re-establishes the same MLS group.
+
+### Deferred to v0.1.18
+- **Opt-in DM hub fallback** (sealed relay via a hub when a peer is
+  genuinely offline, default off) — scoped and planned, held back so the
+  reliability core ships first.
+
 ## v0.1.16 — 2026-06-01 — connect codes: one-step, hub-free contact add
 
 ### Added

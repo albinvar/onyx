@@ -64,7 +64,7 @@ use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{
     Session, handshake_initiator, handshake_responder, read_frame, write_frame,
 };
-use onyx_core::wire::{FRAME_MLS_APP, InnerFrame};
+use onyx_core::wire::{FRAME_MLS_APP, FRAME_PING, FRAME_PONG, InnerFrame};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{Instrument, debug, error, info, info_span, warn};
@@ -267,6 +267,26 @@ pub struct DaemonState {
     /// address. `None` until the HS is published. D-3 keeps it out of the
     /// on-disk log; the API is a separate, deliberate surface.
     pub self_onion: std::sync::OnceLock<String>,
+    /// v0.1.17 (reliable DMs): in-memory cache of the direct-dial address
+    /// we last reached each peer at, keyed by their X25519 identity key.
+    /// Populated when WE dial a peer (`handle_dial_peer` / startup
+    /// `--dial-onion`); inbound peers who dialed US are absent (we never
+    /// learned an onion for them). The reconnect supervisor reads this to
+    /// re-dial after a dropped circuit. Mirrored to the vault's
+    /// `peer_dial` table so it survives a daemon restart. Leaf lock —
+    /// never held across `mls_party`/`vault` (lock-order policy above).
+    pub dial_targets: Arc<Mutex<std::collections::HashMap<[u8; 32], DialTarget>>>,
+}
+
+/// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
+/// data a connect code carries. `onion` may include an optional `:port`
+/// suffix (parsed at dial time); `pubkey_b32` is the peer's X25519
+/// identity key, base32 (kept for cross-checking + re-deriving the
+/// `[u8; 32]` map key on a vault-revive).
+#[derive(Debug, Clone)]
+pub struct DialTarget {
+    pub onion: String,
+    pub pubkey_b32: String,
 }
 
 /// T6.3.i: per-group out-of-order room-frame retry buffer. Map
@@ -631,6 +651,9 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         tor: std::sync::OnceLock::new(),
         // Populated by run_accept_mode once the hidden service publishes.
         self_onion: std::sync::OnceLock::new(),
+        // v0.1.17: populated when we dial a peer (handle_dial_peer /
+        // startup --dial-onion) and revived from the vault below.
+        dial_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
     });
 
     drop(args.passphrase);
@@ -642,6 +665,27 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // (snapshot bytes are deterministic — see the
     // `snapshot_is_deterministic_when_state_unchanged` test).
     spawn_replay_snapshot_task(state.clone());
+
+    // v0.1.17: revive persisted dial targets so the reconnect supervisor
+    // can re-dial peers we had open before the last shutdown — reliability
+    // across daemon restarts, not just dropped circuits. Best-effort: a
+    // read failure just means no auto-revive this run.
+    {
+        let revived = {
+            let vault = state.vault.lock().await;
+            vault.list_peer_dials(state.identity_id).unwrap_or_default()
+        };
+        if !revived.is_empty() {
+            let mut targets = state.dial_targets.lock().await;
+            for (peer_pub, onion, pubkey_b32) in revived {
+                targets.insert(peer_pub, DialTarget { onion, pubkey_b32 });
+            }
+            info!(
+                count = targets.len(),
+                "revived persisted dial targets for reconnect"
+            );
+        }
+    }
 
     let api_socket_path = PathBuf::from(&args.api_socket);
 
@@ -909,15 +953,25 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // task; a dial ending (peer disconnect) no longer tears the daemon
     // down — accept mode keeps it alive.
     if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey) {
-        let tor_dial = tor.clone();
-        let state_dial = state.clone();
-        let onion = onion.clone();
-        let pubkey_b32 = pubkey_b32.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_dial_mode(&tor_dial, &state_dial, &onion, &pubkey_b32).await {
-                warn!(error = %e, "startup --dial-onion task ended with error");
-            }
-        });
+        // v0.1.17: record the explicit startup target so it joins the
+        // supervised set below (and persists for restart-revive).
+        record_dial_target(&state, onion, pubkey_b32).await;
+    }
+    // v0.1.17: spawn a reconnect supervisor for EVERY known dial target —
+    // the explicit `--dial-onion` arg just recorded AND any peers revived
+    // from the vault's `peer_dial` table. Each supervisor keeps its
+    // peer's direct session alive across dropped circuits. Handles are
+    // collected so daemon shutdown can abort them cleanly (Step 5).
+    let mut dial_supervisors: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    {
+        let targets: Vec<[u8; 32]> = state.dial_targets.lock().await.keys().copied().collect();
+        for peer_pub in targets {
+            let tor_sup = tor.clone();
+            let state_sup = state.clone();
+            dial_supervisors.push(tokio::spawn(async move {
+                supervise_dial(tor_sup, state_sup, peer_pub).await;
+            }));
+        }
     }
     let mode_result = run_accept_mode(&tor, state.clone()).await;
 
@@ -928,6 +982,11 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     // Stop the API server so its socket file gets unlinked promptly.
     api_task.abort();
     for h in hub_tasks {
+        h.abort();
+    }
+    // v0.1.17: stop the per-peer reconnect supervisors so they don't keep
+    // dialing after the daemon is shutting down.
+    for h in dial_supervisors {
         h.abort();
     }
     // Surface any mode error after API cleanup so it isn't lost.
@@ -1161,6 +1220,162 @@ async fn run_tcp_dial_mode(
 }
 
 #[allow(clippy::too_many_lines)]
+/// v0.1.17: remember how to re-dial this peer. Records the dial address
+/// both in the in-memory `dial_targets` map (read by the reconnect
+/// supervisor) and, best-effort, in the vault's `peer_dial` table so the
+/// mapping survives a daemon restart. Called from every place we
+/// initiate an outbound dial (`handle_dial_peer`, startup `--dial-onion`).
+/// A bad pubkey is logged and skipped — recording is an optimization,
+/// never a reason to refuse the dial itself.
+async fn record_dial_target(state: &DaemonState, onion: &str, pubkey_b32: &str) {
+    let Ok(peer_pub) = decode_b32_32(pubkey_b32) else {
+        warn!("record_dial_target: peer pubkey did not decode to 32 bytes; not persisting");
+        return;
+    };
+    {
+        let mut targets = state.dial_targets.lock().await;
+        targets.insert(
+            peer_pub,
+            DialTarget {
+                onion: onion.to_string(),
+                pubkey_b32: pubkey_b32.to_string(),
+            },
+        );
+    }
+    // Mirror to the vault (best-effort: a write failure just means we
+    // won't auto-revive this peer after a restart — the in-memory entry
+    // still drives reconnect within this process lifetime).
+    let vault = state.vault.lock().await;
+    if let Err(e) = vault.record_peer_dial(state.identity_id, &peer_pub, onion, pubkey_b32) {
+        warn!(error = %e, "record_dial_target: vault persist failed (reconnect still works this session)");
+    }
+}
+
+/// v0.1.17: supervise a direct DM dial — keep it alive across dropped
+/// Tor circuits. Wraps [`run_dial_mode`] in a reconnect loop so that
+/// when a circuit dies (and `run_dial_mode`/`peer_session` returns) we
+/// re-dial the same peer instead of the conversation silently going
+/// dead. This is what turns "messages just stop arriving" into
+/// "messages resume after a short reconnect."
+///
+/// Design points:
+/// - **MLS continuity is free.** Re-dialing the same `peer_pub` makes
+///   `run_dial_session` find the persisted peer→group mapping and send
+///   `FRAME_MLS_RESUME` rather than bootstrapping a new group, so the
+///   conversation (and its history) continues seamlessly.
+/// - **No duplicate sessions.** Before each dial we check the registry:
+///   if the peer is already `is_connected` (e.g. they dialed *us*, or
+///   another path reconnected first) we idle and re-check instead of
+///   opening a redundant circuit. The `try_register` guard in
+///   `peer_session` is the hard backstop.
+/// - **Fresh circuit isolation per attempt (D-2).** `run_dial_mode`
+///   calls `tor.isolated()` each time, so every reconnect rides its own
+///   circuit and never shares with the hub or another peer.
+/// - **Anti-MITM stop.** If the peer's pinned identity key has changed
+///   (`is_pin_compromised`), we STOP re-dialing and forget the target —
+///   we will not keep reaching out to a possibly-impersonated peer. The
+///   user must re-verify out of band (`onyx contact list` flags it).
+/// - **Backoff.** 500ms, doubling to a 30s cap (mirrors the hub
+///   reconnect loop). A session that stayed up a while resets the
+///   backoff so a long-lived link that finally drops reconnects fast.
+pub(crate) async fn supervise_dial(
+    tor: Arc<TorRuntime>,
+    state: Arc<DaemonState>,
+    peer_pub: [u8; 32],
+) {
+    const BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(500);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+    // A session that survived at least this long is treated as "healthy"
+    // — its drop resets the backoff so we reconnect promptly rather than
+    // inheriting a large delay from earlier failures.
+    const HEALTHY_SESSION: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let mut backoff = BACKOFF_START;
+    let peer_short = short_id_of_peer_pub(&peer_pub);
+
+    loop {
+        // Look up the current dial address (it can be updated if the user
+        // re-dials the peer at a new onion). Absent → nothing to do.
+        let Some(target) = state.dial_targets.lock().await.get(&peer_pub).cloned() else {
+            debug!(peer = %peer_short, "supervise_dial: no dial target; supervisor exiting");
+            return;
+        };
+
+        // Don't open a redundant circuit if the peer is already live
+        // (they dialed us, or another path reconnected first).
+        if state.conversations.lock().await.is_connected(&peer_pub) {
+            tokio::time::sleep(BACKOFF_START).await;
+            continue;
+        }
+
+        // Anti-MITM: if this peer's identity key has changed since we
+        // pinned it, stop reaching out. derive the fingerprint we pinned
+        // from the vault by way of is_pin_compromised on the b32 pubkey?
+        // We pin by Ed25519 fingerprint, which we only learn AFTER a
+        // handshake; so the per-attempt pin check inside peer_session
+        // (pin_check_peer) is the authoritative gate. Here we additionally
+        // bail if a prior attempt already recorded a compromise for this
+        // peer's fingerprint (cheap, avoids hammering a MITM'd peer).
+        // (Handled post-session below where we know the fingerprint.)
+
+        let attempt_start = tokio::time::Instant::now();
+        match run_dial_mode(&tor, &state, &target.onion, &target.pubkey_b32).await {
+            Ok(()) => {
+                debug!(peer = %peer_short, "supervise_dial: session ended; will reconnect");
+            }
+            Err(e) => {
+                debug!(peer = %peer_short, error = %e, "supervise_dial: dial attempt failed");
+            }
+        }
+
+        // If the session was healthy for a while, reset backoff.
+        if attempt_start.elapsed() >= HEALTHY_SESSION {
+            backoff = BACKOFF_START;
+        }
+
+        // Anti-MITM stop: after a session we know the peer's pinned
+        // fingerprint (peer_session ran pin_check_peer). If it is now
+        // flagged compromised, stop the supervisor and forget the target
+        // so we don't keep dialing a possibly-impersonated peer.
+        if pin_compromised_for_peer(&state, &peer_pub).await {
+            warn!(
+                peer = %peer_short,
+                "supervise_dial: peer identity key is flagged CHANGED (possible MITM) — \
+                 stopping auto-reconnect. Re-verify out of band, then re-add the contact."
+            );
+            let vault = state.vault.lock().await;
+            let _ = vault.forget_peer_dial(state.identity_id, &peer_pub);
+            return;
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(BACKOFF_CAP);
+    }
+}
+
+/// v0.1.17: has this peer's pinned identity key been flagged as changed?
+/// We pin by Ed25519 fingerprint (learned during the MLS handshake), so
+/// we resolve the peer's fingerprint from the registry (populated by the
+/// last session) and consult the vault's `key_changed` flag. Best-effort:
+/// any lookup failure returns `false` (don't block reconnect on a
+/// transient vault error — the per-session `pin_check_peer` still warns).
+async fn pin_compromised_for_peer(state: &DaemonState, peer_pub: &[u8; 32]) -> bool {
+    let fingerprint = {
+        let reg = state.conversations.lock().await;
+        reg.fingerprint_for_peer(peer_pub)
+    };
+    let Some(fingerprint) = fingerprint else {
+        return false;
+    };
+    if fingerprint.starts_with("(peer/") {
+        return false; // never had a real verified identity to compromise
+    }
+    let vault = state.vault.lock().await;
+    vault
+        .is_pin_compromised(state.identity_id, &fingerprint)
+        .unwrap_or(false)
+}
+
 async fn run_dial_mode(
     tor: &TorRuntime,
     state: &Arc<DaemonState>,
@@ -1441,12 +1656,65 @@ where
     // detects the leading "(peer/" and skips, which is intentional.)
     pin_check_peer(&state, &fingerprint, &peer_pub).await;
 
+    // v0.1.17: atomic register-if-not-live. If a connected session for
+    // this peer already exists (an inbound accept, a user DialPeer, and
+    // the reconnect supervisor's redial can all land near-together), this
+    // task yields: we close our freshly-handshaked stream and return,
+    // leaving the existing live session — and its MLS ratchet — untouched.
+    // Two live sessions to one peer would desync the group.
     let (handle, mut outbound_rx) = {
         let mut reg = state.conversations.lock().await;
-        reg.register(peer_pub, &peer_pub_b32, fingerprint)
+        match reg.try_register(peer_pub, &peer_pub_b32, fingerprint) {
+            Some(pair) => pair,
+            None => {
+                drop(reg);
+                debug!(
+                    peer = %short_id_of_peer_pub(&peer_pub),
+                    "duplicate session for an already-connected peer; yielding (closing this stream)"
+                );
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+        }
     };
     let short_id = handle.short_id.clone();
     info!(peer = %short_id, "conversation registered with registry");
+
+    // v0.1.17 (send-queue): flush any messages queued while this peer was
+    // disconnected (reconnect window). FIFO order, and BEFORE the select
+    // loop so they precede any live send. The mailbox is bounded
+    // (OUTBOUND_MAILBOX) and the pending queue is capped to the same size,
+    // so this can't overflow the channel. A0.3: re-check the pin here so a
+    // message queued before a key-change isn't delivered to a now-flagged
+    // peer after reconnect.
+    {
+        let pending = state.conversations.lock().await.take_pending(&peer_pub);
+        if !pending.is_empty() {
+            let compromised = {
+                let vault = state.vault.lock().await;
+                vault
+                    .is_pin_compromised(state.identity_id, &handle.fingerprint)
+                    .unwrap_or(false)
+            };
+            if compromised {
+                warn!(
+                    peer = %short_id,
+                    dropped = pending.len(),
+                    "send-queue: peer key is flagged CHANGED — dropping queued messages \
+                     rather than delivering to a possibly-impersonated peer"
+                );
+            } else {
+                let n = pending.len();
+                for item in pending {
+                    if handle.outbound_tx.try_send(item).is_err() {
+                        warn!(peer = %short_id, "send-queue: flush dropped a message (mailbox full)");
+                        break;
+                    }
+                }
+                info!(peer = %short_id, flushed = n, "send-queue: flushed queued messages on reconnect");
+            }
+        }
+    }
 
     let session_result = drive_peer_session(
         &mut stream,
@@ -1533,12 +1801,60 @@ async fn drive_peer_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    // v0.1.17 (adaptive keepalive): send a PING after this much idle so a
+    // silently-dead Tor circuit is detected fast, and fail the session if
+    // no frame arrives within READ_DEADLINE so `supervise_dial` reconnects.
+    // PING/PONG ride inside the Noise session and pad to the same size
+    // bucket as a small app frame, so an on-path observer can't tell a
+    // keepalive from real traffic. Deadline is > 2× the ping interval so a
+    // healthy idle link (which answers PINGs with PONGs) never trips it.
+    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Don't fire a burst of catch-up PINGs if a long encrypt/await stalls
+    // the loop past a tick — one ping per idle window is enough.
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately; consume it so we don't PING the instant
+    // the session opens (the handshake just proved liveness).
+    keepalive.tick().await;
     loop {
         tokio::select! {
-            // Inbound: a frame arrived on the Tor stream.
-            res = read_frame(stream, session) => {
+            // Inbound: a frame arrived on the Tor stream — bounded by a
+            // read deadline so a dead circuit doesn't hang us forever.
+            res = tokio::time::timeout(READ_DEADLINE, read_frame(stream, session)) => {
+                let res = match res {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        // No frame (not even a PONG) within the deadline —
+                        // treat the circuit as dead and let the supervisor
+                        // rebuild it.
+                        return Err(anyhow::anyhow!(
+                            "peer read timeout ({}s) — circuit likely dead, reconnecting",
+                            READ_DEADLINE.as_secs()
+                        ));
+                    }
+                };
                 match res {
                     Ok(frame) => {
+                        // v0.1.17: keepalive frames ride the same session.
+                        if frame.frame_type == FRAME_PING {
+                            // Reply with a PONG; a write failure means the
+                            // circuit is gone → end the session to reconnect.
+                            write_frame(
+                                stream,
+                                session,
+                                &InnerFrame { frame_type: FRAME_PONG, payload: Vec::new() },
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("pong send failed: {e}"))?;
+                            continue;
+                        }
+                        if frame.frame_type == FRAME_PONG {
+                            // Liveness confirmed implicitly by resetting the
+                            // read deadline (we got a frame). Nothing else
+                            // to do.
+                            continue;
+                        }
                         if frame.frame_type != FRAME_MLS_APP {
                             warn!(
                                 frame_type = format!("{:#06x}", frame.frame_type),
@@ -1672,6 +1988,21 @@ where
                 .await
                 .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
                 info!(text = %log_text, "chat message sent");
+            }
+            // v0.1.17: adaptive keepalive. After KEEPALIVE_INTERVAL of no
+            // other branch firing, send a PING. The peer answers with a
+            // PONG (handled above); either the PONG or any other frame
+            // resets the read deadline. A write failure here means the
+            // circuit is already gone, so we end the session to reconnect.
+            _ = keepalive.tick() => {
+                write_frame(
+                    stream,
+                    session,
+                    &InnerFrame { frame_type: FRAME_PING, payload: Vec::new() },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("keepalive ping send failed: {e}"))?;
+                debug!("keepalive ping sent");
             }
         }
     }
@@ -2894,7 +3225,7 @@ pub(crate) fn members_b32_from_group(group: &onyx_core::mls::MlsGroupState) -> S
     out.join(",")
 }
 
-fn decode_b32_32(s: &str) -> anyhow::Result<[u8; 32]> {
+pub(crate) fn decode_b32_32(s: &str) -> anyhow::Result<[u8; 32]> {
     let cleaned: String = s
         .chars()
         .filter(|c| !c.is_whitespace())
