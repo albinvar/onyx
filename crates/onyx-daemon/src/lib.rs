@@ -1716,6 +1716,50 @@ where
         }
     }
 
+    // v0.1.18: advertise our hybrid KEM public key to the peer over the
+    // live session, so they can seal a DM to us via a hub if we go offline
+    // (the opt-in hub fallback). Connect codes carry no KEM, so this
+    // in-session exchange is how peers learn each other's. Best-effort: a
+    // send failure just means the peer won't have our KEM yet; it'll be
+    // re-advertised on the next (re)connect. Queued ahead of the select
+    // loop so it precedes any user traffic.
+    {
+        let our_kem = state.identity.kem_public().to_bytes();
+        let our_fp = state.identity.fingerprint().to_string();
+        let ad = onyx_core::room::RoomAppMessage::KemAdvertisement {
+            fingerprint: our_fp,
+            kem_pub: serde_bytes::ByteBuf::from(our_kem),
+        };
+        match ad.to_cbor() {
+            Ok(cbor) => {
+                let ct = {
+                    let party = state.mls_party.lock().await;
+                    group.encrypt_application(&party, &cbor)
+                };
+                match ct {
+                    Ok(ct) => {
+                        if let Err(e) = write_frame(
+                            &mut stream,
+                            &mut session,
+                            &InnerFrame {
+                                frame_type: FRAME_MLS_APP,
+                                payload: ct,
+                            },
+                        )
+                        .await
+                        {
+                            debug!(peer = %short_id, error = %e, "kem-ad: send failed (will retry next connect)");
+                        } else {
+                            debug!(peer = %short_id, "kem-ad: advertised our KEM to peer");
+                        }
+                    }
+                    Err(e) => debug!(error = %e, "kem-ad: encrypt failed; skipping"),
+                }
+            }
+            Err(e) => debug!(error = %e, "kem-ad: cbor encode failed; skipping"),
+        }
+    }
+
     let session_result = drive_peer_session(
         &mut stream,
         &mut session,
@@ -2099,8 +2143,28 @@ async fn handle_dm_app_frame(
                 info!(path = %path.display(), "dm file received + persisted");
             }
         }
-        onyx_core::room::RoomAppMessage::KemAdvertisement { .. } => {
-            debug!("dm: KemAdvertisement is room-only; ignoring on DM channel");
+        onyx_core::room::RoomAppMessage::KemAdvertisement { kem_pub, .. } => {
+            // v0.1.18: on the DM channel, a KemAdvertisement tells us the
+            // peer's sealed-sender hybrid KEM public key. Persist it keyed
+            // by the peer's X25519 identity (the Noise-authenticated key)
+            // so the opt-in DM hub fallback can seal to this peer when
+            // they're offline. Connect codes carry no KEM, so this
+            // in-session exchange is how we acquire it. Validate it parses
+            // as a hybrid KEM key before storing (don't persist garbage).
+            if onyx_core::crypto::HybridKemPublic::from_bytes(kem_pub.as_ref()).is_ok() {
+                let vault = state.vault.lock().await;
+                if let Err(e) = vault.record_peer_kem(state.identity_id, peer_pub, kem_pub.as_ref())
+                {
+                    warn!(error = %e, "dm: failed to persist peer KEM advertisement");
+                } else {
+                    debug!(
+                        peer_short = %short_id_of_peer_pub(peer_pub),
+                        "dm: stored peer KEM advertisement (enables hub fallback to this peer)"
+                    );
+                }
+            } else {
+                debug!("dm: KemAdvertisement payload is not a valid hybrid KEM key; ignoring");
+            }
         }
     }
 }
