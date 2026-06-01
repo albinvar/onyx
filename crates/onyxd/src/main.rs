@@ -123,6 +123,15 @@ struct Args {
     #[arg(long, env = "ONYX_FIRST_CONTACT_REACHABLE")]
     first_contact_reachable: bool,
 
+    /// **v0.1.18 — opt IN to DM hub fallback (default OFF = private).**
+    /// When off, an undeliverable DM stays queued and flushes on
+    /// reconnect; nothing is relayed to a hub. When on (and a hub is
+    /// configured), a DM sent while the peer is offline is sealed to
+    /// their KEM and relayed via the hub on the DM's per-epoch session
+    /// token. Trades some metadata to the hub for guaranteed delivery.
+    #[arg(long, env = "ONYX_DM_HUB_FALLBACK")]
+    dm_hub_fallback: bool,
+
     /// **A1.2 — acknowledge clearnet (NO TOR, NO ANONYMITY).** Required
     /// to use any plain-TCP transport (`--no-tor`, `--listen-tcp`,
     /// `--dial-tcp`, `--hub-tcp`). Without it the daemon refuses to start
@@ -175,6 +184,7 @@ impl TryFrom<Args> for Config {
             constant_rate_ms: a.constant_rate_ms,
             first_contact_reachable: a.first_contact_reachable,
             allow_clearnet: a.allow_clearnet,
+            dm_hub_fallback: a.dm_hub_fallback,
         })
     }
 }

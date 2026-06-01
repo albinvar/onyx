@@ -171,6 +171,17 @@ pub struct Config {
     /// to start a clearnet mode without it, so a mistyped flag can't
     /// silently expose the user's IP.
     pub allow_clearnet: bool,
+    /// v0.1.18: opt IN to relaying a **direct message** through a hub when
+    /// the peer's direct session is down. **Default `false` = private.**
+    /// Off: an undeliverable DM stays queued (flushed on reconnect) and is
+    /// never sealed to a hub — no DM metadata reaches a third party. On
+    /// (and a hub is configured + the peer's KEM is known from an
+    /// in-session advertisement): the DM is sealed to the peer's hybrid
+    /// KEM and relayed via the hub on the DM group's per-epoch session
+    /// token (NOT the identity-linked intro inbox). The hub sees a sealed
+    /// envelope on an unlinkable token, never content or identities; the
+    /// recipient tags such messages `[hub]`. See `ANONYMITY.md` §3.2.
+    pub dm_hub_fallback: bool,
 }
 
 /// Bundle of state every handler needs.
@@ -276,6 +287,12 @@ pub struct DaemonState {
     /// `peer_dial` table so it survives a daemon restart. Leaf lock —
     /// never held across `mls_party`/`vault` (lock-order policy above).
     pub dial_targets: Arc<Mutex<std::collections::HashMap<[u8; 32], DialTarget>>>,
+    /// v0.1.18: opt-in DM hub fallback (default false = private). Read by
+    /// the `Send` handler / send-queue to decide whether an undeliverable
+    /// DM may be sealed and relayed via a hub. Copied from [`Config`] at
+    /// construction so the API server (which only holds `DaemonState`)
+    /// can see it without threading `Config` through.
+    pub dm_hub_fallback: bool,
 }
 
 /// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
@@ -654,6 +671,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         // v0.1.17: populated when we dial a peer (handle_dial_peer /
         // startup --dial-onion) and revived from the vault below.
         dial_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        // v0.1.18: opt-in DM hub fallback, copied from Config.
+        dm_hub_fallback: args.dm_hub_fallback,
     });
 
     drop(args.passphrase);

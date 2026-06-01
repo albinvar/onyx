@@ -3435,6 +3435,7 @@ mod tests {
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dm_hub_fallback: false,
         });
         (state, encode_b32(group_id))
     }
