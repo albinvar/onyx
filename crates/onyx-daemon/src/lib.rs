@@ -64,7 +64,7 @@ use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{
     Session, handshake_initiator, handshake_responder, read_frame, write_frame,
 };
-use onyx_core::wire::{FRAME_MLS_APP, InnerFrame};
+use onyx_core::wire::{FRAME_MLS_APP, FRAME_PING, FRAME_PONG, InnerFrame};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{Instrument, debug, error, info, info_span, warn};
@@ -1760,12 +1760,60 @@ async fn drive_peer_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    // v0.1.17 (adaptive keepalive): send a PING after this much idle so a
+    // silently-dead Tor circuit is detected fast, and fail the session if
+    // no frame arrives within READ_DEADLINE so `supervise_dial` reconnects.
+    // PING/PONG ride inside the Noise session and pad to the same size
+    // bucket as a small app frame, so an on-path observer can't tell a
+    // keepalive from real traffic. Deadline is > 2× the ping interval so a
+    // healthy idle link (which answers PINGs with PONGs) never trips it.
+    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+    const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(50);
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Don't fire a burst of catch-up PINGs if a long encrypt/await stalls
+    // the loop past a tick — one ping per idle window is enough.
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately; consume it so we don't PING the instant
+    // the session opens (the handshake just proved liveness).
+    keepalive.tick().await;
     loop {
         tokio::select! {
-            // Inbound: a frame arrived on the Tor stream.
-            res = read_frame(stream, session) => {
+            // Inbound: a frame arrived on the Tor stream — bounded by a
+            // read deadline so a dead circuit doesn't hang us forever.
+            res = tokio::time::timeout(READ_DEADLINE, read_frame(stream, session)) => {
+                let res = match res {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        // No frame (not even a PONG) within the deadline —
+                        // treat the circuit as dead and let the supervisor
+                        // rebuild it.
+                        return Err(anyhow::anyhow!(
+                            "peer read timeout ({}s) — circuit likely dead, reconnecting",
+                            READ_DEADLINE.as_secs()
+                        ));
+                    }
+                };
                 match res {
                     Ok(frame) => {
+                        // v0.1.17: keepalive frames ride the same session.
+                        if frame.frame_type == FRAME_PING {
+                            // Reply with a PONG; a write failure means the
+                            // circuit is gone → end the session to reconnect.
+                            write_frame(
+                                stream,
+                                session,
+                                &InnerFrame { frame_type: FRAME_PONG, payload: Vec::new() },
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!("pong send failed: {e}"))?;
+                            continue;
+                        }
+                        if frame.frame_type == FRAME_PONG {
+                            // Liveness confirmed implicitly by resetting the
+                            // read deadline (we got a frame). Nothing else
+                            // to do.
+                            continue;
+                        }
                         if frame.frame_type != FRAME_MLS_APP {
                             warn!(
                                 frame_type = format!("{:#06x}", frame.frame_type),
@@ -1899,6 +1947,21 @@ where
                 .await
                 .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
                 info!(text = %log_text, "chat message sent");
+            }
+            // v0.1.17: adaptive keepalive. After KEEPALIVE_INTERVAL of no
+            // other branch firing, send a PING. The peer answers with a
+            // PONG (handled above); either the PONG or any other frame
+            // resets the read deadline. A write failure here means the
+            // circuit is already gone, so we end the session to reconnect.
+            _ = keepalive.tick() => {
+                write_frame(
+                    stream,
+                    session,
+                    &InnerFrame { frame_type: FRAME_PING, payload: Vec::new() },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("keepalive ping send failed: {e}"))?;
+                debug!("keepalive ping sent");
             }
         }
     }
