@@ -3563,6 +3563,151 @@ mod tests {
             .to_string()
     }
 
+    // ── v0.1.18: opt-in DM hub fallback ─────────────────────────────────
+    //
+    // Verifies the load-bearing send-side logic of `dm_hub_fallback_send`
+    // against a REAL DaemonState: a real 2-party-shaped MLS DM group, a
+    // recorded peer→group mapping, a recorded peer KEM, and a capturing
+    // hub channel. Asserts the function (1) succeeds, (2) emits exactly
+    // one sealed envelope to the hub, and (3) routes it to the DM group's
+    // per-epoch SESSION TOKEN — NOT the peer's identity-linked
+    // introduction inbox. That session-token routing is the privacy
+    // property the feature rests on, so the test pins it explicitly: if a
+    // future change routed DM fallback to introduction_inbox(fp) instead,
+    // this assert fails.
+
+    #[tokio::test]
+    async fn dm_hub_fallback_send_seals_to_dm_session_token() {
+        // Build a DaemonState with a capturing hub channel + fallback on.
+        let mut vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+        let (identity_id, identity) = vault.create_identity("me").expect("identity");
+        let mls_party = MlsParty::from_identity(&identity).expect("party");
+
+        // A real MLS DM group we own; persist its snapshot so load_group
+        // (inside dm_hub_fallback_send) can resume it.
+        let group = mls_party.create_group().expect("group");
+        let group_id = group.group_id_bytes();
+        {
+            let snap = mls_party.snapshot_state().expect("snap");
+            vault.save_mls_state(identity_id, &snap).expect("save mls");
+        }
+
+        // A fictional peer: map their X25519 identity → this DM group, and
+        // record their hybrid KEM (as the in-session advertisement would).
+        let peer_pub = [0x42u8; 32];
+        let peer_kem = HybridKemSecret::generate();
+        let peer_kem_bytes = peer_kem.public().to_bytes();
+        vault
+            .record_peer_group(identity_id, &peer_pub, &group_id)
+            .expect("record group");
+        vault
+            .record_peer_kem(identity_id, &peer_pub, &peer_kem_bytes)
+            .expect("record kem");
+
+        // Capturing hub channel (don't drain until after the call).
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::channel(4);
+
+        let state = Arc::new(DaemonState {
+            identity,
+            identity_id,
+            mls_party: Arc::new(Mutex::new(mls_party)),
+            vault: Arc::new(Mutex::new(vault)),
+            conversations: crate::conversations::new_shared(),
+            hub_outbounds: vec![hub_tx],
+            hub_fetch_lock: Arc::new(Mutex::new(())),
+            seen_envelopes: Arc::new(Mutex::new(crate::replay_guard::EnvelopeReplayGuard::new())),
+            configured_hubs: Vec::new(),
+            pending_room_frames: Arc::new(Mutex::new(HashMap::new())),
+            inflight_files: Arc::new(Mutex::new(HashMap::new())),
+            files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
+            tor: std::sync::OnceLock::new(),
+            self_onion: std::sync::OnceLock::new(),
+            dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dm_hub_fallback: true,
+        });
+
+        // Independently derive the DM group's session token to compare.
+        let expected_token = {
+            let party = state.mls_party.lock().await;
+            let g = party.load_group(&group_id).expect("load").expect("some");
+            let secret = g.export_routing_secret(&party).expect("secret");
+            onyx_core::routing::session_token(&secret, 0)
+        };
+
+        // Act.
+        let ok = dm_hub_fallback_send(&peer_pub, "hello while offline", &state).await;
+        assert!(
+            ok,
+            "dm_hub_fallback_send should succeed with group + KEM present"
+        );
+
+        // Exactly one envelope, routed to the DM session token (NOT an
+        // intro inbox), body is a non-empty sealed blob.
+        let env = hub_rx.try_recv().expect("a hub envelope was queued");
+        match env {
+            crate::hub_client::HubOutbound::Deliver { target, body } => {
+                assert_eq!(
+                    target, expected_token,
+                    "DM fallback must route to the DM session token, not the intro inbox"
+                );
+                assert!(!body.is_empty(), "sealed envelope body must be non-empty");
+            }
+            other => panic!("expected HubOutbound::Deliver, got {other:?}"),
+        }
+        assert!(
+            hub_rx.try_recv().is_err(),
+            "exactly one envelope should be emitted per fallback send"
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_hub_fallback_send_noop_without_peer_kem() {
+        // Same setup but DO NOT record the peer's KEM → can't seal → the
+        // function must return false (caller keeps the message queued)
+        // and emit nothing to the hub.
+        let mut vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+        let (identity_id, identity) = vault.create_identity("me").expect("identity");
+        let mls_party = MlsParty::from_identity(&identity).expect("party");
+        let group = mls_party.create_group().expect("group");
+        let group_id = group.group_id_bytes();
+        {
+            let snap = mls_party.snapshot_state().expect("snap");
+            vault.save_mls_state(identity_id, &snap).expect("save mls");
+        }
+        let peer_pub = [0x43u8; 32];
+        vault
+            .record_peer_group(identity_id, &peer_pub, &group_id)
+            .expect("record group");
+        // No record_peer_kem.
+
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::channel(4);
+        let state = Arc::new(DaemonState {
+            identity,
+            identity_id,
+            mls_party: Arc::new(Mutex::new(mls_party)),
+            vault: Arc::new(Mutex::new(vault)),
+            conversations: crate::conversations::new_shared(),
+            hub_outbounds: vec![hub_tx],
+            hub_fetch_lock: Arc::new(Mutex::new(())),
+            seen_envelopes: Arc::new(Mutex::new(crate::replay_guard::EnvelopeReplayGuard::new())),
+            configured_hubs: Vec::new(),
+            pending_room_frames: Arc::new(Mutex::new(HashMap::new())),
+            inflight_files: Arc::new(Mutex::new(HashMap::new())),
+            files_config: crate::FilesConfig::defaults(std::path::Path::new(".")),
+            tor: std::sync::OnceLock::new(),
+            self_onion: std::sync::OnceLock::new(),
+            dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dm_hub_fallback: true,
+        });
+
+        let ok = dm_hub_fallback_send(&peer_pub, "hi", &state).await;
+        assert!(!ok, "without a known peer KEM the fallback must be a no-op");
+        assert!(
+            hub_rx.try_recv().is_err(),
+            "no envelope may be emitted when the peer KEM is unknown"
+        );
+    }
+
     #[tokio::test]
     async fn send_room_refuses_key_changed_member() {
         let group_id = [7u8; 32];
