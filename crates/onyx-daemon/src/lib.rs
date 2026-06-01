@@ -984,6 +984,11 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     for h in hub_tasks {
         h.abort();
     }
+    // v0.1.17: stop the per-peer reconnect supervisors so they don't keep
+    // dialing after the daemon is shutting down.
+    for h in dial_supervisors {
+        h.abort();
+    }
     // Surface any mode error after API cleanup so it isn't lost.
     mode_result?;
 
