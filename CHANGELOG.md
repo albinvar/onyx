@@ -6,6 +6,48 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.18 — 2026-06-02 — opt-in DM hub fallback (default OFF, experimental)
+
+Lets a direct message reach a peer who is **offline** (not just briefly
+reconnecting) by relaying it through a hub — **opt-in, default off**. With
+it off (the default) nothing changes: an undeliverable DM stays queued and
+flushes on reconnect (v0.1.17 behaviour), and no DM metadata ever reaches a
+third party. Enable with `--dm-hub-fallback` (or `dm_hub_fallback` in
+`~/.onyx/config.json`) **and** a configured hub.
+
+### Added
+- **In-session hybrid-KEM exchange.** Connect codes carry only an onion +
+  identity key, no sealed-sender KEM — so peers now advertise their hybrid
+  KEM (X25519+ML-KEM-768) to each other over the live DM session
+  (`RoomAppMessage::KemAdvertisement`) and persist it (`peer_kem` vault
+  table). This is what makes fallback possible for connect-code peers, not
+  just invite peers.
+- **Sealed, session-token-routed fallback send.** When enabled and the
+  peer is offline (and their KEM is known), the DM is MLS-encrypted, sealed
+  to the peer's KEM, and relayed via the hub on the **DM group's per-epoch
+  session token** — NOT the identity-linked introduction inbox. The hub
+  sees a sealed envelope on an unlinkable, per-epoch token: never the
+  content, never either party's identity. The recipient subscribes to its
+  DM session tokens and surfaces such messages with the weaker-tier `[hub]`
+  badge (per-message PFS, no live-session PCS).
+- `--dm-hub-fallback` flag on `onyx` and `onyxd`; `dm_hub_fallback` config
+  field. Default false everywhere.
+
+### Security / privacy
+- **Default off** keeps the v0.1.16 privacy posture intact: no opt-in, no
+  hub envelope, no metadata. Turning it on trades a little metadata
+  (timing/presence to the hub, on an unlinkable token) for delivery to an
+  offline peer. TOFU pin still gates the send.
+
+### Verification status — EXPERIMENTAL
+- Unit/integration gates pass (peer_kem round-trip, group→peer reverse
+  routing, build/clippy/fmt, full daemon + core test suites). The **full
+  offline→hub→deliver round-trip has NOT yet been exercised end-to-end**
+  (the in-process harness lacks direct-DM + restart support; a real-Tor
+  manual soak is the planned follow-up). Shipping behind the default-off
+  flag and marked experimental until that soak is done — do not rely on it
+  for guaranteed delivery yet.
+
 ## v0.1.17 — 2026-06-02 — reliable direct messages (auto-reconnect, keepalive, send-queue)
 
 The problem this fixes: a 1:1 DM ran over a single long-lived Noise+MLS
