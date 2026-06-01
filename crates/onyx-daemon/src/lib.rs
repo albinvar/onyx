@@ -135,7 +135,13 @@ pub struct HubConfig {
 /// `Args` clap struct used to carry, minus the clap conflicts/requires
 /// constraints — those are enforced by whichever binary is parsing
 /// CLI args (`onyxd` or `onyx daemon`). The library trusts its caller.
+///
+/// (clippy `struct_excessive_bools`: these are independent operator
+/// toggles — `no_tor`, `first_contact_reachable`, `allow_clearnet`,
+/// `dm_hub_fallback` — not a state machine that would read better as an
+/// enum. Each maps 1:1 to a CLI flag / config field.)
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     pub vault: PathBuf,
     pub passphrase: Zeroizing<String>,

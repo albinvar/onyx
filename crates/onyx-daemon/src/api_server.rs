@@ -361,8 +361,10 @@ async fn dispatch_one_shot(
                 // v0.1.17: a full or just-closed live mailbox also queues
                 // rather than failing — the supervisor will flush it on
                 // the next (re)connect.
-                Err(tokio::sync::mpsc::error::TrySendError::Full(item))
-                | Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
+                Err(
+                    tokio::sync::mpsc::error::TrySendError::Full(item)
+                    | tokio::sync::mpsc::error::TrySendError::Closed(item),
+                ) => {
                     let mut reg = state.conversations.lock().await;
                     if reg.enqueue_pending(&handle.peer_pub, item) {
                         reg.push_message(
