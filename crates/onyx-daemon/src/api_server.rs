@@ -312,6 +312,23 @@ async fn dispatch_one_shot(
                 {
                     return block;
                 }
+                // v0.1.18: opt-in DM hub fallback. When enabled (and a hub
+                // is configured + the peer's KEM is known), relay the DM
+                // through the hub so an offline peer still receives it,
+                // instead of only queueing for a reconnect that may never
+                // come while they're away. Sealed + routed on the DM
+                // session token (no identity leak). On success we record
+                // it as via_hub (weaker [hub] tier) and DON'T also queue
+                // it — the hub copy is the delivery. If fallback is off or
+                // can't seal, fall through to the queue (v0.1.17 behaviour).
+                if state.dm_hub_fallback && dm_hub_fallback_send(&peer_pub, text, state).await {
+                    state.conversations.lock().await.push_message_via_hub(
+                        &peer_pub,
+                        MessageDirection::Outgoing,
+                        text.clone(),
+                    );
+                    return ApiResponse::SendOk;
+                }
                 let mut reg = state.conversations.lock().await;
                 if reg.enqueue_pending(
                     &peer_pub,
@@ -1345,6 +1362,102 @@ async fn compute_room_session_token(
     };
     let secret = group.export_routing_secret(&party).ok()?;
     Some(onyx_core::routing::session_token(&secret, 0))
+}
+
+/// v0.1.18: opt-in DM hub fallback. Seal a single DM `text` to the
+/// peer's hybrid KEM and relay it via the hub(s) on the DM group's
+/// per-epoch **session token** — NOT the peer's identity-linked
+/// introduction inbox. This is the privacy-preserving routing choice:
+/// the hub sees a sealed envelope on an unlinkable, per-epoch token, so
+/// it learns neither the content nor either party's identity (the same
+/// property rooms already rely on). Returns `true` if the envelope was
+/// accepted by at least one hub.
+///
+/// Preconditions enforced by the caller: `dm_hub_fallback` is on and a
+/// hub is configured. Here we additionally require that we know the
+/// peer's KEM (learned in-session via `KemAdvertisement`, persisted in
+/// `peer_kem`) and that we have the DM MLS group to encrypt + derive the
+/// token. Any missing piece → `false` (caller keeps the message queued
+/// rather than failing — mirrors the room `skipped_no_kem` behaviour).
+///
+/// The MLS encryption gives the message full DM-tier confidentiality and
+/// the recipient decrypts it with the same group state a direct frame
+/// would use; only the *transport* differs, which is why the recipient
+/// surfaces it with the weaker-tier `[hub]` badge.
+async fn dm_hub_fallback_send(peer_pub: &[u8; 32], text: &str, state: &DaemonState) -> bool {
+    if state.hub_outbounds.is_empty() {
+        return false;
+    }
+    // 1. The DM group_id for this peer (recorded at bootstrap/resume).
+    let group_id_bytes = {
+        let vault = state.vault.lock().await;
+        match vault.lookup_peer_group(state.identity_id, peer_pub) {
+            Ok(Some(g)) => g,
+            _ => return false, // no DM group yet → can't encrypt
+        }
+    };
+    // 2. The peer's hybrid KEM (learned in-session). No KEM → can't seal.
+    let kem_bytes = {
+        let vault = state.vault.lock().await;
+        match vault.lookup_peer_kem(state.identity_id, peer_pub) {
+            Ok(Some(k)) => k,
+            _ => return false,
+        }
+    };
+    let Ok(kem_pub) = onyx_core::crypto::HybridKemPublic::from_bytes(&kem_bytes) else {
+        return false;
+    };
+    // 3. MLS-encrypt the DM text (RoomAppMessage::Text, same envelope as
+    //    a direct DM frame) and derive the DM session token — both under
+    //    the MLS lock, loading the DM group fresh.
+    let Ok(cbor) = onyx_core::room::RoomAppMessage::Text {
+        text: text.to_string(),
+    }
+    .to_cbor() else {
+        return false;
+    };
+    let (ciphertext, token) = {
+        let party = state.mls_party.lock().await;
+        let Ok(Some(mut group)) = party.load_group(&group_id_bytes) else {
+            return false;
+        };
+        let Ok(ct) = group.encrypt_application(&party, &cbor) else {
+            return false;
+        };
+        let Ok(secret) = group.export_routing_secret(&party) else {
+            return false;
+        };
+        (ct, onyx_core::routing::session_token(&secret, 0))
+    };
+    // 4. Seal MlsApp{group_id, ciphertext} to the peer's KEM and relay.
+    let payload = onyx_core::routing::BootstrapPayload::MlsApp {
+        group_id: serde_bytes::ByteBuf::from(group_id_bytes.clone()),
+        ciphertext: serde_bytes::ByteBuf::from(ciphertext),
+    };
+    let Ok(payload_bytes) = payload.to_cbor() else {
+        return false;
+    };
+    let Ok(sealed) = onyx_core::routing::seal_bootstrap(
+        state.identity.signing(),
+        state.identity.identity_key(),
+        &payload_bytes,
+        &kem_pub,
+    ) else {
+        return false;
+    };
+    let mut any_accepted = false;
+    for hub_outbound in &state.hub_outbounds {
+        if hub_outbound
+            .try_send(crate::hub_client::HubOutbound::deliver(
+                token,
+                sealed.clone(),
+            ))
+            .is_ok()
+        {
+            any_accepted = true;
+        }
+    }
+    any_accepted
 }
 
 /// T-polish.3: fetch persistent room scrollback. Returns the most
