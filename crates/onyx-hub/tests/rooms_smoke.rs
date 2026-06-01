@@ -141,6 +141,26 @@ async fn spawn_daemon_with_opts(
     first_contact_reachable: bool,
     constant_rate_ms: Option<u64>,
 ) -> (PathBuf, TempDir) {
+    spawn_daemon_full(
+        hub_addr,
+        hub_pubkey_b32,
+        label,
+        first_contact_reachable,
+        constant_rate_ms,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_daemon_full(
+    hub_addr: &str,
+    hub_pubkey_b32: &str,
+    label: &str,
+    first_contact_reachable: bool,
+    constant_rate_ms: Option<u64>,
+    dm_hub_fallback: bool,
+) -> (PathBuf, TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let vault_path = dir.path().join(format!("{label}-vault.db"));
     let api_socket_path = dir.path().join(format!("{label}.sock"));
@@ -166,6 +186,7 @@ async fn spawn_daemon_with_opts(
         // A1.2: the smoke harness deliberately uses clearnet (--hub-tcp
         // + listen_tcp) — acknowledge it so the guard lets it start.
         allow_clearnet: true,
+        dm_hub_fallback,
     };
 
     tokio::spawn(async move {

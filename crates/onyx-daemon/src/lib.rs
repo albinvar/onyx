@@ -2864,6 +2864,26 @@ async fn current_room_session_tokens(
         };
         tokens.push(onyx_core::routing::session_token(&secret, 0));
     }
+    // v0.1.18: also subscribe to each DM (2-party) group's session token,
+    // so an opt-in hub-fallback DM — sealed and routed on that token —
+    // is actually received. Without this the recipient would never see a
+    // fallback DM (it's addressed to the DM session token, not the
+    // identity-linked intro inbox). Same derivation as rooms.
+    let dm_group_ids = {
+        let vault = state.vault.lock().await;
+        vault
+            .list_peer_group_ids(state.identity_id)
+            .unwrap_or_default()
+    };
+    for gid in &dm_group_ids {
+        let Ok(Some(group)) = party.load_group(gid) else {
+            continue;
+        };
+        let Ok(secret) = group.export_routing_secret(&party) else {
+            continue;
+        };
+        tokens.push(onyx_core::routing::session_token(&secret, 0));
+    }
     tokens
 }
 

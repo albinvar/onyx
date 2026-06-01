@@ -1044,6 +1044,26 @@ impl Vault {
     /// List every room for `identity_id`, ordered by `created_at_ms`
     /// ascending (older first). Returns the rows verbatim — the
     /// daemon decides how to project them into API responses.
+    /// v0.1.18: list the MLS `group_id`s of all DM (2-party) peer groups
+    /// for this identity. The daemon subscribes to each one's per-epoch
+    /// session token so an opt-in hub-fallback DM (sealed + routed on that
+    /// token) is actually received — mirroring how it subscribes to room
+    /// session tokens. Returns the raw group_id bytes.
+    pub fn list_peer_group_ids(&self, identity_id: i64) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_id FROM mls_peer_groups WHERE identity_id = ?")
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(map_db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_db_err)?);
+        }
+        Ok(out)
+    }
+
     pub fn list_rooms(&self, identity_id: i64) -> Result<Vec<RoomRow>> {
         let mut stmt = self
             .conn
