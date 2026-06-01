@@ -640,6 +640,30 @@ impl Vault {
             .map_err(map_db_err)
     }
 
+    /// v0.1.18: reverse of [`Self::lookup_peer_group`] — which DM peer
+    /// (X25519 identity) owns this `group_id`, if any. Used on the
+    /// receive side to tell a hub-relayed **DM** apart from a room frame
+    /// sharing the same `MlsApp` envelope, so it surfaces under the right
+    /// conversation with the `[hub]` tier. Returns `None` for a room (or
+    /// unknown) group_id. A 2-party DM group_id maps to exactly one peer.
+    pub fn lookup_peer_by_group(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+    ) -> Result<Option<[u8; 32]>> {
+        let row: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT peer_x25519 FROM mls_peer_groups \
+                 WHERE identity_id = ? AND group_id = ?",
+                params![identity_id, group_id],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(map_db_err)?;
+        Ok(row.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
+    }
+
     /// v0.1.17: persist the direct-dial address (`.onion` + base32
     /// pubkey) we last reached this peer at, so the reconnect supervisor
     /// can re-dial after a dropped Tor circuit OR a daemon restart.

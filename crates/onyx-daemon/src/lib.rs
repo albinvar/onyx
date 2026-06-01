@@ -3052,6 +3052,26 @@ async fn process_hub_mls_app(
     sender_fingerprint: &str,
     state: &Arc<DaemonState>,
 ) {
+    // v0.1.18: an MlsApp envelope can be a room frame OR a hub-relayed
+    // DM (opt-in fallback). They share the same wire shape, so we
+    // disambiguate by group_id: if it maps to a known DM peer, surface it
+    // under that DM conversation with the [hub] tier; otherwise it's a
+    // room frame. (A 2-party DM group_id maps to exactly one peer.)
+    let dm_peer = {
+        let vault = state.vault.lock().await;
+        vault
+            .lookup_peer_by_group(state.identity_id, group_id)
+            .unwrap_or(None)
+    };
+    if let Some(peer_pub) = dm_peer {
+        handle_hub_dm_app_frame(group_id, ciphertext, &peer_pub, state).await;
+        info!(
+            from_fingerprint = %sender_fingerprint,
+            ciphertext_bytes = ciphertext.len(),
+            "hub: mlsapp/v1 DM frame processed (via_hub)"
+        );
+        return;
+    }
     handle_room_app_frame(group_id, ciphertext, sender_x25519, state).await;
     info!(
         from_fingerprint = %sender_fingerprint,
@@ -3059,6 +3079,60 @@ async fn process_hub_mls_app(
         ciphertext_bytes = ciphertext.len(),
         "hub: mlsapp/v1 room frame processed"
     );
+}
+
+/// v0.1.18: decrypt + surface a hub-relayed DM (opt-in fallback). Mirrors
+/// the direct-DM decrypt path in `drive_peer_session`, but tags the
+/// message `via_hub` (weaker `[hub]` tier — sealed-sender transport, not
+/// a live MLS session). Decrypts against the peer's DM group, advancing
+/// + persisting its ratchet like any DM frame.
+async fn handle_hub_dm_app_frame(
+    group_id: &[u8],
+    ciphertext: &[u8],
+    peer_pub: &[u8; 32],
+    state: &Arc<DaemonState>,
+) {
+    let plaintext = {
+        let party = state.mls_party.lock().await;
+        match party.load_group(group_id) {
+            Ok(Some(mut group)) => match group.decrypt_application(&party, ciphertext) {
+                Ok(pt) => Some(pt),
+                Err(e) => {
+                    debug!(error = %e, "hub DM: decrypt failed; dropping");
+                    None
+                }
+            },
+            _ => {
+                debug!("hub DM: no matching DM group; dropping");
+                None
+            }
+        }
+    };
+    let Some(plaintext) = plaintext else { return };
+    // Persist the advanced ratchet.
+    let snap = {
+        let party = state.mls_party.lock().await;
+        party.snapshot_state().ok()
+    };
+    if let Some(snap) = snap {
+        let vault = state.vault.lock().await;
+        let _ = vault.save_mls_state(state.identity_id, &snap);
+    }
+    let Ok(msg) = onyx_core::room::RoomAppMessage::from_cbor(&plaintext) else {
+        debug!("hub DM: RoomAppMessage decode failed; dropping");
+        return;
+    };
+    // Only Text is surfaced over the hub-DM path; files/KEM-ads are
+    // direct-session concerns. Tag via_hub so the [hub] tier shows.
+    if let onyx_core::room::RoomAppMessage::Text { text } = msg {
+        state.conversations.lock().await.push_message_via_hub(
+            peer_pub,
+            onyx_core::api::MessageDirection::Incoming,
+            text,
+        );
+    } else {
+        debug!("hub DM: non-Text RoomAppMessage on hub path; ignoring");
+    }
 }
 
 // ── Vault helpers ──────────────────────────────────────────────────────────
