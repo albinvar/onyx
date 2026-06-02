@@ -6,6 +6,35 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 vault (D) — 2026-06-03 — vault backup + passphrase rekey
+
+Fills a real gap: there was no way to back up the vault or change its
+passphrase. (There is still no *recovery* of a forgotten passphrase — by
+design — but a deliberate rekey by someone who knows the current one is now
+supported.)
+
+### Added
+- **`onyx_core::storage::Vault::rekey(path, old, new)`** — changes the vault
+  passphrase in place: re-derives the key from a FRESH KDF salt and re-seals
+  every encrypted blob (canary + `identities`/`mls_state`/`replay_state`) under
+  the new key, all in ONE SQLite transaction (atomic — on any error the old
+  passphrase still works). KDF cost preserved. Wrong current passphrase →
+  `VerificationFailed` before anything changes. Unit-tested (wrong-pass rejected,
+  old-fails/new-works after, sealed blob survives).
+- **`onyx vault backup <dest>`** — copies the (already-encrypted) vault file to
+  `dest` (0600). Verified the copy re-opens cleanly. Restore = copy it back over
+  `~/.onyx/vault.db` with the daemon stopped.
+- **`onyx vault rekey`** — interactive: prompts current passphrase + new (twice,
+  min 8), then calls `Vault::rekey`. Passphrases zeroized after use.
+
+### Notes (honest)
+- Both ops are **local file operations** — stop the daemon first (it holds the
+  vault open; otherwise SQLite returns a lock error, surfaced with a clear hint).
+- `vault rekey` needs a real terminal for the hidden prompt (no piped/stdin
+  passphrase). A backup taken before a rekey still uses the OLD passphrase.
+
+---
+
 ## Release v0.1.22 — 2026-06-03
 
 Umbrella for everything merged since v0.1.21 (see the per-item entries below):
