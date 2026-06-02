@@ -6,6 +6,24 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## fix(tui) — 2026-06-02 — reliable clipboard copy (native, not OSC52-only)
+
+Copy (invite link / connect code) silently failed on many terminals —
+notably **macOS Terminal.app, which has no OSC52 support** at all.
+
+### Fixed
+- Copy now uses the **native OS clipboard** first: `pbcopy` (macOS) /
+  `wl-copy` · `xclip` · `xsel` (Linux), piped via a child process so it works
+  regardless of terminal. OSC52 is kept only as a best-effort SSH/headless
+  fallback; since the terminal can't acknowledge OSC52, that path no longer
+  claims a confirmed copy. The "✓ copied to clipboard" badge now reflects an
+  *actual* copy; otherwise the modal shows the text for manual selection.
+- New `copy_to_clipboard` / `pipe_to_cmd` helpers (+ test); the Invite and
+  Connect-code screens use them. Dropped the misleading "(OSC52)" from the
+  success badges.
+
+---
+
 ## v0.2 messaging UX (B) — 2026-06-02 — local message search
 
 ### Added

@@ -1987,7 +1987,7 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
 async fn open_invite_modal(app: &mut AppState) {
     match build_invite_url(&app.socket_path).await {
         Ok(url) => {
-            let copied = osc52_copy(&url).is_ok();
+            let copied = copy_to_clipboard(&url);
             app.modal = Some(ModalState::Invite { url, copied });
         }
         Err(e) => {
@@ -2065,7 +2065,7 @@ fn open_connect_code_modal(app: &AppState) -> ModalState {
             let code =
                 onyx_core::connect::ConnectCode::new(onion.clone(), snap.identity_pub_b32.clone())
                     .to_url();
-            let copied = osc52_copy(&code).is_ok();
+            let copied = copy_to_clipboard(&code);
             ModalState::ConnectCode { code, copied }
         }
         _ => ModalState::ConnectCode {
@@ -2166,12 +2166,63 @@ async fn build_invite_url(socket: &Path) -> anyhow::Result<String> {
     }
 }
 
-/// UX overhaul: copy `text` to the terminal's clipboard via the OSC52
-/// escape sequence. Works over SSH and inside the alternate screen on
-/// terminals that support it (iTerm2, kitty, wezterm, modern xterm,
-/// tmux with `set -g set-clipboard on`). On terminals that don't, the
-/// sequence is silently ignored — the Invite modal still shows the URL
-/// for manual selection, so this is best-effort.
+/// Copy `text` to the system clipboard, returning `true` only if a native
+/// clipboard tool *confirmed* the copy.
+///
+/// We try the OS clipboard first because it works regardless of terminal —
+/// notably **macOS Terminal.app has no OSC52 support**, so the old
+/// OSC52-only path silently failed there. OSC52 is kept as a best-effort
+/// fallback for SSH/headless sessions on terminals that *do* support it
+/// (iTerm2, kitty, wezterm, tmux with `set-clipboard on`), but since the
+/// terminal can't ack it we don't report that as a confirmed copy.
+fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),                        // Wayland
+        ("xclip", &["-selection", "clipboard"]), // X11
+        ("xsel", &["--clipboard", "--input"]),   // X11
+    ];
+    for (cmd, args) in candidates {
+        if pipe_to_cmd(cmd, args, text) {
+            return true;
+        }
+    }
+    // No native tool available (or all failed) — emit OSC52 as a bonus for
+    // terminals that honor it, but we can't confirm it, so report false.
+    let _ = osc52_copy(text);
+    false
+}
+
+/// Spawn `cmd args`, write `text` to its stdin, and report whether it
+/// exited successfully. Used to pipe into `pbcopy`/`xclip`/`wl-copy`/`xsel`.
+fn pipe_to_cmd(cmd: &str, args: &[&str], text: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // Write + close stdin (drop the handle) so the child sees EOF, then
+    // wait for its exit status.
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.wait();
+            return false;
+        }
+    }
+    matches!(child.wait(), Ok(status) if status.success())
+}
+
+/// Best-effort OSC52 clipboard write (SSH/headless fallback). The escape is
+/// silently ignored by terminals that don't support it, so callers treat
+/// this as unconfirmed.
 fn osc52_copy(text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
@@ -3255,7 +3306,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             ));
             let copy_line = if *copied {
                 Span::styled(
-                    " ✓ copied to clipboard (OSC52) ",
+                    "  ✓ copied to clipboard ",
                     Style::default().fg(Color::Green),
                 )
             } else {
@@ -3729,7 +3780,7 @@ fn render_invite_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, url: &str, co
         ));
     let status = if copied {
         Line::from(Span::styled(
-            " ✓ copied to clipboard (OSC52)",
+            " ✓ copied to clipboard",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -4656,6 +4707,15 @@ mod snapshot_tests {
         // header(alice) + 2 bodies + spacer + header(me) + 1 body = 6.
         // (Without grouping it would be one header per message → more.)
         assert_eq!(build_chat_lines(&scroll, "alice").len(), 6);
+    }
+
+    // clipboard: piping into a real stdin-consuming command succeeds; a
+    // missing binary fails gracefully (no panic). `cat` exists on macOS +
+    // Linux and exits 0 after draining stdin.
+    #[test]
+    fn pipe_to_cmd_feeds_stdin_and_reports_success() {
+        assert!(pipe_to_cmd("cat", &[], "hello clipboard"));
+        assert!(!pipe_to_cmd("onyx-no-such-binary-xyz", &[], "x"));
     }
 
     // B (search): case-insensitive substring match across all scrollback,
