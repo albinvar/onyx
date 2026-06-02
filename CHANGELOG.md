@@ -6,6 +6,28 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.22 — 2026-06-03
+
+Umbrella for everything merged since v0.1.21 (see the per-item entries below):
+
+- **Safety-number contact verification** — Signal-style out-of-band MITM check
+  (Ctrl-K palette / `/verify`).
+- **Local message search** — full-text across all conversations
+  (`/search`), Enter jumps to the match.
+- **Reliable clipboard copy** — native OS clipboard (pbcopy / wl-copy / xclip /
+  xsel) instead of OSC52-only, which silently failed on e.g. macOS Terminal.app.
+- **Unified invite/connect UX** — Ctrl-E "Share my contact" (invite link +
+  connect code in one place) and Ctrl-A "Add a contact" (paste either, auto-
+  detected); removed Ctrl-Y/Ctrl-D; relabeled Ctrl-I "Invite into room".
+- **New public hub `onyx-piko-1`** — added to the signed `hubs.json`, so opt-in
+  public-hub users can use it.
+
+Honest status carried forward: the musl binary still isn't phone-verified; the
+piko hub isn't client-tested end-to-end yet; room messages still render incoming
+under `#room` (no per-sender field).
+
+---
+
 ## v0.2 UX — 2026-06-02 — unify invite/connect keybindings (2 flows)
 
 The invite/connect area had grown confusing: "invite" meant three things
