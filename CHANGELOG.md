@@ -6,6 +6,30 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 verification (C) — 2026-06-02 — safety-number contact verification
+
+Signal-style out-of-band verification, layered on top of TOFU pinning.
+
+### Added
+- **`onyx_core::crypto::safety_number(left_b32, right_b32)`** — a
+  deterministic, symmetric 30-digit number (6 groups of 5) derived from two
+  identity keys via BLAKE2b-256. Both peers compute the same value; reading it
+  aloud over a trusted channel and confirming a match proves there's no
+  man-in-the-middle (a swapped identity key changes the number). Unit-tested
+  for symmetry, determinism, distinctness, and format.
+- **TUI "Verify Contact" modal** — opened from the Ctrl-K palette ("Verify
+  contact (safety number)") or the `/verify` (`/safety`) slash command, for
+  the selected 1:1 peer. Computed entirely client-side from my identity key +
+  the peer's (both already in the TUI) — no daemon round-trip. Read-only;
+  shows the number + how to compare it. F1 help updated.
+
+### Note
+- Display/comparison only — it complements (doesn't replace) the existing
+  TOFU pin + key-change warning. Persisting a "verified ✓" flag per contact is
+  a follow-up (needs vault storage).
+
+---
+
 ## Release v0.1.21 — 2026-06-02
 
 Umbrella for everything merged since v0.1.20 (see the per-item entries below):
