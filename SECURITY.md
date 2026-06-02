@@ -282,6 +282,7 @@ Until then, treat every claim in this document and the threat model as **designe
 ## 9. Related documents
 
 - **`THREAT_MODEL.md`** — the adversary classes, defended assets, and residual-linkability accounting.
+- **`AUDIT.md`** — the external-audit brief: scope, freeze target, cryptographic inventory, codebase map, and the known open items an auditor should not have to re-find.
 - **`DESIGN.md`** — the full protocol specification (wire formats, key derivation, frame types, group lifecycle).
 - **`CHANGELOG.md`** — append-only log of every implemented change, with carry-forward security gaps explicitly listed per phase.
 - **`README.md`** — getting-started orientation; not a security reference.
