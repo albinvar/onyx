@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 5 (F5.1) — 2026-06-02 — run Onyx on Android (Termux) via proot-glibc
+
+Addresses the original "it won't run on my phone" problem. Root cause: the
+released Linux binaries are **glibc**, but bare Termux is **bionic** and has
+no glibc loader — so `onyx` fails to exec ("cannot execute: required file
+not found"). Not an Onyx bug; the glibc/bionic mismatch every glibc binary
+hits on Termux.
+
+### Added
+- **`MOBILE.md`** — the problem, three fix options (proot-glibc /
+  static-musl / native-NDK), and honest limits.
+- **`scripts/termux-onyx.sh`** — one-command **proot-glibc** path: installs
+  a small glibc distro via `proot-distro` and installs Onyx *inside* it,
+  where `install.sh` can cosign+SHA verify the **signed** release the normal
+  way (so the F0.2 fail-closed guarantees still hold — unlike bare Termux,
+  where cosign isn't packaged and the binary couldn't exec anyway).
+
+### Honest status
+- The helper is syntax- + logic-validated and uses the standard Termux
+  mechanism, but has **not yet been run end-to-end on a physical phone**
+  (the test device was offline this round). Marked clearly in `MOBILE.md`.
+- **The real fix (F5.2, deferred):** a fully-static `aarch64-unknown-linux-musl`
+  release target that runs on bare Termux with **no** proot — pending a CI
+  spike to confirm arti/ring/libcrux cross-compile cleanly for musl.
+
+---
+
 ## Fortification Phase 2 (F2.2a) — 2026-06-02 — Tor bridges (vanilla)
 
 Implements the F2.2a slice from `TOR-BRIDGES.md`: connect to Tor via an
