@@ -6,6 +6,34 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 1 (F1.3) — 2026-06-02 — cover-traffic default decision + `--high-security`
+
+The decision half of Phase 1's timing work, grounded in the F1.2 numbers.
+
+### Decision: NOT on by default
+Constant-rate is proven (F1.2) but its bandwidth is a permanent drain
+(~544 B/s/direction/hub at 500 ms; ~272 B/s at 1 s). Forcing that on every
+metered/mobile user is the wrong trade, and the downstream half only exists
+if the **hub** operator opts in (a client can't force it), so a client-side
+default would be a false assurance. Onyx keeps *free* privacy wins default
+(D-1, private first-contact, vanguards) and leaves the *costly* one a
+conscious opt-in. Revisitable if a low-bandwidth shaping mode appears.
+
+### Added
+- **`onyxd --high-security`** (env `ONYX_HIGH_SECURITY`) — one switch that
+  turns on the recommended upstream constant-rate. Defaults the slot to
+  1000 ms unless an explicit `--constant-rate-ms` is given (which always
+  wins). First-contact reachability stays OFF. Removes the "assemble three
+  flags correctly" footgun. onyxd's own code is clippy-clean.
+
+### Docs
+- `ANONYMITY.md` §3.1: the decision record (why not default-on) + a
+  **Recommended configurations** matrix (Default / Timing-hardened /
+  Maximum) spelling out the exact client + hub flags per threat tier and
+  what each tier hides.
+
+---
+
 ## Fortification Phase 1 (F1.2) — 2026-06-02 — cover-traffic wire measurement
 
 Turns the "we *think* constant-rate hides active-vs-idle" claim into a
