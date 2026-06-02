@@ -147,6 +147,11 @@ pub struct Config {
     pub passphrase: Zeroizing<String>,
     pub no_tor: bool,
     pub tor_state_dir: Option<PathBuf>,
+    /// F2.2a: Tor bridge lines (vanilla `<ip:port> <fingerprint>`). When
+    /// non-empty, Tor connects via these unlisted relays instead of public
+    /// guards (evades IP-blocklists of public guards). Empty = default
+    /// guard selection. See `TOR-BRIDGES.md`.
+    pub bridges: Vec<String>,
     pub dial_onion: Option<String>,
     pub dial_pubkey: Option<String>,
     pub api_socket: String,
@@ -798,18 +803,25 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     }
 
     // ── Tor bootstrap ───────────────────────────────────────────────────
-    let tor = if let Some(dir) = args.tor_state_dir.as_deref() {
-        info!(state_dir = %dir.display(), "bootstrapping Tor with custom state directory…");
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating tor state dir {}", dir.display()))?;
-        TorRuntime::bootstrap_with_state_dir(dir)
-            .await
-            .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
-    } else {
-        info!(
-            "bootstrapping Tor with default state directory (this may take 30-60s on a cold cache)…"
-        );
-        TorRuntime::bootstrap()
+    let tor = {
+        if let Some(dir) = args.tor_state_dir.as_deref() {
+            info!(state_dir = %dir.display(), "bootstrapping Tor with custom state directory…");
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("creating tor state dir {}", dir.display()))?;
+        } else {
+            info!(
+                "bootstrapping Tor with default state directory (this may take 30-60s on a cold cache)…"
+            );
+        }
+        if !args.bridges.is_empty() {
+            info!(
+                count = args.bridges.len(),
+                "tor: using configured bridge(s) (F2.2a)"
+            );
+        }
+        // F2.2a: thread the bridge list (empty = default guard selection,
+        // identical to the pre-F2.2 path).
+        TorRuntime::bootstrap_with_bridges(args.tor_state_dir.as_deref(), &args.bridges)
             .await
             .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
     };

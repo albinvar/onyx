@@ -79,7 +79,7 @@ impl TorRuntime {
     /// circuits. On a cold cache this can take 30–60 s; on a warm
     /// cache it's much faster.
     pub async fn bootstrap() -> Result<Self> {
-        Self::bootstrap_with(None).await
+        Self::bootstrap_with(None, &[]).await
     }
 
     /// Start Arti with an explicit state directory (overrides the
@@ -91,11 +91,27 @@ impl TorRuntime {
     /// are shared-safe to read between daemons even when written by
     /// only one).
     pub async fn bootstrap_with_state_dir(state_dir: &std::path::Path) -> Result<Self> {
-        Self::bootstrap_with(Some(state_dir)).await
+        Self::bootstrap_with(Some(state_dir), &[]).await
     }
 
-    async fn bootstrap_with(state_dir: Option<&std::path::Path>) -> Result<Self> {
-        let config = build_tor_config(state_dir)?;
+    /// F2.2a: bootstrap with optional state dir AND optional Tor **bridge**
+    /// lines. Each `bridges` entry is a standard bridge line (vanilla:
+    /// `<ip:port> <fingerprint>`); with bridges configured, Arti connects
+    /// via the unlisted bridge relay(s) instead of public guards, evading
+    /// IP-blocklists of public guards. Empty `bridges` → default guard
+    /// selection (byte-identical to the no-bridge path). See `TOR-BRIDGES.md`.
+    pub async fn bootstrap_with_bridges(
+        state_dir: Option<&std::path::Path>,
+        bridges: &[String],
+    ) -> Result<Self> {
+        Self::bootstrap_with(state_dir, bridges).await
+    }
+
+    async fn bootstrap_with(
+        state_dir: Option<&std::path::Path>,
+        bridges: &[String],
+    ) -> Result<Self> {
+        let config = build_tor_config(state_dir, bridges)?;
 
         // Surface the effective HS vanguard mode at startup. This is
         // CONFIG, not identity — safe to log per D-3. If this ever prints
@@ -221,7 +237,11 @@ impl TorRuntime {
 /// would under `Lite`; onion-service circuits additionally get L3. We do
 /// NOT widen the outbound client entry-guard set — more entry guards make
 /// discovery *easier*, not harder.
-fn build_tor_config(state_dir: Option<&std::path::Path>) -> Result<TorClientConfig> {
+fn build_tor_config(
+    state_dir: Option<&std::path::Path>,
+    bridges: &[String],
+) -> Result<TorClientConfig> {
+    use arti_client::config::BridgeConfigBuilder;
     use arti_client::config::CfgPath;
     use arti_client::config::vanguards::VanguardConfigBuilder;
     use tor_config::ExplicitOrAuto;
@@ -230,6 +250,25 @@ fn build_tor_config(state_dir: Option<&std::path::Path>) -> Result<TorClientConf
     let mut builder = TorClientConfig::builder();
     if let Some(dir) = state_dir {
         builder.storage().state_dir(CfgPath::new_literal(dir));
+    }
+
+    // F2.2a: Tor bridges. Each line is parsed into a `BridgeConfigBuilder`
+    // and pushed; a non-empty bridge list makes Arti's `BridgesConfig`
+    // auto-enable bridge mode (connect via the unlisted bridge instead of a
+    // public guard). Vanguards (below) still apply on top. With no bridges
+    // this block is a no-op and the config is identical to the default path.
+    for line in bridges {
+        let bridge: BridgeConfigBuilder = line.parse().map_err(|e| {
+            tracing::error!(error = %e, "tor: invalid --bridge line");
+            Error::InvalidEncoding("tor: invalid bridge line")
+        })?;
+        builder.bridges().bridges().push(bridge);
+    }
+    if !bridges.is_empty() {
+        tracing::info!(
+            count = bridges.len(),
+            "tor: configured with bridge(s) — connecting via unlisted relay(s) (F2.2a)"
+        );
     }
 
     // Pin Full. `.vanguards()` returns the sub-builder (like `.storage()`);
@@ -407,7 +446,7 @@ mod tests {
     /// regressed to inheriting the consensus default.
     #[test]
     fn tor_config_pins_full_vanguards() {
-        let config = build_tor_config(None).expect("config build");
+        let config = build_tor_config(None, &[]).expect("config build");
         assert_eq!(
             effective_vanguard_mode(&config),
             tor_guardmgr::VanguardMode::Full,
@@ -417,11 +456,38 @@ mod tests {
         // Also hold under the multi-daemon state-dir path (what the
         // daemon actually uses via bootstrap_with_state_dir).
         let tmp = std::env::temp_dir();
-        let config2 = build_tor_config(Some(&tmp)).expect("config build (state dir)");
+        let config2 = build_tor_config(Some(&tmp), &[]).expect("config build (state dir)");
         assert_eq!(
             effective_vanguard_mode(&config2),
             tor_guardmgr::VanguardMode::Full,
             "Full vanguards must also be pinned on the state-dir path"
+        );
+    }
+
+    #[test]
+    fn tor_config_accepts_vanilla_bridge_and_keeps_vanguards() {
+        // F2.2a: a syntactically-valid vanilla bridge line (`<ip:port>
+        // <rsa-fingerprint>`) parses and the config builds. We don't
+        // bootstrap — just assert the bridge plumbing + that vanguards are
+        // still pinned alongside bridges.
+        let bridges = vec!["192.0.2.10:443 0123456789ABCDEF0123456789ABCDEF01234567".to_string()];
+        let cfg = build_tor_config(None, &bridges).expect("bridge config should build");
+        assert_eq!(
+            effective_vanguard_mode(&cfg),
+            tor_guardmgr::VanguardMode::Full,
+            "vanguards must still be pinned when bridges are configured"
+        );
+    }
+
+    #[test]
+    fn tor_config_rejects_garbage_bridge_line() {
+        // F2.2a: a malformed --bridge line is a hard error, not silently
+        // dropped (so a typo can't leave you on public guards thinking
+        // you're bridged).
+        let bridges = vec!["definitely not a bridge line".to_string()];
+        assert!(
+            build_tor_config(None, &bridges).is_err(),
+            "a malformed bridge line must fail config build"
         );
     }
 

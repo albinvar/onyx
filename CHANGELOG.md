@@ -6,6 +6,42 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 2 (F2.2a) — 2026-06-02 — Tor bridges (vanilla)
+
+Implements the F2.2a slice from `TOR-BRIDGES.md`: connect to Tor via an
+**unlisted bridge relay** instead of a public guard, so an ISP/censor that
+blocks the published public-guard IPs can't stop (or trivially flag) your
+use of Tor.
+
+### Added
+- Enabled arti's **`bridge-client`** feature.
+- **`--bridge <line>`** (repeatable) on both `onyxd` and `onyx` (env
+  `ONYX_BRIDGE`; also `bridges: [...]` in `config.json`). Vanilla format
+  `<ip:port> <fingerprint>` (get lines from <https://bridges.torproject.org>).
+- `tor.rs`: `build_tor_config` parses each line via `BridgeConfigBuilder`
+  and wires `builder.bridges()`; a non-empty list auto-enables bridge mode.
+  Threaded through new `TorRuntime::bootstrap_with_bridges`.
+
+### Safety / scope
+- **Opt-in, default unchanged**: empty bridge list = normal public-guard
+  selection, byte-identical to before. **Vanguards still pinned** alongside
+  bridges. A **malformed** bridge line is a hard config error — no silent
+  fallback to public guards (a typo can't leave you un-bridged while you
+  think you're bridged). Bridges are still Tor, so they don't trip the A1.2
+  no-clearnet guard.
+- **Honest limit**: vanilla bridges defeat *IP blocklists*, not *DPI
+  fingerprinting* of Tor. obfs4/pluggable transports (which defeat DPI) are
+  the deferred **F2.2b** — they need an external PT binary (lyrebird) we can
+  document but not bundle. See `TOR-BRIDGES.md`.
+
+### Verified
+- `tor_config_accepts_vanilla_bridge_and_keeps_vanguards` (valid line parses,
+  config builds, vanguards intact) + `tor_config_rejects_garbage_bridge_line`.
+  Full workspace: 302 core + all suites pass; clippy `-D warnings` clean;
+  `cargo deny` ok (new bridge-client deps).
+
+---
+
 ## Fortification Phase 2 (F2.2) — 2026-06-02 — design doc: Tor bridges & PT (no code yet)
 
 Design-first. `TOR-BRIDGES.md` — let a user **hide that they use Tor**.

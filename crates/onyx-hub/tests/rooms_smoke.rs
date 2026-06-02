@@ -177,6 +177,7 @@ async fn spawn_daemon_full(
         passphrase: Zeroizing::new("smoke-daemon-pass".to_string()),
         no_tor: false,
         tor_state_dir: None,
+        bridges: Vec::new(),
         dial_onion: None,
         dial_pubkey: None,
         api_socket: api_socket_path.to_string_lossy().into_owned(),
