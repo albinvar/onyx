@@ -6,6 +6,31 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI overhaul (A1) — 2026-06-02 — navigable, multi-select file picker
+
+First slice of the v0.2 TUI work. The Send File modal (Ctrl-F) no longer
+requires typing an absolute path — it's now a real file browser.
+
+### Changed
+- **Send File modal is a navigable browser.** Opens at `$HOME`. `↑/↓` move,
+  `Enter` descends into a directory (or sends, on a file), `←`/`Backspace` go
+  up to the parent, `Space` marks/unmarks a file, `Tab` cycles to the two
+  privacy toggles. Directories are listed first (📁), then files (📄), each
+  sorted case-insensitively; the marked count shows in the title.
+- **Multi-select + multi-send.** Mark several files (across directories) with
+  `Space`; `Enter` on a file sends the whole marked set. Each file is sent via
+  the existing `SendFileToRoom`/`SendFileToPeer` path, with a per-file "📎 sent
+  …" scrollback line and an honest `<n> sent, <m> failed: …` summary on a
+  partial batch. The privacy defaults are unchanged (strip metadata + random
+  filename; toggles opt out).
+
+### Added
+- `read_dir_entries` / `new_send_file_modal` / `send_marked_files` helpers and
+  the `FsEntry` row type; unit tests for listing order (`..` → dirs → files)
+  and the unreadable-dir error path.
+
+---
+
 ## Fortification Phase 5 (F5.2) — 2026-06-02 — static aarch64-musl binary (bare-Termux native, no proot) + rustls
 
 Closes the open question F5.1 left: **can Onyx build as a fully-static musl

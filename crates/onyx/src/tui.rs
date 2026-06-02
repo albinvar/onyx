@@ -241,12 +241,21 @@ enum ModalState {
         /// Where the file goes — a room (`SendFileToRoom`) or a
         /// directly-connected DM peer (`SendFileToPeer`, task 322).
         target: FileTarget,
-        path: String,
+        /// A1 (file picker): directory currently being browsed.
+        cwd: PathBuf,
+        /// Rows in `cwd`: a leading `..`, then dirs, then files.
+        entries: Vec<FsEntry>,
+        /// Highlighted row in `entries`.
+        cursor: usize,
+        /// Multi-selected FILE paths (absolute), accumulated across dirs.
+        marked: Vec<PathBuf>,
         keep_filename: bool,
         keep_metadata: bool,
-        /// 0 = path field, 1 = keep_filename toggle,
+        /// 0 = file browser, 1 = keep_filename toggle,
         /// 2 = keep_metadata toggle.
         focus: usize,
+        /// Last directory-read error, surfaced in the modal.
+        error: Option<String>,
     },
     /// UX overhaul: full keybinding cheat-sheet overlay. Opens on
     /// `F1`. Any key closes it.
@@ -406,6 +415,203 @@ fn file_target_for(entry: SelectedEntry<'_>) -> FileTarget {
             peer_short: p.short_id.clone(),
         },
     }
+}
+
+/// A1 (file picker): one row in the SendFile browser.
+#[derive(Debug, Clone)]
+struct FsEntry {
+    /// Display name; directories get a trailing `/`, the parent is `..`.
+    name: String,
+    /// Absolute path this row points at.
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// Where the file browser opens: `$HOME`, else the process CWD, else `/`.
+fn file_browser_start_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// List a directory for the browser: a leading `..` (unless at the
+/// filesystem root), then directories, then files — each group sorted
+/// case-insensitively. Returns the rows plus an optional read error to
+/// surface in the modal (e.g. a permission-denied directory).
+fn read_dir_entries(dir: &Path) -> (Vec<FsEntry>, Option<String>) {
+    let mut rows = Vec::new();
+    if let Some(parent) = dir.parent() {
+        rows.push(FsEntry {
+            name: "..".to_string(),
+            path: parent.to_path_buf(),
+            is_dir: true,
+        });
+    }
+    let mut items: Vec<FsEntry> = Vec::new();
+    let err = match std::fs::read_dir(dir) {
+        Ok(read) => {
+            for entry in read.flatten() {
+                let path = entry.path();
+                let is_dir = path.is_dir();
+                let mut name = entry.file_name().to_string_lossy().into_owned();
+                if is_dir {
+                    name.push('/');
+                }
+                items.push(FsEntry { name, path, is_dir });
+            }
+            None
+        }
+        Err(e) => Some(format!("cannot read {}: {e}", dir.display())),
+    };
+    // Directories first, then files; alphabetical within each group.
+    items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    rows.extend(items);
+    (rows, err)
+}
+
+/// Build a fresh SendFile browser modal rooted at the start directory.
+fn new_send_file_modal(target: FileTarget) -> ModalState {
+    let cwd = file_browser_start_dir();
+    let (entries, error) = read_dir_entries(&cwd);
+    ModalState::SendFile {
+        target,
+        cwd,
+        entries,
+        cursor: 0,
+        marked: Vec::new(),
+        keep_filename: false,
+        keep_metadata: false,
+        focus: 0,
+        error,
+    }
+}
+
+/// A1: send every marked file to the target, aggregating per-file
+/// results. Mirrors the single-file `SendFileToRoom`/`SendFileToPeer`
+/// success handling (a local "📎 sent …" scrollback line per file), and
+/// reports `<n> sent, <m> failed: …` so a partial batch is honest.
+async fn send_marked_files(
+    app: &mut AppState,
+    target: &FileTarget,
+    paths: &[PathBuf],
+    keep_filename: bool,
+    keep_metadata: bool,
+) {
+    let mut sent = 0usize;
+    let mut errs: Vec<String> = Vec::new();
+    for path in paths {
+        let name = path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let path_str = path.to_string_lossy().to_string();
+        let req = match target {
+            FileTarget::Room { group_id_b32 } => ApiRequest::SendFileToRoom {
+                group_id_b32: group_id_b32.clone(),
+                path: path_str,
+                keep_filename,
+                keep_metadata,
+            },
+            FileTarget::Peer { peer_short } => ApiRequest::SendFileToPeer {
+                peer_short: peer_short.clone(),
+                path: path_str,
+                keep_filename,
+                keep_metadata,
+            },
+        };
+        match client::one_shot(&app.socket_path, &req).await {
+            Ok(ApiResponse::SendFileToRoomOk {
+                group_id_b32,
+                file_id_b32,
+                size,
+                mime,
+                stripped_metadata,
+                chunks,
+                ..
+            }) => {
+                let key = format!("room/{}", short_id(&group_id_b32));
+                push_sent_file_line(
+                    app,
+                    key,
+                    &file_id_b32,
+                    size,
+                    &mime,
+                    stripped_metadata,
+                    chunks,
+                );
+                sent += 1;
+            }
+            Ok(ApiResponse::SendFileToPeerOk {
+                peer_short,
+                file_id_b32,
+                size,
+                mime,
+                stripped_metadata,
+                chunks,
+            }) => {
+                push_sent_file_line(
+                    app,
+                    peer_short,
+                    &file_id_b32,
+                    size,
+                    &mime,
+                    stripped_metadata,
+                    chunks,
+                );
+                sent += 1;
+            }
+            Ok(ApiResponse::Error { message, .. }) => errs.push(format!("{name}: {message}")),
+            Ok(other) => errs.push(format!("{name}: unexpected response: {other:?}")),
+            Err(e) => errs.push(format!("{name}: {e:#}")),
+        }
+    }
+    app.last_send_result = if errs.is_empty() {
+        Some(Ok(()))
+    } else {
+        Some(Err(format!(
+            "{sent} sent, {} failed: {}",
+            errs.len(),
+            errs.join("; ")
+        )))
+    };
+}
+
+/// A1: append the local "📎 sent <file>" line to a conversation's
+/// scrollback (the daemon does not echo outgoing files back as events).
+fn push_sent_file_line(
+    app: &mut AppState,
+    key: String,
+    file_id_b32: &str,
+    size: u64,
+    mime: &str,
+    stripped_metadata: bool,
+    chunks: u32,
+) {
+    let now = now_unix_ms();
+    let label = format!(
+        "📎 sent {} ({} bytes, {}, {} chunks{})",
+        short_id(file_id_b32),
+        size,
+        mime,
+        chunks,
+        if stripped_metadata { ", stripped" } else { "" }
+    );
+    app.scrollback
+        .entry(key.clone())
+        .or_default()
+        .push(ChatLine {
+            direction: MessageDirection::Outgoing,
+            text: label,
+            ts_unix_ms: now,
+            via_hub: false,
+        });
+    app.last_activity_ms.insert(key, now);
 }
 
 /// What the current selection refers to (T6.3.f.2). `Peer` drives
@@ -799,13 +1005,7 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
         // metadata + random filename; toggles flip both in the modal.
         (KeyCode::Char('f'), m) if m.contains(KeyModifiers::CONTROL) => {
             if let Some(target) = app.selected_entry().map(file_target_for) {
-                app.modal = Some(ModalState::SendFile {
-                    target,
-                    path: String::new(),
-                    keep_filename: false,
-                    keep_metadata: false,
-                    focus: 0,
-                });
+                app.modal = Some(new_send_file_modal(target));
             } else {
                 app.last_send_result =
                     Some(Err("send-file needs a peer or room selected".to_string()));
@@ -1083,44 +1283,139 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
         (ModalState::InvitePeer { .. }, KeyCode::Enter) => {
             submit_intent = Some(modal.clone());
         }
-        // T-files.e SendFile arms: Tab cycles (path → keep_filename
-        // → keep_metadata → path), Space toggles the focused
-        // checkbox, Char appends to path, Backspace pops from
-        // path, Enter submits.
+        // ── A1: SendFile is a navigable, multi-select file browser ──
+        // Tab cycles focus: browser → keep_filename → keep_metadata.
         (ModalState::SendFile { focus, .. }, KeyCode::Tab) => {
             *focus = (*focus + 1) % 3;
             app.modal = Some(modal);
             return;
         }
+        // Browser cursor up/down (focus 0).
+        (ModalState::SendFile { focus, cursor, .. }, KeyCode::Up) if *focus == 0 => {
+            *cursor = cursor.saturating_sub(1);
+            app.modal = Some(modal);
+            return;
+        }
         (
             ModalState::SendFile {
-                keep_filename,
-                keep_metadata,
                 focus,
+                cursor,
+                entries,
+                ..
+            },
+            KeyCode::Down,
+        ) if *focus == 0 => {
+            if !entries.is_empty() {
+                *cursor = (*cursor + 1).min(entries.len() - 1);
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        // Left / Backspace go up to the parent directory (focus 0).
+        (
+            ModalState::SendFile {
+                focus,
+                cwd,
+                entries,
+                cursor,
+                error,
+                ..
+            },
+            KeyCode::Left | KeyCode::Backspace,
+        ) if *focus == 0 => {
+            if let Some(parent) = cwd.parent().map(Path::to_path_buf) {
+                *cwd = parent;
+                let (rows, err) = read_dir_entries(cwd);
+                *entries = rows;
+                *error = err;
+                *cursor = 0;
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        // Space marks / unmarks the focused FILE (multi-select). On a
+        // directory it does nothing (use Enter to descend).
+        (
+            ModalState::SendFile {
+                focus,
+                cursor,
+                entries,
+                marked,
                 ..
             },
             KeyCode::Char(' '),
-        ) if *focus != 0 => {
+        ) if *focus == 0 => {
+            if let Some(entry) = entries.get(*cursor) {
+                if !entry.is_dir {
+                    let p = entry.path.clone();
+                    if let Some(pos) = marked.iter().position(|m| m == &p) {
+                        marked.remove(pos);
+                    } else {
+                        marked.push(p);
+                    }
+                }
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        // Space on a toggle row flips it (focus 1 / 2).
+        (
+            ModalState::SendFile {
+                focus,
+                keep_filename,
+                keep_metadata,
+                ..
+            },
+            KeyCode::Char(' '),
+        ) => {
             if *focus == 1 {
                 *keep_filename = !*keep_filename;
-            } else {
+            } else if *focus == 2 {
                 *keep_metadata = !*keep_metadata;
             }
             app.modal = Some(modal);
             return;
         }
-        (ModalState::SendFile { path, focus, .. }, KeyCode::Backspace) if *focus == 0 => {
-            path.pop();
-            app.modal = Some(modal);
-            return;
+        // Enter in the browser: descend into a directory, or on a file
+        // mark it (if not already) and send the whole marked set.
+        (
+            ModalState::SendFile {
+                focus,
+                cursor,
+                entries,
+                cwd,
+                marked,
+                error,
+                ..
+            },
+            KeyCode::Enter,
+        ) if *focus == 0 => {
+            if let Some(entry) = entries.get(*cursor).cloned() {
+                if entry.is_dir {
+                    let next = std::fs::canonicalize(&entry.path).unwrap_or(entry.path);
+                    *cwd = next;
+                    let (rows, err) = read_dir_entries(cwd);
+                    *entries = rows;
+                    *error = err;
+                    *cursor = 0;
+                    app.modal = Some(modal);
+                    return;
+                }
+                if !marked.iter().any(|m| m == &entry.path) {
+                    marked.push(entry.path.clone());
+                }
+                submit_intent = Some(modal.clone());
+            } else {
+                app.modal = Some(modal);
+                return;
+            }
         }
-        (ModalState::SendFile { path, focus, .. }, KeyCode::Char(c)) if *focus == 0 => {
-            path.push(c);
-            app.modal = Some(modal);
-            return;
-        }
-        (ModalState::SendFile { path, .. }, KeyCode::Enter) => {
-            if path.trim().is_empty() {
+        // Enter on a toggle row sends the current marked set (if any).
+        (ModalState::SendFile { marked, .. }, KeyCode::Enter) => {
+            if marked.is_empty() {
+                app.last_send_result = Some(Err(
+                    "no files selected — Space to mark, Enter on a file to send".to_string(),
+                ));
                 app.modal = Some(modal);
                 return;
             }
@@ -1336,6 +1631,19 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
     }
     // Submit path (modal was consumed; don't put back).
     if let Some(submit) = submit_intent {
+        // A1: SendFile sends EACH marked file (multi-select) — handled
+        // here in its own loop rather than the single-request path below.
+        if let ModalState::SendFile {
+            target,
+            marked,
+            keep_filename,
+            keep_metadata,
+            ..
+        } = &submit
+        {
+            send_marked_files(app, target, marked, *keep_filename, *keep_metadata).await;
+            return;
+        }
         let req = match submit {
             ModalState::CreateRoom { name } => Some(ApiRequest::CreateRoom { name }),
             ModalState::InvitePeer {
@@ -1350,30 +1658,10 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 peer_kem_pub_b32: kem_pub_b32,
                 peer_kp_b64: kp_b64,
             }),
-            // T-files.e / task 322: SendFile dispatches to the room
-            // (`SendFileToRoom`) or peer (`SendFileToPeer`) handler
-            // depending on the target. Path trimmed so a trailing
-            // paste-whitespace doesn't blow up open().
-            ModalState::SendFile {
-                target,
-                path,
-                keep_filename,
-                keep_metadata,
-                ..
-            } => Some(match target {
-                FileTarget::Room { group_id_b32 } => ApiRequest::SendFileToRoom {
-                    group_id_b32,
-                    path: path.trim().to_string(),
-                    keep_filename,
-                    keep_metadata,
-                },
-                FileTarget::Peer { peer_short } => ApiRequest::SendFileToPeer {
-                    peer_short,
-                    path: path.trim().to_string(),
-                    keep_filename,
-                    keep_metadata,
-                },
-            }),
+            // A1: SendFile (multi-select) is handled by `send_marked_files`
+            // above and returns early, so this arm is unreachable — it only
+            // exists to keep the match exhaustive.
+            ModalState::SendFile { .. } => None,
             // v0.1.12: accept a pasted invite link — the TUI twin of
             // `onyx accept <url>`. The daemon re-parses + re-verifies the
             // URL, cross-checks the pin store, and picks the tier. We
@@ -1574,13 +1862,7 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
         }
         PaletteAction::SendFile => {
             if let Some(target) = app.selected_entry().map(file_target_for) {
-                app.modal = Some(ModalState::SendFile {
-                    target,
-                    path: String::new(),
-                    keep_filename: false,
-                    keep_metadata: false,
-                    focus: 0,
-                });
+                app.modal = Some(new_send_file_modal(target));
             } else {
                 app.last_send_result =
                     Some(Err("send-file needs a peer or room selected".to_string()));
@@ -2284,6 +2566,140 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 // clippy default. Each variant block is self-contained (different
 // fields, different layouts) so splitting into helpers would just
 // chase the line count around without improving readability.
+/// A1 (file picker): render the navigable, multi-select SendFile browser —
+/// a cwd header, a directory listing (dirs first, files mark-able), the two
+/// privacy toggles, and a keybinding/error hint line.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn render_send_file_modal(
+    frame: &mut ratatui::Frame<'_>,
+    rect: Rect,
+    target: &FileTarget,
+    cwd: &Path,
+    entries: &[FsEntry],
+    cursor: usize,
+    marked: &[PathBuf],
+    keep_filename: bool,
+    keep_metadata: bool,
+    focus: usize,
+    error: Option<&str>,
+) {
+    let dest = match target {
+        FileTarget::Room { group_id_b32 } => format!("room/{}", short_id(group_id_b32)),
+        FileTarget::Peer { peer_short } => format!("{peer_short} (DM)"),
+    };
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        format!(" Send File → {dest}   ({} selected) ", marked.len()),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // cwd path
+            Constraint::Min(3),    // file listing
+            Constraint::Length(2), // toggles
+            Constraint::Length(2), // hint / error
+        ])
+        .split(inner);
+
+    // cwd header.
+    let cwd_line = Line::from(vec![
+        Span::styled("📂 ", Style::default().fg(Color::Magenta)),
+        Span::styled(
+            truncate_for_display(
+                &cwd.to_string_lossy(),
+                usize::from(inner.width).saturating_sub(4),
+            ),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(cwd_line), chunks[0]);
+
+    // File listing — dirs first, files mark-able with Space.
+    let browser_focused = focus == 0;
+    let rows: Vec<ListItem<'_>> = entries
+        .iter()
+        .map(|e| {
+            let is_marked = !e.is_dir && marked.iter().any(|m| m == &e.path);
+            let mark = if is_marked {
+                "[x] "
+            } else if e.is_dir {
+                "    "
+            } else {
+                "[ ] "
+            };
+            let icon = if e.is_dir { "📁 " } else { "📄 " };
+            let style = if e.is_dir {
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_marked {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(Color::Green)),
+                Span::styled(format!("{icon}{}", e.name), style),
+            ]))
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    if !entries.is_empty() {
+        list_state.select(Some(cursor.min(entries.len() - 1)));
+    }
+    let highlight = if browser_focused {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let list = List::new(rows)
+        .highlight_style(highlight)
+        .highlight_symbol(if browser_focused { "▶ " } else { "  " });
+    frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    // Privacy toggles.
+    let mk_toggle = |label: &str, val: bool, idx: usize| -> Line<'_> {
+        let focused = focus == idx;
+        let glyph = if val { "[x]" } else { "[ ]" };
+        Line::from(vec![
+            Span::styled(
+                if focused { "▶ " } else { "  " },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{glyph} {label}"),
+                Style::default().fg(if focused { Color::Yellow } else { Color::Gray }),
+            ),
+        ])
+    };
+    let toggles = Paragraph::new(vec![
+        mk_toggle("keep original filename", keep_filename, 1),
+        mk_toggle("keep metadata (no EXIF/etc. strip)", keep_metadata, 2),
+    ]);
+    frame.render_widget(toggles, chunks[2]);
+
+    // Hint or error, plus the privacy-default reminder.
+    let first = error.map_or_else(
+        || {
+            Line::from(Span::styled(
+                " ↑↓ move · Enter open dir / send file · Space mark · ←/Bksp up · Tab toggles · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ))
+        },
+        |err| Line::from(Span::styled(format!(" {err}"), Style::default().fg(Color::Red))),
+    );
+    let defaults = Line::from(Span::styled(
+        " default: strip metadata + random filename (privacy first) — see FILES.md §4",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(vec![first, defaults]), chunks[3]);
+}
+
 #[allow(clippy::too_many_lines)]
 // Several modal kinds intentionally map to the same height; keeping the
 // arms separate documents each modal rather than collapsing them.
@@ -2294,7 +2710,8 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
     let height = match modal {
         ModalState::CreateRoom { .. } => 7,
         ModalState::InvitePeer { .. } => 17,
-        ModalState::SendFile { .. } => 13,
+        // A1: the file browser wants vertical room for the listing.
+        ModalState::SendFile { .. } => area.height.saturating_sub(2).min(24),
         ModalState::Help => 18,
         ModalState::CommandPalette { .. } => {
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
@@ -2402,88 +2819,27 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         }
         ModalState::SendFile {
             target,
-            path,
+            cwd,
+            entries,
+            cursor,
+            marked,
             keep_filename,
             keep_metadata,
             focus,
-        } => {
-            // T-files.e / task 322: send-file modal. Three rows. Path
-            // is a free-form line; the two toggles are rendered as
-            // [x]/[ ] checkboxes. Hint at the bottom reminds the
-            // operator what defaults-off means (FILES.md §3).
-            let block = Block::default().borders(Borders::ALL).title(Span::styled(
-                " Send File  (Tab=cycle, Space=toggle, Esc=cancel, Enter=send) ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            let sending_to = match target {
-                FileTarget::Room { group_id_b32 } => format!(" → room/{} ", short_id(group_id_b32)),
-                FileTarget::Peer { peer_short } => format!(" → {peer_short} (DM) "),
-            };
-            let path_focused = *focus == 0;
-            let path_line = Line::from(vec![
-                Span::styled(
-                    if path_focused {
-                        "▶ Path: "
-                    } else {
-                        "  Path: "
-                    },
-                    Style::default().fg(if path_focused {
-                        Color::Yellow
-                    } else {
-                        Color::Gray
-                    }),
-                ),
-                Span::styled(
-                    truncate_for_display(path, 60),
-                    Style::default().fg(Color::White),
-                ),
-                if path_focused {
-                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK))
-                } else {
-                    Span::raw("")
-                },
-            ]);
-            let mk_toggle = |label: &str, val: bool, idx: usize| -> Line<'_> {
-                let focused = *focus == idx;
-                let box_glyph = if val { "[x]" } else { "[ ]" };
-                Line::from(vec![
-                    Span::styled(
-                        if focused { "▶ " } else { "  " },
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        format!("{box_glyph} {label}"),
-                        Style::default().fg(if focused { Color::Yellow } else { Color::White }),
-                    ),
-                ])
-            };
-            let body = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    sending_to,
-                    Style::default().fg(Color::Magenta),
-                )),
-                Line::from(""),
-                path_line,
-                Line::from(""),
-                mk_toggle(
-                    "Keep original filename (otherwise random)",
-                    *keep_filename,
-                    1,
-                ),
-                mk_toggle("Keep metadata (no EXIF/etc. strip)", *keep_metadata, 2),
-                Line::from(""),
-                Line::from(Span::styled(
-                    " Default: strip metadata + random filename (privacy first).",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    " Sender-side size cap applies — see FILES.md §4.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-            .block(block);
-            frame.render_widget(body, rect);
-        }
+            error,
+        } => render_send_file_modal(
+            frame,
+            rect,
+            target,
+            cwd,
+            entries,
+            *cursor,
+            marked,
+            *keep_filename,
+            *keep_metadata,
+            *focus,
+            error.as_deref(),
+        ),
         ModalState::Help => render_help_modal(frame, rect),
         ModalState::CommandPalette { query, selected } => {
             render_palette_modal(frame, rect, query, *selected);
@@ -3725,6 +4081,43 @@ mod snapshot_tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    // A1 (file picker): the listing puts `..` first, then directories,
+    // then files — each group sorted case-insensitively — and file rows
+    // carry absolute paths. This is the pure logic the browser navigates.
+    #[test]
+    fn read_dir_entries_orders_parent_dirs_then_files() {
+        let base = std::env::temp_dir().join(format!("onyx_picker_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zsub")).unwrap();
+        std::fs::create_dir_all(base.join("Asub")).unwrap();
+        std::fs::write(base.join("banana.txt"), b"x").unwrap();
+        std::fs::write(base.join("apple.txt"), b"y").unwrap();
+
+        let (rows, err) = read_dir_entries(&base);
+        assert!(err.is_none(), "reading a readable dir should not error");
+        assert_eq!(rows[0].name, "..", "first row is the parent");
+        assert!(rows[0].is_dir);
+        let names: Vec<&str> = rows.iter().skip(1).map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Asub/", "zsub/", "apple.txt", "banana.txt"]);
+
+        let apple = rows.iter().find(|e| e.name == "apple.txt").unwrap();
+        assert!(!apple.is_dir);
+        assert!(apple.path.is_absolute() && apple.path.ends_with("apple.txt"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A unreadable / nonexistent directory surfaces an error but still
+    // yields the `..` row so the user can navigate back out.
+    #[test]
+    fn read_dir_entries_reports_error_but_keeps_parent() {
+        let missing = std::env::temp_dir().join(format!("onyx_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let (rows, err) = read_dir_entries(&missing);
+        assert!(err.is_some(), "a missing dir should report a read error");
+        assert_eq!(rows[0].name, "..");
+    }
 
     fn mock_app_with_status(tor_state: TorState) -> AppState {
         let mut app = AppState::new(PathBuf::from("./onyxd.sock"));
