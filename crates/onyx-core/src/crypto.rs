@@ -455,6 +455,41 @@ pub fn blake2b_256(inputs: &[&[u8]]) -> [u8; 32] {
     result
 }
 
+/// A deterministic, symmetric "safety number" for two identities, à la
+/// Signal. Both peers compute the SAME value from their two canonical
+/// base32 identity keys, so reading it aloud out-of-band (a phone call, in
+/// person) and confirming a match proves there is no man-in-the-middle: an
+/// attacker who substituted either identity key produces a different
+/// number. 30 digits, grouped in 5s for readability.
+///
+/// This is a *display* aid layered on top of TOFU pinning — it does not by
+/// itself change trust state; the value is the human comparison.
+#[must_use]
+pub fn safety_number(left_b32: &str, right_b32: &str) -> String {
+    // Order-independent: sort so each side hashes identical input.
+    let (lo, hi) = if left_b32 <= right_b32 {
+        (left_b32, right_b32)
+    } else {
+        (right_b32, left_b32)
+    };
+    let digest = blake2b_256(&[
+        b"onyx-safety-number-v1",
+        lo.as_bytes(),
+        b"\0",
+        hi.as_bytes(),
+    ]);
+    // 6 groups of 5 digits, each derived from 5 hash bytes mod 100000.
+    let mut groups: Vec<String> = Vec::with_capacity(6);
+    for chunk in digest.chunks(5).take(6) {
+        let mut v: u64 = 0;
+        for &b in chunk {
+            v = (v << 8) | u64::from(b);
+        }
+        groups.push(format!("{:05}", v % 100_000));
+    }
+    groups.join(" ")
+}
+
 // ── Argon2id ────────────────────────────────────────────────────────────────
 
 /// Argon2id parameters for the passphrase-derived vault key (DESIGN.md §7.1).
@@ -1074,6 +1109,28 @@ mod tests {
         assert_eq!(split, joined);
 
         assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn safety_number_is_symmetric_deterministic_and_distinct() {
+        let a = "aaaaidentitykeyaaaa";
+        let b = "bbbbidentitykeybbbb";
+        let c = "ccccidentitykeycccc";
+        // Symmetric: both peers (a,b) and (b,a) get the same number.
+        assert_eq!(safety_number(a, b), safety_number(b, a));
+        // Deterministic.
+        assert_eq!(safety_number(a, b), safety_number(a, b));
+        // A different counterparty yields a different number (so a swapped
+        // identity key is visible).
+        assert_ne!(safety_number(a, b), safety_number(a, c));
+        // Shape: 6 groups of 5 digits, all numeric.
+        let num = safety_number(a, b);
+        let groups: Vec<&str> = num.split(' ').collect();
+        assert_eq!(groups.len(), 6);
+        for g in groups {
+            assert_eq!(g.len(), 5);
+            assert!(g.chars().all(|c| c.is_ascii_digit()));
+        }
     }
 
     #[test]

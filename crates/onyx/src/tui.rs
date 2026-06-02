@@ -314,6 +314,13 @@ enum ModalState {
     AddByCode {
         input: String,
     },
+    /// C (verification): Signal-style safety number for the selected 1:1
+    /// peer — computed client-side from my identity key + the peer's, shown
+    /// for out-of-band comparison. Read-only; any key closes.
+    Verify {
+        peer_short: String,
+        number: String,
+    },
     /// v0.1.12: TUI-managed hub / dial / reachability editor. Reads
     /// `~/.onyx/config.json` on open and writes it back on save (Ctrl-S).
     /// Changes apply on the next `onyx` launch (the embedded daemon
@@ -344,6 +351,7 @@ enum PaletteAction {
     CreateRoom,
     InvitePeer,
     SendFile,
+    VerifyContact,
     CopyInvite,
     AcceptInvite,
     ManageHubs,
@@ -354,10 +362,11 @@ enum PaletteAction {
 
 impl PaletteAction {
     /// All actions, in palette display order.
-    const ALL: [PaletteAction; 9] = [
+    const ALL: [PaletteAction; 10] = [
         PaletteAction::CreateRoom,
         PaletteAction::InvitePeer,
         PaletteAction::SendFile,
+        PaletteAction::VerifyContact,
         PaletteAction::CopyInvite,
         PaletteAction::AcceptInvite,
         PaletteAction::ManageHubs,
@@ -372,6 +381,7 @@ impl PaletteAction {
             PaletteAction::CreateRoom => "Create room",
             PaletteAction::InvitePeer => "Invite peer to room",
             PaletteAction::SendFile => "Send file (room or DM peer)",
+            PaletteAction::VerifyContact => "Verify contact (safety number)",
             PaletteAction::CopyInvite => "Copy my invite link",
             PaletteAction::AcceptInvite => "Accept invite link (paste)",
             PaletteAction::ManageHubs => "Manage hubs / dial / reachability",
@@ -390,7 +400,7 @@ impl PaletteAction {
             PaletteAction::CopyInvite => "^E",
             PaletteAction::AcceptInvite => "^A",
             PaletteAction::ManageHubs => "^G",
-            PaletteAction::Settings => "",
+            PaletteAction::VerifyContact | PaletteAction::Settings => "",
             PaletteAction::Help => "F1",
             PaletteAction::Quit => "^C",
         }
@@ -1165,7 +1175,9 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
             // v0.1.16: the connect-code screen is read-only too.
-            | ModalState::ConnectCode { .. },
+            | ModalState::ConnectCode { .. }
+            // C: the safety-number screen is read-only.
+            | ModalState::Verify { .. },
             _,
         ) => {
             return;
@@ -1696,6 +1708,8 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
             | ModalState::ConnectCode { .. }
+            // C: the safety-number screen is read-only (never submits).
+            | ModalState::Verify { .. }
             // ManageHubs is handled inline (saves a file, no API call), so
             // it never sets submit_intent — but the match must cover it.
             | ModalState::ManageHubs { .. } => None,
@@ -1868,6 +1882,10 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
                     Some(Err("send-file needs a peer or room selected".to_string()));
             }
         }
+        PaletteAction::VerifyContact => match build_verify_modal(app) {
+            Ok(modal) => app.modal = Some(modal),
+            Err(e) => app.last_send_result = Some(Err(e)),
+        },
         PaletteAction::CopyInvite => open_invite_modal(app).await,
         PaletteAction::AcceptInvite => {
             app.modal = Some(ModalState::AcceptInvite {
@@ -1976,6 +1994,27 @@ fn open_connect_code_modal(app: &AppState) -> ModalState {
                 .to_string(),
             copied: false,
         },
+    }
+}
+
+/// C (verification): build the safety-number modal for the selected 1:1
+/// peer. The number is derived client-side from my identity key + the
+/// peer's (both already known to the TUI) — no daemon round-trip. Errors if
+/// the identity isn't loaded yet, or the selection is a room / nothing.
+fn build_verify_modal(app: &AppState) -> Result<ModalState, String> {
+    let mine = match &app.last_status {
+        Some(Ok(snap)) => snap.identity_pub_b32.clone(),
+        _ => return Err("identity not loaded yet — wait for the status line".to_string()),
+    };
+    match app.selected_entry() {
+        Some(SelectedEntry::Peer(p)) => Ok(ModalState::Verify {
+            peer_short: p.short_id.clone(),
+            number: onyx_core::crypto::safety_number(&mine, &p.pubkey_b32),
+        }),
+        Some(SelectedEntry::Room(_)) => {
+            Err("safety numbers are for 1:1 peers, not rooms".to_string())
+        }
+        None => Err("select a peer to verify".to_string()),
     }
 }
 
@@ -2184,6 +2223,10 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
         "hubs" | "hub" => run_palette_action(app, PaletteAction::ManageHubs).await,
         "settings" | "set" => run_palette_action(app, PaletteAction::Settings).await,
         "connect" | "code" => app.modal = Some(open_connect_code_modal(app)),
+        "verify" | "safety" => match build_verify_modal(app) {
+            Ok(modal) => app.modal = Some(modal),
+            Err(e) => app.last_send_result = Some(Err(e)),
+        },
         "quit" | "q" | "exit" => app.quit_requested = true,
         "clear" | "cls" => {
             if let Some(key) = app.selected_entry().map(|e| e.scrollback_key()) {
@@ -2250,7 +2293,7 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
         }
         other => {
             app.last_send_result = Some(Err(format!(
-                "unknown command /{other} — try /help /file /room /invite /accept /add /connect /hubs /settings /clear /quit"
+                "unknown command /{other} — try /help /file /room /invite /accept /add /connect /verify /hubs /settings /clear /quit"
             )));
         }
     }
@@ -2841,6 +2884,8 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         // v0.1.16: connect-code screens.
         ModalState::ConnectCode { .. } => 11,
         ModalState::AddByCode { .. } => 9,
+        // C: safety-number display + instructions.
+        ModalState::Verify { .. } => 12,
         // v0.1.12: hub manager grows with the hub list (+ fixed controls).
         ModalState::ManageHubs { hubs, .. } => u16::try_from(hubs.len() + 12)
             .unwrap_or(20)
@@ -3077,6 +3122,47 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
                 Line::from(""),
                 Line::from(Span::styled(
                     " Connects directly over Tor — no hub needed. ",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(body, rect);
+        }
+        // C: safety-number verification screen (read-only).
+        ModalState::Verify { peer_short, number } => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Verify Contact  (any key to close) ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let body = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Safety number with {peer_short}:"),
+                    Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("    {number}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Read it aloud over a trusted channel (a call, in person).",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  Same on both screens → no eavesdropper; the keys are real.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  Different → do NOT trust this contact.",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -3364,7 +3450,7 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         Line::from(""),
         head("Slash commands (type in the composer)"),
         key("/help /file", "/room [name] · /invite · /accept [url]"),
-        key("/add [code]", "/connect · /hubs · /settings"),
+        key("/add [code]", "/connect · /verify · /hubs · /settings"),
         key("/clear", "clear this conversation · /quit"),
         Line::from(""),
         head("General"),
