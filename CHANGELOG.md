@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 3 (F3.1 / P-3) — 2026-06-02 — inbound delivery off the read loop
+
+Closes the P-3 / A2.5 head-of-line DoS (THREAT_MODEL §8.4). Inbound hub
+deliveries were decapsulated + MLS-processed **inline** in each session's
+read loop, so a flood of junk envelopes to your inbox stalled that session's
+outbound sends and keepalive while the daemon churned on failed decryptions.
+
+### Changed
+- **Per-daemon bounded delivery worker.** Each hub session's `on_deliver`
+  now does a **non-blocking `try_send`** into a bounded (1024) channel; a
+  single ordered worker performs the expensive part (sealed-envelope KEM
+  decapsulation, MLS welcome processing, vault writes) off the read loop.
+  Result: a junk flood can no longer head-of-line-block a session's liveness.
+- **Sheds under flood** at the enqueue (bounded queue) rather than growing
+  memory unboundedly — the hub retains queued envelopes and the recipient's
+  replay guard dedups any re-delivery. **Single** worker → global message
+  ordering + replay-dedup preserved across all hubs.
+- Unified through the existing `supervise_hub_session` (Tor + TCP paths);
+  the per-session hybrid-KEM secret is no longer threaded (only the worker
+  holds it now).
+
+### Verified
+- All 9 integration smoke tests pass — room messages, DMs, and bootstraps
+  still route correctly end-to-end through the decoupled worker. 74 daemon +
+  298 core lib tests pass; new code clippy-clean. (DoS-resistance is
+  structural — the read loop now only enqueues; a deterministic flood test
+  would be timing-flaky, so it's argued, not asserted.)
+
+### Docs
+- `THREAT_MODEL.md` §8.4: P-3 row moved from **Open** to **Resolved (F3.1)**.
+
+---
+
 ## Fortification Phase 4 — 2026-06-02 — audit-residual defense-in-depth
 
 Small, high-confidence hardening of the audit-residual items (the LOW
