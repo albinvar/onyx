@@ -6,6 +6,31 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 2 (F2.1) — 2026-06-02 — design doc: oblivious routing (no code yet)
+
+Design-first, per the agreed approach for the architectural phase. Adds
+`OBLIVIOUS-ROUTING.md` — the design for "separated pub/sub + oblivious-
+recipient routing," reviewed against the actual code before any change.
+
+Key findings recorded:
+- **Established conversations already route obliviously** (high-entropy
+  per-(room,epoch) `session_token`s — the hub can't link them to an
+  identity or tell rooms apart). The residual leak is **first-contact
+  only** (the deterministic `introduction_inbox(fp)`).
+- The real Part-B win is **decoupling identity from activity** (not literally
+  "publish vs subscribe"): in reachable mode, run an *identity session*
+  (long-term keys, KP + intro-inbox) separate from an *activity session*
+  (ephemeral keys, room/DM session-tokens + outbound), so the hub can't link
+  bob to his room set. No-op for the private default (already an ephemeral
+  activity-only session). It's a contained but real supervisor refactor on
+  the opt-in path; the default path stays byte-identical.
+- **Oblivious first-contact (Part C): lean on connect-codes, defer PIR/ORAM.**
+  The connect-code direct dial (v0.1.16) already gives the strongest
+  oblivious first contact (no relay at all); PIR-grade relay stays deferred
+  in `ROTATION.md` §6.
+
+---
+
 ## Fortification Phase 1 (F1.4) — 2026-06-02 — connect-time rotation: resolved by analysis (no code)
 
 The plan listed "session-resume routing-id rotation" as a Phase-1 item.
