@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 1 (F1.4) — 2026-06-02 — connect-time rotation: resolved by analysis (no code)
+
+The plan listed "session-resume routing-id rotation" as a Phase-1 item.
+After review it is **deliberately not shipped as a feature**, because
+`ROTATION.md` already proves rotation *alone* is a non-fix: it relocates
+the §3.2 leak rather than closing it, and would add lockstep sender/
+recipient epoch coordination whose desync risk is real delivery breakage
+for no privacy gain.
+
+- The one leak rotation could help (Noise authenticating your identity
+  before any subscription) is **already closed by the private default
+  (D-1)**: `--first-contact-reachable` defaults OFF, so the daemon already
+  uses a fresh per-connection ephemeral Noise static + ephemeral SUBSCRIBE
+  key and skips intro-inbox/KP. The hub authenticates "some ephemeral
+  peer," not you — which is what rotation was meant to approximate.
+- The genuine residual (separated publish/subscribe connections +
+  oblivious-recipient routing) is architectural and tracked as
+  fortification **Phase 2 (F2.1)**, not a Phase-1 rotation tweak.
+- Decision recorded in `ROTATION.md` §8. Shipping a rotation feature here
+  would have been a false-assurance non-fix.
+
+**Phase 1 (timing/correlation) is complete:** F1.1 constant-rate hub,
+F1.2 wire measurement, F1.3 default decision + `--high-security`, F1.4
+resolved by analysis.
+
+---
+
 ## Fortification Phase 1 (F1.3) — 2026-06-02 — cover-traffic default decision + `--high-security`
 
 The decision half of Phase 1's timing work, grounded in the F1.2 numbers.
