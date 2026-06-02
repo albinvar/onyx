@@ -267,12 +267,18 @@ enum ModalState {
         query: String,
         selected: usize,
     },
-    /// UX overhaul: shows this identity's invite URL (built from
-    /// Identity + KeyPackage + configured hubs) and whether it was
-    /// copied to the clipboard via OSC52. Opens on `Ctrl-E`. The URL
-    /// is fetched async when the modal opens.
-    Invite {
-        url: String,
+    /// Unified "Share my contact" screen (Ctrl-E). Shows BOTH ways a peer
+    /// can reach you — the hub-routed invite link AND the direct connect
+    /// code — so you don't have to remember which key opens which. `↑/↓`
+    /// pick a row; `Enter`/`c` copies it; `Esc` closes. Both strings are
+    /// fetched when the modal opens (invite via the daemon, connect code
+    /// from the published onion).
+    Share {
+        invite_url: String,
+        connect_code: String,
+        /// 0 = invite link, 1 = connect code.
+        selected: usize,
+        /// Set true after a successful copy (for the badge).
         copied: bool,
     },
     /// Task 324: read-only settings / identity panel — your
@@ -292,26 +298,12 @@ enum ModalState {
         lines: Vec<String>,
         scroll: u16,
     },
-    /// v0.1.12: paste a peer's `onyx://invite/v…` URL and accept it
-    /// in-app — the TUI equivalent of `onyx accept <url>`. Opens on
-    /// `Ctrl-A` or via the command palette. `input` is the single
-    /// text field; `Enter` dispatches `ApiRequest::SendInvite` (the
-    /// daemon re-parses + re-verifies the URL, cross-checks the pin
-    /// store, and picks the tier). `Esc` closes without sending.
-    AcceptInvite {
-        input: String,
-    },
-    /// v0.1.16 (easy-connect): read-only "your connect code" screen
-    /// (Ctrl-Y). Shows the `onyx://connect/v1?…` code (onion + identity
-    /// key) a peer pastes to dial you directly, no hub. Any key closes.
-    ConnectCode {
-        code: String,
-        copied: bool,
-    },
-    /// v0.1.16 (easy-connect): paste-a-peer's-connect-code input
-    /// (Ctrl-D). On Enter, parse the code and `DialPeer` that peer
-    /// directly over Tor — one-step add-a-contact, no hub.
-    AddByCode {
+    /// Unified "Add a contact" screen (Ctrl-A). Paste EITHER an
+    /// `onyx://invite/v…` link (hub-routed first contact) OR an
+    /// `onyx://connect/v1?…` code (direct dial) — on `Enter` we auto-detect
+    /// the format and route to the right action (SendInvite vs DialPeer),
+    /// so there's no separate "accept" vs "add" to remember. `Esc` closes.
+    AddContact {
         input: String,
     },
     /// C (verification): Signal-style safety number for the selected 1:1
@@ -362,8 +354,8 @@ enum PaletteAction {
     SendFile,
     SearchMessages,
     VerifyContact,
-    CopyInvite,
-    AcceptInvite,
+    ShareContact,
+    AddContact,
     ManageHubs,
     Settings,
     Help,
@@ -378,8 +370,8 @@ impl PaletteAction {
         PaletteAction::SendFile,
         PaletteAction::SearchMessages,
         PaletteAction::VerifyContact,
-        PaletteAction::CopyInvite,
-        PaletteAction::AcceptInvite,
+        PaletteAction::ShareContact,
+        PaletteAction::AddContact,
         PaletteAction::ManageHubs,
         PaletteAction::Settings,
         PaletteAction::Help,
@@ -394,8 +386,8 @@ impl PaletteAction {
             PaletteAction::SendFile => "Send file (room or DM peer)",
             PaletteAction::SearchMessages => "Search messages",
             PaletteAction::VerifyContact => "Verify contact (safety number)",
-            PaletteAction::CopyInvite => "Copy my invite link",
-            PaletteAction::AcceptInvite => "Accept invite link (paste)",
+            PaletteAction::ShareContact => "Share my contact (invite link + connect code)",
+            PaletteAction::AddContact => "Add a contact (paste invite or connect code)",
             PaletteAction::ManageHubs => "Manage hubs / dial / reachability",
             PaletteAction::Settings => "Settings / identity",
             PaletteAction::Help => "Show keyboard help",
@@ -409,8 +401,8 @@ impl PaletteAction {
             PaletteAction::CreateRoom => "^N",
             PaletteAction::InvitePeer => "^I",
             PaletteAction::SendFile => "^F",
-            PaletteAction::CopyInvite => "^E",
-            PaletteAction::AcceptInvite => "^A",
+            PaletteAction::ShareContact => "^E",
+            PaletteAction::AddContact => "^A",
             PaletteAction::ManageHubs => "^G",
             PaletteAction::SearchMessages
             | PaletteAction::VerifyContact
@@ -1058,31 +1050,18 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             });
             return false;
         }
-        // UX overhaul: Ctrl-E builds + shows + copies the invite link.
+        // Ctrl-E: "Share my contact" — one screen with BOTH your invite
+        // link and your connect code, each copyable (replaces the old
+        // separate Ctrl-E invite + Ctrl-Y connect-code).
         (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
-            open_invite_modal(app).await;
+            open_share_modal(app).await;
             return false;
         }
-        // v0.1.12: Ctrl-A opens the accept-invite modal — paste a peer's
-        // onyx:// URL to start a conversation in-app (no CLI needed).
+        // Ctrl-A: "Add a contact" — paste an onyx://invite/… OR
+        // onyx://connect/… and it auto-detects which (replaces the old
+        // separate Ctrl-A accept-invite + Ctrl-D add-by-code).
         (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => {
-            app.modal = Some(ModalState::AcceptInvite {
-                input: String::new(),
-            });
-            return false;
-        }
-        // v0.1.16: Ctrl-Y shows YOUR connect code (onion + identity key)
-        // so a peer can add you directly. Needs the onion, which only
-        // exists once Tor has published the hidden service — the helper
-        // shows a clear placeholder until then.
-        (KeyCode::Char('y'), m) if m.contains(KeyModifiers::CONTROL) => {
-            app.modal = Some(open_connect_code_modal(app));
-            return false;
-        }
-        // v0.1.16: Ctrl-D opens "add by connect code" — paste a peer's
-        // code to dial them directly over Tor (no hub needed).
-        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
-            app.modal = Some(ModalState::AddByCode {
+            app.modal = Some(ModalState::AddContact {
                 input: String::new(),
             });
             return false;
@@ -1185,11 +1164,8 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
         (_, KeyCode::Esc)
         | (
             ModalState::Help
-            | ModalState::Invite { .. }
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
-            // v0.1.16: the connect-code screen is read-only too.
-            | ModalState::ConnectCode { .. }
             // C: the safety-number screen is read-only.
             | ModalState::Verify { .. },
             _,
@@ -1447,48 +1423,51 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             }
             submit_intent = Some(modal.clone());
         }
-        (ModalState::AcceptInvite { input }, KeyCode::Backspace) => {
+        // Unified "Add a contact": one text field; Enter auto-detects
+        // invite-link vs connect-code (validated in the submit dispatch).
+        (ModalState::AddContact { input }, KeyCode::Backspace) => {
             input.pop();
             app.modal = Some(modal);
             return;
         }
-        (ModalState::AcceptInvite { input }, KeyCode::Char(c)) => {
+        (ModalState::AddContact { input }, KeyCode::Char(c)) => {
             input.push(c);
             app.modal = Some(modal);
             return;
         }
-        (ModalState::AcceptInvite { input }, KeyCode::Enter) => {
-            // Reject empty / obviously-wrong input before bothering the
-            // daemon. The daemon does the real parse + signature verify.
-            if !input.trim().starts_with("onyx://invite/") {
+        (ModalState::AddContact { input }, KeyCode::Enter) => {
+            let t = input.trim();
+            if !(t.starts_with("onyx://invite/") || t.starts_with("onyx://connect/")) {
                 app.last_send_result = Some(Err(
-                    "paste a full onyx://invite/v… link to accept".to_string()
+                    "paste an onyx://invite/v… link or an onyx://connect/v1?… code".to_string(),
                 ));
                 app.modal = Some(modal);
                 return;
             }
             submit_intent = Some(modal.clone());
         }
-        (ModalState::AddByCode { input }, KeyCode::Backspace) => {
-            input.pop();
+        // ── "Share my contact": pick a row, copy it ─────────────────
+        (ModalState::Share { selected, .. }, KeyCode::Up | KeyCode::Down) => {
+            *selected = 1 - *selected; // toggle 0 <-> 1 (two rows)
             app.modal = Some(modal);
             return;
         }
-        (ModalState::AddByCode { input }, KeyCode::Char(c)) => {
-            input.push(c);
-            app.modal = Some(modal);
-            return;
-        }
-        (ModalState::AddByCode { input }, KeyCode::Enter) => {
-            // Cheap guard; the daemon re-parses the connect code.
-            if !input.trim().starts_with("onyx://connect/") {
-                app.last_send_result = Some(Err(
-                    "paste a full onyx://connect/v1?\u{2026} connect code".to_string(),
-                ));
-                app.modal = Some(modal);
-                return;
+        (
+            ModalState::Share {
+                invite_url,
+                connect_code,
+                selected,
+                copied,
+            },
+            KeyCode::Enter | KeyCode::Char('c'),
+        ) => {
+            let text = if *selected == 0 { invite_url } else { connect_code };
+            // Don't "copy" a placeholder string (they start with '(').
+            if !text.starts_with('(') {
+                *copied = copy_to_clipboard(text);
             }
-            submit_intent = Some(modal.clone());
+            app.modal = Some(modal);
+            return;
         }
         // ── B: message search ──────────────────────────────────────
         // Up/Down move the selected hit; Enter jumps to its conversation;
@@ -1751,40 +1730,40 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             // above and returns early, so this arm is unreachable — it only
             // exists to keep the match exhaustive.
             ModalState::SendFile { .. } => None,
-            // v0.1.12: accept a pasted invite link — the TUI twin of
-            // `onyx accept <url>`. The daemon re-parses + re-verifies the
-            // URL, cross-checks the pin store, and picks the tier. We
-            // refuse unsigned (v1) by default here too (no in-TUI danger
-            // override — re-issue a signed link instead).
-            ModalState::AcceptInvite { input } => Some(ApiRequest::SendInvite {
-                url: input.trim().to_string(),
-                text: String::new(),
-                insecure_accept_unsigned: false,
-            }),
-            // v0.1.16: add a peer by their connect code → dial them
-            // directly over Tor (no hub). Parse here; a bad code surfaces
-            // an error and dispatches nothing.
-            ModalState::AddByCode { input } => {
-                match onyx_core::connect::ConnectCode::parse(&input) {
-                    Ok(c) => Some(ApiRequest::DialPeer {
-                        onion: c.onion,
-                        pubkey_b32: c.identity_pub_b32,
-                    }),
-                    Err(e) => {
-                        app.last_send_result = Some(Err(format!("bad connect code: {e}")));
-                        None
+            // Unified "Add a contact": auto-detect the pasted format.
+            //  • onyx://invite/…  → SendInvite (hub-routed first contact;
+            //    the daemon re-parses + re-verifies + picks the tier; we
+            //    refuse unsigned by default — re-issue a signed link).
+            //  • onyx://connect/… → DialPeer (direct dial over Tor).
+            ModalState::AddContact { input } => {
+                let t = input.trim();
+                if t.starts_with("onyx://connect/") {
+                    match onyx_core::connect::ConnectCode::parse(t) {
+                        Ok(c) => Some(ApiRequest::DialPeer {
+                            onion: c.onion,
+                            pubkey_b32: c.identity_pub_b32,
+                        }),
+                        Err(e) => {
+                            app.last_send_result = Some(Err(format!("bad connect code: {e}")));
+                            None
+                        }
                     }
+                } else {
+                    Some(ApiRequest::SendInvite {
+                        url: t.to_string(),
+                        text: String::new(),
+                        insecure_accept_unsigned: false,
+                    })
                 }
             }
-            // Help / CommandPalette / Invite / Settings / ConnectCode never
-            // set submit_intent (handled inline above / read-only), so they
-            // can't reach here.
+            // These never set submit_intent (handled inline above / read-
+            // only / copy-only), so they can't reach here.
             ModalState::Help
             | ModalState::CommandPalette { .. }
-            | ModalState::Invite { .. }
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
-            | ModalState::ConnectCode { .. }
+            // "Share my contact" copies inline (never submits).
+            | ModalState::Share { .. }
             // C: the safety-number screen is read-only (never submits).
             | ModalState::Verify { .. }
             // B: search jumps inline on Enter (never submits).
@@ -1966,9 +1945,9 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
             Ok(modal) => app.modal = Some(modal),
             Err(e) => app.last_send_result = Some(Err(e)),
         },
-        PaletteAction::CopyInvite => open_invite_modal(app).await,
-        PaletteAction::AcceptInvite => {
-            app.modal = Some(ModalState::AcceptInvite {
+        PaletteAction::ShareContact => open_share_modal(app).await,
+        PaletteAction::AddContact => {
+            app.modal = Some(ModalState::AddContact {
                 input: String::new(),
             });
         }
@@ -1981,18 +1960,37 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
     }
 }
 
-/// UX overhaul: build this identity's invite URL, copy it to the
-/// system clipboard (OSC52), and open the Invite modal showing the
-/// URL + whether the copy succeeded.
-async fn open_invite_modal(app: &mut AppState) {
-    match build_invite_url(&app.socket_path).await {
-        Ok(url) => {
-            let copied = copy_to_clipboard(&url);
-            app.modal = Some(ModalState::Invite { url, copied });
+/// Open the unified "Share my contact" modal (Ctrl-E): build BOTH the
+/// hub-routed invite link and the direct connect code, so the user picks
+/// which to copy from one screen. Either may be a placeholder string if it
+/// isn't available yet (no hub configured / onion not published).
+async fn open_share_modal(app: &mut AppState) {
+    let invite_url = match build_invite_url(&app.socket_path).await {
+        Ok(url) => url,
+        Err(e) => format!("(invite link unavailable: {e})"),
+    };
+    let connect_code = my_connect_code(app);
+    app.modal = Some(ModalState::Share {
+        invite_url,
+        connect_code,
+        selected: 0,
+        copied: false,
+    });
+}
+
+/// v0.1.16: this identity's `onyx://connect/v1?…` code (own onion +
+/// identity key) from the cached Status snapshot, or a clear placeholder if
+/// the onion isn't published yet.
+fn my_connect_code(app: &AppState) -> String {
+    let Some(Ok(snap)) = &app.last_status else {
+        return "(connecting to daemon… reopen in a moment)".to_string();
+    };
+    match &snap.onion {
+        Some(onion) if !onion.is_empty() => {
+            onyx_core::connect::ConnectCode::new(onion.clone(), snap.identity_pub_b32.clone())
+                .to_url()
         }
-        Err(e) => {
-            app.last_send_result = Some(Err(format!("invite: {e:#}")));
-        }
+        _ => "(your .onion isn't ready yet — wait for Tor to finish bootstrapping)".to_string(),
     }
 }
 
@@ -2046,35 +2044,6 @@ async fn open_settings_modal(app: &mut AppState) {
         "cover-traffic / intro-inbox set at daemon launch".into(),
     ));
     app.modal = Some(ModalState::Settings { info });
-}
-
-/// v0.1.16 (easy-connect): build the "your connect code" modal from the
-/// cached Status snapshot (our own onion + identity key) and copy the
-/// code to the clipboard via OSC52. If the onion isn't known yet (Tor
-/// still bootstrapping, or a no-Tor build), show a clear placeholder
-/// instead of a broken code.
-fn open_connect_code_modal(app: &AppState) -> ModalState {
-    let Some(Ok(snap)) = &app.last_status else {
-        return ModalState::ConnectCode {
-            code: "(connecting to daemon… try again in a moment)".to_string(),
-            copied: false,
-        };
-    };
-    match &snap.onion {
-        Some(onion) if !onion.is_empty() => {
-            let code =
-                onyx_core::connect::ConnectCode::new(onion.clone(), snap.identity_pub_b32.clone())
-                    .to_url();
-            let copied = copy_to_clipboard(&code);
-            ModalState::ConnectCode { code, copied }
-        }
-        _ => ModalState::ConnectCode {
-            code: "(your .onion isn't ready yet — wait for Tor to finish \
-                   bootstrapping, then press Ctrl-Y again)"
-                .to_string(),
-            copied: false,
-        },
-    }
 }
 
 /// C (verification): build the safety-number modal for the selected 1:1
@@ -2350,10 +2319,11 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
     match cmd.as_str() {
         "help" | "h" | "?" => run_palette_action(app, PaletteAction::Help).await,
         "file" | "f" | "send" => run_palette_action(app, PaletteAction::SendFile).await,
-        "invite" | "i" => run_palette_action(app, PaletteAction::CopyInvite).await,
+        "share" | "invite" | "me" | "code" => {
+            run_palette_action(app, PaletteAction::ShareContact).await;
+        }
         "hubs" | "hub" => run_palette_action(app, PaletteAction::ManageHubs).await,
         "settings" | "set" => run_palette_action(app, PaletteAction::Settings).await,
-        "connect" | "code" => app.modal = Some(open_connect_code_modal(app)),
         "search" | "find" => app.modal = Some(open_search_modal(app, arg)),
         "verify" | "safety" => match build_verify_modal(app) {
             Ok(modal) => app.modal = Some(modal),
@@ -2383,29 +2353,14 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
                 .await;
             }
         }
-        "accept" => {
+        // Unified "add a contact": paste invite link OR connect code; with
+        // no arg, open the modal. Aliases keep old muscle memory working.
+        "add" | "accept" | "dial" | "connect" => {
             if arg.is_empty() {
-                run_palette_action(app, PaletteAction::AcceptInvite).await;
-            } else if arg.starts_with("onyx://invite/") {
-                run_simple_request(
-                    app,
-                    ApiRequest::SendInvite {
-                        url: arg.to_string(),
-                        text: String::new(),
-                        insecure_accept_unsigned: false,
-                    },
-                )
-                .await;
-            } else {
-                app.last_send_result = Some(Err("usage: /accept onyx://invite/v…".to_string()));
-            }
-        }
-        "add" | "dial" => {
-            if arg.is_empty() {
-                app.modal = Some(ModalState::AddByCode {
+                app.modal = Some(ModalState::AddContact {
                     input: String::new(),
                 });
-            } else {
+            } else if arg.starts_with("onyx://connect/") {
                 match onyx_core::connect::ConnectCode::parse(arg) {
                     Ok(c) => {
                         run_simple_request(
@@ -2421,11 +2376,25 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
                         app.last_send_result = Some(Err(format!("bad connect code: {e}")));
                     }
                 }
+            } else if arg.starts_with("onyx://invite/") {
+                run_simple_request(
+                    app,
+                    ApiRequest::SendInvite {
+                        url: arg.to_string(),
+                        text: String::new(),
+                        insecure_accept_unsigned: false,
+                    },
+                )
+                .await;
+            } else {
+                app.last_send_result = Some(Err(
+                    "usage: /add onyx://invite/v… OR onyx://connect/v1?…".to_string(),
+                ));
             }
         }
         other => {
             app.last_send_result = Some(Err(format!(
-                "unknown command /{other} — try /help /file /search /room /invite /accept /add /connect /verify /hubs /settings /clear /quit"
+                "unknown command /{other} — try /help /file /search /room /share /add /verify /hubs /settings /clear /quit"
             )));
         }
     }
@@ -3119,16 +3088,14 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::CommandPalette { .. } => {
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
         }
-        ModalState::Invite { .. } => 11,
+        // "Share my contact": two rows (invite link + connect code) + hints.
+        ModalState::Share { .. } => 14,
         ModalState::Settings { info } => u16::try_from(info.len() + 4).unwrap_or(14),
         // UX phase 4: the log overlay takes most of the height — reading
         // logs benefits from vertical room (capped at 30).
         ModalState::Logs { .. } => area.height.saturating_sub(2).min(30),
-        // v0.1.12: paste-an-invite text input.
-        ModalState::AcceptInvite { .. } => 9,
-        // v0.1.16: connect-code screens.
-        ModalState::ConnectCode { .. } => 11,
-        ModalState::AddByCode { .. } => 9,
+        // "Add a contact": single paste field.
+        ModalState::AddContact { .. } => 9,
         // C: safety-number display + instructions.
         ModalState::Verify { .. } => 12,
         // B: search wants vertical room for the result list.
@@ -3251,18 +3218,21 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::CommandPalette { query, selected } => {
             render_palette_modal(frame, rect, query, *selected);
         }
-        ModalState::Invite { url, copied } => render_invite_modal(frame, rect, url, *copied),
+        ModalState::Share {
+            invite_url,
+            connect_code,
+            selected,
+            copied,
+        } => render_share_modal(frame, rect, invite_url, connect_code, *selected, *copied),
         ModalState::Settings { info } => render_settings_modal(frame, rect, info),
         ModalState::Logs { lines, scroll } => render_logs_modal(frame, rect, lines, *scroll),
-        // v0.1.12: paste a peer's onyx:// invite link and accept it
-        // in-app — the TUI twin of `onyx accept <url>`.
-        ModalState::AcceptInvite { input } => {
+        // Unified "Add a contact": paste an invite link OR a connect code.
+        ModalState::AddContact { input } => {
             let block = Block::default().borders(Borders::ALL).title(Span::styled(
-                " Accept Invite  (Esc=cancel, Enter=accept) ",
+                " Add a Contact  (Esc=cancel, Enter=add) ",
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-            // Show a bounded tail so a ~1500-char invite URL doesn't
-            // overflow the box; the daemon receives the full string.
+            // Bounded tail so a long pasted URL doesn't overflow the box.
             let shown: String = {
                 let n = input.chars().count();
                 if n > 50 {
@@ -3275,7 +3245,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             let body = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    " Paste a peer's onyx://invite/v2 link: ",
+                    " Paste an invite link or a connect code: ",
                     Style::default().fg(Color::Gray),
                 )),
                 Line::from(vec![
@@ -3290,85 +3260,11 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
                 ]),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " Unsigned (v1) links are refused — ask for a fresh `onyx invite`. ",
+                    " onyx://invite/… → via hub · onyx://connect/… → direct dial (auto)",
                     Style::default().fg(Color::DarkGray),
                 )),
-            ])
-            .block(block);
-            frame.render_widget(body, rect);
-        }
-        // v0.1.16: "your connect code" — share this so a friend can add
-        // you directly over Tor (no hub, no reachability toggle).
-        ModalState::ConnectCode { code, copied } => {
-            let block = Block::default().borders(Borders::ALL).title(Span::styled(
-                " Your Connect Code  (press any key to close) ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            let copy_line = if *copied {
-                Span::styled(
-                    "  ✓ copied to clipboard ",
-                    Style::default().fg(Color::Green),
-                )
-            } else {
-                Span::styled(
-                    " select the text below to copy ",
-                    Style::default().fg(Color::DarkGray),
-                )
-            };
-            let body = Paragraph::new(vec![
-                Line::from(""),
                 Line::from(Span::styled(
-                    " Share this — a friend pastes it into Add-by-code (Ctrl-D): ",
-                    Style::default().fg(Color::Gray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!(" {code} "),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(copy_line),
-            ])
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .block(block);
-            frame.render_widget(body, rect);
-        }
-        // v0.1.16: paste a peer's connect code → dial them directly.
-        ModalState::AddByCode { input } => {
-            let block = Block::default().borders(Borders::ALL).title(Span::styled(
-                " Add by Connect Code  (Esc=cancel, Enter=connect) ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            let shown: String = {
-                let n = input.chars().count();
-                if n > 50 {
-                    let tail: String = input.chars().skip(n - 47).collect();
-                    format!("…{tail}")
-                } else {
-                    input.clone()
-                }
-            };
-            let body = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    " Paste a peer's onyx://connect/v1?… code: ",
-                    Style::default().fg(Color::Gray),
-                )),
-                Line::from(vec![
-                    Span::styled(" › ", Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        shown,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    " Connects directly over Tor — no hub needed. ",
+                    " unsigned (v1) invite links are refused — ask for a fresh one.",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -3695,16 +3591,20 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         head("Actions"),
         key("Ctrl-K", "command palette (run anything)"),
         key("Ctrl-N", "create a room / channel"),
-        key("Ctrl-I", "invite a peer to the selected room"),
+        key("Ctrl-I", "invite a peer into the selected room"),
         key("Ctrl-F", "send a file to the selected room"),
-        key("Ctrl-E", "copy my invite link to clipboard"),
-        key("Ctrl-A", "accept an invite link (paste)"),
+        key("Ctrl-E", "Share my contact (invite link + connect code)"),
+        key("Ctrl-A", "Add a contact (paste invite or connect code)"),
         key("Ctrl-G", "manage hubs / dial / reachability"),
         Line::from(""),
         head("Slash commands (type in the composer)"),
-        key("/help /file", "/search · /room [name] · /invite · /accept"),
-        key("/add [code]", "/connect · /verify · /hubs · /settings"),
-        key("/clear", "clear this conversation · /quit"),
+        key("/help /file", "/search · /room [name] · /verify"),
+        key("/share", "show my invite link + connect code"),
+        key("/add <link>", "add a contact (invite OR connect — auto)"),
+        key(
+            "/clear",
+            "clear this conversation · /hubs · /settings · /quit",
+        ),
         Line::from(""),
         head("General"),
         key("F1", "this help · Esc/any key closes overlays"),
@@ -3766,49 +3666,62 @@ fn render_palette_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, query: &str,
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-/// UX overhaul: invite-link overlay (Ctrl-E). Shows the URL and
-/// whether it was copied to the clipboard.
-fn render_invite_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, url: &str, copied: bool) {
+/// "Share my contact" overlay (Ctrl-E). Shows BOTH the hub-routed invite
+/// link and the direct connect code; `↑/↓` picks a row, `Enter`/`c` copies
+/// it. The peer pastes either into their own "Add a contact" (Ctrl-A).
+fn render_share_modal(
+    frame: &mut ratatui::Frame<'_>,
+    rect: Rect,
+    invite_url: &str,
+    connect_code: &str,
+    selected: usize,
+    copied: bool,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green))
         .title(Span::styled(
-            " Your Invite Link  (any key to close) ",
+            " Share my contact  (↑↓ pick · Enter/c copy · Esc close) ",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ));
-    let status = if copied {
-        Line::from(Span::styled(
-            " ✓ copied to clipboard",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ))
-    } else {
-        Line::from(Span::styled(
-            " ⚠ clipboard copy unavailable — select the text below to copy",
-            Style::default().fg(Color::Yellow),
-        ))
+    let row = |idx: usize, title: &str, value: &str| -> Vec<Line<'static>> {
+        let active = selected == idx;
+        let marker = if active { "▶ " } else { "  " };
+        vec![
+            Line::from(Span::styled(
+                format!("{marker}{title}"),
+                Style::default()
+                    .fg(if active { Color::Yellow } else { Color::Gray })
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("    {value}"),
+                Style::default().fg(Color::White),
+            )),
+        ]
     };
-    let body = Paragraph::new(vec![
-        Line::from(""),
-        status,
-        Line::from(""),
-        Line::from(Span::styled(
-            url.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Share it; they paste it via ^A (Accept invite) — or:  onyx accept '<url>'",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(block)
-    .wrap(Wrap { trim: false });
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.extend(row(0, "Invite link (via hub):", invite_url));
+    lines.push(Line::from(""));
+    lines.extend(row(1, "Connect code (direct, no hub):", connect_code));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if copied {
+            "  ✓ copied to clipboard".to_string()
+        } else {
+            "  press Enter/c to copy the highlighted one".to_string()
+        },
+        Style::default().fg(if copied {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    )));
+    let body = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(body, rect);
 }
 
