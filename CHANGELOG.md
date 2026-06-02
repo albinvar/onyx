@@ -6,6 +6,17 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 2 (F2.1b) — 2026-06-02 — docs: connect-code = oblivious first contact
+
+Doc half of F2.1 Part C. `ANONYMITY.md` §3.2 now (a) reflects the F2.1a
+identity/activity split (reachable mode no longer links your identity to
+your room set), and (b) documents the **connect-code direct dial** as the
+recommended oblivious first-contact path — it bypasses the hub entirely, so
+the structural `introduction_inbox(fp)` first-contact leak doesn't apply.
+PIR/ORAM-grade oblivious *relay* stays deferred (`ROTATION.md` §6).
+
+---
+
 ## Fortification Phase 2 (F2.1a) — 2026-06-02 — split identity vs activity hub sessions
 
 Implements the F2.1a slice from `OBLIVIOUS-ROUTING.md`: in **reachable**
