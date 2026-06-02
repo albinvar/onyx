@@ -6,6 +6,40 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.20 — 2026-06-02 — fortification release: trust, timing, federation/DoS, audit-residual
+
+The fortification roadmap's first big batch. Closes whole phases of the
+documented weakness list (see `memory/fortification-plan.md` and the
+per-item entries below). Highlights:
+
+- **Phase 0 — trust foundation:** reproducible builds demonstrated +
+  `verify-reproducible-build.sh`; the installer is now **fail-closed**
+  (aborts without cosign instead of silently degrading); `AUDIT.md`
+  external-audit brief.
+- **Phase 1 — timing/correlation:** constant-rate **hub** mode (both
+  directions can now be invariant); wire-level **measurement** of the
+  cover-traffic indistinguishability; `--high-security` one-switch preset
+  (cover stays opt-in by bandwidth decision).
+- **Phase 3 — federation/DoS:** inbound hub-delivery moved **off the read
+  loop** (P-3 head-of-line DoS); **fair queue eviction** (H-1); **MLS room
+  admin/authority model** (G-2).
+- **Phase 4 — audit-residual:** hybrid-KEM contributory check, fail-closed
+  pin, bootstrap pin-cross-check parity, pin-injection test.
+- **Phase 2 (partial):** identity/activity hub-session split (F2.1a) so a
+  reachable user's identity isn't linked to their room set; connect-code
+  documented as the oblivious first-contact path.
+
+Honest residuals carried forward (documented in `THREAT_MODEL.md` /
+`ANONYMITY.md` / `ROOM-AUTHORITY.md` / `QUEUE-HARDENING.md`): real-Tor
+cover-traffic measurement (loopback-measured only), G-2 fork residual
+(patched client), Tor bridges (F2.2), identity-derived onion (F2.3), mobile
+build (Phase 5), and the external audit itself (§8.2 #7). No confidentiality
+regressions; full workspace tests + `cargo deny` green.
+
+Per-item detail follows.
+
+---
+
 ## Fortification Phase 3 (F3.3 / G-2) — 2026-06-02 — MLS room admin/authority model
 
 Closes G-2 (audit MED-2): previously *any* room member could add/remove
