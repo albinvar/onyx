@@ -106,11 +106,17 @@ layers on top — verify they compose, they should).
 
 ## §6 Recommendation & slices
 
-1. **F2.2a — vanilla bridges (`bridge-client`).** Contained: enable the
-   feature, add `--bridge` config (parse via `BridgeConfigBuilder`), wire
-   `builder.bridges()` in `build_tor_config`, opt-in (default path
-   unchanged). Test: bridge lines parse + the config builds (no real
-   bootstrap in CI). Ships the IP-blocklist-evasion tier.
+1. **F2.2a — vanilla bridges (`bridge-client`).** ✅ **DONE.** Enabled the
+   `bridge-client` feature; added `--bridge` (onyxd + onyx, repeatable; env
+   `ONYX_BRIDGE`; also `bridges` in `config.json`); parse via
+   `BridgeConfigBuilder` and wire `builder.bridges()` in `build_tor_config`
+   (auto-enables bridge mode when the list is non-empty); threaded through
+   `TorRuntime::bootstrap_with_bridges`. Opt-in — empty list = default guard
+   selection, byte-identical to before; vanguards still pinned; a malformed
+   bridge line is a hard error (no silent fallback to public guards). Tests:
+   `tor_config_accepts_vanilla_bridge_and_keeps_vanguards`,
+   `tor_config_rejects_garbage_bridge_line`. Ships the IP-blocklist-evasion
+   tier.
 2. **F2.2b — pluggable transports / obfs4 (`pt-client`).** Add the managed
    `TransportConfigBuilder` + `--pt-binary` config + **per-platform docs**
    for installing lyrebird/snowflake. The real censorship-resistance tier;

@@ -60,6 +60,12 @@ arti-client      = { version = "0.42", features = [
     # this change (cargo tree showed tor-guardmgr=default, no vanguards).
     # `tor.rs::bootstrap_with` then pins the mode to Full.
     "vanguards",
+    # F2.2a: Tor bridges — connect via an unlisted relay instead of a
+    # public guard (evades IP-blocklists of public guards). Vanilla
+    # bridges only; obfs4/PT (the `pt-client` feature + an external PT
+    # binary) is the deferred F2.2b. Opt-in via `--bridge`; default path
+    # unchanged. See `TOR-BRIDGES.md`.
+    "bridge-client",
 ] }
 tor-rtcompat     = "0.42"
 tor-hsservice    = "0.42"

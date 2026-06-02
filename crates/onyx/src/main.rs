@@ -143,6 +143,14 @@ struct Args {
     #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS", global = true)]
     cover_traffic_mean_secs: Option<u64>,
 
+    /// F2.2a: Tor **bridge** line(s). Repeatable. Connect via an unlisted
+    /// relay instead of a public guard (evades IP-blocklists of public
+    /// guards). Vanilla format `<ip:port> <fingerprint>`; get bridges from
+    /// <https://bridges.torproject.org>. Also settable as `bridges` in
+    /// config.json. See `TOR-BRIDGES.md`.
+    #[arg(long = "bridge", action = clap::ArgAction::Append, global = true)]
+    bridge: Vec<String>,
+
     /// **Opt-in, "high mode".** Slot interval (in milliseconds) for
     /// constant-rate client→hub cover traffic. When set, the daemon
     /// sends exactly one frame per slot to each hub — a queued real
@@ -633,6 +641,9 @@ struct FileConfig {
     /// Each entry is `onion:port,b32pubkey` — same grammar as `--hub`.
     #[serde(default)]
     hubs: Vec<String>,
+    /// F2.2a: Tor bridge line(s), same grammar as `--bridge`.
+    #[serde(default)]
+    bridges: Vec<String>,
     /// P2P direct-dial target onion (`onion` or `onion:port`).
     #[serde(default)]
     dial_onion: Option<String>,
@@ -879,6 +890,12 @@ fn build_daemon_config(
     let cover_traffic_mean_secs = args
         .cover_traffic_mean_secs
         .or(file_cfg.cover_traffic_mean_secs);
+    // F2.2a: CLI `--bridge` wins if given, else fall back to config.json.
+    let bridges = if args.bridge.is_empty() {
+        file_cfg.bridges.clone()
+    } else {
+        args.bridge.clone()
+    };
     // A peer dial (Tor onion or test TCP) needs the peer's identity key,
     // or the daemon would silently fall back to accept mode (lib.rs:878).
     // Fail loudly so a half-typed P2P dial doesn't look like "nothing
@@ -901,6 +918,7 @@ fn build_daemon_config(
             || args.dial_tcp.is_some()
             || (!args.hub_tcp.is_empty() && args.hubs.is_empty()),
         tor_state_dir: None,
+        bridges,
         // P2P: direct onion dial needs Tor (never a no-Tor path), so it
         // doesn't appear in the `no_tor` condition above — it just wires
         // the target through to `run_dial_mode`. Resolved CLI-over-file.

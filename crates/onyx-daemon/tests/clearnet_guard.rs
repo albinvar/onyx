@@ -33,6 +33,7 @@ fn clearnet_config(dir: &std::path::Path, set_flag: impl FnOnce(&mut Config)) ->
         passphrase: Zeroizing::new("integration-test-pass".to_string()),
         no_tor: false,
         tor_state_dir: None,
+        bridges: Vec::new(),
         dial_onion: None,
         dial_pubkey: None,
         api_socket: dir.join("api.sock").to_string_lossy().into_owned(),
