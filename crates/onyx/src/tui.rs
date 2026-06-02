@@ -48,9 +48,10 @@
 //!   * `F1`                 — keyboard help overlay (every binding).
 //!   * `Ctrl-K`             — command palette: fuzzy-run any action.
 //!   * `Ctrl-N`             — open the Create Room modal (T-polish.6).
-//!   * `Ctrl-I`             — open the Invite Peer modal (requires a room selected; T-polish.6).
-//!   * `Ctrl-F`             — open the Send File modal (requires a room selected; T-files.e).
-//!   * `Ctrl-E`             — build + copy (OSC52) this identity's invite link.
+//!   * `Ctrl-I`             — invite a peer INTO the selected room (T-polish.6).
+//!   * `Ctrl-F`             — open the Send File browser (room or DM peer).
+//!   * `Ctrl-E`             — Share my contact: invite link + connect code (pick + copy).
+//!   * `Ctrl-A`             — Add a contact: paste an invite link OR connect code (auto).
 //!   * `Tab` (in modal)     — cycle between input fields.
 //!   * `Space` (in modal)   — toggle the focused checkbox (Send File only).
 //!   * `Enter`              — send composer text / submit active modal.
@@ -4325,8 +4326,8 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     Style::default().fg(Color::Gray),
                 )),
                 Line::from(""),
-                step("Ctrl-E", "copy your invite link — send it to a friend"),
-                step("", "(they run: onyx accept '<link>')"),
+                step("Ctrl-E", "Share your contact — invite link + connect code"),
+                step("Ctrl-A", "Add a contact — paste a friend's link or code"),
                 Line::from(""),
                 step("Ctrl-N", "create a room / channel"),
                 step("Ctrl-K", "command palette — run anything by name"),
@@ -4350,7 +4351,7 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Ctrl-K palette · F1 help · Ctrl-E invite",
+                    "  Ctrl-K palette · F1 help · Ctrl-E share · Ctrl-A add",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -4418,6 +4419,17 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             " > (no peer or room to send to)",
             Style::default().fg(Color::DarkGray),
         ))
+    } else if app.composer.is_empty() {
+        // Empty composer → faint placeholder that teaches the two discovery
+        // affordances (slash commands + palette).
+        Line::from(vec![
+            Span::raw(" > "),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(
+                "  type a message  ·  / for commands  ·  ^K palette",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else {
         Line::from(vec![
             Span::raw(" > "),
@@ -4472,17 +4484,18 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 Span::raw("  ·  "),
                 Span::styled(format!("v{}", s.daemon_version), theme::muted()),
                 Span::raw("   "),
-                // UX overhaul: colored, always-visible keybind hints.
+                // Always-visible keybind hints (the two contact flows +
+                // palette/help, which reach everything else).
                 kb("F1"),
                 Span::styled("help ", theme::keylabel()),
                 kb("^K"),
                 Span::styled("palette ", theme::keylabel()),
-                kb("^N"),
-                Span::styled("room ", theme::keylabel()),
-                kb("^F"),
-                Span::styled("file ", theme::keylabel()),
                 kb("^E"),
-                Span::styled("invite", theme::keylabel()),
+                Span::styled("share ", theme::keylabel()),
+                kb("^A"),
+                Span::styled("add ", theme::keylabel()),
+                kb("^F"),
+                Span::styled("file", theme::keylabel()),
             ])
         }
     };
@@ -4495,8 +4508,8 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let line = if !app.first_contact_reachable && matches!(app.last_status, Some(Ok(_))) {
         Line::from(vec![
             Span::styled(" ⚠ not addable by invite ", theme::warn()),
-            Span::styled("— share your code ", theme::text()),
-            kb("^Y"),
+            Span::styled("— share your contact ", theme::text()),
+            kb("^E"),
             Span::styled("or enable reachability ", theme::text()),
             kb("^G"),
         ])
