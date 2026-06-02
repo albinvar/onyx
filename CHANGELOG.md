@@ -6,6 +6,24 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 messaging UX (B) — 2026-06-02 — local message search
+
+### Added
+- **Full-text search across all conversations.** Ctrl-K palette → "Search
+  messages", or `/search [query]` (`/find`). Type to filter live;
+  case-insensitive substring match over all loaded scrollback, newest-first,
+  capped at 100 hits. Each result shows `label · HH:MM  snippet`; `↑/↓` move,
+  `Enter` jumps straight to that conversation, `Esc` closes.
+- Helpers `search_scrollback` / `conv_label_for_key` / `open_search_modal` +
+  `SearchHit`; unit test for case-insensitive/newest-first/empty/no-match.
+
+### Scope (honest)
+- Searches what the TUI currently holds (live + backfilled history), not the
+  daemon's full on-disk store — so very old, not-yet-loaded messages won't
+  appear. A daemon-side search API over the vault is a follow-up.
+
+---
+
 ## v0.2 verification (C) — 2026-06-02 — safety-number contact verification
 
 Signal-style out-of-band verification, layered on top of TOFU pinning.

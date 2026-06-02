@@ -321,6 +321,15 @@ enum ModalState {
         peer_short: String,
         number: String,
     },
+    /// B (search): full-text search across all loaded conversation
+    /// scrollback. Type to filter; `↑/↓` move; `Enter` jumps to the
+    /// selected match's conversation; `Esc` closes. `results` is recomputed
+    /// on each query edit and read on navigate/enter.
+    Search {
+        query: String,
+        results: Vec<SearchHit>,
+        selected: usize,
+    },
     /// v0.1.12: TUI-managed hub / dial / reachability editor. Reads
     /// `~/.onyx/config.json` on open and writes it back on save (Ctrl-S).
     /// Changes apply on the next `onyx` launch (the embedded daemon
@@ -351,6 +360,7 @@ enum PaletteAction {
     CreateRoom,
     InvitePeer,
     SendFile,
+    SearchMessages,
     VerifyContact,
     CopyInvite,
     AcceptInvite,
@@ -362,10 +372,11 @@ enum PaletteAction {
 
 impl PaletteAction {
     /// All actions, in palette display order.
-    const ALL: [PaletteAction; 10] = [
+    const ALL: [PaletteAction; 11] = [
         PaletteAction::CreateRoom,
         PaletteAction::InvitePeer,
         PaletteAction::SendFile,
+        PaletteAction::SearchMessages,
         PaletteAction::VerifyContact,
         PaletteAction::CopyInvite,
         PaletteAction::AcceptInvite,
@@ -381,6 +392,7 @@ impl PaletteAction {
             PaletteAction::CreateRoom => "Create room",
             PaletteAction::InvitePeer => "Invite peer to room",
             PaletteAction::SendFile => "Send file (room or DM peer)",
+            PaletteAction::SearchMessages => "Search messages",
             PaletteAction::VerifyContact => "Verify contact (safety number)",
             PaletteAction::CopyInvite => "Copy my invite link",
             PaletteAction::AcceptInvite => "Accept invite link (paste)",
@@ -400,7 +412,9 @@ impl PaletteAction {
             PaletteAction::CopyInvite => "^E",
             PaletteAction::AcceptInvite => "^A",
             PaletteAction::ManageHubs => "^G",
-            PaletteAction::VerifyContact | PaletteAction::Settings => "",
+            PaletteAction::SearchMessages
+            | PaletteAction::VerifyContact
+            | PaletteAction::Settings => "",
             PaletteAction::Help => "F1",
             PaletteAction::Quit => "^C",
         }
@@ -1476,6 +1490,69 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             }
             submit_intent = Some(modal.clone());
         }
+        // ── B: message search ──────────────────────────────────────
+        // Up/Down move the selected hit; Enter jumps to its conversation;
+        // Backspace/Char edit the query (re-running the search live).
+        (ModalState::Search { selected, .. }, KeyCode::Up) => {
+            *selected = selected.saturating_sub(1);
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::Search {
+                selected, results, ..
+            },
+            KeyCode::Down,
+        ) => {
+            if !results.is_empty() {
+                *selected = (*selected + 1).min(results.len() - 1);
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::Search {
+                results, selected, ..
+            },
+            KeyCode::Enter,
+        ) => {
+            if let Some(hit) = results.get(*selected) {
+                let key = hit.conv_key.clone();
+                app.restore_selection_by_key(&key);
+                app.snap_messages_to_live();
+                app.unread.remove(&key);
+            }
+            // Modal closed (not put back).
+            return;
+        }
+        (
+            ModalState::Search {
+                query,
+                results,
+                selected,
+            },
+            KeyCode::Backspace,
+        ) => {
+            query.pop();
+            *results = search_scrollback(app, query.as_str());
+            *selected = 0;
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::Search {
+                query,
+                results,
+                selected,
+            },
+            KeyCode::Char(c),
+        ) => {
+            query.push(c);
+            *results = search_scrollback(app, query.as_str());
+            *selected = 0;
+            app.modal = Some(modal);
+            return;
+        }
         // ── v0.1.12: hub / dial / reachability manager ──────────────
         // Ctrl-S persists to ~/.onyx/config.json. Guard must precede the
         // generic Char arm so typing 's' into a field isn't a save.
@@ -1710,6 +1787,8 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             | ModalState::ConnectCode { .. }
             // C: the safety-number screen is read-only (never submits).
             | ModalState::Verify { .. }
+            // B: search jumps inline on Enter (never submits).
+            | ModalState::Search { .. }
             // ManageHubs is handled inline (saves a file, no API call), so
             // it never sets submit_intent — but the match must cover it.
             | ModalState::ManageHubs { .. } => None,
@@ -1882,6 +1961,7 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
                     Some(Err("send-file needs a peer or room selected".to_string()));
             }
         }
+        PaletteAction::SearchMessages => app.modal = Some(open_search_modal(app, "")),
         PaletteAction::VerifyContact => match build_verify_modal(app) {
             Ok(modal) => app.modal = Some(modal),
             Err(e) => app.last_send_result = Some(Err(e)),
@@ -2223,6 +2303,7 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
         "hubs" | "hub" => run_palette_action(app, PaletteAction::ManageHubs).await,
         "settings" | "set" => run_palette_action(app, PaletteAction::Settings).await,
         "connect" | "code" => app.modal = Some(open_connect_code_modal(app)),
+        "search" | "find" => app.modal = Some(open_search_modal(app, arg)),
         "verify" | "safety" => match build_verify_modal(app) {
             Ok(modal) => app.modal = Some(modal),
             Err(e) => app.last_send_result = Some(Err(e)),
@@ -2293,7 +2374,7 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
         }
         other => {
             app.last_send_result = Some(Err(format!(
-                "unknown command /{other} — try /help /file /room /invite /accept /add /connect /verify /hubs /settings /clear /quit"
+                "unknown command /{other} — try /help /file /search /room /invite /accept /add /connect /verify /hubs /settings /clear /quit"
             )));
         }
     }
@@ -2724,6 +2805,119 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 // clippy default. Each variant block is self-contained (different
 // fields, different layouts) so splitting into helpers would just
 // chase the line count around without improving readability.
+/// B (search): render the message-search modal — a query line, a list of
+/// `label · HH:MM  snippet` hits (newest first), and a match-count footer.
+fn render_search_modal(
+    frame: &mut ratatui::Frame<'_>,
+    rect: Rect,
+    query: &str,
+    results: &[SearchHit],
+    selected: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Search Messages  (type · ↑↓ · Enter jump · Esc) ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // query
+            Constraint::Min(3),    // results
+            Constraint::Length(1), // footer
+        ])
+        .split(inner);
+
+    // Query line.
+    let query_line = Line::from(vec![
+        Span::styled("  🔎 ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            query.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+    ]);
+    frame.render_widget(Paragraph::new(query_line), chunks[0]);
+
+    // Results.
+    if results.is_empty() {
+        let msg = if query.trim().is_empty() {
+            "  type to search your conversations…"
+        } else {
+            "  no matches in loaded history"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            chunks[1],
+        );
+    } else {
+        let width = usize::from(chunks[1].width);
+        let rows: Vec<ListItem<'_>> = results
+            .iter()
+            .map(|hit| {
+                let prefix = format!("{} · {}  ", hit.label, fmt_hhmm(hit.ts_unix_ms));
+                let budget = width.saturating_sub(prefix.len() + 4).max(8);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", hit.label),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("· {}  ", fmt_hhmm(hit.ts_unix_ms)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        truncate_for_display(&hit.text, budget),
+                        Style::default().fg(Color::White),
+                    ),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(selected.min(results.len() - 1)));
+        let list = List::new(rows)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+        frame.render_stateful_widget(list, chunks[1], &mut state);
+    }
+
+    // Footer.
+    let footer = if results.is_empty() {
+        String::from("  searches loaded history (live + backfilled)")
+    } else {
+        format!(
+            "  {} match{}",
+            results.len(),
+            if results.len() == 1 { "" } else { "es" }
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
+}
+
 /// A1 (file picker): render the navigable, multi-select SendFile browser —
 /// a cwd header, a directory listing (dirs first, files mark-able), the two
 /// privacy toggles, and a keybinding/error hint line.
@@ -2886,6 +3080,8 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::AddByCode { .. } => 9,
         // C: safety-number display + instructions.
         ModalState::Verify { .. } => 12,
+        // B: search wants vertical room for the result list.
+        ModalState::Search { .. } => area.height.saturating_sub(2).min(22),
         // v0.1.12: hub manager grows with the hub list (+ fixed controls).
         ModalState::ManageHubs { hubs, .. } => u16::try_from(hubs.len() + 12)
             .unwrap_or(20)
@@ -3169,6 +3365,12 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             .block(block);
             frame.render_widget(body, rect);
         }
+        // B: full-text message search across conversations.
+        ModalState::Search {
+            query,
+            results,
+            selected,
+        } => render_search_modal(frame, rect, query, results, *selected),
         // v0.1.12: hub / dial / reachability manager.
         ModalState::ManageHubs {
             hubs,
@@ -3449,7 +3651,7 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         key("Ctrl-G", "manage hubs / dial / reachability"),
         Line::from(""),
         head("Slash commands (type in the composer)"),
-        key("/help /file", "/room [name] · /invite · /accept [url]"),
+        key("/help /file", "/search · /room [name] · /invite · /accept"),
         key("/add [code]", "/connect · /verify · /hubs · /settings"),
         key("/clear", "clear this conversation · /quit"),
         Line::from(""),
@@ -3982,6 +4184,76 @@ fn fmt_hhmm(ts_unix_ms: u64) -> String {
     }
 }
 
+/// B (search): one match from a full-text scrollback search.
+#[derive(Debug, Clone)]
+struct SearchHit {
+    /// Scrollback key of the conversation (peer short_id or `room/<id>`).
+    conv_key: String,
+    /// Human label for display (e.g. `alice` or `#general`).
+    label: String,
+    ts_unix_ms: u64,
+    /// The matching message text.
+    text: String,
+}
+
+/// Cap search results so a broad query stays responsive.
+const SEARCH_MAX_HITS: usize = 100;
+
+/// B: resolve a scrollback key to a human display label using the current
+/// peer/room lists; falls back to the key itself.
+fn conv_label_for_key(app: &AppState, key: &str) -> String {
+    if app.peers.iter().any(|p| p.short_id == key) {
+        return key.to_string();
+    }
+    if let Some(r) = app
+        .rooms
+        .iter()
+        .find(|r| format!("room/{}", short_id(&r.group_id_b32)) == key)
+    {
+        return format!("#{}", r.name);
+    }
+    key.to_string()
+}
+
+/// B: case-insensitive substring search across ALL loaded conversation
+/// scrollback, newest-first and capped. Searches what the TUI currently
+/// holds (live + backfilled history), not the daemon's full on-disk store.
+fn search_scrollback(app: &AppState, query: &str) -> Vec<SearchHit> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for (key, lines) in &app.scrollback {
+        for line in lines {
+            if line.text.to_lowercase().contains(&needle) {
+                hits.push(SearchHit {
+                    conv_key: key.clone(),
+                    label: conv_label_for_key(app, key),
+                    ts_unix_ms: line.ts_unix_ms,
+                    text: line.text.clone(),
+                });
+            }
+        }
+    }
+    // Newest first.
+    hits.sort_by_key(|h| std::cmp::Reverse(h.ts_unix_ms));
+    hits.truncate(SEARCH_MAX_HITS);
+    hits
+}
+
+/// B: build the search modal seeded with an initial query (empty, or the
+/// inline arg from `/search <q>`).
+fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
+    let query = initial.to_string();
+    let results = search_scrollback(app, &query);
+    ModalState::Search {
+        query,
+        results,
+        selected: 0,
+    }
+}
+
 /// A2: turn a conversation's scrollback into styled lines, chat-app style:
 /// a `name · HH:MM` header is drawn whenever the sender OR the minute
 /// changes, then each message is indented beneath it — so a burst from one
@@ -4384,6 +4656,46 @@ mod snapshot_tests {
         // header(alice) + 2 bodies + spacer + header(me) + 1 body = 6.
         // (Without grouping it would be one header per message → more.)
         assert_eq!(build_chat_lines(&scroll, "alice").len(), 6);
+    }
+
+    // B (search): case-insensitive substring match across all scrollback,
+    // newest-first; empty/whitespace query and no-match both yield nothing.
+    #[test]
+    fn search_scrollback_matches_case_insensitive_newest_first() {
+        let mut app = AppState::new(PathBuf::from("./onyxd.sock"));
+        app.scrollback.insert(
+            "alice".to_string(),
+            vec![
+                ChatLine {
+                    direction: MessageDirection::Incoming,
+                    text: "Hello world".into(),
+                    ts_unix_ms: 1000,
+                    via_hub: false,
+                },
+                ChatLine {
+                    direction: MessageDirection::Outgoing,
+                    text: "goodbye".into(),
+                    ts_unix_ms: 2000,
+                    via_hub: false,
+                },
+            ],
+        );
+        app.scrollback.insert(
+            "bob".to_string(),
+            vec![ChatLine {
+                direction: MessageDirection::Incoming,
+                text: "WORLD news".into(),
+                ts_unix_ms: 3000,
+                via_hub: false,
+            }],
+        );
+
+        let hits = search_scrollback(&app, "world");
+        assert_eq!(hits.len(), 2, "matches alice@1000 + bob@3000");
+        assert_eq!(hits[0].ts_unix_ms, 3000, "newest first");
+        assert_eq!(hits[1].ts_unix_ms, 1000);
+        assert!(search_scrollback(&app, "   ").is_empty(), "blank → none");
+        assert!(search_scrollback(&app, "zzz").is_empty(), "no match → none");
     }
 
     // A3 (slash commands): the parser lowercases the command word and
