@@ -2066,6 +2066,13 @@ async fn send_composer(app: &mut AppState) {
     if app.composer.is_empty() {
         return;
     }
+    // A3: a composer line starting with '/' is a slash command, not a
+    // message. Handle it and return (never sent to a peer).
+    if app.composer.trim_start().starts_with('/') {
+        let raw = std::mem::take(&mut app.composer);
+        run_slash_command(app, raw.trim()).await;
+        return;
+    }
     // T6.3.f.2: clone the bits we need out of the borrow before we
     // mutate `app.composer` — the selection borrow holds `app`
     // immutably otherwise.
@@ -2150,6 +2157,114 @@ async fn send_composer(app: &mut AppState) {
             app.composer = text;
             app.last_send_result = Some(Err(format!("{e:#}")));
         }
+    }
+}
+
+/// A3: split a composer slash line into a lowercased command word and its
+/// trimmed argument string. `"/room  My Cool Room"` → `("room", "My Cool
+/// Room")`; `"/HELP"` → `("help", "")`.
+fn parse_slash_command(line: &str) -> (String, &str) {
+    let body = line.trim_start_matches('/');
+    let (cmd, arg) = body
+        .split_once(char::is_whitespace)
+        .map_or((body, ""), |(c, a)| (c, a.trim()));
+    (cmd.to_ascii_lowercase(), arg)
+}
+
+/// A3: run a `/command` typed in the composer. `line` is the trimmed
+/// composer text including the leading slash. Most commands just open the
+/// matching modal (reusing the command-palette dispatch); a few accept an
+/// inline argument so power users can skip the modal entirely.
+async fn run_slash_command(app: &mut AppState, line: &str) {
+    let (cmd, arg) = parse_slash_command(line);
+    match cmd.as_str() {
+        "help" | "h" | "?" => run_palette_action(app, PaletteAction::Help).await,
+        "file" | "f" | "send" => run_palette_action(app, PaletteAction::SendFile).await,
+        "invite" | "i" => run_palette_action(app, PaletteAction::CopyInvite).await,
+        "hubs" | "hub" => run_palette_action(app, PaletteAction::ManageHubs).await,
+        "settings" | "set" => run_palette_action(app, PaletteAction::Settings).await,
+        "connect" | "code" => app.modal = Some(open_connect_code_modal(app)),
+        "quit" | "q" | "exit" => app.quit_requested = true,
+        "clear" | "cls" => {
+            if let Some(key) = app.selected_entry().map(|e| e.scrollback_key()) {
+                if let Some(v) = app.scrollback.get_mut(&key) {
+                    v.clear();
+                }
+                app.last_send_result = Some(Ok(()));
+            } else {
+                app.last_send_result = Some(Err("no conversation selected".to_string()));
+            }
+        }
+        "room" | "newroom" => {
+            if arg.is_empty() {
+                run_palette_action(app, PaletteAction::CreateRoom).await;
+            } else {
+                run_simple_request(
+                    app,
+                    ApiRequest::CreateRoom {
+                        name: arg.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+        "accept" => {
+            if arg.is_empty() {
+                run_palette_action(app, PaletteAction::AcceptInvite).await;
+            } else if arg.starts_with("onyx://invite/") {
+                run_simple_request(
+                    app,
+                    ApiRequest::SendInvite {
+                        url: arg.to_string(),
+                        text: String::new(),
+                        insecure_accept_unsigned: false,
+                    },
+                )
+                .await;
+            } else {
+                app.last_send_result = Some(Err("usage: /accept onyx://invite/v…".to_string()));
+            }
+        }
+        "add" | "dial" => {
+            if arg.is_empty() {
+                app.modal = Some(ModalState::AddByCode {
+                    input: String::new(),
+                });
+            } else {
+                match onyx_core::connect::ConnectCode::parse(arg) {
+                    Ok(c) => {
+                        run_simple_request(
+                            app,
+                            ApiRequest::DialPeer {
+                                onion: c.onion,
+                                pubkey_b32: c.identity_pub_b32,
+                            },
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        app.last_send_result = Some(Err(format!("bad connect code: {e}")));
+                    }
+                }
+            }
+        }
+        other => {
+            app.last_send_result = Some(Err(format!(
+                "unknown command /{other} — try /help /file /room /invite /accept /add /connect /hubs /settings /clear /quit"
+            )));
+        }
+    }
+}
+
+/// A3: fire a one-shot request and record a coarse ok/error result. Used by
+/// inline slash commands whose follow-up state arrives on the next status
+/// tick (room list, peer list, …), so a rich per-response handler isn't
+/// needed.
+async fn run_simple_request(app: &mut AppState, req: ApiRequest) {
+    match client::one_shot(&app.socket_path, &req).await {
+        Ok(ApiResponse::Error { message, .. }) => app.last_send_result = Some(Err(message)),
+        Ok(_) => app.last_send_result = Some(Ok(())),
+        Err(e) => app.last_send_result = Some(Err(format!("{e:#}"))),
     }
 }
 
@@ -2712,7 +2827,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::InvitePeer { .. } => 17,
         // A1: the file browser wants vertical room for the listing.
         ModalState::SendFile { .. } => area.height.saturating_sub(2).min(24),
-        ModalState::Help => 18,
+        ModalState::Help => 23,
         ModalState::CommandPalette { .. } => {
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
         }
@@ -3246,6 +3361,11 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         key("Ctrl-E", "copy my invite link to clipboard"),
         key("Ctrl-A", "accept an invite link (paste)"),
         key("Ctrl-G", "manage hubs / dial / reachability"),
+        Line::from(""),
+        head("Slash commands (type in the composer)"),
+        key("/help /file", "/room [name] · /invite · /accept [url]"),
+        key("/add [code]", "/connect · /hubs · /settings"),
+        key("/clear", "clear this conversation · /quit"),
         Line::from(""),
         head("General"),
         key("F1", "this help · Esc/any key closes overlays"),
@@ -4178,6 +4298,23 @@ mod snapshot_tests {
         // header(alice) + 2 bodies + spacer + header(me) + 1 body = 6.
         // (Without grouping it would be one header per message → more.)
         assert_eq!(build_chat_lines(&scroll, "alice").len(), 6);
+    }
+
+    // A3 (slash commands): the parser lowercases the command word and
+    // returns the trimmed remainder as the argument.
+    #[test]
+    fn parse_slash_command_splits_cmd_and_arg() {
+        assert_eq!(parse_slash_command("/help"), ("help".to_string(), ""));
+        assert_eq!(parse_slash_command("/HELP"), ("help".to_string(), ""));
+        assert_eq!(
+            parse_slash_command("/room   My Cool Room  "),
+            ("room".to_string(), "My Cool Room")
+        );
+        assert_eq!(
+            parse_slash_command("/accept onyx://invite/v2?x"),
+            ("accept".to_string(), "onyx://invite/v2?x")
+        );
+        assert_eq!(parse_slash_command("/q"), ("q".to_string(), ""));
     }
 
     // A unreadable / nonexistent directory surfaces an error but still

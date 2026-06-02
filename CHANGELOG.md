@@ -6,6 +6,23 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI overhaul (A3) — 2026-06-02 — slash commands
+
+Type-to-run commands in the composer, complementing the Ctrl-K palette.
+
+### Added
+- **Slash commands.** A composer line starting with `/` is run as a command
+  instead of being sent. Supported: `/help`, `/file`, `/room [name]`,
+  `/invite`, `/accept [url]`, `/add [code]`, `/connect`, `/hubs`,
+  `/settings`, `/clear` (clear the current conversation's local scrollback),
+  `/quit`. No-arg forms open the matching modal; `/room`, `/accept`, `/add`
+  also take an inline argument to skip the modal. Unknown commands list the
+  valid ones. Aliases: `/h /? /f /send /i /q /exit /cls /dial /code`.
+- F1 help overlay gained a "Slash commands" section; `parse_slash_command`
+  helper + a parse unit test.
+
+---
+
 ## v0.2 TUI overhaul (A2) — 2026-06-02 — chat window rendering
 
 The message pane was a cramped `        name: text` list with no times and a
