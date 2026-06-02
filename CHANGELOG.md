@@ -6,6 +6,42 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 4 — 2026-06-02 — audit-residual defense-in-depth
+
+Small, high-confidence hardening of the audit-residual items (the LOW
+findings + the missing pin test). Each is independently testable.
+
+### Fixed / hardened
+- **F4.1 — hybrid KEM contributory check** (`crypto.rs`). `decapsulate` and
+  `encapsulate` now reject a **non-contributory** X25519 result
+  (`was_contributory()`). A malicious sender's low-order `classical` point
+  could otherwise force an all-zero DH output, silently stripping the X25519
+  half and downgrading "secure if EITHER primitive holds" to ML-KEM-only.
+  This is the RUSTSEC-2026-0072 analogue for our own code. Test:
+  `hybrid_kem_rejects_low_order_classical_point`.
+- **F4.2 — pin check fails CLOSED** (`api_server.rs::pin_block`). On a vault
+  read error the daemon now **refuses the send** instead of allowing it — if
+  we can't rule out a key-changed (MITM'd) pin, a security tool must not send.
+- **F4.3 — bootstrap pin cross-check parity** (`api_server.rs`).
+  `SendBootstrap`/`SendBootstrapMls` now call `pin_block` at dispatch, closing
+  the gap where the direct bootstrap verbs bypassed `SendInvite`'s Gate 3 and
+  could re-bootstrap a key-changed peer.
+- **F4.4 — pin-injection test** for the bootstrap path:
+  `send_bootstrap_refuses_key_changed_peer` (DM/room paths already had A0.3
+  key-changed tests).
+
+### Verified (no change needed)
+- **F4.5 — unbounded-decode audit.** All network-path CBOR decodes run from
+  **bounded slices** — gated by the 2-byte outer length prefix (≤64 KiB/frame)
+  and the explicit `MAX_ENVELOPE_CBOR_BYTES` (128 KiB) check before decode.
+  The only `read_to_string` calls are local config/log files (trusted operator
+  input). No remaining unbounded decode on the wire.
+
+### Docs
+- `AUDIT.md` §7: the four LOW items above moved from "open" to resolved.
+
+---
+
 ## Fortification Phase 2 (F2.1b) — 2026-06-02 — docs: connect-code = oblivious first contact
 
 Doc half of F2.1 Part C. `ANONYMITY.md` §3.2 now (a) reflects the F2.1a
