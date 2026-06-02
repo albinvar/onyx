@@ -115,4 +115,8 @@ jobs:
           #    arti-client → fs-mistrust → pwd-grp).
           #  - RUSTSEC-2023-0071: Marvin timing attack on `rsa` 0.9
           #    (transitive via arti; no RSA decryption on Onyx's hot path).
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2023-0071
+          #  - RUSTSEC-2026-0124: libcrux-chacha20poly1305 <0.0.8 encrypt
+          #    buffer panic (transitive via openmls→hpke-rs→libcrux-aead,
+          #    pinned ^0.0.7); not reachable in Onyx. Drop when upstream
+          #    bumps libcrux to 0.0.8+.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2023-0071,RUSTSEC-2026-0124
