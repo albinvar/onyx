@@ -6,6 +6,40 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.1.19 — 2026-06-02 — DM hub fallback: fix + verify the receive path
+
+Makes the opt-in DM hub fallback (shipped experimental in v0.1.18)
+**actually work**. Writing a real end-to-end receive test revealed that
+v0.1.18's receive path was silently broken — an offline-delivery feature
+that didn't deliver. All three bugs are fixed and the path is now
+verified end to end (still opt-in, still default off).
+
+### Fixed
+- **Hub-relayed DM dropped on receive.** `push_message_via_hub` only
+  updates an *existing* conversation row, but a fallback DM can arrive
+  when there is **no live session** for the sender (the whole point of
+  the fallback). The message was silently discarded. Now the receiver
+  registers the peer (hub-only) before surfacing the message.
+- **Receiver not subscribed to DM session tokens.** The fallback routes
+  on the DM group's session token, but the recipient only subscribed to
+  *room* tokens — so a fallback DM was never picked up. The daemon now
+  subscribes to every DM group's session token too.
+- **Self-deadlock on receive.** An interim fix derived the sender's
+  fingerprint while already holding the MLS lock (tokio's mutex is not
+  reentrant) and hung the receive task. Hub-relayed DMs are now
+  attributed under the `(peer/<short>)` placeholder until a live MLS
+  session supplies the real identity.
+
+### Verified
+- New end-to-end test (`hub_relayed_dm_is_decrypted_and_surfaced_via_hub`):
+  a real two-party MLS DM, sealed exactly as the send path does, fed
+  through the real hub-delivery receive path — decrypts and surfaces
+  under the peer's conversation with the `[hub]` tier. Combined with the
+  v0.1.18 send-side tests, the fallback is now verified end to end
+  in-process (real-Tor transport itself was already proven in v0.1.16/17).
+  The feature remains **opt-in / default off**; the v0.1.18 "experimental"
+  caveat is lifted now that the round-trip is proven.
+
 ## v0.1.18 — 2026-06-02 — opt-in DM hub fallback (default OFF, experimental)
 
 Lets a direct message reach a peer who is **offline** (not just briefly
