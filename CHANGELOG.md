@@ -6,6 +6,30 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 3 (F3.2 + F3.3) — 2026-06-02 — design docs (no code yet)
+
+Design-first for the two remaining Phase-3 items (both have real trade-offs
+worth reviewing before code).
+
+- **`QUEUE-HARDENING.md` (F3.2 / H-1)** — offline-queue-fill DoS. Two attack
+  shapes (single-inbox flood of a fingerprint-derivable intro inbox; many-
+  inbox global byte-cap exhaustion). Core tension: sealed-sender + D-1
+  ephemeral keys make per-sender quota evadable. Recommendation: ship **fair
+  eviction** (evict oldest-from-largest queue under memory pressure instead
+  of drop-newest) — identity-free, defeats hub-wide exhaustion; **defer**
+  proof-of-work to an opt-in hub policy; **reject** capability tokens /
+  stable-key quota (break first-contact / sender-privacy). Notes the private
+  default already has no targetable inbox (shape 1 only hits reachable users).
+- **`ROOM-AUTHORITY.md` (F3.3 / G-2)** — any member can add/remove any member.
+  Inherent MLS limit: you can't *prevent* a member emitting a valid commit,
+  only make honest clients **reject** it (which forks the group). Recommended
+  MVP: an **admin set** (seed: creator) with send-side refusal + receive-side
+  rejection+warning; defer the GroupContext-extension authenticated variant
+  and full fork-recovery. Honest framing: makes violations honest-client-
+  enforced + visible, not impossible.
+
+---
+
 ## Fortification Phase 3 (F3.1 / P-3) — 2026-06-02 — inbound delivery off the read loop
 
 Closes the P-3 / A2.5 head-of-line DoS (THREAT_MODEL §8.4). Inbound hub
