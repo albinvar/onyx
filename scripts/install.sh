@@ -134,6 +134,17 @@ detect_target() {
       esac
       ;;
     Linux)
+      # Termux (Android) uses bionic libc and ships no glibc loader, so the
+      # glibc `*-linux-gnu` binary can't exec there ("cannot execute:
+      # required file not found"). On Termux/aarch64 select the fully-static
+      # musl build (F5.2), which runs on bare Termux with no proot. Detect
+      # Termux via its env: $TERMUX_VERSION, or a $PREFIX under com.termux.
+      if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+        if [ -n "${TERMUX_VERSION:-}" ] || case "${PREFIX:-}" in *com.termux*) true ;; *) false ;; esac; then
+          echo "aarch64-unknown-linux-musl"
+          return 0
+        fi
+      fi
       case "$arch" in
         x86_64|amd64)   echo "x86_64-unknown-linux-gnu" ;;
         aarch64|arm64)  echo "aarch64-unknown-linux-gnu" ;;

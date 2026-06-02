@@ -1,0 +1,70 @@
+# F5.2 spike: can Onyx build as a fully-STATIC aarch64 musl binary?
+#
+# A static musl binary runs on bare Termux (Android/bionic) with NO proot —
+# the real fix for "Onyx won't run on my phone" (MOBILE.md). The open
+# question is whether the C-heavy dep tree (ring, libcrux, rusqlite bundled)
+# cross-compiles for aarch64-unknown-linux-musl. This is a SEPARATE,
+# non-blocking workflow so a failure here never breaks the real release.yml.
+# If it goes green, promote the target into release.yml (F5.2 proper).
+#
+# Trigger: pushes to the spike branch, or manually (workflow_dispatch).
+name: musl-spike
+
+on:
+  push:
+    branches: [fort-phase5-musl-spike]
+  workflow_dispatch:
+
+jobs:
+  build-aarch64-musl:
+    name: build static aarch64-musl (onyx + onyxd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + musl target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-unknown-linux-musl
+      # Sets up the cross C toolchain + linker so ring/libcrux's C deps
+      # cross-compile for the musl target (this is the part that usually
+      # decides whether a C-heavy Rust tree builds for musl).
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build static musl binaries
+        env:
+          # Force a fully-static binary (no dynamic loader needed → runs on
+          # bare Termux). The setup action exports the right CC/linker.
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          # Build the FULL workspace (onyx + onyxd + onyx-hub) exactly as
+          # release.yml does — onyx-hub must cross-compile too or the
+          # promoted release target's rename step would fail on a missing
+          # binary.
+          cargo build --release --locked \
+            --target aarch64-unknown-linux-musl
+      - name: Confirm the binaries are static
+        run: |
+          set -e
+          BIN=target/aarch64-unknown-linux-musl/release
+          for b in onyx onyxd onyx-hub; do
+            echo "── file $b ──"
+            file "$BIN/$b" || true
+            # A static binary has no INTERP / no NEEDED dynamic libs.
+            if command -v readelf >/dev/null; then
+              if readelf -l "$BIN/$b" 2>/dev/null | grep -q INTERP; then
+                echo "WARNING: $b has an INTERP segment — not fully static"
+              else
+                echo "OK: $b has no INTERP (static)"
+              fi
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onyx-aarch64-musl-static
+          path: |
+            target/aarch64-unknown-linux-musl/release/onyx
+            target/aarch64-unknown-linux-musl/release/onyxd
+            target/aarch64-unknown-linux-musl/release/onyx-hub
+          if-no-files-found: error

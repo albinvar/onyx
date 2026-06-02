@@ -27,6 +27,11 @@ openmls_rust_crypto = { workspace = true }
 openmls_basic_credential = { workspace = true }
 openmls_traits   = { workspace = true }
 arti-client      = { workspace = true }
+# F5.2: pin the rustls `ring` CryptoProvider tree-wide (see root Cargo.toml).
+# Not referenced in code — present only so rustls's `ring` feature is enabled
+# on the shared rustls that arti's rustls backend uses, so rustls can
+# auto-select a provider instead of panicking at first TLS use.
+rustls           = { workspace = true }
 tor-rtcompat     = { workspace = true }
 tor-hsservice    = { workspace = true }
 tor-hscrypto     = { workspace = true }

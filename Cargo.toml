@@ -49,7 +49,18 @@ openmls_traits   = "0.5"
 # Tor — outbound circuits + hidden service publication.
 # arti is a large dep set; bringing it in significantly bumps build time.
 # `onion-service-service` enables tor-hsservice + keymgr for HS publishing.
-arti-client      = { version = "0.42", features = [
+# F5.2: use the rustls TLS backend instead of the default native-tls.
+# native-tls pulls in `openssl-sys`, whose C library does NOT cross-compile
+# for `aarch64-unknown-linux-musl` without a target OpenSSL install — it was
+# the sole blocker for a fully-static musl binary that runs on bare Termux
+# (the crypto stack libcrux/ring + bundled-sqlite cross-compile fine). rustls
+# is pure-Rust (ring-backed), so disabling defaults + selecting it removes the
+# OpenSSL dependency for every target, not just musl. `tokio` + `compression`
+# were in arti's default set, so we must re-list them explicitly.
+arti-client      = { version = "0.42", default-features = false, features = [
+    "tokio",                 # async runtime (was in arti's default set)
+    "rustls",                # pure-Rust TLS — replaces default native-tls
+    "compression",           # directory compression (was in arti's default set)
     "onion-service-service", # for publishing our v3 HS
     "onion-service-client",  # for dialing other peers' .onion addresses
     # A1.3: vanguards (guard-discovery defense). NOT in arti's default
@@ -77,6 +88,16 @@ tor-hscrypto     = "0.42"
 # need the type name in scope.
 tor-guardmgr     = { version = "0.42", features = ["vanguards"] }
 tor-config       = "0.42"
+# F5.2: arti's `rustls` backend leaves the rustls CryptoProvider *unselected*
+# (it enables neither `ring` nor `aws-lc-rs` on the shared rustls), so at first
+# TLS use rustls 0.23 panics "could not automatically determine the
+# process-level CryptoProvider". We pin the pure-Rust `ring` provider — and
+# ONLY ring (default-features=false keeps the C-heavy aws-lc-rs out, which also
+# matters for the musl cross-build). With exactly one provider feature enabled,
+# rustls auto-selects it; no per-binary install_default() needed. onyx-core is
+# in every binary + integration test, so depending on it here turns the feature
+# on tree-wide.
+rustls           = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Needed to construct the `Connected` relay-cell reply when accepting
 # an inbound onion-service stream.
 tor-cell         = "0.42"
@@ -159,3 +180,18 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# Dev/test disk footprint. Onyx pulls a very large dependency tree
+# (arti/tor + libcrux + openmls); embedding FULL debuginfo for every one of
+# those crates was the bulk of a ~31 GB `target/debug`. We almost never step
+# into dependency internals with a debugger, so:
+#   - our OWN crates keep line tables (backtraces still show file:line), and
+#   - dependencies get no debuginfo at all (`package."*"` = the bulk).
+# Typical effect: target/debug shrinks by well over half. Backtraces through
+# dep frames lose line numbers; that's the only trade-off. Release builds are
+# unaffected (separate profile above).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
