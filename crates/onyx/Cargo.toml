@@ -26,6 +26,9 @@ base64 = { workspace = true }
 zeroize = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+# A2 (chat rendering): local HH:MM timestamps on messages. `clock` enables
+# the local-timezone clock; chrono is already in the dependency tree.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [lints]
 workspace = true

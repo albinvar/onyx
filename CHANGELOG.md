@@ -6,6 +6,34 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI overhaul (A2) — 2026-06-02 — chat window rendering
+
+The message pane was a cramped `        name: text` list with no times and a
+repeated sender on every line. Reworked into a grouped, timestamped, modern
+chat view.
+
+### Changed
+- **Grouped, timestamped messages.** A `name · HH:MM` header (local time, via
+  chrono) is drawn only when the sender or the minute changes; messages are
+  indented beneath it, so a burst from one sender reads as one block instead
+  of repeating the name. Own messages are green, peers cyan.
+- **Attachment + hub accents.** Lines starting with 📎 get a magenta accent;
+  `[hub]`-delivered messages keep their yellow tag on the body line.
+- Friendlier empty-state ("type below and press Enter").
+
+### Added
+- `chrono` (clock) as a direct dep of `onyx` (already in the tree) for local
+  `HH:MM`; `fmt_hhmm` + `build_chat_lines` helpers; a unit test for the
+  sender/minute grouping.
+
+### Known limit (honest)
+- Room messages still render incoming under the room label (`#room`), not the
+  individual member — `ChatLine` carries direction, not per-message sender.
+  Per-sender room attribution is a follow-up (needs a `ChatLine` sender field
+  + daemon event plumbing).
+
+---
+
 ## v0.2 TUI overhaul (A1) — 2026-06-02 — navigable, multi-select file picker
 
 First slice of the v0.2 TUI work. The Send File modal (Ctrl-F) no longer

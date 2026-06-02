@@ -3208,6 +3208,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
+ "chrono",
  "clap",
  "crossterm",
  "onyx-core",
