@@ -38,14 +38,17 @@ jobs:
           # bare Termux). The setup action exports the right CC/linker.
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
+          # Build the FULL workspace (onyx + onyxd + onyx-hub) exactly as
+          # release.yml does — onyx-hub must cross-compile too or the
+          # promoted release target's rename step would fail on a missing
+          # binary.
           cargo build --release --locked \
-            --target aarch64-unknown-linux-musl \
-            -p onyx -p onyxd
+            --target aarch64-unknown-linux-musl
       - name: Confirm the binaries are static
         run: |
           set -e
           BIN=target/aarch64-unknown-linux-musl/release
-          for b in onyx onyxd; do
+          for b in onyx onyxd onyx-hub; do
             echo "── file $b ──"
             file "$BIN/$b" || true
             # A static binary has no INTERP / no NEEDED dynamic libs.
@@ -63,4 +66,5 @@ jobs:
           path: |
             target/aarch64-unknown-linux-musl/release/onyx
             target/aarch64-unknown-linux-musl/release/onyxd
+            target/aarch64-unknown-linux-musl/release/onyx-hub
           if-no-files-found: error

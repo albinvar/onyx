@@ -48,6 +48,19 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             ext: ''
+          # F5.2: fully-STATIC aarch64 musl build. Runs on bare Termux
+          # (Android/bionic) with NO proot — the native mobile fix
+          # (MOBILE.md). Cross-compiled on an x86_64 runner via a musl
+          # cross C toolchain (`cross: true` selects the setup step below);
+          # the only thing that previously blocked it was native-tls's
+          # openssl-sys, removed by switching arti to rustls(ring).
+          # `crt-static` makes it self-contained. fail-fast is off, so even
+          # if this target ever breaks it cannot block the other four.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            ext: ''
+            cross: true
+            rustflags_extra: '-C target-feature=+crt-static'
           - target: aarch64-unknown-linux-gnu
             # Build natively on an ARM runner instead of cross-compiling.
             # The Arti dep stack pulls in ring / aws-lc-sys, whose build
@@ -80,6 +93,15 @@ jobs:
         run: |
           rustup target add ${{ matrix.target }}
 
+      # F5.2: only the musl target cross-compiles (the four native targets
+      # build on their own-arch runners). This sets up the cross C toolchain
+      # + linker so ring's C/asm cross-compiles for aarch64-musl.
+      - name: Setup cross toolchain (musl)
+        if: ${{ matrix.cross }}
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Reproducible release build
@@ -89,10 +111,13 @@ jobs:
           # path in the binary's metadata to a stable prefix.
           # The `-C link-arg=-s` strips the symbol table on Linux; macOS
           # uses `strip` separately.
+          # `rustflags_extra` is empty for the four native targets and
+          # `-C target-feature=+crt-static` for the musl target (F5.2).
           RUSTFLAGS: >-
             --remap-path-prefix ${{ github.workspace }}=/onyx
             --remap-path-prefix ${HOME}/.cargo=/cargo
             -C link-arg=-s
+            ${{ matrix.rustflags_extra }}
         run: |
           # Stamp the user-facing version (git tag minus the `v`) into
           # the binaries so `--version` and the daemon's reported
