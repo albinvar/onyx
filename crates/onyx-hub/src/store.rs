@@ -161,6 +161,25 @@ impl Store {
         Ok(entries)
     }
 
+    /// H-1 (F3.2a): delete the single OLDEST queued payload for
+    /// `routing_id` (lowest `id` = FIFO head). Used by fair eviction
+    /// under global memory pressure to keep the durable store consistent
+    /// with the in-memory queue when the largest queue is trimmed.
+    /// Returns `Ok(true)` if a row was deleted, `Ok(false)` if the queue
+    /// was already empty on disk.
+    pub fn delete_oldest(&self, routing_id: &RoutingId) -> anyhow::Result<bool> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM queue_entry WHERE id = (
+                     SELECT id FROM queue_entry WHERE routing_id = ? ORDER BY id ASC LIMIT 1
+                 )",
+                params![routing_id.as_slice()],
+            )
+            .context("delete_oldest")?;
+        Ok(affected > 0)
+    }
+
     /// Load every queued payload (per routing id) from disk. Used
     /// once at hub startup to warm the in-memory queue cache so
     /// reads during normal operation don't touch SQLite.
@@ -308,6 +327,24 @@ mod tests {
         // Second drain on the same id returns empty.
         let again = s.drain_queue(&rid).unwrap();
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn delete_oldest_removes_fifo_head_only() {
+        // H-1 (F3.2a): fair eviction trims the FIFO head one at a time.
+        let mut s = fresh();
+        let rid: RoutingId = [0xCC; 16];
+        s.enqueue(&rid, b"first").unwrap();
+        s.enqueue(&rid, b"second").unwrap();
+        s.enqueue(&rid, b"third").unwrap();
+
+        assert!(s.delete_oldest(&rid).unwrap(), "should delete the head");
+        // Remaining are second, third in FIFO order.
+        let drained = s.drain_queue(&rid).unwrap();
+        assert_eq!(drained, vec![b"second".to_vec(), b"third".to_vec()]);
+
+        // Deleting from an empty queue is a no-op (false), not an error.
+        assert!(!s.delete_oldest(&rid).unwrap());
     }
 
     #[test]
