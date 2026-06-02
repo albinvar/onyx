@@ -18,9 +18,11 @@ ships fine). Fixed all three jobs:
   (`too_many_lines` on linear dispatchers, `match_same_arms` on
   intentionally-separate modal/key arms, `similar_names` on `a`/`b` test
   bindings). Includes the 1–2 lints this session added.
-- **`cargo-audit`**: synced the action's `ignore` to the ONE justified
-  `deny.toml` advisory (`RUSTSEC-2024-0436` — `paste` unmaintained, transitive
-  via arti; review by 2026-12-31). The job stays a tripwire for *new*
+- **`cargo-audit`**: added the missing `checks: write` permission (the action
+  posts a Check Run; without it: "Resource not accessible by integration")
+  and synced the action's `ignore` to deny.toml's two justified advisories
+  (`RUSTSEC-2024-0436` paste-unmaintained + `RUSTSEC-2023-0071` Marvin-RSA,
+  both transitive via arti, reviewed). The job stays a tripwire for *new*
   advisories instead of a permanent red.
 - **`test`**: bumped the `rooms_smoke` integration `SETUP_TIMEOUT`/`EVENT_TIMEOUT`
   15s → 60s so the 9 concurrent spawn-hub+daemon tests don't flake on loaded
