@@ -516,41 +516,85 @@ impl HubState {
     /// logged at `warn!` and silently lost — same delivery contract as
     /// the existing "every subscriber was full" path, just bounded.
     fn enqueue_offline(&mut self, target: RoutingId, payload: Vec<u8>) {
-        if !self.can_enqueue(target, payload.len()) {
-            return;
-        }
-        // Write through to disk first (borrow), then take ownership
-        // into the in-memory queue and update the byte accounting.
-        self.enqueue_durable(target, &payload);
-        self.queued_bytes += payload.len() + QUEUE_ENTRY_OVERHEAD_BYTES; // A-3
-        self.queues.entry(target).or_default().push(payload);
-    }
-
-    /// Whether an envelope of `len` bytes may be queued for `target`
-    /// without breaching the per-id depth cap or the global byte cap
-    /// (audit MEDIUM). Logs the reason at `warn!` on refusal.
-    fn can_enqueue(&self, target: RoutingId, len: usize) -> bool {
+        let needed = payload.len() + QUEUE_ENTRY_OVERHEAD_BYTES; // A-3
+        // Per-id depth cap is a HARD refuse: it bounds a single inbox's
+        // growth, and the byte-cap eviction below is GLOBAL only — we never
+        // evict other inboxes' mail to push one inbox past its own depth.
         let depth = self.queues.get(&target).map_or(0, Vec::len);
         if depth >= MAX_QUEUE_DEPTH_PER_ID {
             warn!(
                 target_prefix = format!("{:02x}{:02x}", target[0], target[1]),
                 depth, "hub: offline queue at per-id depth cap; dropping envelope"
             );
-            return false;
+            return;
         }
-        // A-3: include the per-entry overhead in the admission check so
-        // the cap reflects the memory this enqueue will actually pin.
-        if self
+        // H-1 (F3.2a): fair eviction under global memory pressure. Rather
+        // than dropping THIS (newest) envelope when the byte cap is hit —
+        // which lets whoever filled the queue first starve everyone else —
+        // evict the oldest entry from the LARGEST queue until there's room.
+        // A flood concentrated in one/few queues is trimmed first; the many
+        // small legitimate queues are protected. (Under-attack only: it can
+        // evict an older real message, same lossy regime as the old
+        // drop-newest, but now biased toward the biggest hog.)
+        if needed > MAX_TOTAL_QUEUED_BYTES {
+            warn!("hub: single envelope exceeds the entire queue budget; dropping");
+            return;
+        }
+        let mut guard = 0usize;
+        while self.queued_bytes.saturating_add(needed) > MAX_TOTAL_QUEUED_BYTES {
+            if !self.evict_oldest_from_largest() {
+                warn!("hub: byte cap reached with nothing to evict; dropping envelope");
+                return;
+            }
+            guard += 1;
+            if guard > MAX_QUEUE_DEPTH_PER_ID.saturating_mul(8) {
+                warn!("hub: fair-eviction guard tripped; dropping envelope");
+                return;
+            }
+        }
+        // Write through to disk first (borrow), then take ownership
+        // into the in-memory queue and update the byte accounting.
+        self.enqueue_durable(target, &payload);
+        self.queued_bytes += needed;
+        self.queues.entry(target).or_default().push(payload);
+    }
+
+    /// H-1 (F3.2a): evict the oldest entry from the queue with the most
+    /// entries (the biggest hog under a flood), keeping the durable store
+    /// consistent. Returns `false` when there is nothing to evict.
+    fn evict_oldest_from_largest(&mut self) -> bool {
+        let victim = self
+            .queues
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .max_by_key(|(_, q)| q.len())
+            .map(|(rid, _)| *rid);
+        let Some(rid) = victim else {
+            return false;
+        };
+        // O(n) front-removal, but only on the rare under-pressure path and
+        // bounded by the per-id depth cap.
+        let evicted_len = self
+            .queues
+            .get_mut(&rid)
+            .expect("victim queue exists")
+            .remove(0)
+            .len();
+        self.queued_bytes = self
             .queued_bytes
-            .saturating_add(len + QUEUE_ENTRY_OVERHEAD_BYTES)
-            > MAX_TOTAL_QUEUED_BYTES
-        {
-            warn!(
-                queued_bytes = self.queued_bytes,
-                "hub: total offline-queue byte cap reached; dropping envelope"
-            );
-            return false;
+            .saturating_sub(evicted_len + QUEUE_ENTRY_OVERHEAD_BYTES);
+        if self.queues.get(&rid).is_some_and(Vec::is_empty) {
+            self.queues.remove(&rid);
         }
+        if let Some(store) = &self.durable_store
+            && let Err(e) = store.delete_oldest(&rid)
+        {
+            warn!(error = %e, "hub store: delete_oldest failed during fair eviction (in-memory queue still consistent)");
+        }
+        warn!(
+            victim_prefix = format!("{:02x}{:02x}", rid[0], rid[1]),
+            "hub: fair-eviction trimmed oldest from the largest offline queue under memory pressure"
+        );
         true
     }
 
@@ -811,6 +855,53 @@ mod tests {
             state.queue_len(&id),
             MAX_QUEUE_DEPTH_PER_ID,
             "queue depth must be clamped at the per-id cap"
+        );
+    }
+
+    #[test]
+    fn fair_eviction_trims_the_largest_queue_first() {
+        // H-1 (F3.2a): under memory pressure we evict the oldest entry from
+        // the LARGEST queue, so a flood concentrated in one inbox is trimmed
+        // before a small legitimate inbox loses anything.
+        let mut state = HubState::new();
+        let big: RoutingId = [0xB1; 16];
+        let small: RoutingId = [0x59; 16];
+        // No subscribers → deliver() queues offline.
+        for _ in 0..5 {
+            state.deliver(big, b"x".to_vec());
+        }
+        state.deliver(small, b"y".to_vec());
+        assert_eq!(state.queue_len(&big), 5);
+        assert_eq!(state.queue_len(&small), 1);
+
+        // First eviction must hit the LARGEST queue, never the small one.
+        assert!(state.evict_oldest_from_largest());
+        assert_eq!(
+            state.queue_len(&big),
+            4,
+            "largest queue should lose its oldest entry"
+        );
+        assert_eq!(
+            state.queue_len(&small),
+            1,
+            "small legitimate queue must be protected"
+        );
+
+        // Keep trimming the big queue down to a tie with the small one.
+        for _ in 0..3 {
+            assert!(state.evict_oldest_from_largest());
+        }
+        assert_eq!(state.queue_len(&big), 1);
+        assert_eq!(state.queue_len(&small), 1);
+
+        // Two more evictions clear both (tie-break order unspecified).
+        assert!(state.evict_oldest_from_largest());
+        assert!(state.evict_oldest_from_largest());
+        assert_eq!(state.queue_len(&big), 0);
+        assert_eq!(state.queue_len(&small), 0);
+        assert!(
+            !state.evict_oldest_from_largest(),
+            "no-op when all queues are empty"
         );
     }
 

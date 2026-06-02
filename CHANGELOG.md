@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 3 (F3.2a / H-1) — 2026-06-02 — fair queue eviction
+
+Implements the F3.2a slice from `QUEUE-HARDENING.md`: the hub's offline
+queue no longer lets a flood that *arrives first* starve everyone else.
+
+### Changed
+- **Fair eviction under memory pressure** (`onyx-hub/src/state.rs`). When the
+  global byte cap (256 MiB) would be exceeded, instead of dropping the new
+  envelope ("drop-newest"), the hub evicts the **oldest entry from the
+  largest queue** until there's room, then enqueues. A flood concentrated in
+  one/few queues is trimmed first; the many small legitimate queues are
+  protected. The per-id depth cap (1024) stays a hard refuse.
+- `onyx-hub/src/store.rs`: `delete_oldest(routing_id)` keeps the durable
+  SQLite queue consistent when the in-memory largest queue is trimmed.
+
+### Honest scope
+This defeats the **many-inbox global-exhaustion** attack (one bloated queue
+can't deny the many). It does **not** stop a **single-inbox flood** of a
+*reachable* user's intro inbox within the per-id cap — the private default
+(no targetable inbox) avoids that, and proof-of-work stays a deferred opt-in
+hub policy. Under attack, eviction can drop an *older* real message (same
+lossy regime as the old drop-newest, now biased to the biggest hog).
+
+### Verified
+- `fair_eviction_trims_the_largest_queue_first` (largest trimmed, small
+  protected) + `delete_oldest_removes_fifo_head_only`. 63 hub-lib + 9
+  integration tests pass; clippy-clean.
+
+### Docs
+- `THREAT_MODEL.md` §8.4 H-1 row: 🟠→🟡 updated to "further mitigated (F3.2a)".
+
+---
+
 ## Fortification Phase 3 (F3.2 + F3.3) — 2026-06-02 — design docs (no code yet)
 
 Design-first for the two remaining Phase-3 items (both have real trade-offs
