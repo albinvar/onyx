@@ -6,6 +6,31 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## CI green — 2026-06-02 — clear the chronically-red CI jobs
+
+`ci.yml` had been red long-term (independent of the Release workflow, which
+ships fine). Fixed all three jobs:
+
+- **clippy `-D warnings`**: cleared the workspace-wide pedantic-lint debt —
+  real fixes where behaviour is identical (`sort_by_key`, `String::clone`,
+  `Vec::contains`, `is_some_and`, `match`→`if let`/`let…else`) and targeted
+  `#[allow(...)]` with rationale where the lint fights clarity
+  (`too_many_lines` on linear dispatchers, `match_same_arms` on
+  intentionally-separate modal/key arms, `similar_names` on `a`/`b` test
+  bindings). Includes the 1–2 lints this session added.
+- **`cargo-audit`**: synced the action's `ignore` to the ONE justified
+  `deny.toml` advisory (`RUSTSEC-2024-0436` — `paste` unmaintained, transitive
+  via arti; review by 2026-12-31). The job stays a tripwire for *new*
+  advisories instead of a permanent red.
+- **`test`**: bumped the `rooms_smoke` integration `SETUP_TIMEOUT`/`EVENT_TIMEOUT`
+  15s → 60s so the 9 concurrent spawn-hub+daemon tests don't flake on loaded
+  CI runners (fast runs still return early via the poll loops).
+
+Verified locally: `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all --check`, and `cargo test --workspace` all green.
+
+---
+
 ## v0.1.20 — 2026-06-02 — fortification release: trust, timing, federation/DoS, audit-residual
 
 The fortification roadmap's first big batch. Closes whole phases of the

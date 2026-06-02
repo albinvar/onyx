@@ -687,8 +687,7 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
     app.first_contact_reachable = crate::load_file_config()
         .ok()
         .flatten()
-        .map(|c| c.first_contact_reachable)
-        .unwrap_or(false);
+        .is_some_and(|c| c.first_contact_reachable);
 
     // Background: tail subscription (reconnects automatically).
     let (tail_tx, tail_rx) = mpsc::channel::<ApiResponse>(256);
@@ -746,6 +745,9 @@ async fn event_loop(
 }
 
 /// Returns `true` if the loop should exit.
+// One big key dispatcher; the long linear match + intentionally-separate
+// arms (some sharing a body for readability) are clearer inline than split.
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
@@ -915,7 +917,11 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
     clippy::too_many_lines,
     clippy::collapsible_if,
     clippy::collapsible_match,
-    clippy::if_not_else
+    clippy::if_not_else,
+    // distinct (modal, key) arms intentionally share bodies (e.g. each
+    // text-input modal handles Backspace/Char the same way) — separate
+    // arms document each modal rather than collapsing them.
+    clippy::match_same_arms
 )]
 async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
     // Take + put back so we can mutate without fighting the borrow
@@ -1668,14 +1674,11 @@ async fn open_settings_modal(app: &mut AppState) {
 /// still bootstrapping, or a no-Tor build), show a clear placeholder
 /// instead of a broken code.
 fn open_connect_code_modal(app: &AppState) -> ModalState {
-    let snap = match &app.last_status {
-        Some(Ok(s)) => s,
-        _ => {
-            return ModalState::ConnectCode {
-                code: "(connecting to daemon… try again in a moment)".to_string(),
-                copied: false,
-            };
-        }
+    let Some(Ok(snap)) = &app.last_status else {
+        return ModalState::ConnectCode {
+            code: "(connecting to daemon… try again in a moment)".to_string(),
+            copied: false,
+        };
     };
     match &snap.onion {
         Some(onion) if !onion.is_empty() => {
@@ -2282,6 +2285,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 // fields, different layouts) so splitting into helpers would just
 // chase the line count around without improving readability.
 #[allow(clippy::too_many_lines)]
+// Several modal kinds intentionally map to the same height; keeping the
+// arms separate documents each modal rather than collapsing them.
+#[allow(clippy::match_same_arms)]
 fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) {
     // Compute a centered region. Width = min(76, area.width - 4).
     let width = area.width.saturating_sub(4).min(76);
