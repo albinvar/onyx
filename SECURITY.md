@@ -245,7 +245,27 @@ Do not run `--listen-tcp` against real peers. The daemon will not stop you, but 
 
 ---
 
-## 7. What changes when we get audited
+## 7. Supply chain — how a downloaded binary is tied to this source
+
+A signed, reproducible release lets you replace "trust the maintainer didn't slip something in" with "rebuild it yourself and check the bytes." The chain has four links, each independently checkable:
+
+1. **Deterministic build (`release.yml`).** Every release is built with `SOURCE_DATE_EPOCH` pinned, `--remap-path-prefix` rewriting host paths to stable prefixes, `--locked` (exact `Cargo.lock`), symbol stripping, and the version stamped from the tag via `ONYX_RELEASE_VERSION`. The same source therefore produces the same bytes regardless of who builds it or when. *Status: demonstrated locally (two independent `--release --locked` builds produced a byte-identical `onyx`); independent cross-machine confirmation of the published artifacts is still owed.*
+
+2. **Signed checksums.** CI computes `SHA256SUMS-<target>.txt` per target, aggregates them into a single `SHA256SUMS.txt`, and signs it with sigstore **cosign** (keyless, OIDC-bound to this repo's `release.yml` — no long-lived key to steal). Each individual binary is also signed so a single-binary download can be verified without the manifest.
+
+3. **Verified install (`scripts/install.sh`).** The installer is **fail-closed** (per P6): it downloads each binary's `.cosign-bundle` and verifies the signature with cosign. If cosign is missing, or a signature bundle is absent, the install **aborts** — it does not fall back to "SHA256 only," because the binary and `SHA256SUMS.txt` come from the same release an attacker would control, so the hash alone proves nothing about authenticity. The only way past is the explicit `ONYX_NO_VERIFY=1` opt-out.
+
+4. **Reproduce from source (`scripts/verify-reproducible-build.sh`).** Anyone can check out a release tag, rebuild with the exact flags from link 1, and diff the resulting SHA256 against the published (signed) `SHA256SUMS.txt`. A byte-identical match proves the published binary was built from that exact, auditable source — closing the gap sigstore alone leaves (sigstore signs *what CI built*; it does not tell you the source is honest).
+
+```
+scripts/verify-reproducible-build.sh v0.1.19 SHA256SUMS.txt   # rebuild tag + compare
+```
+
+What this still does **not** establish: a backdoor committed to the source *before* the tag was cut (that is what the external audit in §8 is for), and full cross-machine reproducibility of the *published* artifacts (link 1's outstanding item).
+
+---
+
+## 8. What changes when we get audited
 
 When an external security audit completes, this document will be updated as follows:
 
@@ -259,7 +279,7 @@ Until then, treat every claim in this document and the threat model as **designe
 
 ---
 
-## 8. Related documents
+## 9. Related documents
 
 - **`THREAT_MODEL.md`** — the adversary classes, defended assets, and residual-linkability accounting.
 - **`DESIGN.md`** — the full protocol specification (wire formats, key derivation, frame types, group lifecycle).

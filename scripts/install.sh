@@ -22,6 +22,9 @@
 #                        Set to "onyx onyxd onyx-hub" to grab them all.
 #   ONYX_NO_VERIFY     — set to 1 to skip cosign verification (NOT RECOMMENDED).
 #                        SHA256 of the binary against SHA256SUMS still happens.
+#                        WITHOUT this, the install ABORTS if cosign is missing
+#                        or a signature bundle is absent — it is fail-closed
+#                        (per SECURITY.md P6: no "less secure but easier" path).
 #   ONYX_SKIP_PATH_HINT — set to 1 to suppress the "add to PATH" message
 #
 # Threat model:
@@ -202,13 +205,18 @@ verify_sigstore() {
     return 0
   fi
   if ! command -v cosign >/dev/null 2>&1; then
-    warn "cosign not installed — sigstore signature NOT checked."
-    warn "this means: SHA256 catches transport corruption, but an attacker"
-    warn "who tampered with the binary in the GitHub release tab will not"
-    warn "be detected. install cosign and re-run for full verification:"
-    warn "  macOS:   brew install cosign"
-    warn "  Linux:   https://docs.sigstore.dev/cosign/installation/"
-    return 0
+    err "cosign not installed — cannot verify the sigstore signature."
+    err "SHA256 alone is NOT protection here: the binary and SHA256SUMS.txt"
+    err "come from the same GitHub release, so an attacker who tampers with"
+    err "one tampers with both. refusing to install an unverified binary."
+    err "either install cosign and re-run (RECOMMENDED):"
+    err "  macOS:        brew install cosign"
+    err "  Linux:        https://docs.sigstore.dev/cosign/installation/"
+    err "  Termux/arm64: download the linux/arm64 cosign binary from"
+    err "                https://github.com/sigstore/cosign/releases (it is a"
+    err "                static Go binary) and put it on your PATH"
+    err "or accept the risk explicitly by re-running with ONYX_NO_VERIFY=1."
+    die "aborting: no cosign and no ONYX_NO_VERIFY override"
   fi
   info "verifying sigstore signature with cosign..."
   if cosign verify-blob \
@@ -259,9 +267,15 @@ fetch_and_install() {
     fi
   fi
 
-  # Sigstore verification.
+  # Sigstore verification. Fail-closed: a binary is mandatory, so a missing
+  # signature bundle is refused (not silently skipped) unless the user has
+  # explicitly accepted the risk with ONYX_NO_VERIFY=1.
   if [ -f "${tmpdir}/${asset}.cosign-bundle" ]; then
     verify_sigstore "${tmpdir}/${asset}" "${tmpdir}/${asset}.cosign-bundle" "$ONYX_REPO"
+  elif [ "$ONYX_NO_VERIFY" = "1" ]; then
+    warn "no signature bundle for ${asset} and ONYX_NO_VERIFY=1 — installing unverified."
+  else
+    die "no sigstore bundle for ${asset} — refusing to install an unverified binary (set ONYX_NO_VERIFY=1 to override)."
   fi
 
   # macOS quarantine xattr — applied by curl when downloading. Strip

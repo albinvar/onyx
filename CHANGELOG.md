@@ -6,6 +6,36 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 0 (F0.2) — 2026-06-02 — verified install is now fail-closed
+
+`install.sh` already cosign-verified each binary against its sigstore
+bundle and checked SHA256 against the signed manifest — but it **silently
+continued** when cosign was absent or a signature bundle was missing,
+falling back to "SHA256 only." That fallback is no protection: the binary
+and `SHA256SUMS.txt` come from the same GitHub release, so an attacker who
+tampers with one tampers with both. This violated SECURITY.md P6 ("no
+optional weakening — that codepath must not exist").
+
+### Changed
+- **Install is fail-closed.** When cosign is missing, or a binary's
+  `.cosign-bundle` is absent, the install now **aborts** instead of
+  installing an unverified binary. The only way past is the explicit
+  `ONYX_NO_VERIFY=1` opt-out (which already existed and still skips
+  verification end to end). Verified by a behavioral test: cosign-hidden
+  + no override ⇒ exit 1; cosign-hidden + `ONYX_NO_VERIFY=1` ⇒ skip + continue.
+- The cosign-missing message now includes **Termux/arm64** guidance
+  (download the static linux/arm64 cosign release binary), not just
+  macOS/Linux. (Closes the gap behind the user's Termux install report.)
+
+### Docs
+- `SECURITY.md` §7 (new) — "Supply chain: how a downloaded binary is tied
+  to this source": the four-link chain (deterministic build → signed
+  checksums → fail-closed verified install → reproduce-from-source), what
+  it proves, and what it still doesn't (pre-tag source backdoor → audit;
+  cross-machine repro of published artifacts → owed).
+
+---
+
 ## Fortification Phase 0 (F0.1) — 2026-06-02 — reproducible builds: demonstrated + verify tooling
 
 First step of the fortification roadmap (close every documented weakness,
