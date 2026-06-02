@@ -1379,3 +1379,55 @@ async fn rooms_e2e_private_mode_leaks_no_identity_to_hub() {
          private-mode zero above is meaningful)"
     );
 }
+
+/// F2.1a: a daemon in **reachable** mode opens TWO hub connections — an
+/// identity session (long-term keys: KP publish + intro-inbox subscribe)
+/// and an activity session (ephemeral keys: room/DM session tokens +
+/// outbound) — so the hub cannot link the identity surface to the
+/// activity surface. The **private default** opens exactly ONE. This pins
+/// the core F2.1a behaviour. See `OBLIVIOUS-ROUTING.md` §3.
+#[tokio::test]
+async fn rooms_e2e_reachable_splits_identity_and_activity_connections() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,onyx_daemon=warn,onyx_hub=warn")
+        .with_test_writer()
+        .try_init();
+
+    // Reachable daemon on its own hub: expect TWO connections.
+    let (hub_a, hub_a_pub, _hub_a_dir, hub_a_state) = spawn_hub_with_state(None, None).await;
+    let (reach_sock, _reach_dir) =
+        spawn_daemon_with_opts(&hub_a, &hub_a_pub, "reach_split", true, None).await;
+    let _ = one_shot_until_ok(&reach_sock, &ApiRequest::Identity, "reach_split ready").await;
+    let mut reach_conns = 0;
+    for _ in 0..40 {
+        reach_conns = hub_a_state.lock().await.connection_count();
+        if reach_conns >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        reach_conns, 2,
+        "reachable daemon must open exactly two hub connections \
+         (identity + activity), got {reach_conns}"
+    );
+
+    // Private daemon on its OWN hub: expect exactly ONE connection.
+    let (hub_b, hub_b_pub, _hub_b_dir, hub_b_state) = spawn_hub_with_state(None, None).await;
+    let (priv_sock, _priv_dir) =
+        spawn_daemon_with_opts(&hub_b, &hub_b_pub, "priv_single", false, None).await;
+    let _ = one_shot_until_ok(&priv_sock, &ApiRequest::Identity, "priv_single ready").await;
+    for _ in 0..40 {
+        if hub_b_state.lock().await.connection_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Settle, then confirm no phantom second connection appears.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let priv_conns = hub_b_state.lock().await.connection_count();
+    assert_eq!(
+        priv_conns, 1,
+        "private-default daemon must open exactly one hub connection, got {priv_conns}"
+    );
+}

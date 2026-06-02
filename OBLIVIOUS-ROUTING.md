@@ -201,10 +201,14 @@ explicitly out of scope for v0 and stays in ROTATION.md §6's deferred list.
 
 ## §5 Proposed slices (in order)
 
-1. **F2.1a — separated publish/subscribe connections** (Part B). Small,
-   additive, default-mode-untouched, wire- and hub-compatible. Ships with
-   the dual-connection test + red-team distinct-key assertion. **This is the
-   concrete code slice F2.1 should produce.**
+1. **F2.1a — identity/activity session split** (Part B). ✅ **DONE**
+   (2026-06-02). Reachable mode runs an identity session (long-term keys,
+   KP + intro-inbox) separate from an activity session (ephemeral keys,
+   session-tokens + outbound), each on its own isolated circuit. Private
+   default unchanged (single ephemeral activity session). Unified Tor + TCP
+   reconnect loops behind `supervise_hub_session` / `spawn_hub_role_sessions`.
+   Verified by `rooms_e2e_reachable_splits_identity_and_activity_connections`
+   (reachable → 2 connections, private → 1). Wire + hub unchanged.
 2. **F2.1b — docs: connect-code as the oblivious first-contact path** (Part
    C recommendation). Update ANONYMITY.md §3.2 + the recommended-config
    matrix; cross-reference connect-codes. Doc-only.

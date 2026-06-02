@@ -846,108 +846,39 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
 
             let state_for_hub_task = state.clone();
-            // D-2: each hub connection gets its own circuit-isolation
-            // group, so a network/exit observer can't link this user's
-            // separate hub sessions by seeing them share a Tor circuit.
-            // The isolated client is held across this task's reconnect
-            // loop, so the per-hub isolation is stable.
-            let tor_clone = tor.isolated();
             // Per-iter Zeroizing clones — both buffers are no longer
             // Copy (the Zeroizing wrapper opts out), so each spawned
             // task gets its own scrub-on-drop copy of the seed bytes.
             let our_sk_bytes_task = our_sk_bytes.clone();
             let our_kem_bytes_task = our_kem_bytes.clone();
             let our_signing_bytes_task = our_signing_bytes.clone();
-            let mut outbound_rx = hub_tor_rxs.remove(0);
-            let host = host.clone();
-            // D-1: the single master switch. `false` (default) = the
-            // private mode (ephemeral Noise + ephemeral SUBSCRIBE
-            // signing + no intro-inbox subscription + no KP publish).
-            let first_contact_reachable = args.first_contact_reachable;
-            let span = info_span!("hub", idx, host = %host, port);
-
-            hub_tasks.push(tokio::spawn(async move {
-                let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes_task);
-                let our_signing =
-                    onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes_task);
-                let our_kem = std::sync::Arc::new(
-                    onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes_task)
-                        .expect("our own KEM secret must round-trip"),
-                );
-                let state_for_hub_cb = state_for_hub_task.clone();
-                let our_kem_for_cb = our_kem.clone();
-                let mut backoff = std::time::Duration::from_millis(500);
-                loop {
-                    // D-1: publishing a KeyPackage is one of the three
-                    // hub-linkage leaks (the KP carries our signing key
-                    // = fingerprint). Only publish in first-contact-
-                    // reachable mode; in the private default we skip it
-                    // entirely so the hub never sees our identity.
-                    let self_publish = if first_contact_reachable {
-                        let party = state_for_hub_task.mls_party.lock().await;
-                        match party.key_package_bytes() {
-                            Ok(kp_bytes) => Some(hub_client::SelfPublish {
-                                routing_id: our_inbox,
-                                kp_bytes,
-                            }),
-                            Err(e) => {
-                                warn!(error = %e, "hub: KeyPackage generation failed; skipping publish this cycle");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    // T6.3.g: subscribe to every current room's
-                    // per-epoch session token, computed per (re)connect
-                    // so vault state at connect time wins; mid-session
-                    // room changes arrive via incremental
-                    // `HubOutbound::Subscribe` pushes.
-                    // D-1: the fingerprint-derived intro_inbox is added
-                    // ONLY in first-contact-reachable mode — it's an
-                    // identity leak otherwise. Room session tokens carry
-                    // no identity, so they subscribe in both modes.
-                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> = Vec::new();
-                    if first_contact_reachable {
-                        subscriptions.push(our_inbox);
-                    }
-                    subscriptions.extend(
-                        current_room_session_tokens(&state_for_hub_task).await,
-                    );
-                    info!(
-                        sub_count = subscriptions.len(),
-                        first_contact_reachable,
-                        "hub: connect subscriptions (intro + room session tokens)"
-                    );
-                    let result = hub_client::run_hub_session(
-                        &tor_clone,
-                        &host,
-                        port,
-                        &hub_pubkey,
-                        &our_sk,
-                        &our_signing,
-                        &subscriptions,
-                        &mut outbound_rx,
-                        |target, body| {
-                            let state = state_for_hub_cb.clone();
-                            let our_kem = our_kem_for_cb.clone();
-                            async move {
-                                handle_hub_delivery(target, body, &state, &our_kem).await;
-                            }
-                        },
-                        self_publish.as_ref(),
-                        !first_contact_reachable,
-                    )
-                    .await;
-                    match result {
-                        Ok(()) => info!("hub: session ended cleanly"),
-                        Err(e) => warn!(error = %e, "hub: session ended with error"),
-                    }
-                    info!(?backoff, "hub: backing off before reconnect");
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
-                }
-            }.instrument(span)));
+            let outbound_rx = hub_tor_rxs.remove(0);
+            // F2.1a: split into an identity session (long-term keys, KP +
+            // intro inbox) and an activity session (ephemeral keys, room
+            // session tokens + outbound) when reachable; a single
+            // ephemeral activity session in the private default (D-1) —
+            // byte-identical to pre-F2.1a behaviour. `fresh_session()`
+            // gives each session its own isolated Tor circuit (D-2), so a
+            // network/exit observer can't link them by a shared circuit.
+            let transport = HubTransport::Tor {
+                // Base isolated client; `fresh_session()` isolates again
+                // per session so identity and activity ride distinct
+                // circuits (D-2).
+                tor: tor.isolated(),
+                host: host.clone(),
+                port,
+            };
+            hub_tasks.extend(spawn_hub_role_sessions(
+                &transport,
+                hub_pubkey,
+                &state_for_hub_task,
+                &our_sk_bytes_task,
+                &our_signing_bytes_task,
+                &our_kem_bytes_task,
+                our_inbox,
+                args.first_contact_reachable,
+                outbound_rx,
+            ));
 
             // T-cover.2: per-hub cover-traffic emitter. Opt-in via
             // `--cover-traffic-mean-secs <N>`. The emitter clones the
@@ -2446,6 +2377,219 @@ fn now_unix_ms_i64() -> i64 {
     .unwrap_or(0)
 }
 
+/// F2.1a: the role a hub session plays. Splitting them lets a daemon
+/// that opted into first-contact reachability decouple its **identity**
+/// surface from its **activity** surface, so the hub learns "bob is
+/// reachable" but cannot link bob's fingerprint to *which rooms/DMs* he
+/// is in. See `OBLIVIOUS-ROUTING.md` §3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HubRole {
+    /// Long-term keys. Publishes our KeyPackage + subscribes to our
+    /// fingerprint-derived intro inbox; receives first-contact bootstraps.
+    /// The hub knows this is us — by design (we opted into reachability).
+    /// Carries NO outbound.
+    Identity,
+    /// Fresh ephemeral Noise + SUBSCRIBE-signing keys. Subscribes to the
+    /// per-(room, epoch) session tokens (high-entropy, identity-free) and
+    /// carries ALL outbound (sends + KP_FETCH). In the private default
+    /// this is the *only* session — byte-identical to pre-F2.1a behaviour.
+    Activity,
+}
+
+/// How a hub session reaches its hub. Tor in production; plain TCP for
+/// the test harness.
+#[derive(Clone)]
+enum HubTransport {
+    Tor {
+        tor: TorRuntime,
+        host: String,
+        port: u16,
+    },
+    Tcp {
+        addr: String,
+    },
+}
+
+impl HubTransport {
+    /// A fresh transport for one session. For Tor this is a freshly
+    /// *isolated* circuit (D-2) so the identity and activity sessions
+    /// cannot be linked by a shared Tor circuit; for TCP (test-only) a
+    /// plain clone.
+    fn fresh_session(&self) -> Self {
+        match self {
+            Self::Tor { tor, host, port } => Self::Tor {
+                tor: tor.isolated(),
+                host: host.clone(),
+                port: *port,
+            },
+            Self::Tcp { addr } => Self::Tcp { addr: addr.clone() },
+        }
+    }
+}
+
+/// F2.1a: one supervised (reconnecting) hub session in a given role.
+/// Unifies the Tor and TCP reconnect loops behind a single body so the
+/// identity/activity split lives in exactly one place. Loops forever with
+/// capped exponential backoff; aborted on daemon shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_hub_session(
+    role: HubRole,
+    transport: HubTransport,
+    hub_pubkey: IdentityPublic,
+    state: Arc<DaemonState>,
+    our_sk_bytes: Zeroizing<[u8; 32]>,
+    our_signing_bytes: Zeroizing<[u8; 32]>,
+    our_kem_bytes: Zeroizing<Vec<u8>>,
+    our_inbox: onyx_core::routing::RoutingId,
+    mut outbound_rx: mpsc::Receiver<hub_client::HubOutbound>,
+) {
+    let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes);
+    let our_signing = onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes);
+    let our_kem = std::sync::Arc::new(
+        onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes)
+            .expect("our own KEM secret must round-trip"),
+    );
+    let mut backoff = std::time::Duration::from_millis(500);
+    loop {
+        // Role decides keys, subscriptions, and whether we publish a KP.
+        let (ephemeral_noise, self_publish, subscriptions) = match role {
+            HubRole::Identity => {
+                let sp = {
+                    let party = state.mls_party.lock().await;
+                    party
+                        .key_package_bytes()
+                        .ok()
+                        .map(|kp_bytes| hub_client::SelfPublish {
+                            routing_id: our_inbox,
+                            kp_bytes,
+                        })
+                };
+                if sp.is_none() {
+                    warn!(
+                        "hub[identity]: KeyPackage generation failed; skipping publish this cycle"
+                    );
+                }
+                (false, sp, vec![our_inbox])
+            }
+            HubRole::Activity => (true, None, current_room_session_tokens(&state).await),
+        };
+        info!(
+            ?role,
+            sub_count = subscriptions.len(),
+            "hub: connecting session"
+        );
+        let state_cb = state.clone();
+        let kem_cb = our_kem.clone();
+        let on_deliver = |target, body| {
+            let state = state_cb.clone();
+            let kem = kem_cb.clone();
+            async move {
+                handle_hub_delivery(target, body, &state, &kem).await;
+            }
+        };
+        let result = match &transport {
+            HubTransport::Tor { tor, host, port } => {
+                hub_client::run_hub_session(
+                    tor,
+                    host,
+                    *port,
+                    &hub_pubkey,
+                    &our_sk,
+                    &our_signing,
+                    &subscriptions,
+                    &mut outbound_rx,
+                    on_deliver,
+                    self_publish.as_ref(),
+                    ephemeral_noise,
+                )
+                .await
+            }
+            HubTransport::Tcp { addr } => {
+                hub_client::run_hub_session_tcp(
+                    addr,
+                    &hub_pubkey,
+                    &our_sk,
+                    &our_signing,
+                    &subscriptions,
+                    &mut outbound_rx,
+                    on_deliver,
+                    self_publish.as_ref(),
+                    ephemeral_noise,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(()) => info!(?role, "hub: session ended cleanly"),
+            Err(e) => warn!(?role, error = %e, "hub: session ended with error"),
+        }
+        info!(?backoff, ?role, "hub: backing off before reconnect");
+        tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
+    }
+}
+
+/// F2.1a: spawn the session(s) for one hub. ALWAYS spawns the activity
+/// session (the only session in the private default). When the daemon
+/// opted into first-contact reachability, ALSO spawns a separate identity
+/// session on an independent transport/circuit + independent ephemeral
+/// keys, with its own (parked) outbound channel. Returns the join handles
+/// so the caller can collect them for shutdown.
+#[allow(clippy::too_many_arguments)]
+fn spawn_hub_role_sessions(
+    transport: &HubTransport,
+    hub_pubkey: IdentityPublic,
+    state: &Arc<DaemonState>,
+    our_sk_bytes: &Zeroizing<[u8; 32]>,
+    our_signing_bytes: &Zeroizing<[u8; 32]>,
+    our_kem_bytes: &Zeroizing<Vec<u8>>,
+    our_inbox: onyx_core::routing::RoutingId,
+    first_contact_reachable: bool,
+    activity_outbound_rx: mpsc::Receiver<hub_client::HubOutbound>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles = Vec::new();
+    // Activity session — always.
+    handles.push(tokio::spawn(supervise_hub_session(
+        HubRole::Activity,
+        transport.fresh_session(),
+        hub_pubkey,
+        state.clone(),
+        our_sk_bytes.clone(),
+        our_signing_bytes.clone(),
+        our_kem_bytes.clone(),
+        our_inbox,
+        activity_outbound_rx,
+    )));
+    // Identity session — only when reachable.
+    if first_contact_reachable {
+        // Dummy outbound: the identity session never sends. Hold the
+        // Sender for the task's lifetime so the outbound select branch
+        // parks (pending) rather than seeing a closed channel.
+        let (id_tx, id_rx) = mpsc::channel::<hub_client::HubOutbound>(1);
+        let transport = transport.fresh_session();
+        let state = state.clone();
+        let sk = our_sk_bytes.clone();
+        let sg = our_signing_bytes.clone();
+        let km = our_kem_bytes.clone();
+        handles.push(tokio::spawn(async move {
+            let _park = id_tx;
+            supervise_hub_session(
+                HubRole::Identity,
+                transport,
+                hub_pubkey,
+                state,
+                sk,
+                sg,
+                km,
+                our_inbox,
+                id_rx,
+            )
+            .await;
+        }));
+    }
+    handles
+}
+
 /// **TEST-ONLY** spawn the TCP-hub client tasks (and their
 /// per-hub cover-traffic emitters when enabled). Mirrors the
 /// Tor-hub spawn loop in `run` but uses
@@ -2471,81 +2615,30 @@ fn spawn_tcp_hub_tasks(
         Zeroizing::new(*state.identity.identity_key().to_bytes());
     let our_signing_bytes: Zeroizing<[u8; 32]> =
         Zeroizing::new(*state.identity.signing().to_bytes());
+    let our_kem_bytes: Zeroizing<Vec<u8>> =
+        Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
     let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
     for (rel_idx, hub_cfg) in hub_tcp_addrs.iter().enumerate() {
         let hub_pubkey_bytes = decode_b32_32(&hub_cfg.pubkey)
             .with_context(|| format!("--hub-tcp pubkey: {}", hub_cfg.pubkey))?;
         let hub_pubkey = IdentityPublic::from_bytes(hub_pubkey_bytes);
         let addr = hub_cfg.onion.clone();
-        let state_for_hub_task = state.clone();
-        let our_sk_bytes_task = our_sk_bytes.clone();
-        let our_signing_bytes_task = our_signing_bytes.clone();
-        let mut outbound_rx = hub_tcp_rxs.remove(0);
+        let outbound_rx = hub_tcp_rxs.remove(0);
         let absolute_idx = tor_hub_count + rel_idx;
-        let span = info_span!("hub-tcp", idx = absolute_idx, addr = %addr);
-        tokio::spawn(
-            async move {
-                let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes_task);
-                let our_signing =
-                    onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes_task);
-                let state_for_hub_cb = state_for_hub_task.clone();
-                let mut backoff = std::time::Duration::from_millis(500);
-                loop {
-                    // D-1: KP publish + intro-inbox subscription are
-                    // identity leaks; gate both on first_contact_reachable
-                    // (same as the Tor path).
-                    let self_publish = if first_contact_reachable {
-                        let party = state_for_hub_task.mls_party.lock().await;
-                        party
-                            .key_package_bytes()
-                            .ok()
-                            .map(|kp_bytes| hub_client::SelfPublish {
-                                routing_id: our_inbox,
-                                kp_bytes,
-                            })
-                    } else {
-                        None
-                    };
-                    let mut subscriptions: Vec<onyx_core::routing::RoutingId> = Vec::new();
-                    if first_contact_reachable {
-                        subscriptions.push(our_inbox);
-                    }
-                    subscriptions.extend(current_room_session_tokens(&state_for_hub_task).await);
-                    let kem_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
-                        state_for_hub_task.identity.kem_secret().to_bytes().to_vec(),
-                    );
-                    let our_kem = std::sync::Arc::new(
-                        onyx_core::crypto::HybridKemSecret::from_bytes(&kem_bytes)
-                            .expect("own KEM round-trip"),
-                    );
-                    let our_kem_for_cb = our_kem.clone();
-                    let result = hub_client::run_hub_session_tcp(
-                        &addr,
-                        &hub_pubkey,
-                        &our_sk,
-                        &our_signing,
-                        &subscriptions,
-                        &mut outbound_rx,
-                        |target, body| {
-                            let state = state_for_hub_cb.clone();
-                            let our_kem = our_kem_for_cb.clone();
-                            async move {
-                                handle_hub_delivery(target, body, &state, &our_kem).await;
-                            }
-                        },
-                        self_publish.as_ref(),
-                        !first_contact_reachable,
-                    )
-                    .await;
-                    match result {
-                        Ok(()) => info!("hub-tcp: session ended cleanly"),
-                        Err(e) => warn!(error = %e, "hub-tcp: session ended with error"),
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
-                }
-            }
-            .instrument(span),
+        // F2.1a: same identity/activity split as the Tor path, via the
+        // shared supervisor. Spawned-and-forgotten (test-only path); the
+        // returned handles are dropped, the tasks live for the runtime.
+        let transport = HubTransport::Tcp { addr };
+        let _handles = spawn_hub_role_sessions(
+            &transport,
+            hub_pubkey,
+            state,
+            &our_sk_bytes,
+            &our_signing_bytes,
+            &our_kem_bytes,
+            our_inbox,
+            first_contact_reachable,
+            outbound_rx,
         );
 
         if let Some(mean_secs) = cover_traffic_mean_secs

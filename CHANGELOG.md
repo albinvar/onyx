@@ -6,6 +6,39 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 2 (F2.1a) — 2026-06-02 — split identity vs activity hub sessions
+
+Implements the F2.1a slice from `OBLIVIOUS-ROUTING.md`: in **reachable**
+mode the daemon now decouples its identity surface from its activity
+surface at the hub, so a hub learns "bob is reachable" but cannot link
+bob's fingerprint to *which rooms/DMs* he is in.
+
+### Changed
+- **Reachable daemons open two hub sessions** (per hub): an **identity
+  session** (long-term keys — KP publish + intro-inbox subscribe; receives
+  first-contact bootstraps) and an **activity session** (fresh ephemeral
+  Noise + SUBSCRIBE-signing keys — room/DM session tokens + all outbound).
+  Independent ephemeral keys + independent isolated Tor circuits (D-2) mean
+  the hub can't correlate the two.
+- **Private default is byte-identical**: a single ephemeral activity-only
+  session, exactly as before. The identity session only spins up when
+  `--first-contact-reachable` is set.
+- Unified the Tor and TCP hub reconnect loops behind one role-aware
+  supervisor (`supervise_hub_session` + `spawn_hub_role_sessions`), so the
+  split lives in exactly one place.
+
+### Verified
+- New integration test `rooms_e2e_reachable_splits_identity_and_activity_connections`:
+  reachable daemon → exactly **2** hub connections; private daemon →
+  exactly **1**. All 9 integration + 61 hub-lib + 73 daemon-lib tests pass;
+  new code is clippy-clean.
+
+### Not included (deferred, per the design)
+- Oblivious first-contact relay (PIR/ORAM) — use connect-codes; tracked in
+  `ROTATION.md` §6. Wire format + hub are unchanged; backward compatible.
+
+---
+
 ## Fortification Phase 2 (F2.1) — 2026-06-02 — design doc: oblivious routing (no code yet)
 
 Design-first, per the agreed approach for the architectural phase. Adds
