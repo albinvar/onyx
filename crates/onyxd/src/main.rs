@@ -14,8 +14,16 @@ use std::path::PathBuf;
 use clap::Parser;
 use onyx_daemon::Config;
 
+/// F1.3: default upstream constant-rate slot for the `--high-security`
+/// preset when the user didn't pick one. ~272 B/s of floor traffic per
+/// hub — a deliberate balance of timing protection vs bandwidth.
+const HIGH_SECURITY_SLOT_MS: u64 = 1000;
+
 #[derive(Parser, Debug)]
 #[command(name = "onyxd", version = onyx_core::VERSION, about = "Onyx daemon (headless)")]
+// A CLI flag struct naturally accumulates booleans (one per toggle);
+// grouping them into sub-structs would only obscure the clap surface.
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     /// Path to the encrypted vault file. Defaults to `~/.onyx/vault.db`
     /// (the parent directory is auto-created with mode 0700 if missing).
@@ -120,6 +128,25 @@ struct Args {
     #[arg(long, env = "ONYX_CONSTANT_RATE_MS")]
     constant_rate_ms: Option<u64>,
 
+    /// **F1.3 — one-switch timing-defense preset.** Turns on the
+    /// recommended constant-rate upstream shaping with a single flag so
+    /// you don't have to assemble the timing knobs by hand. When set and
+    /// `--constant-rate-ms` is not given explicitly, it defaults the slot
+    /// to 1000 ms (~272 B/s of floor traffic per hub — a deliberate
+    /// balance of protection vs bandwidth; lower the slot with an
+    /// explicit `--constant-rate-ms` for a tighter cadence). First-contact
+    /// reachability stays OFF (the private default) regardless.
+    ///
+    /// NOTE: this is the **client→hub (upstream)** half. Full
+    /// bidirectional invariance also needs the *hub* operator to run
+    /// `onyx-hub --constant-rate-ms` (the downstream half); a client
+    /// cannot force that. See `ANONYMITY.md` §3.1 "Recommended
+    /// configurations". Cover traffic is NOT on by default for everyone
+    /// because the steady bandwidth cost is unacceptable to impose on
+    /// metered/mobile users — this flag is the conscious opt-in.
+    #[arg(long, env = "ONYX_HIGH_SECURITY")]
+    high_security: bool,
+
     /// **D-1 — opt IN to first-contact reachability via the hub
     /// (default OFF = private).** Single master switch. Off (default):
     /// fresh per-connection ephemeral Noise static + ephemeral
@@ -194,6 +221,16 @@ impl TryFrom<Args> for Config {
             });
         }
 
+        // F1.3: the --high-security preset defaults the upstream
+        // constant-rate slot when the user didn't set one explicitly. An
+        // explicit --constant-rate-ms always wins (lets a user pick a
+        // tighter cadence). 1000 ms ≈ 272 B/s of floor traffic per hub.
+        let constant_rate_ms = match (a.high_security, a.constant_rate_ms) {
+            (_, Some(ms)) => Some(ms),
+            (true, None) => Some(HIGH_SECURITY_SLOT_MS),
+            (false, None) => None,
+        };
+
         Ok(Self {
             vault: a.vault.unwrap_or_else(onyx_daemon::default_vault_path),
             passphrase: zeroize::Zeroizing::new(a.passphrase),
@@ -209,7 +246,7 @@ impl TryFrom<Args> for Config {
             listen_tcp: a.listen_tcp,
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,
-            constant_rate_ms: a.constant_rate_ms,
+            constant_rate_ms,
             first_contact_reachable: a.first_contact_reachable,
             allow_clearnet: a.allow_clearnet,
             dm_hub_fallback: a.dm_hub_fallback,

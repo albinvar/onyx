@@ -96,6 +96,22 @@ A global passive adversary watching both your Tor entry guard and your peer's ca
     4. **Per-connection cadence on the hub side reveals "alice connected" + "alice disconnected" by absence.** A hub-watching adversary still sees TCP open / close events. Cover on the open session doesn't change that. Closing this would need session-resume routing-id rotation (the unrelated §3.2 fix; queued for a future slice).
   * **What's left to close it fully:** ~~a constant-rate mode on the hub binary~~ (DONE, F1.1 — both directions can now be invariant); real-Tor verification of both Poisson and constant-rate modes (operator drill via `scripts/real_tor_smoke.sh`) — still the headline unmeasured claim; and the §3.2 routing-id rotation for connect-time fingerprinting.
 
+#### Why cover traffic is NOT on by default (F1.3 decision)
+
+The measurement above shows constant-rate works, so why not force it on? **Bandwidth.** A 500 ms slot is ~544 B/s *per direction per hub* of floor traffic that never stops (≈47 MB/day); even a conservative 1 s slot is ~272 B/s. Imposing a permanent uplink drain on every metered/mobile user by default is the wrong trade — and it would be a *false* assurance anyway, because the downstream half only exists if the **hub operator** also runs `--constant-rate-ms`, which a client cannot force. Onyx already makes the *free* privacy wins default (D-1 ephemeral keys, private first-contact, vanguards); the *costly* one stays a conscious opt-in. The decision is revisitable if a future low-bandwidth shaping mode changes the cost.
+
+What we ship instead of a global default: **one switch.** `onyxd --high-security` turns on the recommended upstream constant-rate (1 s slot unless you pass an explicit `--constant-rate-ms`) so a user doesn't have to assemble the knobs by hand.
+
+#### Recommended configurations
+
+| Tier | Client (`onyxd`) | Hub (`onyx-hub`) | Hides from a hub/wire observer |
+|------|------------------|------------------|--------------------------------|
+| **Default** | (nothing) | (nothing) | content + who-you-talk-to (sealed sender); **not** coarse activity timing |
+| **Timing-hardened** | `--high-security` | — | + your *send* timing (upstream invariant) |
+| **Maximum** | `--high-security` (or `--constant-rate-ms 500`) | `--constant-rate-ms 500` | + your *receive* timing too (both directions invariant) |
+
+The "Maximum" tier needs cooperation from the hub operator; on a hub you don't control you get the "Timing-hardened" tier. Direct P2P (connect-code, no hub) sidesteps the hub-observer entirely but still benefits from `--high-security` against a network observer of your own link.
+
 ### 3.2 Hub knows online/offline timing — structural, partially mitigated
 
 When your daemon connects to the hub, the hub learns "this client is online now" through **three independent leaks**:
