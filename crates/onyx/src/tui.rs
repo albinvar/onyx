@@ -3767,6 +3767,71 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// A2: format a unix-ms timestamp as local `HH:MM` (empty on bad input).
+fn fmt_hhmm(ts_unix_ms: u64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(i64::try_from(ts_unix_ms).unwrap_or(0)) {
+        chrono::LocalResult::Single(dt) => dt.format("%H:%M").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// A2: turn a conversation's scrollback into styled lines, chat-app style:
+/// a `name · HH:MM` header is drawn whenever the sender OR the minute
+/// changes, then each message is indented beneath it — so a burst from one
+/// sender reads as a single grouped block instead of repeating the name on
+/// every line. Own messages are green, peers cyan; attachment lines (📎)
+/// get a magenta accent and `[hub]`-delivered lines keep their tag.
+fn build_chat_lines<'a>(scroll: &'a [ChatLine], who_label: &'a str) -> Vec<Line<'a>> {
+    let mut out: Vec<Line<'a>> = Vec::new();
+    // (is_outgoing, hhmm) of the last header emitted; a new header is drawn
+    // only when this key changes.
+    let mut last_key: Option<(bool, String)> = None;
+    for line in scroll {
+        let outgoing = matches!(line.direction, MessageDirection::Outgoing);
+        let (who, color) = if outgoing {
+            ("me", Color::Green)
+        } else {
+            (who_label, Color::Cyan)
+        };
+        let hhmm = fmt_hhmm(line.ts_unix_ms);
+        let key = (outgoing, hhmm.clone());
+        if last_key.as_ref() != Some(&key) {
+            // Blank spacer between groups (but not above the first).
+            if last_key.is_some() {
+                out.push(Line::from(""));
+            }
+            out.push(Line::from(vec![
+                Span::styled(
+                    who.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {hhmm}"), Style::default().fg(Color::DarkGray)),
+            ]));
+            last_key = Some(key);
+        }
+        let is_attachment = line.text.starts_with('📎');
+        let body_style = if is_attachment {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans: Vec<Span<'a>> = Vec::with_capacity(3);
+        spans.push(Span::raw("  "));
+        if line.via_hub {
+            spans.push(Span::styled(
+                "[hub] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(line.text.clone(), body_style));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
 // Linear render fn: title selection + empty-state branches + message
 // styling loop. Over the 100-line budget but cohesive (same rationale
 // as render_modal / render_details).
@@ -3852,32 +3917,9 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         return;
     }
     let lines: Vec<Line<'_>> = match app.scrollback.get(&scrollback_key) {
-        Some(scroll) if !scroll.is_empty() => scroll
-            .iter()
-            .map(|line| {
-                let (who, color) = match line.direction {
-                    MessageDirection::Incoming => (who_label.as_str(), Color::Cyan),
-                    MessageDirection::Outgoing => ("me", Color::Green),
-                };
-                let mut spans: Vec<Span<'_>> = Vec::with_capacity(3);
-                spans.push(Span::styled(
-                    format!("{who:>10}: "),
-                    Style::default().fg(color),
-                ));
-                if line.via_hub {
-                    spans.push(Span::styled(
-                        "[hub] ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-                spans.push(Span::raw(line.text.clone()));
-                Line::from(spans)
-            })
-            .collect(),
+        Some(scroll) if !scroll.is_empty() => build_chat_lines(scroll, &who_label),
         _ => vec![Line::from(Span::styled(
-            "(no messages yet — send one below)",
+            "  (no messages yet — type below and press Enter)",
             Style::default().fg(Color::DarkGray),
         ))],
     };
@@ -4106,6 +4148,36 @@ mod snapshot_tests {
         assert!(apple.path.is_absolute() && apple.path.ends_with("apple.txt"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A2 (chat rendering): consecutive messages from the same sender in
+    // the same minute share ONE `name · HH:MM` header; a sender change
+    // starts a new group (with a blank spacer before it).
+    #[test]
+    fn build_chat_lines_groups_by_sender_and_minute() {
+        let scroll = vec![
+            ChatLine {
+                direction: MessageDirection::Incoming,
+                text: "hi".into(),
+                ts_unix_ms: 1_700_000_000_000,
+                via_hub: false,
+            },
+            ChatLine {
+                direction: MessageDirection::Incoming,
+                text: "there".into(),
+                ts_unix_ms: 1_700_000_000_010, // same minute → grouped
+                via_hub: false,
+            },
+            ChatLine {
+                direction: MessageDirection::Outgoing,
+                text: "yo".into(),
+                ts_unix_ms: 1_700_000_000_020, // sender change → new group
+                via_hub: false,
+            },
+        ];
+        // header(alice) + 2 bodies + spacer + header(me) + 1 body = 6.
+        // (Without grouping it would be one header per message → more.)
+        assert_eq!(build_chat_lines(&scroll, "alice").len(), 6);
     }
 
     // A unreadable / nonexistent directory surfaces an error but still
