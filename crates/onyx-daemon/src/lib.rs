@@ -714,6 +714,34 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
 
     let api_socket_path = PathBuf::from(&args.api_socket);
 
+    // P-3 (#339): per-daemon inbound-delivery worker. Hub sessions hand
+    // every inbound DELIVER here via a non-blocking `try_send`; this single
+    // ordered worker performs the expensive part (sealed-envelope KEM
+    // decapsulation, MLS welcome processing, vault writes) OFF the session
+    // read loop. That removes the head-of-line block where a flood of junk
+    // envelopes to our inbox would stall a session's outbound sends +
+    // keepalive while we churn on failed decryptions. Bounded → under flood
+    // we shed at the enqueue (the hub retains queued envelopes; the replay
+    // guard dedups any re-delivery). Single worker → global ordering +
+    // replay-dedup preserved across all hubs.
+    // Bounded at 1024 inbound envelopes; under a flood the enqueue sheds
+    // rather than letting an attacker grow daemon memory without limit.
+    let (delivery_tx, mut delivery_rx) =
+        mpsc::channel::<(onyx_core::routing::RoutingId, Vec<u8>)>(1024);
+    let delivery_worker = {
+        let worker_state = state.clone();
+        let kem_bytes: Zeroizing<Vec<u8>> =
+            Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
+        tokio::spawn(async move {
+            let our_kem = onyx_core::crypto::HybridKemSecret::from_bytes(&kem_bytes)
+                .expect("our own KEM secret must round-trip");
+            while let Some((target, body)) = delivery_rx.recv().await {
+                handle_hub_delivery(target, body, &worker_state, &our_kem).await;
+            }
+            info!("hub: inbound-delivery worker ended (channel closed)");
+        })
+    };
+
     // **TEST-ONLY** spawn the TCP-hub client tasks BEFORE the
     // listen_tcp early-return. Otherwise --listen-tcp would skip
     // hub connectivity entirely, which defeats the smoke-harness
@@ -729,6 +757,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         args.cover_traffic_mean_secs,
         args.first_contact_reachable,
         &mut hub_tcp_rxs,
+        &delivery_tx,
     ) {
         warn!(error = %e, "failed to spawn TCP-hub tasks; continuing without them");
     }
@@ -831,10 +860,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         // memory until the allocator happened to overwrite them.
         let our_sk_bytes: Zeroizing<[u8; 32]> =
             Zeroizing::new(*state.identity.identity_key().to_bytes());
-        let our_kem_bytes: Zeroizing<Vec<u8>> =
-            Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
         // HIGH-1: the Ed25519 signing seed, threaded into each hub task
         // so it can sign SUBSCRIBE proofs. Same Zeroizing round-trip.
+        // (The hybrid-KEM secret is no longer threaded per session — P-3
+        // moved envelope decapsulation into the single delivery worker.)
         let our_signing_bytes: Zeroizing<[u8; 32]> =
             Zeroizing::new(*state.identity.signing().to_bytes());
 
@@ -850,7 +879,6 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
             // Copy (the Zeroizing wrapper opts out), so each spawned
             // task gets its own scrub-on-drop copy of the seed bytes.
             let our_sk_bytes_task = our_sk_bytes.clone();
-            let our_kem_bytes_task = our_kem_bytes.clone();
             let our_signing_bytes_task = our_signing_bytes.clone();
             let outbound_rx = hub_tor_rxs.remove(0);
             // F2.1a: split into an identity session (long-term keys, KP +
@@ -874,10 +902,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                 &state_for_hub_task,
                 &our_sk_bytes_task,
                 &our_signing_bytes_task,
-                &our_kem_bytes_task,
                 our_inbox,
                 args.first_contact_reachable,
                 outbound_rx,
+                &delivery_tx,
             ));
 
             // T-cover.2: per-hub cover-traffic emitter. Opt-in via
@@ -940,6 +968,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     for h in hub_tasks {
         h.abort();
     }
+    // P-3: stop the inbound-delivery worker.
+    delivery_worker.abort();
     // v0.1.17: stop the per-peer reconnect supervisors so they don't keep
     // dialing after the daemon is shutting down.
     for h in dial_supervisors {
@@ -2439,16 +2469,15 @@ async fn supervise_hub_session(
     state: Arc<DaemonState>,
     our_sk_bytes: Zeroizing<[u8; 32]>,
     our_signing_bytes: Zeroizing<[u8; 32]>,
-    our_kem_bytes: Zeroizing<Vec<u8>>,
     our_inbox: onyx_core::routing::RoutingId,
     mut outbound_rx: mpsc::Receiver<hub_client::HubOutbound>,
+    // P-3 (#339): inbound DELIVER frames are handed to the per-daemon
+    // delivery worker via this channel instead of being decrypted inline
+    // in the read loop (see the worker spawned in `run`).
+    delivery_tx: mpsc::Sender<(onyx_core::routing::RoutingId, Vec<u8>)>,
 ) {
     let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes);
     let our_signing = onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes);
-    let our_kem = std::sync::Arc::new(
-        onyx_core::crypto::HybridKemSecret::from_bytes(&our_kem_bytes)
-            .expect("our own KEM secret must round-trip"),
-    );
     let mut backoff = std::time::Duration::from_millis(500);
     loop {
         // Role decides keys, subscriptions, and whether we publish a KP.
@@ -2478,13 +2507,21 @@ async fn supervise_hub_session(
             sub_count = subscriptions.len(),
             "hub: connecting session"
         );
-        let state_cb = state.clone();
-        let kem_cb = our_kem.clone();
-        let on_deliver = |target, body| {
-            let state = state_cb.clone();
-            let kem = kem_cb.clone();
+        // P-3 (#339): hand inbound DELIVERs to the delivery worker with a
+        // NON-BLOCKING `try_send`. The expensive part (sealed-envelope KEM
+        // decapsulation + MLS welcome processing) used to run inline here,
+        // so a flood of junk envelopes to our inbox head-of-line-blocked
+        // this session's outbound sends + keepalive. Now the read loop just
+        // enqueues; if the worker is backed up (flood) we shed rather than
+        // stall — the hub keeps queued envelopes and the replay guard dedups
+        // any re-delivery.
+        let tx = delivery_tx.clone();
+        let on_deliver = move |target, body| {
+            let tx = tx.clone();
             async move {
-                handle_hub_delivery(target, body, &state, &kem).await;
+                if let Err(e) = tx.try_send((target, body)) {
+                    debug!(error = %e, "hub: inbound-delivery queue full/closed; shedding envelope");
+                }
             }
         };
         let result = match &transport {
@@ -2542,10 +2579,10 @@ fn spawn_hub_role_sessions(
     state: &Arc<DaemonState>,
     our_sk_bytes: &Zeroizing<[u8; 32]>,
     our_signing_bytes: &Zeroizing<[u8; 32]>,
-    our_kem_bytes: &Zeroizing<Vec<u8>>,
     our_inbox: onyx_core::routing::RoutingId,
     first_contact_reachable: bool,
     activity_outbound_rx: mpsc::Receiver<hub_client::HubOutbound>,
+    delivery_tx: &mpsc::Sender<(onyx_core::routing::RoutingId, Vec<u8>)>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
     // Activity session — always.
@@ -2556,9 +2593,9 @@ fn spawn_hub_role_sessions(
         state.clone(),
         our_sk_bytes.clone(),
         our_signing_bytes.clone(),
-        our_kem_bytes.clone(),
         our_inbox,
         activity_outbound_rx,
+        delivery_tx.clone(),
     )));
     // Identity session — only when reachable.
     if first_contact_reachable {
@@ -2570,7 +2607,7 @@ fn spawn_hub_role_sessions(
         let state = state.clone();
         let sk = our_sk_bytes.clone();
         let sg = our_signing_bytes.clone();
-        let km = our_kem_bytes.clone();
+        let dtx = delivery_tx.clone();
         handles.push(tokio::spawn(async move {
             let _park = id_tx;
             supervise_hub_session(
@@ -2580,9 +2617,9 @@ fn spawn_hub_role_sessions(
                 state,
                 sk,
                 sg,
-                km,
                 our_inbox,
                 id_rx,
+                dtx,
             )
             .await;
         }));
@@ -2603,6 +2640,7 @@ fn spawn_tcp_hub_tasks(
     cover_traffic_mean_secs: Option<u64>,
     first_contact_reachable: bool,
     hub_tcp_rxs: &mut Vec<mpsc::Receiver<hub_client::HubOutbound>>,
+    delivery_tx: &mpsc::Sender<(onyx_core::routing::RoutingId, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     if hub_tcp_addrs.is_empty() {
         return Ok(());
@@ -2615,8 +2653,6 @@ fn spawn_tcp_hub_tasks(
         Zeroizing::new(*state.identity.identity_key().to_bytes());
     let our_signing_bytes: Zeroizing<[u8; 32]> =
         Zeroizing::new(*state.identity.signing().to_bytes());
-    let our_kem_bytes: Zeroizing<Vec<u8>> =
-        Zeroizing::new(state.identity.kem_secret().to_bytes().to_vec());
     let our_inbox = onyx_core::routing::introduction_inbox(&state.identity.fingerprint());
     for (rel_idx, hub_cfg) in hub_tcp_addrs.iter().enumerate() {
         let hub_pubkey_bytes = decode_b32_32(&hub_cfg.pubkey)
@@ -2635,10 +2671,10 @@ fn spawn_tcp_hub_tasks(
             state,
             &our_sk_bytes,
             &our_signing_bytes,
-            &our_kem_bytes,
             our_inbox,
             first_contact_reachable,
             outbound_rx,
+            delivery_tx,
         );
 
         if let Some(mean_secs) = cover_traffic_mean_secs
