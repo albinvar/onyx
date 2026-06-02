@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 2 (F2.2) — 2026-06-02 — design doc: Tor bridges & PT (no code yet)
+
+Design-first. `TOR-BRIDGES.md` — let a user **hide that they use Tor**.
+Researched against arti 0.42's real API:
+
+- **`bridge-client`** feature → vanilla bridges (`BridgeConfigBuilder`):
+  connect via an unlisted relay, evading IP blocklists of public guards.
+  Doesn't defeat DPI.
+- **`pt-client`** feature → pluggable transports (`TransportConfigBuilder` +
+  an **external** PT binary like lyrebird/snowflake): obfuscate the channel
+  so DPI can't fingerprint Tor — the real censorship-resistance, at the cost
+  of a third-party binary we can document but not bundle.
+
+Wires into `tor.rs::build_tor_config` via `builder.bridges()`; opt-in,
+default path unchanged; composes with vanguards; doesn't trip the A1.2
+no-clearnet guard (a bridge *is* Tor). Recommendation: ship **F2.2a vanilla
+bridges** (contained) first; **F2.2b obfs4/PT** is the strong tier but needs
+the external binary + per-platform docs. Honest residuals: PT binary not
+bundled, bridge discovery is the user's problem, and it's censorship-
+resistance not added anonymity.
+
+---
+
 ## CI green — 2026-06-02 — clear the chronically-red CI jobs
 
 `ci.yml` had been red long-term (independent of the Release workflow, which
