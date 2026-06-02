@@ -404,6 +404,40 @@ pub(crate) fn unseal(key: &AeadKey, blob: &[u8]) -> Result<Vec<u8>> {
     key.decrypt(&nonce, b"", ct)
 }
 
+/// Re-seal every `encrypted_blob` in `table` from `old` to `new` inside an
+/// open transaction. `table` is a hardcoded constant (never user input), so
+/// the format! into SQL carries no injection risk. Decrypted plaintext is
+/// held in `Zeroizing` and scrubbed promptly.
+fn rekey_blob_column(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    old: &AeadKey,
+    new: &AeadKey,
+) -> Result<()> {
+    // Collect (rowid, blob) first so the read statement is dropped before
+    // we issue UPDATEs against the same table.
+    let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare(&format!("SELECT rowid, encrypted_blob FROM {table}"))
+            .map_err(map_db_err)?;
+        let mapped = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .map_err(map_db_err)?;
+        for row in mapped {
+            rows.push(row.map_err(map_db_err)?);
+        }
+    }
+    let update_sql = format!("UPDATE {table} SET encrypted_blob = ?1 WHERE rowid = ?2");
+    for (rowid, blob) in rows {
+        let plaintext = Zeroizing::new(unseal(old, &blob)?);
+        let resealed = seal(new, &plaintext)?;
+        tx.execute(&update_sql, params![resealed, rowid])
+            .map_err(map_db_err)?;
+    }
+    Ok(())
+}
+
 /// The unlocked vault. Holds an open SQLite connection plus the derived
 /// AEAD key. Dropping the vault zeroizes the key (via [`AeadKey`]'s
 /// `ZeroizeOnDrop`) and closes the SQLite connection.
@@ -509,6 +543,90 @@ impl Vault {
             .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
+    }
+
+    /// Change the vault's passphrase in place (no recovery of a forgotten
+    /// passphrase — this is a *deliberate* rekey by someone who knows the
+    /// current one).
+    ///
+    /// Re-derives the vault key from `new_passphrase` under a FRESH KDF
+    /// salt, then re-encrypts every sealed blob — the canary plus the
+    /// `encrypted_blob` of `identities`, `mls_state`, and `replay_state` —
+    /// under the new key. The whole rewrite runs in ONE SQLite transaction,
+    /// so it is atomic: on any error nothing changes and the old passphrase
+    /// still works. KDF cost parameters are preserved.
+    ///
+    /// A wrong `old_passphrase` surfaces as [`Error::VerificationFailed`]
+    /// (via the canary) before anything is modified. The file must not be
+    /// open by another process (e.g. a running daemon) or SQLite returns a
+    /// lock error.
+    pub fn rekey(path: &Path, old_passphrase: &[u8], new_passphrase: &[u8]) -> Result<()> {
+        let mut conn = Connection::open(path).map_err(map_db_err)?;
+
+        let (schema_version, salt_bytes, mem_kib, iters, parallel, canary): (
+            i32,
+            Vec<u8>,
+            u32,
+            u32,
+            u32,
+            Vec<u8>,
+        ) = conn
+            .query_row(
+                "SELECT schema_version, kdf_salt, kdf_memory_kib, kdf_iterations, \
+                 kdf_parallelism, canary FROM vault_meta WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .map_err(map_db_err)?;
+        if schema_version != SCHEMA_VERSION {
+            return Err(Error::Internal("vault: schema version mismatch"));
+        }
+        let salt: [u8; 16] = salt_bytes
+            .try_into()
+            .map_err(|_| Error::InvalidEncoding("vault: salt must be 16 bytes"))?;
+        let params = Argon2Params {
+            memory_kib: mem_kib,
+            iterations: iters,
+            parallelism: parallel,
+        };
+        params.validate()?;
+
+        // Derive + verify the OLD key (canary) before touching anything.
+        let mut old_key = Zeroizing::new([0u8; 32]);
+        argon2id_derive(old_passphrase, &salt, &params, old_key.as_mut_slice())?;
+        let old_aead = AeadKey::from_bytes(*old_key);
+        if unseal(&old_aead, &canary)? != CANARY_PLAINTEXT {
+            return Err(Error::VerificationFailed);
+        }
+
+        // Derive the NEW key under a fresh salt (same KDF cost).
+        let new_salt: [u8; 16] = random_array();
+        let mut new_key = Zeroizing::new([0u8; 32]);
+        argon2id_derive(new_passphrase, &new_salt, &params, new_key.as_mut_slice())?;
+        let new_aead = AeadKey::from_bytes(*new_key);
+
+        // Re-seal everything atomically.
+        let tx = conn.transaction().map_err(map_db_err)?;
+        let new_canary = seal(&new_aead, CANARY_PLAINTEXT)?;
+        tx.execute(
+            "UPDATE vault_meta SET kdf_salt = ?1, canary = ?2 WHERE id = 1",
+            params![new_salt.to_vec(), new_canary],
+        )
+        .map_err(map_db_err)?;
+        for table in ["identities", "mls_state", "replay_state"] {
+            rekey_blob_column(&tx, table, &old_aead, &new_aead)?;
+        }
+        tx.commit().map_err(map_db_err)?;
+        Ok(())
     }
 
     fn initialize(conn: Connection, passphrase: &[u8], params: &Argon2Params) -> Result<Self> {
@@ -2192,6 +2310,48 @@ mod tests {
                 .expect("MLS state lost across reopen");
             assert_eq!(loaded, saved_blob);
         }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rekey_changes_passphrase_and_preserves_data() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        tmp.close().unwrap();
+
+        let identity_id;
+        let mls_blob = b"mls snapshot that must survive rekey";
+        {
+            let mut v = Vault::create(&path, b"old-pass", &Argon2Params::FLOOR).unwrap();
+            let (id, _identity) = v.create_identity("alice").unwrap();
+            v.save_mls_state(id, mls_blob).unwrap();
+            identity_id = id;
+        } // drop closes the connection so rekey can open the file
+
+        // Wrong old passphrase is rejected and changes nothing.
+        assert!(matches!(
+            Vault::rekey(&path, b"not-the-old-pass", b"new-pass"),
+            Err(Error::VerificationFailed)
+        ));
+        // Old passphrase still works after the failed attempt.
+        Vault::open(&path, b"old-pass").unwrap();
+
+        // Real rekey.
+        Vault::rekey(&path, b"old-pass", b"new-pass").unwrap();
+
+        // Old passphrase no longer opens it.
+        assert!(matches!(
+            Vault::open(&path, b"old-pass"),
+            Err(Error::VerificationFailed)
+        ));
+        // New passphrase opens it AND the encrypted blob survived intact.
+        let v = Vault::open(&path, b"new-pass").unwrap();
+        assert_eq!(
+            v.load_mls_state(identity_id).unwrap().unwrap(),
+            mls_blob,
+            "sealed blob must be readable under the new passphrase"
+        );
 
         std::fs::remove_file(&path).ok();
     }

@@ -397,6 +397,30 @@ enum Command {
         #[command(subcommand)]
         cmd: ContactCommand,
     },
+    /// Vault maintenance — local file operations on `~/.onyx/vault.db`
+    /// (or `--vault`). These do NOT talk to the daemon; stop a running
+    /// daemon first (it holds the vault open).
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCommand,
+    },
+}
+
+/// Subcommands under `onyx vault`. Local file ops (no daemon round-trip).
+#[derive(Subcommand, Debug)]
+enum VaultCommand {
+    /// Copy the (encrypted) vault file to `dest` — a portable backup.
+    /// The copy is encrypted with your CURRENT passphrase; restore by
+    /// copying it back over `~/.onyx/vault.db` while the daemon is stopped.
+    Backup {
+        /// Destination path for the backup copy.
+        dest: PathBuf,
+    },
+    /// Change the vault passphrase in place. Prompts for the current
+    /// passphrase, then a new one (twice). Re-encrypts the vault under a
+    /// fresh key + salt atomically. There is NO recovery of a forgotten
+    /// passphrase — this only rekeys when you know the current one.
+    Rekey,
 }
 
 /// Subcommands under `onyx contact`. Pure dispatch to `ApiRequest::*`.
@@ -1372,6 +1396,102 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
         Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
         Some(Command::Files { cmd }) => dispatch_files(&socket, cmd).await,
         Some(Command::Contact { cmd }) => dispatch_contact(&socket, cmd).await,
+        Some(Command::Vault { cmd }) => {
+            let vault_path = args
+                .vault
+                .clone()
+                .unwrap_or_else(onyx_daemon::default_vault_path);
+            dispatch_vault(cmd, &vault_path)
+        }
+    }
+}
+
+/// Dispatch `onyx vault *` — local file operations on the vault, no daemon
+/// round-trip. The daemon must be stopped (it holds the vault open).
+fn dispatch_vault(cmd: VaultCommand, vault_path: &std::path::Path) -> anyhow::Result<ExitCode> {
+    use anyhow::Context as _;
+    use onyx_core::error::Error as CoreError;
+    use zeroize::Zeroize as _;
+
+    if !vault_path.exists() {
+        eprintln!(
+            "onyx: no vault at {} — nothing to back up / rekey.",
+            vault_path.display()
+        );
+        return Ok(ExitCode::from(2));
+    }
+
+    match cmd {
+        VaultCommand::Backup { dest } => {
+            // A plain file copy: the vault is already encrypted at rest with
+            // your current passphrase, so the copy is a valid backup.
+            std::fs::copy(vault_path, &dest).with_context(|| {
+                format!(
+                    "copying vault {} → {}",
+                    vault_path.display(),
+                    dest.display()
+                )
+            })?;
+            // Match the vault's restrictive perms on the backup (best-effort).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600));
+            }
+            println!("backed up vault to {}", dest.display());
+            eprintln!(
+                "note: the backup is encrypted with your CURRENT passphrase. \
+                 Restore by copying it back over {} while the daemon is stopped.",
+                vault_path.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        VaultCommand::Rekey => {
+            let mut old = read_hidden_line(&paint("  Current passphrase: ", ANSI_GREEN))?;
+            let mut new1 =
+                read_hidden_line(&paint("  New passphrase (min 8 chars): ", ANSI_GREEN))?;
+            if new1.chars().count() < 8 {
+                old.zeroize();
+                new1.zeroize();
+                eprintln!("onyx: new passphrase too short (min 8 chars) — aborted.");
+                return Ok(ExitCode::from(2));
+            }
+            let mut new2 = read_hidden_line(&paint("  Confirm new passphrase: ", ANSI_GREEN))?;
+            if new1 != new2 {
+                old.zeroize();
+                new1.zeroize();
+                new2.zeroize();
+                eprintln!("onyx: passphrases did not match — aborted.");
+                return Ok(ExitCode::from(2));
+            }
+            let result =
+                onyx_core::storage::Vault::rekey(vault_path, old.as_bytes(), new1.as_bytes());
+            old.zeroize();
+            new1.zeroize();
+            new2.zeroize();
+            match result {
+                Ok(()) => {
+                    println!("vault passphrase changed.");
+                    eprintln!(
+                        "note: existing backups still use the OLD passphrase. \
+                         Make a fresh backup with `onyx vault backup` if you want one \
+                         under the new passphrase."
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(CoreError::VerificationFailed) => {
+                    eprintln!("onyx: current passphrase is wrong — vault unchanged.");
+                    Ok(ExitCode::from(2))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "onyx: rekey failed ({e}). Is the daemon running? Stop it first \
+                         (it holds the vault open). The vault is unchanged."
+                    );
+                    Ok(ExitCode::from(2))
+                }
+            }
+        }
     }
 }
 
