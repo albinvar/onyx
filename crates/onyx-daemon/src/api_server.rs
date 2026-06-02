@@ -612,6 +612,12 @@ async fn handle_create_room(name: &str, state: &DaemonState) -> ApiResponse {
                 message: format!("save_room: {e}"),
             };
         }
+        // G-2 (F3.3): the creator is the room's initial (and, in this MVP,
+        // sole) admin. Propagated to every invitee in their Welcome so all
+        // members' clients enforce the same authority policy.
+        if let Err(e) = vault.add_room_admin(state.identity_id, &group_id_bytes, &our_fp) {
+            warn!(error = %e, "create_room: seeding creator as admin failed");
+        }
     }
 
     // T6.3.g: subscribe to the new room's session-token inbox so
@@ -994,6 +1000,28 @@ async fn handle_invite_to_room(
             message: "group_id_b32 is not valid base32".into(),
         };
     };
+    // G-2 (F3.3): send-side authority gate. Refuse to *issue* a membership
+    // add if we're not an admin of this room. Empty admin set = legacy room
+    // = unrestricted (back-compat). Fail-OPEN on a vault read error — the
+    // receive-side enforcement is the real backstop; don't block a
+    // legitimate admin on a transient vault hiccup.
+    {
+        let our_fp = state.identity.fingerprint().to_string();
+        let allowed = {
+            let vault = state.vault.lock().await;
+            vault
+                .is_room_admin(state.identity_id, &group_id_bytes, &our_fp)
+                .unwrap_or(true)
+        };
+        if !allowed {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: "refusing to invite: you are not an admin of this room (G-2). \
+                          Only a room admin can add or remove members."
+                    .into(),
+            };
+        }
+    }
     let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
         return ApiResponse::Error {
             code: ApiErrorCode::Malformed,
@@ -1220,6 +1248,18 @@ async fn handle_invite_to_room(
         out
     };
 
+    // G-2 (F3.3): propagate the room's admin set so the new member's
+    // client can enforce the same authority policy (send-side refusal +
+    // receive-side rejection of membership commits from non-admins). Empty
+    // for a legacy room with no recorded admin set → recipient treats it
+    // as unrestricted (back-compat).
+    let admins = {
+        let vault = state.vault.lock().await;
+        vault
+            .list_room_admins(state.identity_id, &group_id_bytes)
+            .unwrap_or_default()
+    };
+
     // 7. Seal the Welcome with room_name = Some(room.name) so the
     //    recipient knows this is a room invite, not a DM bootstrap.
     let payload = onyx_core::routing::BootstrapPayload::MlsWelcome {
@@ -1227,6 +1267,7 @@ async fn handle_invite_to_room(
         first_message: None,
         room_name: Some(room.name.clone()),
         member_kems,
+        admins,
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {
@@ -1772,6 +1813,25 @@ async fn handle_remove_from_room(
             code: ApiErrorCode::Malformed,
             message: "use `leave` to remove yourself, not `remove`".into(),
         };
+    }
+    // G-2 (F3.3): send-side authority gate — only an admin may remove a
+    // member. Empty admin set = legacy room = unrestricted. Fail-OPEN on a
+    // vault read error (receive-side is the backstop).
+    {
+        let allowed = {
+            let vault = state.vault.lock().await;
+            vault
+                .is_room_admin(state.identity_id, &group_id_bytes, &our_fp)
+                .unwrap_or(true)
+        };
+        if !allowed {
+            return ApiResponse::Error {
+                code: ApiErrorCode::Malformed,
+                message: "refusing to remove: you are not an admin of this room (G-2). \
+                          Only a room admin can add or remove members."
+                    .into(),
+            };
+        }
     }
 
     // Issue the Remove commit. Capture the OLD-epoch routing token
@@ -3167,6 +3227,8 @@ async fn handle_send_bootstrap_mls(
         room_name: None,
         // T6.3.h: not a room, so no member-roster KEM list.
         member_kems: vec![],
+        // G-2 (F3.3): a 2-party DM has no admin/authority concept.
+        admins: vec![],
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {

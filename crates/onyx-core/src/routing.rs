@@ -320,6 +320,22 @@ pub enum BootstrapPayload {
         /// member: see [`crate::room::RoomAppMessage::KemAdvertisement`].
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         member_kems: Vec<RoomMemberKem>,
+        /// G-2 (F3.3): the room's **admin set** — base32 fingerprints
+        /// allowed to add/remove members. Propagated so the new member's
+        /// client can enforce the same authority policy (send-side refusal
+        /// + receive-side rejection of membership commits from non-admins).
+        ///
+        /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]` for
+        /// back-compat: pre-F3.3 Welcomes lack it and decode cleanly; an
+        /// empty set means "no policy recorded" (recipient treats the room
+        /// as unrestricted — see `Vault::is_room_admin`). Covered by the
+        /// outer sealed-sender Ed25519 signature alongside `welcome` /
+        /// `room_name` / `member_kems`, so a hostile hub cannot tamper. The
+        /// inviter is trusted to state the admin set honestly (same trust
+        /// scope as the roster); the receive-side enforcement uses it to
+        /// reject unauthorized commits from honest members' point of view.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        admins: Vec<String>,
     },
     /// "mlsapp/v1" (T6.3.e) — already-encrypted MLS application
     /// message routed via the hub. Wraps a single ciphertext
@@ -790,6 +806,7 @@ mod tests {
             first_message: None,
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -803,6 +820,7 @@ mod tests {
             first_message: Some("hi from the invite URL".to_string()),
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -817,6 +835,7 @@ mod tests {
             first_message: None,
             room_name: Some("#general".to_string()),
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -840,6 +859,7 @@ mod tests {
                     kem_pub: ByteBuf::from(vec![0xB2u8; 1216]),
                 },
             ],
+            admins: vec![],
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -856,6 +876,7 @@ mod tests {
             first_message: None,
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -877,6 +898,7 @@ mod tests {
             first_message: None,
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -897,6 +919,7 @@ mod tests {
             first_message: None,
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -913,6 +936,7 @@ mod tests {
             first_message: None,
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -977,6 +1001,7 @@ mod tests {
             first_message: None,
             room_name: None,
             member_kems: vec![],
+            admins: vec![],
         };
         let payload_bytes = payload.to_cbor().unwrap();
 

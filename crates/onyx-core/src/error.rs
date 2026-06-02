@@ -32,6 +32,14 @@ pub enum Error {
     /// Placeholder used by scaffold modules that have no implementation yet.
     #[error("{0}: not yet implemented")]
     NotImplemented(&'static str),
+
+    /// G-2 (F3.3b): an incoming MLS commit changed group membership
+    /// (add/remove) but the committer is not authorized by the room's
+    /// admin policy. The commit is rejected (not merged) so an honest
+    /// client ignores an unauthorized membership change. See
+    /// `ROOM-AUTHORITY.md`.
+    #[error("unauthorized membership change: {0}")]
+    Unauthorized(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

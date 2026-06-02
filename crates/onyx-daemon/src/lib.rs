@@ -2179,11 +2179,37 @@ async fn handle_room_app_frame(
     // commit (an existing member added/removed someone — we must
     // merge it so our group state advances to the new epoch).
     // `process_incoming` discriminates internally.
+    // G-2 (F3.3b): receive-side authority enforcement. Fetch the room's
+    // admin set; a membership-changing commit (add/remove) from a non-admin
+    // is rejected — not merged — so an honest client ignores an
+    // unauthorized membership change. Empty set = legacy room with no
+    // recorded policy = unrestricted (back-compat).
+    let admins = {
+        let vault = state.vault.lock().await;
+        vault
+            .list_room_admins(state.identity_id, group_id)
+            .unwrap_or_default()
+    };
     let processed_result = {
         let party = state.mls_party.lock().await;
         match party.load_group(group_id) {
             Ok(Some(mut room_group)) => room_group
-                .process_incoming_with_sender(&party, payload)
+                .process_incoming_with_authority(&party, payload, |committer_id| {
+                    if admins.is_empty() {
+                        return true;
+                    }
+                    // The committer identity is the leaf credential = the
+                    // 32-byte Ed25519 fingerprint. If it doesn't resolve and
+                    // a policy exists, deny (fail-closed on the enforcement
+                    // side).
+                    match <[u8; 32]>::try_from(committer_id) {
+                        Ok(bytes) => {
+                            let fp = onyx_core::crypto::Fingerprint::from_bytes(bytes).to_string();
+                            admins.iter().any(|a| *a == fp)
+                        }
+                        Err(_) => false,
+                    }
+                })
                 .map(|(im, sender)| (im, sender, room_group.epoch())),
             Ok(None) => {
                 debug!(
@@ -2198,15 +2224,29 @@ async fn handle_room_app_frame(
             }
         }
     };
-    let Ok((incoming, sender_identity, epoch)) = processed_result else {
-        // T6.3.i: process_incoming failed — most likely the message
-        // arrived ahead of a commit that would have advanced us to
-        // the right epoch (e.g. a KEM-ad encrypted at N+1 reached
-        // us before the commit from N→N+1). Stash for retry; we'll
-        // re-feed every pending frame for this group right after
-        // the next Commit merge lands.
-        buffer_pending_room_frame(group_id, payload, state).await;
-        return;
+    let (incoming, sender_identity, epoch) = match processed_result {
+        Ok(v) => v,
+        Err(onyx_core::error::Error::Unauthorized(_)) => {
+            // G-2 (F3.3b): a membership commit from a non-admin. Drop it —
+            // do NOT stash for retry (retrying re-rejects). Our group state
+            // did not advance, so we ignore the unauthorized change.
+            warn!(
+                group_id_b32 = %encode_b32(group_id),
+                "G-2: rejected an unauthorized room membership commit (committer is not a \
+                 room admin); ignoring it"
+            );
+            return;
+        }
+        Err(_) => {
+            // T6.3.i: process_incoming failed — most likely the message
+            // arrived ahead of a commit that would have advanced us to
+            // the right epoch (e.g. a KEM-ad encrypted at N+1 reached
+            // us before the commit from N→N+1). Stash for retry; we'll
+            // re-feed every pending frame for this group right after
+            // the next Commit merge lands.
+            buffer_pending_room_frame(group_id, payload, state).await;
+            return;
+        }
     };
     // Persist updated MLS state regardless of message kind — both
     // app messages and commits mutate the ratchet.
@@ -3158,12 +3198,14 @@ async fn handle_hub_delivery(
             first_message,
             room_name,
             member_kems,
+            admins,
         } => {
             process_hub_mls_welcome(
                 welcome.as_ref(),
                 first_message,
                 room_name,
                 member_kems,
+                admins,
                 sender_x25519,
                 &sender_pub_b32,
                 sender_fingerprint,
@@ -3357,6 +3399,7 @@ async fn process_hub_mls_welcome(
     first_message: Option<String>,
     room_name: Option<String>,
     member_kems: Vec<onyx_core::routing::RoomMemberKem>,
+    admins: Vec<String>,
     sender_x25519: [u8; 32],
     sender_pub_b32: &str,
     sender_fingerprint: String,
@@ -3455,7 +3498,7 @@ async fn process_hub_mls_welcome(
                 "hub: mls/v1 Welcome carried roster KEMs; persisted"
             );
         }
-        process_room_welcome(&group, &name, &sender_fingerprint, state).await;
+        process_room_welcome(&group, &name, &admins, &sender_fingerprint, state).await;
         // T6.3.g: subscribe to the new room's session-token inbox so
         // we receive subsequent hub-routed room messages without
         // waiting for the next hub reconnect.
@@ -3492,6 +3535,7 @@ async fn process_hub_mls_welcome(
 async fn process_room_welcome(
     group: &onyx_core::mls::MlsGroupState,
     name: &str,
+    admins: &[String],
     sender_fingerprint: &str,
     state: &Arc<DaemonState>,
 ) {
@@ -3512,10 +3556,19 @@ async fn process_room_welcome(
         now_ms,
     ) {
         Ok(()) => {
+            // G-2 (F3.3): persist the admin set the inviter propagated so
+            // this member's client can enforce the same authority policy.
+            // Empty set → unrestricted (legacy inviter / back-compat).
+            for admin_fp in admins {
+                if let Err(e) = vault.add_room_admin(state.identity_id, &group_id_bytes, admin_fp) {
+                    warn!(error = %e, "hub: mls/v1 Welcome: add_room_admin failed");
+                }
+            }
             info!(
                 room_name = %name,
                 group_id_b32 = %encode_b32(&group_id_bytes),
                 mls_epoch = group.epoch(),
+                admin_count = admins.len(),
                 from_fingerprint = %sender_fingerprint,
                 "hub: mls/v1 Welcome processed, joined room"
             );

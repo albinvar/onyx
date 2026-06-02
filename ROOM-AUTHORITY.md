@@ -10,6 +10,23 @@ Companion to `THREAT_MODEL.md` §8.4 (G-2 row).
 
 ---
 
+## §0 Status: IMPLEMENTED (F3.3, 2026-06-02)
+
+The MVP below is shipped. Each room has an **admin set** (seeded with the
+creator) **propagated to every member in the Welcome** (`MlsWelcome.admins`,
+covered by the sealed-sender signature). Enforcement is on both sides:
+**send** (`handle_invite_to_room`/`handle_remove_from_room` refuse when the
+local identity isn't an admin) and **receive**
+(`MlsGroupState::process_incoming_with_authority` rejects — does **not**
+merge — a membership-changing commit from a non-admin; the daemon resolves
+the committer fingerprint against the room's admin set). Empty admin set
+(legacy rooms) = unrestricted (back-compat). Tests:
+`mls::authority_rejects_unauthorized_membership_commit`,
+`storage::room_admins_authority_semantics`. The **inherent residual** stands
+(§2.3): a patched client can still emit a valid commit and fork honest
+members (they reject + warn, no auto-recovery); GroupContext-authenticated
+admin sets (B1) and fork recovery (Option C) remain deferred.
+
 ## §1 Current state (no authority at all)
 
 - **Add:** `MlsGroupState::invite()` → `group.add_members()` (mls.rs). Daemon
