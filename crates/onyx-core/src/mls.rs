@@ -620,6 +620,28 @@ impl MlsGroupState {
         party: &MlsParty,
         ciphertext: &[u8],
     ) -> Result<(IncomingRoomMessage, Option<Vec<u8>>)> {
+        // No authority policy: accept any cryptographically-valid commit
+        // (the pre-G-2 behaviour). Callers that want room-admin enforcement
+        // use `process_incoming_with_authority`.
+        self.process_incoming_with_authority(party, ciphertext, |_| true)
+    }
+
+    /// G-2 (F3.3b): like [`Self::process_incoming_with_sender`] but enforces
+    /// an application-layer authority policy on **membership-changing**
+    /// commits. `authorize_membership(committer_identity)` is invoked ONLY
+    /// when the incoming commit contains add and/or remove proposals; if it
+    /// returns `false`, the commit is **rejected (not merged)** and
+    /// [`Error::Unauthorized`] is returned, so an honest client ignores an
+    /// unauthorized membership change. Application messages and non-
+    /// membership commits (e.g. a self key-update) are unaffected. The
+    /// `committer_identity` bytes are the leaf credential identity (= the
+    /// committer's Ed25519 fingerprint). See `ROOM-AUTHORITY.md`.
+    pub fn process_incoming_with_authority(
+        &mut self,
+        party: &MlsParty,
+        ciphertext: &[u8],
+        authorize_membership: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<(IncomingRoomMessage, Option<Vec<u8>>)> {
         let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
             .map_err(|_| Error::InvalidEncoding("mls: incoming message not TLS-encoded"))?;
         let protocol_msg: ProtocolMessage = match mls_in.extract() {
@@ -647,6 +669,18 @@ impl MlsGroupState {
                 sender_identity,
             )),
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                // G-2 (F3.3b): only ADD/REMOVE commits are gated; a commit
+                // that just rotates keys (self key-update) changes no
+                // membership and is always allowed.
+                let changes_membership = staged.add_proposals().next().is_some()
+                    || staged.remove_proposals().next().is_some();
+                if changes_membership
+                    && !authorize_membership(sender_identity.as_deref().unwrap_or(&[]))
+                {
+                    // Reject WITHOUT merging — our group state does not
+                    // advance, so we ignore the unauthorized change.
+                    return Err(Error::Unauthorized("mls: committer is not a room admin"));
+                }
                 self.group
                     .merge_staged_commit(&party.provider, *staged)
                     .map_err(internal("mls: merge_staged_commit failed"))?;
@@ -909,6 +943,66 @@ mod tests {
             .unwrap();
         let pt3 = alice_group2.decrypt_application(&alice2, &ct3).unwrap();
         assert_eq!(pt3, b"bob's reply post-restore");
+    }
+
+    /// G-2 (F3.3b): a membership-changing commit from a non-admin is
+    /// rejected (not merged) by `process_incoming_with_authority`, while an
+    /// authorized one merges. Builds a fresh alice+bob group per case so
+    /// each processes its own commit exactly once.
+    fn bob_add_commit_vs_alice(seed: u8) -> (MlsParty, MlsGroupState, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let id_a = identity_from_seed([seed; 32], [seed.wrapping_add(1); 32]);
+        let id_b = identity_from_seed([seed.wrapping_add(2); 32], [seed.wrapping_add(3); 32]);
+        let id_c = identity_from_seed([seed.wrapping_add(4); 32], [seed.wrapping_add(5); 32]);
+        let alice = MlsParty::from_identity(&id_a).unwrap();
+        let bob = MlsParty::from_identity(&id_b).unwrap();
+        let carol = MlsParty::from_identity(&id_c).unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let (_c, bob_welcome) = alice_group
+            .invite(&alice, &bob.key_package_bytes().unwrap())
+            .unwrap();
+        // Alice merged her own add of Bob via `invite`; Bob joins.
+        let mut bob_group = bob.join_from_welcome(&bob_welcome).unwrap();
+        // Bob (a non-admin under Alice's policy) commits an ADD of Carol.
+        let (bob_add_commit, _carol_welcome) = bob_group
+            .invite(&bob, &carol.key_package_bytes().unwrap())
+            .unwrap();
+        let alice_fp = id_a
+            .signing()
+            .verifying_key()
+            .fingerprint()
+            .as_bytes()
+            .to_vec();
+        let bob_fp = id_b
+            .signing()
+            .verifying_key()
+            .fingerprint()
+            .as_bytes()
+            .to_vec();
+        // Return the REAL `alice` party — its openmls provider holds the
+        // group's secrets, which a freshly re-derived party would not.
+        (alice, alice_group, bob_add_commit, alice_fp, bob_fp)
+    }
+
+    #[test]
+    fn authority_rejects_unauthorized_membership_commit() {
+        // Reject case: only Alice is an admin; Bob's add-commit is refused.
+        let (alice, mut alice_group, commit, alice_fp, bob_fp) = bob_add_commit_vs_alice(40);
+        assert_ne!(alice_fp, bob_fp);
+        let rejected = alice_group.process_incoming_with_authority(&alice, &commit, |committer| {
+            committer == alice_fp.as_slice()
+        });
+        assert!(
+            matches!(rejected, Err(Error::Unauthorized(_))),
+            "a membership commit from a non-admin must be rejected, got {rejected:?}"
+        );
+
+        // Accept case (fresh group): allow-all policy merges the commit.
+        let (alice2, mut alice_group2, commit2, _a, _b) = bob_add_commit_vs_alice(60);
+        let accepted = alice_group2.process_incoming_with_authority(&alice2, &commit2, |_| true);
+        assert!(
+            accepted.is_ok(),
+            "an authorized membership commit must merge, got {accepted:?}"
+        );
     }
 
     #[test]

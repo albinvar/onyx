@@ -6,6 +6,49 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 3 (F3.3 / G-2) — 2026-06-02 — MLS room admin/authority model
+
+Closes G-2 (audit MED-2): previously *any* room member could add/remove
+*any* member. Now there's an app-layer admin model, enforced by honest
+clients on both the send and receive sides. (Implements the full F3.3 from
+`ROOM-AUTHORITY.md` after the §3.5 finding that a send-gate alone, without
+propagation, is a no-op.)
+
+### Added
+- **Admin set per room**, seeded with the **creator** (`room_admins` table +
+  `add_room_admin`/`list_room_admins`/`is_room_admin`; empty set = legacy
+  room = unrestricted, for back-compat).
+- **Propagation**: the admin set is carried in the Welcome
+  (`MlsWelcome.admins`, covered by the sealed-sender signature) so every
+  member's client knows — and enforces — the same policy.
+- **Send-side gate**: `handle_invite_to_room` / `handle_remove_from_room`
+  refuse when the local identity isn't an admin.
+- **Receive-side gate**: `MlsGroupState::process_incoming_with_authority`
+  **rejects (does not merge)** a membership-changing commit (add/remove) from
+  a non-admin — so an honest member ignores an unauthorized change; the
+  daemon resolves the committer's fingerprint against the admin set and drops
+  + warns on `Error::Unauthorized` (no retry-stash). Self key-update commits
+  and application messages are unaffected.
+
+### Honest residual (inherent to MLS)
+MLS has no RBAC — you cannot *prevent* a member emitting a valid commit, only
+make honest clients **reject** it, which **forks** the group. A patched
+client can still fork honest members (they reject + warn, no auto-recovery).
+The GroupContext-authenticated admin set and fork recovery stay deferred
+(`ROOM-AUTHORITY.md` §3/§4).
+
+### Fixed (found while implementing)
+- `Vault` schema: `room_admins` is now created in the `initialize` path too
+  (not just `open`), so `create()` / `open_memory()` vaults have the table.
+
+### Verified
+- `mls::authority_rejects_unauthorized_membership_commit` (non-admin commit
+  rejected, authorized one merges) + `storage::room_admins_authority_semantics`.
+  300 core + 74 daemon + 9 integration tests pass; changed files clippy-clean.
+- `THREAT_MODEL.md` §8.4 G-2: **Open → Mitigated (F3.3)**.
+
+---
+
 ## Fortification Phase 3 (F3.2a / H-1) — 2026-06-02 — fair queue eviction
 
 Implements the F3.2a slice from `QUEUE-HARDENING.md`: the hub's offline

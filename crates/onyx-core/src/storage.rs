@@ -173,6 +173,25 @@ CREATE TABLE IF NOT EXISTS room_member_kems (
 );
 ";
 
+/// G-2 (F3.3): per-room admin set — fingerprints allowed to add/remove
+/// members. Seeded with the creator at room creation; propagated to new
+/// members in the Welcome so every member's client can enforce the same
+/// policy (send-side refusal + receive-side rejection of commits from
+/// non-admins). Same additive `CREATE TABLE IF NOT EXISTS` pattern.
+///
+/// App-layer authority (see `ROOM-AUTHORITY.md`): this makes honest
+/// clients enforce the policy and makes violations visible; it does NOT
+/// cryptographically prevent a patched client from emitting a valid MLS
+/// commit (the fork residual is documented).
+const SCHEMA_ROOM_ADMINS_ADD: &str = "
+CREATE TABLE IF NOT EXISTS room_admins (
+  identity_id   INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  group_id      BLOB NOT NULL,
+  fingerprint   TEXT NOT NULL,
+  PRIMARY KEY (identity_id, group_id, fingerprint)
+);
+";
+
 /// Additive extension for v0.1.17 — persistent direct-dial targets.
 /// Maps a peer's X25519 identity key to the `.onion` (+ base32 pubkey,
 /// stored for convenience/cross-check) we last dialed them at, so the
@@ -486,6 +505,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_KEM_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOM_ADMINS_ADD)
+            .map_err(map_db_err)?;
 
         Ok(Self { conn, aead })
     }
@@ -507,6 +528,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_KEM_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_ROOM_ADMINS_ADD)
             .map_err(map_db_err)?;
 
         let salt: [u8; 16] = random_array();
@@ -1090,6 +1113,62 @@ impl Vault {
         Ok(out)
     }
 
+    /// G-2 (F3.3): record `fingerprint` as an admin of `(identity, group)`.
+    /// Idempotent (`INSERT OR IGNORE`).
+    pub fn add_room_admin(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO room_admins (identity_id, group_id, fingerprint) \
+                 VALUES (?, ?, ?)",
+                params![identity_id, group_id, fingerprint],
+            )
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// G-2 (F3.3): list the admin fingerprints for `(identity, group)`,
+    /// sorted. Empty = no admin set recorded for this room (e.g. a room
+    /// created before F3.3, or one whose Welcome carried no admin set);
+    /// callers treat an empty set as "unrestricted" to stay backward-
+    /// compatible and avoid freezing legacy rooms.
+    pub fn list_room_admins(&self, identity_id: i64, group_id: &[u8]) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT fingerprint FROM room_admins \
+                 WHERE identity_id = ? AND group_id = ? ORDER BY fingerprint",
+            )
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id, group_id], |r| r.get::<_, String>(0))
+            .map_err(map_db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_db_err)?);
+        }
+        Ok(out)
+    }
+
+    /// G-2 (F3.3): is `fingerprint` allowed to change membership in
+    /// `(identity, group)`? Returns `true` if the fingerprint is a recorded
+    /// admin OR if the room has **no** admin set recorded at all (fail-OPEN
+    /// for legacy/unknown rooms — see [`Self::list_room_admins`]). The
+    /// authority policy only bites once a room has a known admin set.
+    pub fn is_room_admin(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        fingerprint: &str,
+    ) -> Result<bool> {
+        let admins = self.list_room_admins(identity_id, group_id)?;
+        Ok(admins.is_empty() || admins.iter().any(|a| a == fingerprint))
+    }
+
     /// Delete a room by `(identity_id, group_id)`. Idempotent — no
     /// error if the row didn't exist. Note: this does NOT drop the
     /// underlying MLS state (that's `mls_state`); a future `leave-
@@ -1434,6 +1513,35 @@ mod tests {
     #[test]
     fn create_open_memory_succeeds() {
         let _v = fresh_vault();
+    }
+
+    #[test]
+    fn room_admins_authority_semantics() {
+        // G-2 (F3.3): the admin set drives is_room_admin. No recorded set
+        // → unrestricted (fail-open, back-compat); once seeded, only listed
+        // fingerprints are admins; add is idempotent.
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("me").expect("identity");
+        let group = [7u8; 32];
+        // No admin set recorded → unrestricted.
+        assert!(
+            v.is_room_admin(id, &group, "anyone").unwrap(),
+            "empty admin set must be unrestricted (back-compat)"
+        );
+        // Seed an admin → policy now bites.
+        v.add_room_admin(id, &group, "fp_creator").unwrap();
+        assert!(v.is_room_admin(id, &group, "fp_creator").unwrap());
+        assert!(
+            !v.is_room_admin(id, &group, "fp_stranger").unwrap(),
+            "a non-admin must not be authorized once a set exists"
+        );
+        assert_eq!(
+            v.list_room_admins(id, &group).unwrap(),
+            vec!["fp_creator".to_string()]
+        );
+        // Idempotent.
+        v.add_room_admin(id, &group, "fp_creator").unwrap();
+        assert_eq!(v.list_room_admins(id, &group).unwrap().len(), 1);
     }
 
     #[test]
