@@ -92,6 +92,17 @@ struct Args {
           conflicts_with_all = ["dial_onion", "listen_tcp"])]
     dial_tcp: Option<String>,
 
+    /// **TEST-ONLY** hub-client over plain TCP. No Tor, no anonymity.
+    /// Repeatable: each `--hub-tcp 127.0.0.1:PORT,b32pubkey` adds one
+    /// TCP hub (same role as `--hub`, but over a clearnet socket instead
+    /// of a `.onion`). The daemon library already supported this for the
+    /// integration smoke harness; surfacing it on the binary lets
+    /// operators run the cover-traffic measurement drill
+    /// (`scripts/cover-traffic-measure.py`) and local hub smokes without
+    /// Tor. Requires `--allow-clearnet`. See `SECURITY.md` §6.2.
+    #[arg(long = "hub-tcp", action = clap::ArgAction::Append)]
+    hub_tcp: Vec<String>,
+
     /// **Opt-in.** Mean interval (in seconds) between cover-traffic
     /// PAD frames on each configured hub. See `ANONYMITY.md` §3.1.
     /// Off by default (the v0 default; not yet verified in real-Tor
@@ -166,6 +177,23 @@ impl TryFrom<Args> for Config {
             });
         }
 
+        // TEST-ONLY: TCP hubs (`--hub-tcp addr,b32pubkey`). Same
+        // HubConfig shape as the Tor form; the run()-time clearnet guard
+        // refuses these unless --allow-clearnet is set.
+        let mut hub_tcp_addrs: Vec<onyx_daemon::HubConfig> = Vec::new();
+        for raw in a.hub_tcp {
+            let (addr, pubkey) = raw.split_once(',').ok_or_else(|| {
+                anyhow::anyhow!("--hub-tcp value must be `addr,b32pubkey` (missing comma): {raw}")
+            })?;
+            if addr.is_empty() || pubkey.is_empty() {
+                anyhow::bail!("--hub-tcp value has empty field: {raw}");
+            }
+            hub_tcp_addrs.push(onyx_daemon::HubConfig {
+                onion: addr.to_string(),
+                pubkey: pubkey.to_string(),
+            });
+        }
+
         Ok(Self {
             vault: a.vault.unwrap_or_else(onyx_daemon::default_vault_path),
             passphrase: zeroize::Zeroizing::new(a.passphrase),
@@ -177,7 +205,7 @@ impl TryFrom<Args> for Config {
                 .api_socket
                 .unwrap_or_else(onyx_daemon::default_api_socket_path),
             hubs,
-            hub_tcp_addrs: Vec::new(),
+            hub_tcp_addrs,
             listen_tcp: a.listen_tcp,
             dial_tcp: a.dial_tcp,
             cover_traffic_mean_secs: a.cover_traffic_mean_secs,

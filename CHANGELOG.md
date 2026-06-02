@@ -6,6 +6,42 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 1 (F1.2) — 2026-06-02 — cover-traffic wire measurement
+
+Turns the "we *think* constant-rate hides active-vs-idle" claim into a
+measured one — at the wire-observer level. (Real-Tor end-to-end remains
+the operator drill; loopback omits only Tor's content-independent jitter.)
+
+### Added
+- **`scripts/cover-traffic-measure.py`** — interposes a transparent
+  framing tap on the daemon↔hub TCP socket (parsing the 2-byte length
+  prefix that frames each Noise ciphertext) and records the size + timing
+  of every frame a wiretap would see. Reports inter-frame mean/stdev and
+  the coefficient of variation (CV) — the active-vs-idle distinguisher.
+- **`onyxd --hub-tcp addr,b32pubkey`** (repeatable, requires
+  `--allow-clearnet`). The daemon *library* already supported TCP hubs
+  (the smoke harness uses them) and the no-clearnet guard already listed
+  the flag, but the binary never surfaced it. Now it does — enabling the
+  measurement drill and local hub smokes without Tor.
+
+### Measured (loopback, 2026-06-02)
+- Constant-rate, 500 ms slot, **both directions**: inter-frame mean
+  500.0 ms, **stdev 1.2 ms (CV 0.002)** — metronomic — with uniform
+  **272-byte** frames.
+- Shaping **off**, idle: **0 frames** — silence trivially reveals idle.
+- Poisson cover (mean 1 s): stdev ~217 ms (CV 0.18) — a residual rate
+  signal, which is exactly why constant-rate is the stronger mode.
+- Since every frame is equal-size ciphertext, a real message just occupies
+  a slot a PAD would have filled (same size + cadence — pinned by the F1.1
+  unit test), so active and idle are indistinguishable to the wire observer.
+
+### Docs
+- `ANONYMITY.md` §3.1: the indistinguishability claim is now backed by the
+  wire measurement; the remaining gap (real-Tor end-to-end) is stated
+  precisely, with the argument for why loopback transfers to Tor for timing.
+
+---
+
 ## Fortification Phase 1 (F1.1) — 2026-06-02 — constant-rate hub (downstream) mode
 
 The daemon's `--constant-rate-ms` already made the client→hub (upstream)
