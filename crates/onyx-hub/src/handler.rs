@@ -4,6 +4,7 @@
 //! pairs to exercise the protocol without spinning Tor; the binary
 //! passes in a `TorStream` from arti.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use onyx_core::crypto::IdentitySecret;
@@ -41,7 +42,7 @@ pub async fn hub_handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    hub_handle_connection_with_cover(stream, hub_x25519, state, None).await
+    hub_handle_connection_with_cover(stream, hub_x25519, state, None, None).await
 }
 
 /// T-cover.hub: same as [`hub_handle_connection`] but with an
@@ -55,11 +56,22 @@ where
 /// existing callers (e.g. tests) get byte-identical behaviour.
 /// `onyx-hub/src/main.rs`'s production accept loop reads the
 /// operator's `--cover-traffic-mean-secs` flag and threads it in.
+///
+/// F1.1: `constant_rate_ms` is the downstream (hub→client) half of
+/// the client's `--constant-rate-ms`. When `Some(ms > 0)`, the hub
+/// emits exactly one frame to this client every `ms` — a queued real
+/// `FRAME_DELIVER` if one is waiting, otherwise a `FRAME_PAD` — so the
+/// hub→client inter-frame cadence is invariant whether the client is
+/// receiving messages or idle. It **supersedes** Poisson cover on this
+/// connection (constant-rate already pads idle slots, so running both
+/// would just waste bandwidth); when both flags are set, constant-rate
+/// wins and cover is disabled for the connection.
 pub async fn hub_handle_connection_with_cover<S>(
     mut stream: S,
     hub_x25519: &IdentitySecret,
     state: Arc<Mutex<HubState>>,
     cover_traffic_mean_secs: Option<u64>,
+    constant_rate_ms: Option<u64>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -109,6 +121,7 @@ where
         &peer_pk,
         &mut rx,
         cover_traffic_mean_secs,
+        constant_rate_ms,
     )
     .await;
 
@@ -339,7 +352,11 @@ async fn handle_gossip_deliver(
 // long because each branch handles a complete protocol verb inline.
 // Splitting per-verb helpers would just rename code into call sites
 // without making the dispatch easier to follow.
-#[allow(clippy::too_many_lines)]
+// Arg count: the frame loop genuinely needs the stream, session, shared
+// state, connection id, peer key, outbound receiver, and the two shaping
+// knobs (cover mean + constant-rate slot). Bundling them into a struct
+// would obscure, not clarify, this single call site.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve_frames<S>(
     stream: &mut S,
     session: &mut Session,
@@ -348,16 +365,48 @@ async fn serve_frames<S>(
     peer_pk: &[u8; 32],
     rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     cover_traffic_mean_secs: Option<u64>,
+    constant_rate_ms: Option<u64>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // F1.1: constant-rate downstream. When enabled, a fixed-interval
+    // ticker drives all hub→client writes — one frame per slot, real or
+    // PAD — making the cadence invariant. It supersedes Poisson cover on
+    // this connection (constant-rate already pads idle slots).
+    let constant_enabled = matches!(constant_rate_ms, Some(ms) if ms > 0);
+    if constant_enabled && matches!(cover_traffic_mean_secs, Some(s) if s > 0) {
+        warn!(
+            conn = conn_id,
+            "hub: both constant-rate and cover-traffic set; constant-rate supersedes \
+             (cover disabled for this connection)"
+        );
+    }
+    // `interval` panics on a zero period; when constant-rate is off we
+    // still construct a ticker (with a long dummy period) but its select
+    // branch is guarded off, so it never fires.
+    let pacer_period = if constant_enabled {
+        std::time::Duration::from_millis(constant_rate_ms.expect("checked above"))
+    } else {
+        std::time::Duration::from_secs(86_400)
+    };
+    let mut pacer = tokio::time::interval(pacer_period);
+    // Delay (not Burst) is load-bearing: a stalled slot must not emit a
+    // catch-up burst that reintroduces a detectable rate spike. Mirrors
+    // the daemon-side `run_constant_rate_pacer`.
+    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Real frames waiting to be paced out (e.g. queued messages drained
+    // on SUBSCRIBE). Only used in constant-rate mode; in the default mode
+    // those are written immediately.
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+
     // T-cover.hub: when cover traffic is enabled for this hub,
     // arm a sleep that fires at the first Poisson-distributed
     // interval. After each fire we re-arm with a fresh sample so
-    // the inter-arrival times stay memoryless. Disabled → arm a
-    // never-ready sleep so the select branch is a no-op.
-    let cover_enabled = matches!(cover_traffic_mean_secs, Some(s) if s > 0);
+    // the inter-arrival times stay memoryless. Disabled (or
+    // superseded by constant-rate) → arm a never-ready sleep so the
+    // select branch is a no-op.
+    let cover_enabled = matches!(cover_traffic_mean_secs, Some(s) if s > 0) && !constant_enabled;
     let initial_cover_dt = if cover_enabled {
         sample_exponential_interval(cover_traffic_mean_secs.expect("checked above"))
     } else {
@@ -453,13 +502,22 @@ where
                             queued_drained = drained.len(),
                             "hub: client subscribed"
                         );
-                        // Flush any queued payloads to the client right away.
-                        for payload in drained {
-                            write_frame(stream, session, &InnerFrame {
-                                frame_type: FRAME_DELIVER,
-                                payload,
-                            }).await
-                                .map_err(|e| anyhow::anyhow!("hub: write drained: {e}"))?;
+                        // Flush any queued payloads to the client. In the
+                        // default mode, write them right away. Under
+                        // constant-rate, hand them to the pacer instead
+                        // (buffer in `pending`) so a subscribe-time drain
+                        // doesn't burst — which would reintroduce exactly
+                        // the timing signal constant-rate exists to remove.
+                        if constant_enabled {
+                            pending.extend(drained);
+                        } else {
+                            for payload in drained {
+                                write_frame(stream, session, &InnerFrame {
+                                    frame_type: FRAME_DELIVER,
+                                    payload,
+                                }).await
+                                    .map_err(|e| anyhow::anyhow!("hub: write drained: {e}"))?;
+                            }
                         }
                     }
                     FRAME_DELIVER => {
@@ -670,12 +728,37 @@ where
                 }
             }
             // Live message from the state — write it out as DELIVER.
-            Some(payload) = rx.recv() => {
+            // In constant-rate mode this branch is disabled; live
+            // messages stay queued in `rx` and the pacer drains them
+            // one-per-slot below.
+            Some(payload) = rx.recv(), if !constant_enabled => {
                 write_frame(stream, session, &InnerFrame {
                     frame_type: FRAME_DELIVER,
                     payload,
                 }).await
                     .map_err(|e| anyhow::anyhow!("hub: write live: {e}"))?;
+            }
+            // F1.1: constant-rate slot. Emit exactly one frame — a
+            // pending/queued real DELIVER if one is waiting, otherwise a
+            // PAD — so the hub→client cadence is invariant. `pending`
+            // (subscribe-drain) is drained before live `rx` traffic to
+            // preserve ordering: queued-while-offline arrives first.
+            _ = pacer.tick(), if constant_enabled => {
+                let real = pending.pop_front().or_else(|| rx.try_recv().ok());
+                if let Some(payload) = real {
+                    write_frame(stream, session, &InnerFrame {
+                        frame_type: FRAME_DELIVER,
+                        payload,
+                    }).await
+                        .map_err(|e| anyhow::anyhow!("hub: write paced: {e}"))?;
+                } else {
+                    write_frame(stream, session, &InnerFrame {
+                        frame_type: FRAME_PAD,
+                        payload: Vec::new(),
+                    }).await
+                        .map_err(|e| anyhow::anyhow!("hub: write paced PAD: {e}"))?;
+                    tracing::trace!(conn = conn_id, "hub: constant-rate PAD sent");
+                }
             }
             // T-cover.hub: cover-traffic tick. Send a FRAME_PAD and
             // re-arm with a fresh exponentially-distributed interval.
@@ -1072,6 +1155,107 @@ mod tests {
         let (target_echo, body) = split_deliver_payload(&alice_payload).unwrap();
         assert_eq!(target_echo, alice_inbox);
         assert_eq!(body, b"hello");
+    }
+
+    /// F1.1: with constant-rate downstream enabled, the hub→client side
+    /// is an invariant clock. This test pins the two properties that
+    /// make it a timing defense rather than just cover:
+    ///   1. **Paced, not bursted.** Three messages queued *before*
+    ///      subscribe are drained on SUBSCRIBE, but emitted one-per-slot
+    ///      — never as an instantaneous burst (which would leak "3
+    ///      messages were waiting" via timing).
+    ///   2. **Idle slots are PADs.** Once the real traffic is drained,
+    ///      the cadence continues with `FRAME_PAD`, so an observer sees
+    ///      the same frame rate whether alice is receiving or idle.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn constant_rate_paces_drain_and_pads_when_idle() {
+        let slot_ms = 100u64;
+        let hub_sk = IdentitySecret::generate();
+        let hub_pk = hub_sk.public();
+        let alice_sk = IdentitySecret::generate();
+        let state = Arc::new(Mutex::new(HubState::new()));
+
+        let (client, hub) = tokio::io::duplex(65_536);
+        let hub_sk_owned = hub_sk_clone(&hub_sk);
+        let state_for_hub = state.clone();
+        let _hub_task = tokio::spawn(async move {
+            hub_handle_connection_with_cover(hub, &hub_sk_owned, state_for_hub, None, Some(slot_ms))
+                .await
+        });
+
+        let alice_inbox: RoutingId = [0xC0; 16];
+        // Pre-queue three messages (no live subscriber yet → they land in
+        // the offline queue and are drained on SUBSCRIBE).
+        {
+            let mut s = state.lock().await;
+            for i in 0..3u8 {
+                let mut p = Vec::with_capacity(17);
+                p.extend_from_slice(&alice_inbox);
+                p.push(i);
+                s.deliver(alice_inbox, p);
+            }
+        }
+
+        let mut stream = client;
+        let mut session = handshake_initiator(&mut stream, &alice_sk, &hub_pk)
+            .await
+            .expect("alice handshake");
+        let signing = onyx_core::crypto::SigningKey::generate();
+        let hh = session.handshake_hash();
+        write_frame(
+            &mut stream,
+            &mut session,
+            &InnerFrame {
+                frame_type: FRAME_SUBSCRIBE,
+                payload: onyx_core::routing::encode_signed_subscribe(&signing, &hh, &[alice_inbox]),
+            },
+        )
+        .await
+        .expect("alice subscribe");
+
+        // Read six paced frames, timestamping each.
+        let mut kinds = Vec::new();
+        let start = tokio::time::Instant::now();
+        let mut last = start;
+        let mut max_gap = Duration::ZERO;
+        for _ in 0..6 {
+            let f = tokio::time::timeout(
+                Duration::from_secs(3),
+                read_frame(&mut stream, &mut session),
+            )
+            .await
+            .expect("frame within timeout")
+            .expect("frame ok");
+            let now = tokio::time::Instant::now();
+            max_gap = max_gap.max(now.duration_since(last));
+            last = now;
+            kinds.push(f.frame_type);
+        }
+        let span = last.duration_since(start);
+
+        // Property 1: all three queued messages arrive as DELIVERs…
+        let delivers = kinds.iter().filter(|&&k| k == FRAME_DELIVER).count();
+        assert!(
+            delivers >= 3,
+            "expected >=3 drained DELIVERs, got {delivers} (kinds={kinds:?})"
+        );
+        // …but PACED, not bursted: six frames must span at least four
+        // slots. A burst would deliver them in milliseconds.
+        assert!(
+            span >= Duration::from_millis(slot_ms * 4),
+            "drain was bursted, not paced: 6 frames in {span:?} (slot={slot_ms}ms)"
+        );
+        // Property 2: once drained, idle slots are PADs.
+        assert!(
+            kinds.contains(&FRAME_PAD),
+            "expected PAD frames once the queue drained (kinds={kinds:?})"
+        );
+        // Sanity: no single gap collapsed to a burst (each slot honored).
+        assert!(
+            max_gap >= Duration::from_millis(slot_ms / 2),
+            "a slot fired too fast ({max_gap:?}); pacing not honored"
+        );
     }
 
     /// Bob delivers before alice subscribes; alice subscribes and

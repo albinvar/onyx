@@ -6,6 +6,38 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 1 (F1.1) — 2026-06-02 — constant-rate hub (downstream) mode
+
+The daemon's `--constant-rate-ms` already made the client→hub (upstream)
+cadence invariant. This adds the missing downstream half so the hub→client
+direction can be invariant too — with both set, the daemon↔hub channel
+leaks no timing in either direction.
+
+### Added
+- **`onyx-hub --constant-rate-ms <MS>`** (env `ONYX_HUB_CONSTANT_RATE_MS`).
+  When set (>0), a per-connection fixed-slot pacer emits exactly one frame
+  per slot to each client — a queued real `FRAME_DELIVER` if one is waiting,
+  otherwise a `FRAME_PAD` — so the hub→client inter-frame timing is the same
+  whether the client is receiving messages or idle. `MissedTickBehavior::Delay`
+  (mirrors the daemon pacer) ensures a stalled slot never emits a catch-up
+  burst that would reintroduce a rate spike.
+- Messages **drained on SUBSCRIBE** (offline queue) are fed through the same
+  pacer (buffered in `pending`), not flushed in a burst — so a backlog
+  doesn't leak "N messages were waiting" via timing.
+- It **supersedes** `--cover-traffic-mean-secs` per connection (constant-rate
+  already fills idle slots; running both just wastes bandwidth → cover is
+  disabled for that connection, with a warning).
+- Test `constant_rate_paces_drain_and_pads_when_idle`: proves paced-not-bursted
+  drain, idle PADs, and per-slot cadence. All 61 hub unit tests + 8 integration
+  smoke pass; onyx-hub is clippy-clean.
+
+### Docs
+- `ANONYMITY.md` §3.1: the "constant-rate hub not yet built" limit is removed;
+  both directions can now be invariant. Real-Tor measurement of the
+  indistinguishability claim (F1.2) remains the headline open item.
+
+---
+
 ## Fortification Phase 0 (F0.3) — 2026-06-02 — external-audit brief (AUDIT.md)
 
 Closes the prep half of THREAT_MODEL §8.2 #7 — the external audit, which the

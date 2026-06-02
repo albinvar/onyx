@@ -64,7 +64,7 @@ async fn spawn_hub() -> (String, String, TempDir) {
 /// `rooms_e2e_hub_cover_traffic_does_not_break_flow` to prove the
 /// T-cover.hub emitter doesn't interfere with real messages.
 async fn spawn_hub_with_cover(cover_traffic_mean_secs: Option<u64>) -> (String, String, TempDir) {
-    let (addr, pubkey, dir, _state) = spawn_hub_with_state(cover_traffic_mean_secs).await;
+    let (addr, pubkey, dir, _state) = spawn_hub_with_state(cover_traffic_mean_secs, None).await;
     (addr, pubkey, dir)
 }
 
@@ -74,6 +74,7 @@ async fn spawn_hub_with_cover(cover_traffic_mean_secs: Option<u64>) -> (String, 
 /// known intro inbox for a privacy-mode daemon).
 async fn spawn_hub_with_state(
     cover_traffic_mean_secs: Option<u64>,
+    constant_rate_ms: Option<u64>,
 ) -> (String, String, TempDir, Arc<Mutex<HubState>>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let vault_path = dir.path().join("hub-vault.db");
@@ -110,6 +111,7 @@ async fn spawn_hub_with_state(
                     identity_sk.identity_key(),
                     state,
                     cover_traffic_mean_secs,
+                    constant_rate_ms,
                 )
                 .await;
             });
@@ -1318,7 +1320,7 @@ async fn rooms_e2e_private_mode_leaks_no_identity_to_hub() {
         .with_test_writer()
         .try_init();
 
-    let (hub_addr, hub_pub_b32, _hub_dir, hub_state) = spawn_hub_with_state(None).await;
+    let (hub_addr, hub_pub_b32, _hub_dir, hub_state) = spawn_hub_with_state(None, None).await;
 
     // Private-mode daemon: first_contact_reachable = false.
     let (alice_sock, _alice_dir) =

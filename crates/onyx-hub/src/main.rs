@@ -184,6 +184,24 @@ struct Args {
     /// cover. Set to 0 to disable.
     #[arg(long, env = "ONYX_HUB_COVER_TRAFFIC_MEAN_SECS")]
     cover_traffic_mean_secs: Option<u64>,
+
+    /// F1.1: constant-rate downstream cadence, in milliseconds. The
+    /// hub→client half of the client's `--constant-rate-ms`. When set
+    /// (>0), the hub writes exactly one frame to each connected client
+    /// every `N` ms — a queued real delivery if one is waiting, else a
+    /// `FRAME_PAD` — so the hub→client inter-frame timing is invariant
+    /// whether the client is receiving messages or idle. This removes
+    /// the rate signal entirely (stronger than Poisson cover, which a
+    /// rate-autocorrelating observer can eventually defeat), at the cost
+    /// of up to one slot of delivery latency and a steady PAD/slot of
+    /// bandwidth per client even when idle.
+    ///
+    /// Supersedes `--cover-traffic-mean-secs` per connection (constant
+    /// rate already pads idle slots). Off by default. See `ANONYMITY.md`
+    /// §3.1. Bandwidth: `bucket::SMALL` per slot per client — at 500 ms
+    /// with 100 clients that's ~50 KB/s of floor traffic.
+    #[arg(long, env = "ONYX_HUB_CONSTANT_RATE_MS")]
+    constant_rate_ms: Option<u64>,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -237,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
             args.max_queue_age_days,
             args.max_frames_per_minute,
             args.cover_traffic_mean_secs,
+            args.constant_rate_ms,
         )
         .await;
     }
@@ -452,7 +471,16 @@ async fn main() -> anyhow::Result<()> {
             "T-cover.hub: cover-traffic emitter enabled per inbound client connection"
         );
     }
+    if let Some(slot_ms) = args.constant_rate_ms
+        && slot_ms > 0
+    {
+        info!(
+            constant_rate_ms = slot_ms,
+            "F1.1: constant-rate downstream enabled per inbound client connection"
+        );
+    }
     let cover_secs = args.cover_traffic_mean_secs;
+    let constant_rate_ms = args.constant_rate_ms;
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
             let state = state.clone();
@@ -465,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
                         hub_secret.identity_key(),
                         state,
                         cover_secs,
+                        constant_rate_ms,
                     )
                     .await
                     {
@@ -503,6 +532,7 @@ async fn run_listen_tcp_mode(
     max_queue_age_days: u32,
     max_frames_per_minute: u32,
     cover_traffic_mean_secs: Option<u64>,
+    constant_rate_ms: Option<u64>,
 ) -> anyhow::Result<()> {
     warn!(
         addr = %addr,
@@ -579,6 +609,7 @@ async fn run_listen_tcp_mode(
                         hub_secret.identity_key(),
                         state,
                         cover_traffic_mean_secs,
+                        constant_rate_ms,
                     )
                     .await
                     {
