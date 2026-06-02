@@ -253,7 +253,7 @@ A multi-agent internal review of the security-critical code, followed by an adve
   4. **Replay guard is in-memory with a ≤60 s restart window** (§8.2 #16 detail) — unchanged.
   5. **The crypto primitives themselves** (X25519, ML-KEM-768, MLS, ChaCha20-Poly1305) are assumed correct; the underlying libraries (`snow`, `openmls`, `ml-kem`) are not fully audited (§4 trust assumptions, N5).
   6. **Timing / traffic analysis** — constant-rate "high mode" cover (`--constant-rate-ms`, T-cover.const) now exists opt-in for the client→hub **upstream**, making that cadence invariant; the **hub-side (downstream) constant-rate, direct peer-circuit cover, and real-Tor measurement remain unbuilt/unverified** (§8.2 #3, A2 caveat, N1).
-  7. **External audit (§8.2 #7) remains the single most important open item.** Everything above is "survives the attacks we knew to write," not "proven secure."
+  7. **External audit (§8.2 #7) remains the single most important open item.** Everything above is "survives the attacks we knew to write," not "proven secure." The prep we own — scope, freeze target, cryptographic inventory, codebase map, and the disclosed known-open-items list — is now written up in **`AUDIT.md`** (ready to hand to an auditing firm); the engagement itself is the remaining third-party step.
 
 ### 8.4 Security review — 2026-05-29 (mixed manual + agent)
 

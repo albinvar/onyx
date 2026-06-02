@@ -6,6 +6,42 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 0 (F0.3) — 2026-06-02 — external-audit brief (AUDIT.md)
+
+Closes the prep half of THREAT_MODEL §8.2 #7 — the external audit, which the
+threat model calls the single most important open item. The audit *execution*
+is a third-party engagement; this is the package we own and hand over.
+
+### Added
+- **`AUDIT.md`** — the auditor brief. Contents, all cross-checked against the
+  source at this commit (not summarized from memory):
+  - **Scope** (in/out, priority order) and a **freeze** recommendation (audit a
+    tagged immutable commit; `Cargo.lock` + `--locked` pin the dep graph).
+  - **Codebase map**: ~34.8k LoC across 5 crates, 465 tests; `onyx-core` is the
+    primary surface.
+  - **Cryptographic inventory** with exact pinned versions: Ed25519
+    (`ed25519-dalek` 2.2.0), Noise XK (`snow` 0.9.6), MLS `openmls` 0.8.1
+    (ciphersuite `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`), X-Wing
+    hybrid KEM (`x25519-dalek` 2.0.1 + `ml-kem` 0.2.3), ChaCha20-Poly1305
+    0.10.1, Argon2id 0.5.3 (DEFAULT 256 MiB / t=3 / p=4, FLOOR 64 MiB),
+    HKDF-SHA256, BLAKE2b-128 routing IDs, CBOR `MAX_ENVELOPE` 128 KiB — each
+    mapped to its file → symbol.
+  - **Trust boundaries** — precisely what a *malicious hub* and a *network
+    observer* each see.
+  - **Known open items** disclosed up front (KEM all-zero check, fail-open pin,
+    bootstrap pin parity, missing pin-injection harness, timing/correlation,
+    MLS authority, cross-machine repro) so the audit spends its time on the
+    unknown.
+  - **Build/test/verify** instructions incl. `verify-reproducible-build.sh` and
+    `cargo deny check`.
+  - The reason `openmls` is on 0.8 (avoids RUSTSEC-2026-0072 via
+    `hpke-rs-rust-crypto` 0.6+).
+
+### Docs
+- `THREAT_MODEL.md` §8.4 #7 and `SECURITY.md` §9 now reference `AUDIT.md`.
+
+---
+
 ## Fortification Phase 0 (F0.2) — 2026-06-02 — verified install is now fail-closed
 
 `install.sh` already cosign-verified each binary against its sigstore
