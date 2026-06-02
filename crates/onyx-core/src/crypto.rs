@@ -661,6 +661,15 @@ impl HybridKemSecret {
     pub fn decapsulate(&self, ct: &HybridCiphertext) -> Result<HybridSharedSecret> {
         let their_classical = x25519_dalek::PublicKey::from(ct.classical);
         let x_ss = self.classical.diffie_hellman(&their_classical);
+        // Audit LOW (RUSTSEC-2026-0072 analogue): reject a non-contributory
+        // X25519 result. A malicious sender can put a low-order point in
+        // `ct.classical` that forces the DH output to a fixed all-zero
+        // value, stripping the X25519 half's contribution from the hybrid
+        // secret and silently downgrading "secure if EITHER primitive holds"
+        // to ML-KEM-only. Refusing keeps the hybrid guarantee intact.
+        if !x_ss.was_contributory() {
+            return Err(Error::VerificationFailed);
+        }
 
         let pq_ct_array = PqCiphertextArray::from(ct.post_quantum);
         let pq_ss = Decapsulate::decapsulate(&self.post_quantum, &pq_ct_array)
@@ -707,6 +716,12 @@ impl HybridKemPublic {
         let eph_public_bytes = x25519_dalek::PublicKey::from(&eph_secret).to_bytes();
         let recipient_classical = x25519_dalek::PublicKey::from(self.classical);
         let x_ss = eph_secret.diffie_hellman(&recipient_classical);
+        // Symmetric with decapsulate: reject a non-contributory result so a
+        // malicious/low-order recipient public key can't strip the X25519
+        // half of the hybrid secret. Defense-in-depth on the send side.
+        if !x_ss.was_contributory() {
+            return Err(Error::VerificationFailed);
+        }
 
         // ML-KEM encapsulation.
         let (pq_ct_array, pq_ss) = Encapsulate::encapsulate(&self.post_quantum, &mut OsRng)
@@ -1194,6 +1209,25 @@ mod tests {
             ss_send.as_bytes(),
             ss_recv.as_bytes(),
             "tampering the PQ half must change the combined secret"
+        );
+    }
+
+    #[test]
+    fn hybrid_kem_rejects_low_order_classical_point() {
+        // Audit LOW (RUSTSEC-2026-0072 analogue): a sender that puts a
+        // low-order X25519 point in the classical half forces a
+        // non-contributory (all-zero) DH result, which would strip the
+        // X25519 contribution from the hybrid secret and downgrade it to
+        // ML-KEM-only. Decapsulation must REFUSE, not silently continue.
+        let sk = HybridKemSecret::generate();
+        let pk = sk.public();
+        let (mut ct, _ss) = pk.encapsulate().unwrap();
+        // The all-zero u-coordinate is low-order: X25519 against it yields
+        // the all-zero shared secret (was_contributory() == false).
+        ct.classical = [0u8; HYBRID_CLASSICAL_LEN];
+        assert!(
+            sk.decapsulate(&ct).is_err(),
+            "decapsulation must reject a non-contributory X25519 result"
         );
     }
 

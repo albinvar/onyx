@@ -386,20 +386,34 @@ async fn dispatch_one_shot(
             peer_fingerprint,
             peer_kem_pub_b32,
             text,
-        } => handle_send_bootstrap(
-            peer_fingerprint,
-            peer_kem_pub_b32,
-            text,
-            state.identity.signing(),
-            state.identity.identity_key(),
-            &state.hub_outbounds,
-        ),
+        } => {
+            // Audit LOW (#348): pin cross-check parity with SendInvite's
+            // Gate 3. The direct bootstrap verbs bypassed `handle_send_invite`
+            // and so skipped the "already pinned AND key changed → refuse"
+            // gate; add it here so re-bootstrapping a peer whose key rotated
+            // (possible MITM) is refused on every send path.
+            if let Some(block) = pin_block(state, peer_fingerprint).await {
+                return block;
+            }
+            handle_send_bootstrap(
+                peer_fingerprint,
+                peer_kem_pub_b32,
+                text,
+                state.identity.signing(),
+                state.identity.identity_key(),
+                &state.hub_outbounds,
+            )
+        }
         ApiRequest::SendBootstrapMls {
             peer_fingerprint,
             peer_kem_pub_b32,
             peer_kp_b64,
             initial_text,
         } => {
+            // Audit LOW (#348): same pin cross-check as SendBootstrap above.
+            if let Some(block) = pin_block(state, peer_fingerprint).await {
+                return block;
+            }
             handle_send_bootstrap_mls(
                 peer_fingerprint,
                 peer_kem_pub_b32,
@@ -811,8 +825,21 @@ async fn pin_block(state: &DaemonState, fingerprint: &str) -> Option<ApiResponse
         }),
         Ok(false) => None,
         Err(e) => {
-            warn!(error = %e, fingerprint = %fingerprint, "pin_block: vault read failed; failing open");
-            None
+            // Audit LOW (#347): fail CLOSED. If we can't read the pin
+            // state we cannot rule out a key-changed (possibly MITM'd)
+            // pin, so a security tool must REFUSE the send rather than
+            // risk delivering to the wrong key. A transient vault error →
+            // the user retries; a persistent one needs fixing before
+            // sending is safe anyway.
+            warn!(error = %e, fingerprint = %fingerprint, "pin_block: vault read failed; failing CLOSED (refusing send)");
+            Some(ApiResponse::Error {
+                code: ApiErrorCode::Internal,
+                message: format!(
+                    "refusing to send: could not verify the pinned key for {fingerprint} \
+                     (vault read error: {e}). Failing closed to avoid sending to a possibly \
+                     changed key — retry; if it persists, check the daemon/vault logs."
+                ),
+            })
         }
     }
 }
@@ -3561,6 +3588,50 @@ mod tests {
             .verifying_key()
             .fingerprint()
             .to_string()
+    }
+
+    /// Audit LOW (#348) / F4.4: the direct `SendBootstrap` verb refuses a
+    /// peer whose pinned key has CHANGED — pin cross-check parity with
+    /// `SendInvite`'s Gate 3. Closes the previously-uncovered bootstrap
+    /// send path (the DM/room paths already have A0.3 key-changed tests).
+    /// Exercised through `dispatch_one_shot` so the dispatch-layer
+    /// `pin_block` gate is what's under test.
+    #[tokio::test]
+    async fn send_bootstrap_refuses_key_changed_peer() {
+        let group_id = [9u8; 32];
+        let (state, _gid) = room_state_with_members("", &group_id);
+        let victim = fresh_fp();
+        // Pin then poison (TOFU mismatch → key_changed).
+        {
+            let vault = state.vault.lock().await;
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[1u8; 32], 1_000)
+                .expect("first pin");
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[2u8; 32], 2_000)
+                .expect("mismatching pin sets key_changed");
+            assert!(
+                vault
+                    .is_pin_compromised(state.identity_id, &victim)
+                    .expect("is_pin_compromised"),
+                "test setup: victim pin must be flagged key_changed"
+            );
+        }
+        // The pin gate fires before the bootstrap body, so the KEM b32
+        // value is irrelevant here.
+        let req = ApiRequest::SendBootstrap {
+            peer_fingerprint: victim.clone(),
+            peer_kem_pub_b32: "aaaa".to_string(),
+            text: "hi".to_string(),
+        };
+        let resp = dispatch_one_shot(&req, &state, TorState::Disabled).await;
+        match resp {
+            ApiResponse::Error { message, .. } => assert!(
+                message.to_lowercase().contains("changed"),
+                "expected a key-changed refusal, got: {message}"
+            ),
+            other => panic!("expected refusal of key-changed peer, got {other:?}"),
+        }
     }
 
     // ── v0.1.18: opt-in DM hub fallback ─────────────────────────────────

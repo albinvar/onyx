@@ -142,21 +142,27 @@ see §7).
 Tracked in THREAT_MODEL.md §8 and our fortification plan. We disclose them so
 the audit spends its time on the *unknown*:
 
-- **Hybrid KEM all-zero / contributory check** on X25519 decap — not yet added
-  (the analogue of RUSTSEC-2026-0072 for our own code).
-- **`is_pin_compromised` fails *open*** on a vault read error (`api_server.rs`
-  → `pin_block`) — we plan fail-closed.
-- **Bootstrap send paths** (`SendBootstrap`/`SendBootstrapMls`) lack the pin
-  cross-check that `SendInvite` has.
-- **No pin-injection integration harness** yet proving all send paths block a
-  key-changed peer end-to-end (one such gap shipped silently before).
-- **Traffic-correlation / timing**: cover traffic is opt-in and the hub→client
-  direction is not yet constant-rate; cover-traffic indistinguishability is not
-  yet measured on *real* Tor.
+- ✅ **Hybrid KEM all-zero / contributory check** on X25519 — **DONE** (F4.1).
+  `decapsulate`/`encapsulate` now reject a non-contributory X25519 result
+  (`was_contributory()`), so a low-order point can't strip the X25519 half.
+- ✅ **`is_pin_compromised` now fails *closed*** on a vault read error (F4.2):
+  `pin_block` refuses the send instead of allowing it.
+- ✅ **Bootstrap send paths** now carry the pin cross-check (F4.3):
+  `SendBootstrap`/`SendBootstrapMls` call `pin_block` at dispatch, parity
+  with `SendInvite`'s Gate 3.
+- ✅ **Pin-injection test** added (F4.4): `send_bootstrap_refuses_key_changed_peer`
+  covers the previously-untested bootstrap path (DM/room already had A0.3 tests).
+- **Traffic-correlation / timing** (partially closed, Phase 1): constant-rate
+  is now available **both directions** (F1.1) and **measured at the wire
+  observer** (F1.2, CV 0.002); the residual gap is *real-Tor* end-to-end
+  measurement (operator drill) — cover traffic remains opt-in (F1.3 decision).
 - **MLS authority model**: plain MLS lets any member add/remove any member; no
-  admin/committer-authority gate yet.
+  admin/committer-authority gate yet (Phase 3 / G-2).
 - **Reproducible builds**: demonstrated locally (byte-identical) but not yet
   confirmed cross-machine against *published* artifacts (SECURITY.md §7).
+- **Oblivious first-contact relay**: deferred (PIR/ORAM); use connect-codes
+  (ROTATION.md §6). Identity↔activity at the hub is decoupled in reachable
+  mode (F2.1a).
 
 We specifically invite: attacks on the **sealed-sender unlinkability**, the
 **Noise↔MLS identity binding**, **replay** across the hub and gossip paths, and
