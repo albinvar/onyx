@@ -6,6 +6,41 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 0 (F0.1) — 2026-06-02 — reproducible builds: demonstrated + verify tooling
+
+First step of the fortification roadmap (close every documented weakness,
+trust foundation first). Turns "trust the maintainer didn't slip something
+in" into "rebuild it yourself and check the bytes." This is the concrete
+defense against the supply-chain attack class — including the real one that
+bit us (a published binary that didn't match its claimed source/platform).
+
+### Added
+- **`scripts/verify-reproducible-build.sh`** — anyone can check out a release
+  tag, rebuild with the exact deterministic flags `release.yml` uses
+  (`SOURCE_DATE_EPOCH` pinned, `--remap-path-prefix` ×2, `--locked`, symbol
+  strip, env version stamp), and diff the resulting SHA256 against the
+  published `SHA256SUMS`. MATCH = the published binary was built from that
+  exact source.
+- **`scripts/two-mac-connect-test.sh`** — the Mac↔Mac stand-in for the
+  Mac↔phone connect test: A publishes a hidden service, B dials A via the
+  connect-code path over real Tor; PASS = both sides register the
+  conversation. Used to prove the P2P path works when a device can't run
+  the binary (the phone's actual problem).
+
+### Verified
+- Two independent `--release --locked` builds of the same source with the
+  reproducible flags produce a **byte-identical** `onyx` binary (SHA256
+  match). `release.yml` already builds this way; this confirms it holds.
+
+### Docs
+- `THREAT_MODEL.md` §4 reproducible-builds row updated from "not yet
+  established" to **partially established**: deterministic build + local
+  byte-match demonstrated + a user-runnable verify script. Still owed: an
+  independent second builder confirming *published* artifacts reproduce
+  cross-machine, and signed releases (tracked separately).
+
+---
+
 ## v0.1.19 — 2026-06-02 — DM hub fallback: fix + verify the receive path
 
 Makes the opt-in DM hub fallback (shipped experimental in v0.1.18)
