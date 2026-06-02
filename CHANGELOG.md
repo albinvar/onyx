@@ -6,6 +6,53 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fortification Phase 5 (F5.2) — 2026-06-02 — static aarch64-musl binary (bare-Termux native, no proot) + rustls
+
+Closes the open question F5.1 left: **can Onyx build as a fully-static musl
+binary that runs on bare Termux with no proot?** Yes. A CI spike proved the
+only blocker was `openssl-sys` (pulled in by arti's default `native-tls`
+backend) — the crypto stack (libcrux/ring) and bundled-sqlite cross-compile
+for musl fine. Switching arti to its pure-Rust **rustls** backend removes
+OpenSSL for *every* target; the musl build then links fully static.
+
+### Changed
+- **arti-client → rustls(ring), not native-tls.** `default-features = false`
+  + `["tokio", "rustls", "compression", …]`. Pinned the rustls **`ring`**
+    CryptoProvider tree-wide (a non-code `rustls` dep on `onyx-core` with
+    `default-features = false, features = ["ring", …]`) so rustls 0.23
+    auto-selects it instead of panicking "could not determine process-level
+    CryptoProvider" at first TLS use. `aws-lc-rs` deliberately kept out
+    (no C dep — also keeps musl light). Affects all targets; host build +
+    `clippy -D warnings` + fmt + full test suite (12 binaries) stay green.
+
+### Added
+- **`aarch64-unknown-linux-musl` as the 5th `release.yml` target** — fully
+  static (`-C target-feature=+crt-static`), cross-compiled on an x86_64
+  runner via `taiki-e/setup-cross-toolchain-action`. Only that target sets
+  `cross`/`crt-static`; `fail-fast: false` keeps it from ever blocking the
+  four native targets. Signed + `SHA256SUMS`'d like every other binary. CI
+  confirms all three binaries are `ELF … statically linked` (no INTERP).
+- **`install.sh` Termux branch** — detects Termux (`$TERMUX_VERSION` / a
+  `com.termux` `$PREFIX`) and selects the musl target so `install.sh` works
+  on **bare** Termux (cosign still required; cosign's `linux/arm64` is itself
+  a static Go binary that runs there — the installer prints the hint).
+- **`.github/workflows/musl-spike.yml`** — the non-blocking experiment that
+  answered the cross-compile question (kept as a standalone guard).
+
+### Dev ergonomics (unrelated, same session)
+- **`[profile.dev]` + `[profile.dev.package."*"]`** — drop debuginfo for
+  dependencies (line-tables-only for our own crates). Onyx's huge arti/tor/
+  libcrux tree made `target/debug` ~31 GB; this cuts the full build+test
+  footprint to ~6 GB (~80% smaller) with no effect on release builds.
+
+### Honest status
+- The static binaries are **confirmed to build + be fully static in CI**.
+  **Not yet confirmed on a physical phone** (device offline this round): that
+  the binary *runs* under Termux/bionic end-to-end and that `install.sh`'s
+  Termux branch picks + verifies it on-device. See `MOBILE.md`.
+
+---
+
 ## Fortification Phase 5 (F5.1) — 2026-06-02 — run Onyx on Android (Termux) via proot-glibc
 
 Addresses the original "it won't run on my phone" problem. Root cause: the

@@ -1,15 +1,18 @@
-# Running Onyx on Android (Termux) — Phase 5 / F5.1
+# Running Onyx on Android (Termux) — Phase 5 (F5.1 + F5.2)
 
-**Status:** the works-today path (proot-glibc) is implemented + scripted
-below; the "native binary" path is analysed as the follow-up (F5.2).
+**Status:** there are now **two** paths. The native static-musl binary
+(F5.2) runs on **bare Termux with no proot** and is the recommended path;
+the proot-glibc helper (F5.1) remains as a fallback.
 
-> **Verification (honest):** the helper (`scripts/termux-onyx.sh`) is
-> syntax- + logic-validated and uses the standard Termux mechanism
-> (`proot-distro` + a glibc distro + the normal verified `install.sh`
-> inside it). It has **not yet been run end-to-end on a physical phone**
-> this round — the test device was offline. Treat the steps below as
-> "should work, pending a real-device confirmation"; if anything snags on
-> your phone, that's the gap to close.
+> **Verification (honest):** the static `aarch64-unknown-linux-musl`
+> binaries (onyx/onyxd/onyx-hub) are **confirmed to build and to be fully
+> static** (`ELF … statically linked`, no INTERP) in CI — that was F5.2's
+> open question and it's answered. What is **not yet confirmed on a
+> physical phone** (the test device was offline this round): that the
+> static binary *runs* under Termux/bionic end-to-end, and that
+> `install.sh`'s new Termux branch picks it + verifies it on-device. Treat
+> the steps below as "builds + should run, pending a real-device
+> confirmation."
 
 ## The problem (why the normal binary won't run)
 
@@ -29,34 +32,53 @@ binary hits on bare Termux.
 
 | Approach | Works today? | Cost | Notes |
 |----------|--------------|------|-------|
-| **A. proot-glibc** (run the glibc binary inside a proot Linux distro) | **Yes** (scripted below) | ~500 MB distro download; small runtime overhead | No new build; reuses the *signed* release binary, verified *inside* the distro where cosign is installable |
-| **B. static musl binary** (`aarch64-unknown-linux-musl`, fully static) | Needs a CI build target | one-time release-engineering | The *real* fix — a static musl binary runs on bare Termux with **no** proot. Risk: arti/ring/libcrux C deps must cross-compile for musl. **F5.2.** |
-| **C. native Android (bionic, NDK)** | Needs NDK cross-build | higher | `aarch64-linux-android` via the NDK; more toolchain friction than musl for little extra benefit. Not recommended. |
+| **B. static musl binary** (`aarch64-unknown-linux-musl`, fully static) | **Yes** (shipped F5.2) | none for the user | The real fix — runs on **bare Termux, no proot**. Same cosign-signing + `SHA256SUMS` flow as every other target. `install.sh` auto-selects it on Termux. |
+| **A. proot-glibc** (run the glibc binary inside a proot Linux distro) | **Yes** (fallback) | ~500 MB distro download; runtime overhead | No new build; reuses the *signed* glibc release binary, verified *inside* the distro. Use if the static binary ever misbehaves on your device. |
+| **C. native Android (bionic, NDK)** | Needs NDK cross-build | higher | `aarch64-linux-android` via the NDK; more toolchain friction than musl for little extra benefit. Not pursued. |
 
-### Recommended now: **A (proot-glibc)** — `scripts/termux-onyx.sh`
-It reuses the **signed** release and verifies it the normal way (cosign +
-SHA256) *inside* the proot distro (where `apt install cosign` works), so the
-F0.2 fail-closed install guarantees still hold — unlike running `install.sh`
-on bare Termux, where cosign isn't packaged and the binary couldn't exec
-anyway.
+### Recommended: **B (static musl)** — just run `install.sh`
+The static `aarch64-unknown-linux-musl` binary needs no proot and no glibc.
+`install.sh` detects Termux (via `$TERMUX_VERSION` / a `com.termux` `$PREFIX`)
+and downloads that target instead of the glibc one. cosign verification still
+applies — cosign's `linux/arm64` release is itself a static Go binary, so it
+runs on bare Termux; put it on your PATH first (the installer prints this hint
+if it's missing).
+
+```
+# In Termux:
+pkg install -y curl
+# install cosign (static Go binary — runs on bionic):
+curl -fsSL -o "$PREFIX/bin/cosign" \
+  https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-arm64
+chmod +x "$PREFIX/bin/cosign"
+# verified install (auto-picks the musl target on Termux):
+curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh | bash
+onyx --version
+```
+
+How F5.2 was made to work: the only thing that blocked a static musl build
+was `openssl-sys` (pulled in by arti's default `native-tls` backend) — its C
+library doesn't cross-compile for musl without a target OpenSSL install. The
+crypto stack (libcrux/ring) and bundled-sqlite cross-compile fine. Switching
+arti to its pure-Rust **rustls** backend (`default-features = false` +
+`rustls`, with the `ring` CryptoProvider pinned tree-wide) removed OpenSSL
+for *every* target, after which `aarch64-unknown-linux-musl` builds fully
+static (`-C target-feature=+crt-static`) and signs through the normal flow.
+It's now the 5th target in `release.yml` (cross-compiled via
+`taiki-e/setup-cross-toolchain-action`; `fail-fast: false` keeps it from ever
+blocking the four native targets).
+
+### Fallback: **A (proot-glibc)** — `scripts/termux-onyx.sh`
+If the static binary misbehaves on your device, the proot path reuses the
+**signed** glibc release, verified the normal way (cosign + SHA256) *inside* a
+proot distro:
 
 ```
 # In Termux:
 pkg install -y proot-distro curl
 curl -fsSL https://raw.githubusercontent.com/albinvar/onyx/main/scripts/termux-onyx.sh | bash
-# then:
 proot-distro login onyx-ubuntu -- onyx --version
 ```
-
-### The real fix (F5.2): static musl binary
-Add `aarch64-unknown-linux-musl` to `release.yml` as a **fully static**
-build (`RUSTFLAGS="-C target-feature=+crt-static"` with the musl target).
-If arti + ring + libcrux cross-compile cleanly for musl (the open question —
-ring's asm + libcrux's C need a musl C toolchain in CI), the resulting
-binary runs directly on bare Termux with no proot, and slots into the same
-cosign-signing + `SHA256SUMS` flow. Deferred because it needs a CI build
-spike to confirm the C-dep cross-compile, and a failed target must not break
-the existing 4-target release.
 
 ## Honest limits
 

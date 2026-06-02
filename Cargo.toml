@@ -180,3 +180,18 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+# Dev/test disk footprint. Onyx pulls a very large dependency tree
+# (arti/tor + libcrux + openmls); embedding FULL debuginfo for every one of
+# those crates was the bulk of a ~31 GB `target/debug`. We almost never step
+# into dependency internals with a debugger, so:
+#   - our OWN crates keep line tables (backtraces still show file:line), and
+#   - dependencies get no debuginfo at all (`package."*"` = the bulk).
+# Typical effect: target/debug shrinks by well over half. Backtraces through
+# dep frames lose line numbers; that's the only trade-off. Release builds are
+# unaffected (separate profile above).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
