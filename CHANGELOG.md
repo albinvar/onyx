@@ -6,6 +6,37 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 UX — 2026-06-02 — unify invite/connect keybindings (2 flows)
+
+The invite/connect area had grown confusing: "invite" meant three things
+(Ctrl-E my invite link, Ctrl-I invite-to-room, Ctrl-A accept invite), there
+were two parallel "share me" artifacts (Ctrl-E invite link vs Ctrl-Y connect
+code) and two parallel "add" actions (Ctrl-A accept-link vs Ctrl-D add-code),
+and you had to know in advance which format a pasted code was.
+
+### Changed
+- **Ctrl-E → "Share my contact"** — one screen showing BOTH your invite link
+  (via hub) and your connect code (direct), `↑/↓` to pick, `Enter`/`c` to copy.
+  Replaces the old separate Ctrl-E (invite) + Ctrl-Y (connect code).
+- **Ctrl-A → "Add a contact"** — paste an `onyx://invite/…` link OR an
+  `onyx://connect/…` code; it **auto-detects** the format and routes to the
+  right action (SendInvite vs DialPeer). Replaces the old separate Ctrl-A
+  (accept) + Ctrl-D (add-by-code).
+- **Ctrl-Y and Ctrl-D removed** (folded into the two flows above).
+- **Ctrl-I** relabeled "Invite peer **into room**" to stop colliding with
+  "invite link".
+- Palette + slash + F1 help updated: `/share` (`/invite` `/me` `/code`) opens
+  Share; `/add` (`/accept` `/connect` `/dial`) opens Add-a-contact and accepts
+  an inline link/code.
+
+### Removed (internal)
+- `ModalState::{Invite, ConnectCode, AcceptInvite, AddByCode}` →
+  `ModalState::{Share, AddContact}`; `PaletteAction::{CopyInvite, AcceptInvite}`
+  → `{ShareContact, AddContact}`. Dead `open_connect_code_modal` /
+  `render_invite_modal` removed.
+
+---
+
 ## fix(tui) — 2026-06-02 — reliable clipboard copy (native, not OSC52-only)
 
 Copy (invite link / connect code) silently failed on many terminals —
