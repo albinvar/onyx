@@ -104,6 +104,27 @@ state. This is the "real" solution to §2.3 and is a large protocol effort
 
 ---
 
+## §3.5 Implementation finding (2026-06-02): the send-gate needs propagation
+
+Starting the F3.3a build surfaced a correction to the "ship the send-gate
+first" plan. A send-side gate checks *is the local identity an admin?* — but
+that only bites if the client **knows the admin set**. If admins live in a
+local-only `room_admins` table seeded with the creator (the simplest B2),
+then:
+- the **creator's** client knows it (and the creator is the admin anyway, so
+  the gate never refuses them), and
+- a **Welcome-joined** member has **no admin set locally** (it isn't carried
+  in the Welcome today), so their gate **fails open** — they can still
+  invite/remove.
+
+Net: the send-gate **alone, without propagation, restricts effectively
+nobody.** For it to bind, the admin set must be **shared with every member** —
+carried in the invite/Welcome payload (small protocol-format change to
+`BootstrapPayload::MlsWelcome` + the invite path) or as an MLS GroupContext
+extension (B1). So a *useful* G-2 MVP is **propagation + send-gate +
+receive-gate**, i.e. the full F3.3 — not a quick first slice. This is logged
+so the build is scoped honestly rather than shipping a no-op gate.
+
 ## §4 Recommendation
 
 1. **Ship Option B2 as the F3.3 MVP** — admin set in the room record (seed:
