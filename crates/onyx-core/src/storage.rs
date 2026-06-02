@@ -2108,7 +2108,7 @@ mod tests {
         v.record_peer_dial(id, &peer2, "ghi.onion", "pubkeyb32ccc")
             .unwrap();
         let mut listed = v.list_peer_dials(id).unwrap();
-        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        listed.sort_by_key(|x| x.0);
         assert_eq!(listed.len(), 2);
         assert_eq!(
             listed[0],

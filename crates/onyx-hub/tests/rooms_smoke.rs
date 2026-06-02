@@ -49,8 +49,13 @@ use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
-const EVENT_TIMEOUT: Duration = Duration::from_secs(15);
+// Generous ceilings so these spawn-hub+daemon(s) integration tests don't
+// flake on slow/loaded CI runners — all 9 run concurrently (cargo's default
+// per-binary parallelism) and contend for CPU on the real Noise + MLS
+// handshakes. Fast runs still return early via the poll loops; only the
+// flake ceiling rises. (CI was intermittently red on these at 15s.)
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Spawn an in-process hub listening on a fresh ephemeral TCP port.
 /// Returns `(addr, hub_pub_b32)` — pass these into the daemon as
@@ -1386,6 +1391,9 @@ async fn rooms_e2e_private_mode_leaks_no_identity_to_hub() {
 /// outbound) — so the hub cannot link the identity surface to the
 /// activity surface. The **private default** opens exactly ONE. This pins
 /// the core F2.1a behaviour. See `OBLIVIOUS-ROUTING.md` §3.
+// hub_a_* / hub_b_* are intentionally parallel (two hubs); the a/b suffixes
+// are clearer than contrived distinct names.
+#[allow(clippy::similar_names)]
 #[tokio::test]
 async fn rooms_e2e_reachable_splits_identity_and_activity_connections() {
     let _ = tracing_subscriber::fmt()

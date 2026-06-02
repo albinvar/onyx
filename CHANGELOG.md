@@ -6,6 +6,42 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## CI green — 2026-06-02 — clear the chronically-red CI jobs
+
+`ci.yml` had been red long-term (independent of the Release workflow, which
+ships fine). Fixed all three jobs:
+
+- **clippy `-D warnings`**: cleared the workspace-wide pedantic-lint debt —
+  real fixes where behaviour is identical (`sort_by_key`, `String::clone`,
+  `Vec::contains`, `is_some_and`, `match`→`if let`/`let…else`) and targeted
+  `#[allow(...)]` with rationale where the lint fights clarity
+  (`too_many_lines` on linear dispatchers, `match_same_arms` on
+  intentionally-separate modal/key arms, `similar_names` on `a`/`b` test
+  bindings). Includes the 1–2 lints this session added.
+- **`cargo-audit`**: added the missing `checks: write` permission (the action
+  posts a Check Run; without it: "Resource not accessible by integration")
+  and synced the action's `ignore` to deny.toml's two justified advisories
+  (`RUSTSEC-2024-0436` paste-unmaintained + `RUSTSEC-2023-0071` Marvin-RSA,
+  both transitive via arti, reviewed). The job stays a tripwire for *new*
+  advisories instead of a permanent red.
+  - **Surfaced a real new advisory in the process** — `RUSTSEC-2026-0124`
+    (`libcrux-chacha20poly1305` <0.0.8 can panic on an overlong *encrypt*
+    ciphertext buffer). Transitive via openmls → hpke-rs → libcrux-aead
+    (pinned `^0.0.7`, so a clean bump to the patched 0.0.8 is blocked until
+    hpke-rs/libcrux release). **Not reachable in Onyx**: we never call
+    libcrux directly (our own AEAD is the RustCrypto `chacha20poly1305`
+    crate), and openmls/hpke-rs size the buffer correctly. Recorded as a
+    documented, tracked ignore in `deny.toml` + the audit job; drop when
+    upstream bumps libcrux.
+- **`test`**: bumped the `rooms_smoke` integration `SETUP_TIMEOUT`/`EVENT_TIMEOUT`
+  15s → 60s so the 9 concurrent spawn-hub+daemon tests don't flake on loaded
+  CI runners (fast runs still return early via the poll loops).
+
+Verified locally: `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all --check`, and `cargo test --workspace` all green.
+
+---
+
 ## v0.1.20 — 2026-06-02 — fortification release: trust, timing, federation/DoS, audit-residual
 
 The fortification roadmap's first big batch. Closes whole phases of the

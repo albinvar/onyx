@@ -53,6 +53,17 @@ ignore = [
     # when the `rsa` crate ships a constant-time PKCS#1 implementation
     # or when arti drops the transitive dependency.
     { id = "RUSTSEC-2023-0071", reason = "[review by 2026-12-31] Marvin attack on rsa 0.9 — transitive via arti; no RSA decryption on Onyx's hot path. Documented as an accepted risk in CHANGELOG." },
+
+    # RUSTSEC-2026-0124 — `libcrux-chacha20poly1305` < 0.0.8 can panic when
+    # the CALLER passes an encrypt ciphertext buffer longer than
+    # `ptxt.len() + TAG_LEN`. Transitive ONLY via openmls_rust_crypto →
+    # hpke-rs → hpke-rs-libcrux → libcrux-aead (pinned `^0.0.7`, so a clean
+    # bump to the patched 0.0.8 is blocked until hpke-rs/libcrux release).
+    # NOT reachable in Onyx: we never call libcrux directly (our own AEAD is
+    # the RustCrypto `chacha20poly1305` crate); openmls/hpke-rs size the
+    # buffer correctly, so the panic path is never hit. Re-evaluate / drop
+    # when hpke-rs-libcrux bumps to libcrux 0.0.8+.
+    { id = "RUSTSEC-2026-0124", reason = "[review by 2026-12-31] libcrux-chacha20poly1305 <0.0.8 encrypt-buffer panic; transitive via openmls→hpke-rs→libcrux-aead (^0.0.7 pins it); not reachable in Onyx (openmls sizes buffers; our direct AEAD is RustCrypto). Drop when hpke-rs bumps libcrux." },
 ]
 
 # ─── Licenses ──────────────────────────────────────────────────────────────

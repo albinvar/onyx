@@ -97,8 +97,26 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check posts results as a GitHub Check Run; without
+    # `checks: write` it fails with "Resource not accessible by integration".
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Mirror the justified ignores from deny.toml's [advisories] so this
+          # job is a tripwire for NEW/unjustified advisories rather than a
+          # permanent red. Keep in sync with deny.toml (remove when the
+          # upstream arti deps drop these):
+          #  - RUSTSEC-2024-0436: `paste` unmaintained (transitive via
+          #    arti-client → fs-mistrust → pwd-grp).
+          #  - RUSTSEC-2023-0071: Marvin timing attack on `rsa` 0.9
+          #    (transitive via arti; no RSA decryption on Onyx's hot path).
+          #  - RUSTSEC-2026-0124: libcrux-chacha20poly1305 <0.0.8 encrypt
+          #    buffer panic (transitive via openmls→hpke-rs→libcrux-aead,
+          #    pinned ^0.0.7); not reachable in Onyx. Drop when upstream
+          #    bumps libcrux to 0.0.8+.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2023-0071,RUSTSEC-2026-0124

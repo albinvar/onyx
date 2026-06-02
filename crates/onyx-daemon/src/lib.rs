@@ -1001,7 +1001,7 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
         // v0.1.16 (easy-connect): publish our own onion into shared state
         // so the Status API can surface it to the local TUI for the
         // user's connect code. Safe — own address, local socket only.
-        let _ = state.self_onion.set(addr.to_string());
+        let _ = state.self_onion.set(addr.clone());
     } else {
         warn!("hidden service has no address yet — Arti will produce one shortly");
     }
@@ -1610,6 +1610,7 @@ async fn record_peer_group(
 // `EventPeerDisconnected` for any active tail), snapshot+save MLS
 // state, then drain-and-shutdown the Tor stream.
 
+#[allow(clippy::too_many_lines)]
 async fn peer_session<S>(
     mut stream: S,
     mut session: Session,
@@ -1650,18 +1651,16 @@ where
     // Two live sessions to one peer would desync the group.
     let (handle, mut outbound_rx) = {
         let mut reg = state.conversations.lock().await;
-        match reg.try_register(peer_pub, &peer_pub_b32, fingerprint) {
-            Some(pair) => pair,
-            None => {
-                drop(reg);
-                debug!(
-                    peer = %short_id_of_peer_pub(&peer_pub),
-                    "duplicate session for an already-connected peer; yielding (closing this stream)"
-                );
-                let _ = stream.shutdown().await;
-                return Ok(());
-            }
-        }
+        let Some(pair) = reg.try_register(peer_pub, &peer_pub_b32, fingerprint) else {
+            drop(reg);
+            debug!(
+                peer = %short_id_of_peer_pub(&peer_pub),
+                "duplicate session for an already-connected peer; yielding (closing this stream)"
+            );
+            let _ = stream.shutdown().await;
+            return Ok(());
+        };
+        pair
     };
     let short_id = handle.short_id.clone();
     info!(peer = %short_id, "conversation registered with registry");
@@ -2205,7 +2204,7 @@ async fn handle_room_app_frame(
                     match <[u8; 32]>::try_from(committer_id) {
                         Ok(bytes) => {
                             let fp = onyx_core::crypto::Fingerprint::from_bytes(bytes).to_string();
-                            admins.iter().any(|a| *a == fp)
+                            admins.contains(&fp)
                         }
                         Err(_) => false,
                     }
@@ -3285,18 +3284,17 @@ async fn handle_hub_dm_app_frame(
 ) {
     let plaintext = {
         let party = state.mls_party.lock().await;
-        match party.load_group(group_id) {
-            Ok(Some(mut group)) => match group.decrypt_application(&party, ciphertext) {
+        if let Ok(Some(mut group)) = party.load_group(group_id) {
+            match group.decrypt_application(&party, ciphertext) {
                 Ok(pt) => Some(pt),
                 Err(e) => {
                     debug!(error = %e, "hub DM: decrypt failed; dropping");
                     None
                 }
-            },
-            _ => {
-                debug!("hub DM: no matching DM group; dropping");
-                None
             }
+        } else {
+            debug!("hub DM: no matching DM group; dropping");
+            None
         }
     };
     let Some(plaintext) = plaintext else { return };
