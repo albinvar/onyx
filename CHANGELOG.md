@@ -6,6 +6,28 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI polish — 2026-06-03 — fix stale key hints + composer placeholder
+
+Cohesion pass after the invite/connect unification — the status bar, welcome
+screen, and docs still referenced removed keys.
+
+### Fixed
+- **Status bar referenced the removed `Ctrl-Y`** in the "not addable by invite"
+  banner and labeled **`Ctrl-E` as "invite"** (it's now "Share"). Both
+  corrected: the banner points at `^E` (Share my contact, which shows the
+  connect code), and the footer keybar now reads `F1 help · ^K palette · ^E
+  share · ^A add · ^F file`.
+- **Welcome / empty-state** updated to the two-flow model (`Ctrl-E` Share,
+  `Ctrl-A` Add) instead of the old "copy your invite link". Narrow-mode hint
+  too. Module-doc keymap refreshed.
+
+### Added
+- **Composer placeholder** when empty: `type a message · / for commands · ^K
+  palette` — surfaces slash commands + the palette so features are discoverable
+  without F1.
+
+---
+
 ## v0.2 vault (D) — 2026-06-03 — vault backup + passphrase rekey
 
 Fills a real gap: there was no way to back up the vault or change its
