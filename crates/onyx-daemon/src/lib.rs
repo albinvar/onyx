@@ -3145,11 +3145,22 @@ async fn handle_hub_dm_app_frame(
     // Only Text is surfaced over the hub-DM path; files/KEM-ads are
     // direct-session concerns. Tag via_hub so the [hub] tier shows.
     if let onyx_core::room::RoomAppMessage::Text { text } = msg {
-        state.conversations.lock().await.push_message_via_hub(
-            peer_pub,
-            onyx_core::api::MessageDirection::Incoming,
-            text,
-        );
+        let peer_pub_b32 = encode_b32(peer_pub);
+        // A hub-relayed DM may arrive when there is NO live session for
+        // this peer (that's the whole point of the fallback). push_message*
+        // only updates an EXISTING registry row, so first ensure the peer
+        // is registered (hub-only — no transport to reply on); idempotent,
+        // a no-op when a session already exists. We attribute under the
+        // `(peer/<short>)` placeholder (same as the direct DM path's
+        // fallback): the real Ed25519 fingerprint comes from the live MLS
+        // session when one is established. NOTE: do NOT re-lock mls_party
+        // here — the earlier `derive_peer_fingerprint` call did, while a
+        // prior revision already held the party lock, self-deadlocking
+        // (tokio Mutex is not reentrant). Caught by the receive test.
+        let fingerprint = format!("(peer/{})", short_id_of_peer_pub(peer_pub));
+        let mut reg = state.conversations.lock().await;
+        let _ = reg.register_hub_only(*peer_pub, &peer_pub_b32, fingerprint);
+        reg.push_message_via_hub(peer_pub, onyx_core::api::MessageDirection::Incoming, text);
     } else {
         debug!("hub DM: non-Text RoomAppMessage on hub path; ignoring");
     }
@@ -3668,5 +3679,146 @@ mod cover_traffic_tests {
             .await
             .expect("pacer should exit promptly after the session closes")
             .expect("pacer task should not panic");
+    }
+}
+
+#[cfg(test)]
+mod dm_fallback_receive_tests {
+    //! v0.1.18: end-to-end RECEIVE side of the opt-in DM hub fallback.
+    //!
+    //! A real two-party MLS group (sender + receiver, established via
+    //! Welcome) — the sender encrypts a `RoomAppMessage::Text` exactly as
+    //! `dm_hub_fallback_send` does, and we feed the resulting ciphertext
+    //! into the receiver's `process_hub_mls_app` (the actual hub-delivery
+    //! entry point). We assert the receiver decrypts it and surfaces it
+    //! under the DM conversation with `via_hub = true` (the `[hub]` tier) —
+    //! NOT as a room message. This closes the receive half that the
+    //! api_server send-side tests don't cover.
+    use super::*;
+    use onyx_core::crypto::Argon2Params;
+    use onyx_core::mls::MlsParty;
+    use onyx_core::storage::Vault;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn daemon_state_for(
+        vault: Vault,
+        identity_id: i64,
+        identity: Identity,
+        party: MlsParty,
+    ) -> Arc<DaemonState> {
+        Arc::new(DaemonState {
+            identity,
+            identity_id,
+            mls_party: Arc::new(Mutex::new(party)),
+            vault: Arc::new(Mutex::new(vault)),
+            conversations: conversations::new_shared(),
+            hub_outbounds: Vec::new(),
+            hub_fetch_lock: Arc::new(Mutex::new(())),
+            seen_envelopes: Arc::new(Mutex::new(replay_guard::EnvelopeReplayGuard::new())),
+            configured_hubs: Vec::new(),
+            pending_room_frames: Arc::new(Mutex::new(HashMap::new())),
+            inflight_files: Arc::new(Mutex::new(HashMap::new())),
+            files_config: FilesConfig::defaults(std::path::Path::new(".")),
+            tor: std::sync::OnceLock::new(),
+            self_onion: std::sync::OnceLock::new(),
+            dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dm_hub_fallback: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn hub_relayed_dm_is_decrypted_and_surfaced_via_hub() {
+        // --- sender side: own party + group ---
+        let mut send_vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+        let (_sid, send_identity) = send_vault.create_identity("sender").expect("id");
+        let sender_party = MlsParty::from_identity(&send_identity).expect("party");
+        let mut sender_group = sender_party.create_group().expect("group");
+
+        // --- receiver side: own party, joins via Welcome ---
+        let mut recv_vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+        let (recv_id, recv_identity) = recv_vault.create_identity("receiver").expect("id");
+        let receiver_party = MlsParty::from_identity(&recv_identity).expect("party");
+        let recv_kp = receiver_party.key_package_bytes().expect("kp");
+
+        // Sender invites receiver → Welcome → receiver joins the SAME group.
+        let (_commit, welcome) = sender_group
+            .invite(&sender_party, &recv_kp)
+            .expect("invite");
+        let receiver_group = receiver_party.join_from_welcome(&welcome).expect("join");
+        let group_id = receiver_group.group_id_bytes();
+        assert_eq!(group_id, sender_group.group_id_bytes());
+
+        // Persist the receiver's joined MLS state so load_group resumes it,
+        // and map the group_id → the sender's peer_pub (the DM mapping the
+        // receive path keys on).
+        {
+            let snap = receiver_party.snapshot_state().expect("snap");
+            recv_vault.save_mls_state(recv_id, &snap).expect("save");
+        }
+        let sender_peer_pub = [0x77u8; 32]; // stand-in X25519 identity
+        recv_vault
+            .record_peer_group(recv_id, &sender_peer_pub, &group_id)
+            .expect("record group");
+
+        // Sender encrypts the DM exactly as dm_hub_fallback_send would.
+        let cbor = onyx_core::room::RoomAppMessage::Text {
+            text: "delivered while you were offline".to_string(),
+        }
+        .to_cbor()
+        .expect("cbor");
+        let ciphertext = sender_group
+            .encrypt_application(&sender_party, &cbor)
+            .expect("encrypt");
+
+        // --- feed into the receiver's actual hub-delivery entry point ---
+        let recv_state = daemon_state_for(recv_vault, recv_id, recv_identity, receiver_party);
+
+        // Verify only the non-consuming precondition (the reverse map);
+        // do NOT decrypt here — an MLS ratchet can't decrypt the same
+        // ciphertext twice, so a diagnostic decrypt would poison the real
+        // path below.
+        {
+            let v = recv_state.vault.lock().await;
+            let mapped = v
+                .lookup_peer_by_group(recv_state.identity_id, &group_id)
+                .expect("query");
+            assert_eq!(
+                mapped,
+                Some(sender_peer_pub),
+                "group_id must reverse-map to the sender peer"
+            );
+        }
+
+        process_hub_mls_app(
+            &group_id,
+            &ciphertext,
+            &sender_peer_pub,
+            "(sender-fp)",
+            &recv_state,
+        )
+        .await;
+
+        // Assert: surfaced under the DM conversation, with via_hub = true.
+        let short = short_id_of_peer_pub(&sender_peer_pub);
+        let hist = {
+            let reg = recv_state.conversations.lock().await;
+            reg.history(&short, 10)
+        };
+        let hist = hist.expect("DM conversation should exist after a hub-relayed DM");
+        assert_eq!(hist.len(), 1, "exactly one received message");
+        assert_eq!(hist[0].text, "delivered while you were offline");
+        assert!(
+            hist[0].via_hub,
+            "a hub-relayed DM must carry the [hub] tier (via_hub = true)"
+        );
+        assert!(
+            matches!(
+                hist[0].direction,
+                onyx_core::api::MessageDirection::Incoming
+            ),
+            "received message must be Incoming"
+        );
     }
 }
