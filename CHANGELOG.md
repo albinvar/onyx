@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.21 — 2026-06-02
+
+Umbrella for everything merged since v0.1.20 (see the per-item entries below):
+
+- **F2.2a** — Tor bridges (vanilla), opt-in `--bridge`.
+- **F5.1** — run on Android/Termux via proot-glibc (`scripts/termux-onyx.sh`).
+- **F5.2** — fully-static `aarch64-musl` binary that runs on **bare Termux, no
+  proot**; achieved by switching arti to the **rustls(ring)** TLS backend
+  (drops OpenSSL for every target). New 5th release target; `install.sh`
+  auto-selects it on Termux.
+- **TUI overhaul** — A1 navigable multi-select file picker · A2 grouped,
+  timestamped chat rendering · A3 slash commands.
+- **Dev** — `[profile.dev]` slims `target/debug` ~31 GB → ~6 GB.
+
+Honest status carried forward: the musl binary is built + static-verified in
+CI but **not yet run on a physical phone**; room messages still render incoming
+under `#room` (no per-sender field yet).
+
+---
+
 ## v0.2 TUI overhaul (A3) — 2026-06-02 — slash commands
 
 Type-to-run commands in the composer, complementing the Ctrl-K palette.
