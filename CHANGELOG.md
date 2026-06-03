@@ -6,6 +6,28 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI-UX (A) — 2026-06-03 — context action menu + complete palette
+
+Second of the three TUI-UX slices. Goal: stop making users memorise key
+combos — point at a conversation and pick.
+
+### Added
+- **Context action menu (`Tab`).** Opens a short, selectable list of the
+  actions that apply to the *currently selected* conversation: for a peer —
+  Send file / Verify contact / Search / Share my contact; for a room —
+  Invite peer / Send file / Search; with nothing selected — Create room /
+  Add contact / Share / Manage hubs. `↑↓` move, `Enter` runs, `Esc` closes.
+  Footer points at `Ctrl-K` for the full command list. Dispatches through the
+  same `run_palette_action` path as the palette, so behaviour stays in sync.
+- **Palette now exposes "View daemon logs"** (was `Ctrl-L`-only) so every
+  feature is reachable from `Ctrl-K`.
+
+### Notes
+- `Tab` was previously unused in the main view; modal `Tab` (field cycling in
+  Invite/SendFile) is unchanged.
+
+---
+
 ## v0.2 TUI-UX (A) — 2026-06-03 — richer conversation list
 
 User direction: "improve the overall TUI experience first.. more columns of
