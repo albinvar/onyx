@@ -4253,6 +4253,21 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     if !app.peers.is_empty() {
         items.push(header("DIRECT MESSAGES"));
     }
+    // Width available for a preview line (box borders + highlight symbol).
+    let preview_w = usize::from(area.width).saturating_sub(5).max(8);
+    // Second line of a row: last-message preview (dim), or a fallback.
+    let preview_line = |text: Option<&str>, fallback: &'static str| -> Line<'static> {
+        match text {
+            Some(t) if !t.trim().is_empty() => Line::from(Span::styled(
+                format!("   {}", truncate_for_display(t.trim(), preview_w)),
+                Style::default().fg(Color::DarkGray),
+            )),
+            _ => Line::from(Span::styled(
+                format!("   {fallback}"),
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
+    };
     for p in &app.peers {
         let dot = if p.connected {
             Span::styled("● ", Style::default().fg(Color::Green))
@@ -4273,51 +4288,80 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     Modifier::empty()
                 }),
         );
-        let mut spans = vec![dot, name];
-        // C (verify): key-change warning ⚠ (possible MITM) beats a verified
-        // ✓; both surface right next to the name.
+        let mut head = vec![dot, name];
+        let rel = fmt_relative(p.last_active_unix_ms);
+        if rel != "—" {
+            head.push(Span::styled(
+                format!("  {rel}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        // C (verify): key-change warning ⚠ (possible MITM) beats verified ✓.
         if p.key_changed {
-            spans.push(Span::styled(
+            head.push(Span::styled(
                 " ⚠",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
         } else if p.verified {
-            spans.push(Span::styled(" ✓", Style::default().fg(Color::Green)));
+            head.push(Span::styled(" ✓", Style::default().fg(Color::Green)));
         }
-        // T-polish.5: unread badge on the right.
         if let Some(&n) = app.unread.get(&p.short_id)
             && n > 0
         {
-            spans.push(Span::styled(
+            head.push(Span::styled(
                 format!(" ({n})"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        items.push(ListItem::new(Line::from(spans)));
+        items.push(ListItem::new(vec![
+            Line::from(head),
+            preview_line(p.last_message_preview.as_deref(), "(no messages yet)"),
+        ]));
     }
     if !app.rooms.is_empty() {
         items.push(header("CHANNELS"));
     }
     for r in &app.rooms {
-        let label = format!("#{} ({}m)", r.name, r.members.len());
-        let mut spans = vec![
-            Span::styled("◆ ", Style::default().fg(Color::Magenta)),
-            Span::styled(label, Style::default().fg(Color::White)),
-        ];
         let room_key = format!("room/{}", short_id(&r.group_id_b32));
+        let mut head = vec![
+            Span::styled("◆ ", Style::default().fg(Color::Magenta)),
+            Span::styled(format!("#{}", r.name), Style::default().fg(Color::White)),
+        ];
+        if let Some(&ms) = app.last_activity_ms.get(&room_key) {
+            head.push(Span::styled(
+                format!("  {}", fmt_relative(ms)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if let Some(&n) = app.unread.get(&room_key)
             && n > 0
         {
-            spans.push(Span::styled(
+            head.push(Span::styled(
                 format!(" ({n})"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        items.push(ListItem::new(Line::from(spans)));
+        // Line 2: last message preview, else the member count.
+        let last = app
+            .scrollback
+            .get(&room_key)
+            .and_then(|s| s.last())
+            .map(|l| l.text.clone());
+        let line2 = match last {
+            Some(t) if !t.trim().is_empty() => Line::from(Span::styled(
+                format!("   {}", truncate_for_display(t.trim(), preview_w)),
+                Style::default().fg(Color::DarkGray),
+            )),
+            _ => Line::from(Span::styled(
+                format!("   {} members", r.members.len()),
+                Style::default().fg(Color::DarkGray),
+            )),
+        };
+        items.push(ListItem::new(vec![Line::from(head), line2]));
     }
     let list = List::new(items)
         .block(block)
@@ -5192,13 +5236,13 @@ mod snapshot_tests {
                 created_at_ms: 1_700_000_010_000,
             },
         ];
-        let snap = render_to_string(&app, 90, 24);
+        let snap = render_to_string(&app, 90, 30);
         assert!(
             snap.contains("#general"),
             "room name must render with `#` prefix; got:\n{snap}"
         );
         assert!(
-            snap.contains("(2m)"),
+            snap.contains("2 members"),
             "room member count must render; got:\n{snap}"
         );
         assert!(
@@ -5206,7 +5250,7 @@ mod snapshot_tests {
             "second room must render; got:\n{snap}"
         );
         assert!(
-            snap.contains("(3m)"),
+            snap.contains("3 members"),
             "second room's member count must render; got:\n{snap}"
         );
     }

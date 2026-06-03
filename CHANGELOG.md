@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI-UX (A) — 2026-06-03 — richer conversation list
+
+User direction: "improve the overall TUI experience first.. more columns of
+information.. the commands we can avoid.. more and more UX-friendly." First of
+three slices (richer list · complete palette/action-menu · info header).
+
+### Changed
+- **Conversation list is now 2 lines per entry.** Header line: presence dot
+  (●/○ for peers, ◆ for rooms) + name + relative last-activity (`fmt_relative`,
+  omitted when unknown) + trust badges (⚠ key-changed / ✓ verified) + `(N)`
+  unread. Second (dim) line: the last message preview, truncated to the pane
+  width — or, for rooms with no preview, the member count (`{N} members`).
+  Much more context at a glance without opening a conversation.
+
+### Notes
+- 2-line rows are denser, so very short terminals show fewer conversations at
+  once; the list scrolls and `ListState` still selects by item (not visual
+  line), so selection mapping stays correct.
+
+---
+
 ## v0.2 messaging (B) — 2026-06-03 — local message retention (auto-clear)
 
 First slice of disappearing messages: the daemon **actually deletes** persisted
