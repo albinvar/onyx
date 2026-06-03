@@ -432,6 +432,13 @@ pub enum ApiResponse {
         /// back-compat with older daemons that didn't send it.
         #[serde(default)]
         onion: Option<String>,
+        /// Number of hubs the daemon is configured to use (Tor + TCP).
+        /// `0` means messages to an offline/not-directly-connected peer
+        /// can't be delivered (no store-and-forward) — the TUI uses this
+        /// to show a transport badge and a clearer "no hubs" hint.
+        /// `#[serde(default)]` for wire back-compat with older daemons.
+        #[serde(default)]
+        hub_count: u32,
     },
     /// Reply to [`ApiRequest::Identity`].
     IdentityOk {
@@ -854,6 +861,7 @@ mod tests {
             tor_state: TorState::Ready,
             identity_kem_pub_b32: "long-b32-string-stand-in".into(),
             onion: Some("abc.onion".into()),
+            hub_count: 2,
         };
         let line = encode_response_line(&r).unwrap();
         let parsed = decode_response(line.trim_end_matches('\n')).unwrap();

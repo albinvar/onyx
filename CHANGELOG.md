@@ -6,6 +6,32 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI — 2026-06-03 — transport/online indicator + clearer no-hub error
+
+Direct response to "why didn't P2P work / where did my message go": the TUI
+gave no signal whether a send goes direct vs via a hub, and the no-hub error
+was a dead end.
+
+### Added
+- **Transport badge in the composer title**: `● direct` (a live P2P session),
+  `◌ via hub` (offline / not-directly-connected — rides a hub, queues if the
+  peer is offline), or `✕ no route` / `✕ no hub` (nothing configured to deliver
+  through). So before you press Enter you can see how the message will travel.
+- **`StatusOk.hub_count`** (new API field, `#[serde(default)]` back-compat) so
+  the TUI knows whether any hub is configured.
+
+### Changed
+- The **"no hubs configured"** daemon error now explains the consequence and the
+  fix: enable public hubs / add one via the TUI's `Ctrl-G`, then relaunch (or
+  `--hub onion:port,b32pubkey`) — instead of the bare `--hub` instruction.
+
+### Docs
+- README keymap refreshed to the current bindings; HOW_IT_WORKS gained a
+  "Direct vs hub delivery" section explaining when each path is used and why a
+  message to an offline peer needs a hub.
+
+---
+
 ## v0.2 TUI polish — 2026-06-03 — fix stale key hints + composer placeholder
 
 Cohesion pass after the invite/connect unification — the status bar, welcome
