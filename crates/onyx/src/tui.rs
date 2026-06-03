@@ -204,6 +204,10 @@ struct AppState {
     /// modal-key return into a quit signal. Checked by `handle_key`
     /// right after the modal handler runs.
     quit_requested: bool,
+    /// Local message retention (auto-clear). `Some(secs)` → the TUI hides
+    /// scrollback older than this (the daemon deletes the persisted copy on
+    /// its sweep). Loaded from config.json; set live via `/retention`.
+    retention_secs: Option<u64>,
 }
 
 /// T-polish.6: TUI modals for room operations that can't easily
@@ -708,6 +712,7 @@ impl AppState {
             modal: None,
             seen_files: HashSet::new(),
             quit_requested: false,
+            retention_secs: None,
         }
     }
 
@@ -919,6 +924,12 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
         .ok()
         .flatten()
         .is_some_and(|c| c.first_contact_reachable);
+    // Local message retention (auto-clear): load so the TUI hides scrollback
+    // older than the window (the daemon deletes the persisted copy).
+    app.retention_secs = crate::load_file_config()
+        .ok()
+        .flatten()
+        .and_then(|c| c.message_retention_secs);
 
     // Background: tail subscription (reconnects automatically).
     let (tail_tx, tail_rx) = mpsc::channel::<ApiResponse>(256);
@@ -2357,6 +2368,52 @@ fn parse_slash_command(line: &str) -> (String, &str) {
 /// composer text including the leading slash. Most commands just open the
 /// matching modal (reusing the command-palette dispatch); a few accept an
 /// inline argument so power users can skip the modal entirely.
+/// Parse a retention duration: a bare number of seconds, or a value with a
+/// `s`/`m`/`h`/`d` suffix (e.g. `30m`, `1h`, `7d`). `None` on garbage.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400)
+    } else {
+        return None;
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|v| v.saturating_mul(mult))
+}
+
+/// Human label for a retention window (inverse of [`parse_duration_secs`]).
+fn fmt_duration_secs(secs: u64) -> String {
+    if secs >= 86_400 && secs % 86_400 == 0 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3600 && secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Persist the message-retention setting to `~/.onyx/config.json`.
+fn set_config_retention(secs: Option<u64>) -> anyhow::Result<()> {
+    let mut cfg = crate::load_file_config()?.unwrap_or_default();
+    cfg.message_retention_secs = secs;
+    crate::save_file_config(&cfg)
+}
+
+// The command table is long by nature (one arm per slash command).
+#[allow(clippy::too_many_lines)]
 async fn run_slash_command(app: &mut AppState, line: &str) {
     let (cmd, arg) = parse_slash_command(line);
     match cmd.as_str() {
@@ -2381,6 +2438,43 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
                 app.last_send_result = Some(Ok(()));
             } else {
                 app.last_send_result = Some(Err("no conversation selected".to_string()));
+            }
+        }
+        "retention" | "ttl" => {
+            if arg.is_empty() {
+                let cur = app
+                    .retention_secs
+                    .map_or("off".to_string(), fmt_duration_secs);
+                app.last_notice = Some(format!(
+                    "message retention is {cur}. Set with /retention <off|30m|1h|7d>"
+                ));
+            } else {
+                let parsed = if matches!(arg, "off" | "none" | "0") {
+                    Some(None)
+                } else {
+                    parse_duration_secs(arg).map(Some)
+                };
+                match parsed {
+                    Some(secs) => {
+                        app.retention_secs = secs;
+                        match set_config_retention(secs) {
+                            Ok(()) => {
+                                let label = secs.map_or("off".to_string(), fmt_duration_secs);
+                                app.last_notice = Some(format!(
+                                    "message retention → {label} (hidden now; daemon deletes persisted history on its next sweep / launch)"
+                                ));
+                            }
+                            Err(e) => {
+                                app.last_send_result = Some(Err(format!("save config: {e}")));
+                            }
+                        }
+                    }
+                    None => {
+                        app.last_send_result = Some(Err(
+                            "usage: /retention <off | 30m | 1h | 7d | 3600>".to_string(),
+                        ));
+                    }
+                }
             }
         }
         "room" | "newroom" => {
@@ -2437,7 +2531,7 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
         }
         other => {
             app.last_send_result = Some(Err(format!(
-                "unknown command /{other} — try /help /file /search /room /share /add /verify /hubs /settings /clear /quit"
+                "unknown command /{other} — try /help /file /search /room /share /add /verify /retention /hubs /settings /clear /quit"
             )));
         }
     }
@@ -4366,8 +4460,11 @@ fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
 /// sender reads as a single grouped block instead of repeating the name on
 /// every line. Own messages are green, peers cyan; attachment lines (📎)
 /// get a magenta accent and `[hub]`-delivered lines keep their tag.
-fn build_chat_lines<'a>(scroll: &'a [ChatLine], who_label: &'a str) -> Vec<Line<'a>> {
-    let mut out: Vec<Line<'a>> = Vec::new();
+fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> {
+    // Every span built below owns its text (clone / to_string / format!), so
+    // the result is 'static — it doesn't borrow `scroll`/`who_label`. That
+    // lets callers pass a temporary filtered Vec (retention) safely.
+    let mut out: Vec<Line<'static>> = Vec::new();
     // (is_outgoing, hhmm) of the last header emitted; a new header is drawn
     // only when this key changes.
     let mut last_key: Option<(bool, String)> = None;
@@ -4400,7 +4497,7 @@ fn build_chat_lines<'a>(scroll: &'a [ChatLine], who_label: &'a str) -> Vec<Line<
         } else {
             Style::default().fg(Color::White)
         };
-        let mut spans: Vec<Span<'a>> = Vec::with_capacity(3);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
         spans.push(Span::raw("  "));
         if line.via_hub {
             spans.push(Span::styled(
@@ -4500,8 +4597,31 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         frame.render_widget(body.block(block).wrap(Wrap { trim: false }), area);
         return;
     }
+    // Local message retention (auto-clear): hide scrollback older than the
+    // window (the daemon deletes the persisted copy on its sweep).
+    let retention_cutoff_ms: Option<u64> = app
+        .retention_secs
+        .map(|secs| now_unix_ms().saturating_sub(secs.saturating_mul(1000)));
     let lines: Vec<Line<'_>> = match app.scrollback.get(&scrollback_key) {
-        Some(scroll) if !scroll.is_empty() => build_chat_lines(scroll, &who_label),
+        Some(scroll) if !scroll.is_empty() => {
+            if let Some(cutoff) = retention_cutoff_ms {
+                let kept: Vec<ChatLine> = scroll
+                    .iter()
+                    .filter(|l| l.ts_unix_ms >= cutoff)
+                    .cloned()
+                    .collect();
+                if kept.is_empty() {
+                    vec![Line::from(Span::styled(
+                        "  (messages cleared by retention)",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else {
+                    build_chat_lines(&kept, &who_label)
+                }
+            } else {
+                build_chat_lines(scroll, &who_label)
+            }
+        }
         _ => vec![Line::from(Span::styled(
             "  (no messages yet — type below and press Enter)",
             Style::default().fg(Color::DarkGray),
@@ -4882,6 +5002,22 @@ mod snapshot_tests {
         assert_eq!(fmt_relative(0), "—");
         // A timestamp ~now reads as "just now".
         assert_eq!(fmt_relative(now_unix_ms()), "just now");
+    }
+
+    // Retention: duration parsing (bare secs + s/m/h/d suffixes) and the
+    // round-trip label.
+    #[test]
+    fn parse_and_fmt_duration() {
+        assert_eq!(parse_duration_secs("3600"), Some(3600));
+        assert_eq!(parse_duration_secs("30m"), Some(1800));
+        assert_eq!(parse_duration_secs("1h"), Some(3600));
+        assert_eq!(parse_duration_secs("7d"), Some(604_800));
+        assert_eq!(parse_duration_secs("45s"), Some(45));
+        assert_eq!(parse_duration_secs("nope"), None);
+        assert_eq!(fmt_duration_secs(604_800), "7d");
+        assert_eq!(fmt_duration_secs(3600), "1h");
+        assert_eq!(fmt_duration_secs(1800), "30m");
+        assert_eq!(fmt_duration_secs(45), "45s");
     }
 
     // A3 (slash commands): the parser lowercases the command word and

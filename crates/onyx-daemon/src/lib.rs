@@ -193,6 +193,11 @@ pub struct Config {
     /// envelope on an unlinkable token, never content or identities; the
     /// recipient tags such messages `[hub]`. See `ANONYMITY.md` §3.2.
     pub dm_hub_fallback: bool,
+    /// Local message retention (auto-clear). When `Some(secs)`, the daemon
+    /// periodically deletes persisted room messages older than `secs`
+    /// (our own copy only — not a mutual/disappearing TTL). `None` = keep
+    /// forever. Default `None`.
+    pub message_retention_secs: Option<u64>,
 }
 
 /// Bundle of state every handler needs.
@@ -304,6 +309,10 @@ pub struct DaemonState {
     /// construction so the API server (which only holds `DaemonState`)
     /// can see it without threading `Config` through.
     pub dm_hub_fallback: bool,
+    /// Local message retention (auto-clear). `Some(secs)` → the periodic
+    /// task deletes persisted room messages older than `secs`. Copied from
+    /// [`Config`] at construction. `None` = keep forever.
+    pub message_retention_secs: Option<u64>,
 }
 
 /// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
@@ -684,6 +693,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         dial_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
         // v0.1.18: opt-in DM hub fallback, copied from Config.
         dm_hub_fallback: args.dm_hub_fallback,
+        // Local message retention (auto-clear), copied from Config.
+        message_retention_secs: args.message_retention_secs,
     });
 
     drop(args.passphrase);
@@ -3693,6 +3704,30 @@ fn spawn_replay_snapshot_task(state: Arc<DaemonState>) {
                     warn!(error = %e, "replay seen-set snapshot save failed; will retry next tick");
                 }
             }
+            // Local message-retention sweep (auto-clear): delete persisted
+            // room messages older than the configured window. Local copy
+            // only — not a mutual/disappearing TTL.
+            if let Some(secs) = state.message_retention_secs {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                let cutoff = now_ms.saturating_sub(secs.saturating_mul(1000));
+                let pruned = {
+                    let vault = state.vault.lock().await;
+                    vault.prune_room_messages_older_than(state.identity_id, cutoff)
+                };
+                match pruned {
+                    Ok(n) if n > 0 => {
+                        debug!(
+                            removed = n,
+                            retention_secs = secs,
+                            "message-retention sweep"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "message-retention sweep failed"),
+                }
+            }
         }
     });
 }
@@ -3917,6 +3952,7 @@ mod dm_fallback_receive_tests {
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: true,
+            message_retention_secs: None,
         })
     }
 

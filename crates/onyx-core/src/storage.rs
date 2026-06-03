@@ -1577,6 +1577,26 @@ impl Vault {
         Ok(())
     }
 
+    /// Local message retention (auto-clear): permanently delete persisted
+    /// room messages older than `cutoff_ms` (wall-clock ms since epoch)
+    /// across all of this identity's rooms; returns the row count removed.
+    /// This deletes our OWN local copy only — it does not signal peers
+    /// (mutual/disappearing TTL is a separate wire-format feature).
+    pub fn prune_room_messages_older_than(
+        &self,
+        identity_id: i64,
+        cutoff_ms: u64,
+    ) -> Result<usize> {
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff = cutoff_ms as i64;
+        self.conn
+            .execute(
+                "DELETE FROM room_messages WHERE identity_id = ? AND created_at_ms < ?",
+                params![identity_id, cutoff],
+            )
+            .map_err(map_db_err)
+    }
+
     /// Drop every `room_member_kems` row for a given (identity, room)
     /// pair (T-polish.1). Used alongside `delete_room` so leaving /
     /// deleting a room doesn't leave orphan KEM cache entries that
@@ -2394,6 +2414,23 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn prune_room_messages_deletes_only_old() {
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("me").unwrap();
+        let g = [3u8; 32];
+        v.append_room_message(id, &g, false, "fp", "old", 1_000)
+            .unwrap();
+        v.append_room_message(id, &g, true, "me", "new", 10_000)
+            .unwrap();
+        // Cut off at 5_000 → "old" (1_000) goes, "new" (10_000) stays.
+        let removed = v.prune_room_messages_older_than(id, 5_000).unwrap();
+        assert_eq!(removed, 1);
+        let remaining = v.room_history(id, &g, 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].text, "new");
     }
 
     #[test]
