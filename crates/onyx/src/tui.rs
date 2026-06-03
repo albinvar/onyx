@@ -3847,7 +3847,7 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         Some(SelectedEntry::Peer(p)) => {
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(5), Constraint::Min(3)])
+                .constraints([Constraint::Length(8), Constraint::Min(3)])
                 .split(area);
             let state = if p.connected {
                 Span::styled(
@@ -3859,28 +3859,41 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             } else {
                 Span::styled("○ offline", Style::default().fg(Color::DarkGray))
             };
-            boxed(
-                frame,
-                rows[0],
-                "Peer",
-                Color::Cyan,
-                vec![
-                    kv("peer", p.short_id.clone()),
-                    Line::from(vec![
-                        Span::styled(" state: ", Style::default().fg(Color::Gray)),
-                        state,
-                    ]),
-                ],
-            );
+            let hub_count = match &app.last_status {
+                Some(Ok(s)) => Some(s.hub_count),
+                _ => None,
+            };
+            let mut peer_lines = vec![
+                kv("peer", p.short_id.clone()),
+                Line::from(vec![
+                    Span::styled(" state: ", Style::default().fg(Color::Gray)),
+                    state,
+                ]),
+            ];
+            if let Some((label, color)) = transport_badge(SelectedEntry::Peer(p), hub_count) {
+                peer_lines.push(Line::from(vec![
+                    Span::styled(" via:   ", Style::default().fg(Color::Gray)),
+                    Span::styled(label, Style::default().fg(color)),
+                ]));
+            }
+            peer_lines.push(kv("seen", fmt_relative(p.last_active_unix_ms)));
+            peer_lines.push(kv("fp", short_fingerprint(&p.fingerprint)));
+            boxed(frame, rows[0], "Peer", Color::Cyan, peer_lines);
             boxed(
                 frame,
                 rows[1],
                 "Actions",
                 Color::Green,
-                vec![Line::from(vec![
-                    Span::styled(" ^F ", Style::default().fg(Color::Yellow)),
-                    Span::styled("send file (direct)", Style::default().fg(Color::White)),
-                ])],
+                vec![
+                    Line::from(vec![
+                        Span::styled(" ^F ", Style::default().fg(Color::Yellow)),
+                        Span::styled("send file", Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" ^K ", Style::default().fg(Color::Yellow)),
+                        Span::styled("verify safety #", Style::default().fg(Color::White)),
+                    ]),
+                ],
             );
         }
         None => {
@@ -4152,6 +4165,38 @@ fn fmt_hhmm(ts_unix_ms: u64) -> String {
     match Local.timestamp_millis_opt(i64::try_from(ts_unix_ms).unwrap_or(0)) {
         chrono::LocalResult::Single(dt) => dt.format("%H:%M").to_string(),
         _ => String::new(),
+    }
+}
+
+/// Short relative time ("just now" / "5m ago" / "3h ago" / "2d ago"), or
+/// "—" if the timestamp is unknown (0). Used in the details pane.
+fn fmt_relative(ts_unix_ms: u64) -> String {
+    if ts_unix_ms == 0 {
+        return "—".to_string();
+    }
+    let secs = now_unix_ms().saturating_sub(ts_unix_ms) / 1000;
+    if secs < 10 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// First three groups of a base32-grouped fingerprint + "…" — enough to
+/// recognise a contact in the narrow details pane without overflowing it.
+/// Full verification is via the safety number (`/verify`).
+fn short_fingerprint(fp: &str) -> String {
+    let head: Vec<&str> = fp.split_whitespace().take(3).collect();
+    if head.is_empty() {
+        "—".to_string()
+    } else {
+        format!("{} …", head.join(" "))
     }
 }
 
@@ -4733,6 +4778,20 @@ mod snapshot_tests {
         assert_eq!(hits[1].ts_unix_ms, 1000);
         assert!(search_scrollback(&app, "   ").is_empty(), "blank → none");
         assert!(search_scrollback(&app, "zzz").is_empty(), "no match → none");
+    }
+
+    // Details pane: short_fingerprint shows the first 3 groups + ellipsis;
+    // fmt_relative handles the unknown (0) case.
+    #[test]
+    fn details_helpers_format_sanely() {
+        assert_eq!(
+            short_fingerprint("6dzx yrut hgez rucw js3g fpdu"),
+            "6dzx yrut hgez …"
+        );
+        assert_eq!(short_fingerprint(""), "—");
+        assert_eq!(fmt_relative(0), "—");
+        // A timestamp ~now reads as "just now".
+        assert_eq!(fmt_relative(now_unix_ms()), "just now");
     }
 
     // A3 (slash commands): the parser lowercases the command word and
