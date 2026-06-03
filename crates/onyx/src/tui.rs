@@ -262,6 +262,18 @@ enum ModalState {
         /// Last directory-read error, surfaced in the modal.
         error: Option<String>,
     },
+    /// Slice 2 (action menu): a short, context-aware list of the actions
+    /// that make sense for the *currently selected* conversation — opened
+    /// with `Tab` so you can point at a peer/room and pick an action
+    /// instead of memorising key combos. `↑/↓` move; `Enter` runs the
+    /// highlighted action (dispatched through `run_palette_action`); `Esc`
+    /// closes. The full command set is still on `Ctrl-K`.
+    ActionMenu {
+        /// Header describing the target, e.g. "@u5lhmxps" or "#general".
+        target_label: String,
+        actions: Vec<PaletteAction>,
+        selected: usize,
+    },
     /// UX overhaul: full keybinding cheat-sheet overlay. Opens on
     /// `F1`. Any key closes it.
     Help,
@@ -366,6 +378,7 @@ enum PaletteAction {
     ShareContact,
     AddContact,
     ManageHubs,
+    ViewLogs,
     Settings,
     Help,
     Quit,
@@ -373,7 +386,7 @@ enum PaletteAction {
 
 impl PaletteAction {
     /// All actions, in palette display order.
-    const ALL: [PaletteAction; 11] = [
+    const ALL: [PaletteAction; 12] = [
         PaletteAction::CreateRoom,
         PaletteAction::InvitePeer,
         PaletteAction::SendFile,
@@ -382,6 +395,7 @@ impl PaletteAction {
         PaletteAction::ShareContact,
         PaletteAction::AddContact,
         PaletteAction::ManageHubs,
+        PaletteAction::ViewLogs,
         PaletteAction::Settings,
         PaletteAction::Help,
         PaletteAction::Quit,
@@ -398,6 +412,7 @@ impl PaletteAction {
             PaletteAction::ShareContact => "Share my contact (invite link + connect code)",
             PaletteAction::AddContact => "Add a contact (paste invite or connect code)",
             PaletteAction::ManageHubs => "Manage hubs / dial / reachability",
+            PaletteAction::ViewLogs => "View daemon logs",
             PaletteAction::Settings => "Settings / identity",
             PaletteAction::Help => "Show keyboard help",
             PaletteAction::Quit => "Quit Onyx",
@@ -413,6 +428,7 @@ impl PaletteAction {
             PaletteAction::ShareContact => "^E",
             PaletteAction::AddContact => "^A",
             PaletteAction::ManageHubs => "^G",
+            PaletteAction::ViewLogs => "^L",
             PaletteAction::SearchMessages
             | PaletteAction::VerifyContact
             | PaletteAction::Settings => "",
@@ -1061,6 +1077,13 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             });
             return false;
         }
+        // Slice 2: Tab opens the context action menu for the selected
+        // conversation — a short list of just-relevant actions, so you
+        // don't have to remember key combos. Ctrl-K is the full list.
+        (KeyCode::Tab, _) => {
+            app.modal = Some(context_action_menu(app));
+            return false;
+        }
         // UX phase 4: Ctrl-L opens the daemon-log overlay (tail of
         // ~/.onyx/onyx.log), color-coded by level + scrollable.
         (KeyCode::Char('l'), m) if m.contains(KeyModifiers::CONTROL) => {
@@ -1254,6 +1277,38 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             query.push(c);
             *selected = 0;
             app.modal = Some(modal);
+            return;
+        }
+        // Slice 2: context action-menu navigation. Up/Down move; Enter
+        // runs the highlighted action (same dispatch as the palette).
+        (ModalState::ActionMenu { selected, .. }, KeyCode::Up) => {
+            *selected = selected.saturating_sub(1);
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::ActionMenu {
+                actions, selected, ..
+            },
+            KeyCode::Down,
+        ) => {
+            if !actions.is_empty() {
+                *selected = (*selected + 1).min(actions.len() - 1);
+            }
+            app.modal = Some(modal);
+            return;
+        }
+        (
+            ModalState::ActionMenu {
+                actions, selected, ..
+            },
+            KeyCode::Enter,
+        ) => {
+            // Consume the modal (not put back) and run the action — it
+            // opens the relevant modal or performs the action itself.
+            if let Some(a) = actions.get(*selected).copied() {
+                run_palette_action(app, a).await;
+            }
             return;
         }
         (ModalState::CreateRoom { name }, KeyCode::Enter) => {
@@ -1822,7 +1877,10 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             | ModalState::Search { .. }
             // ManageHubs is handled inline (saves a file, no API call), so
             // it never sets submit_intent — but the match must cover it.
-            | ModalState::ManageHubs { .. } => None,
+            | ModalState::ManageHubs { .. }
+            // Slice 2: the action menu runs its action inline on Enter
+            // (dispatched through run_palette_action), never submits here.
+            | ModalState::ActionMenu { .. } => None,
         };
         if let Some(req) = req {
             match client::one_shot(&app.socket_path, &req).await {
@@ -1962,6 +2020,46 @@ fn palette_filter(query: &str) -> Vec<PaletteAction> {
         .collect()
 }
 
+/// Slice 2 (action menu): build the context menu for the current
+/// selection. Lists the few actions that actually apply to the selected
+/// peer/room first, so a user can act without remembering key combos.
+/// The full palette (Ctrl-K) remains the exhaustive list.
+fn context_action_menu(app: &AppState) -> ModalState {
+    let (target_label, actions) = match app.selected_entry() {
+        Some(SelectedEntry::Peer(p)) => (
+            format!("@{}", p.short_id),
+            vec![
+                PaletteAction::SendFile,
+                PaletteAction::VerifyContact,
+                PaletteAction::SearchMessages,
+                PaletteAction::ShareContact,
+            ],
+        ),
+        Some(SelectedEntry::Room(r)) => (
+            format!("#{}", r.name),
+            vec![
+                PaletteAction::InvitePeer,
+                PaletteAction::SendFile,
+                PaletteAction::SearchMessages,
+            ],
+        ),
+        None => (
+            "Onyx".to_string(),
+            vec![
+                PaletteAction::CreateRoom,
+                PaletteAction::AddContact,
+                PaletteAction::ShareContact,
+                PaletteAction::ManageHubs,
+            ],
+        ),
+    };
+    ModalState::ActionMenu {
+        target_label,
+        actions,
+        selected: 0,
+    }
+}
+
 /// UX overhaul: run a command-palette action. Opens the relevant
 /// modal, performs the action, or (Quit) sets `app.quit_requested`.
 async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
@@ -2005,6 +2103,12 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
         }
         PaletteAction::ManageHubs => {
             app.modal = Some(open_manage_hubs_modal());
+        }
+        PaletteAction::ViewLogs => {
+            app.modal = Some(ModalState::Logs {
+                lines: read_log_tail(500),
+                scroll: 0,
+            });
         }
         PaletteAction::Settings => open_settings_modal(app).await,
         PaletteAction::Help => app.modal = Some(ModalState::Help),
@@ -3223,10 +3327,12 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::InvitePeer { .. } => 17,
         // A1: the file browser wants vertical room for the listing.
         ModalState::SendFile { .. } => area.height.saturating_sub(2).min(24),
-        ModalState::Help => 23,
+        ModalState::Help => 24,
         ModalState::CommandPalette { .. } => {
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
         }
+        // Slice 2: short context menu — sized to its (few) entries.
+        ModalState::ActionMenu { actions, .. } => u16::try_from(actions.len() + 5).unwrap_or(9),
         // "Share my contact": two rows (invite link + connect code) + hints.
         ModalState::Share { .. } => 14,
         ModalState::Settings { info } => u16::try_from(info.len() + 4).unwrap_or(14),
@@ -3357,6 +3463,11 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::CommandPalette { query, selected } => {
             render_palette_modal(frame, rect, query, *selected);
         }
+        ModalState::ActionMenu {
+            target_label,
+            actions,
+            selected,
+        } => render_action_menu_modal(frame, rect, target_label, actions, *selected),
         ModalState::Share {
             invite_url,
             connect_code,
@@ -3748,6 +3859,7 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         key("Enter", "send the composed message"),
         Line::from(""),
         head("Actions"),
+        key("Tab", "actions for the selected conversation"),
         key("Ctrl-K", "command palette (run anything)"),
         key("Ctrl-N", "create a room / channel"),
         key("Ctrl-I", "invite a peer into the selected room"),
@@ -3822,6 +3934,54 @@ fn render_palette_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, query: &str,
             ),
         ]));
     }
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// Slice 2: the context action menu (Tab). A short, selectable list of the
+/// actions that apply to the selected conversation — chosen so the user can
+/// act by pointing-and-picking instead of memorising key combos. The full
+/// command set stays on Ctrl-K (hinted in the footer).
+fn render_action_menu_modal(
+    frame: &mut ratatui::Frame<'_>,
+    rect: Rect,
+    target_label: &str,
+    actions: &[PaletteAction],
+    selected: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            format!(" Actions · {target_label}  (↑↓ · Enter · Esc) "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let mut lines: Vec<Line> = Vec::with_capacity(actions.len() + 2);
+    for (i, action) in actions.iter().enumerate() {
+        let sel = i == selected;
+        let marker = if sel { "▶ " } else { "  " };
+        let row_style = if sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}{:<34}", action.label()), row_style),
+            Span::styled(
+                action.key_hint().to_string(),
+                Style::default().fg(if sel { Color::Black } else { Color::DarkGray }),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Ctrl-K for the full command list",
+        Style::default().fg(Color::DarkGray),
+    )));
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
@@ -5252,6 +5412,56 @@ mod snapshot_tests {
         assert!(
             snap.contains("3 members"),
             "second room's member count must render; got:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn action_menu_is_context_aware() {
+        // Slice 2: the Tab action menu lists actions for the *selected*
+        // conversation. With a peer selected it offers peer-relevant
+        // actions and is headed by the peer's handle.
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.selected = 0; // first peer
+        app.modal = Some(context_action_menu(&app));
+        let snap = render_to_string(&app, 90, 24);
+        assert!(
+            snap.contains("Actions"),
+            "action menu title must render; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("@u5lhmxps"),
+            "menu must be headed by the selected peer; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("Verify contact"),
+            "peer menu must offer verify; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("Ctrl-K"),
+            "footer must point at the full palette; got:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn action_menu_room_context_offers_invite() {
+        // With a room selected the menu offers room-relevant actions.
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.rooms = vec![RoomInfo {
+            name: "general".into(),
+            group_id_b32: "abcdefghijkl".into(),
+            members: vec!["fp_alice".into(), "fp_bob".into()],
+            created_at_ms: 1_700_000_000_000,
+        }];
+        app.selected = app.peers.len(); // first room
+        app.modal = Some(context_action_menu(&app));
+        let snap = render_to_string(&app, 90, 24);
+        assert!(
+            snap.contains("#general"),
+            "menu must be headed by the selected room; got:\n{snap}"
+        );
+        assert!(
+            snap.contains("Invite peer"),
+            "room menu must offer invite-peer; got:\n{snap}"
         );
     }
 
