@@ -290,9 +290,41 @@ CREATE TABLE IF NOT EXISTS pinned_keys (
   first_seen_ms  INTEGER NOT NULL,
   last_seen_ms   INTEGER NOT NULL,
   key_changed    INTEGER NOT NULL DEFAULT 0,
+  verified       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (identity_id, fingerprint)
 );
 ";
+
+/// Idempotently add a column to a table if it isn't already present. Used
+/// for additive migrations on existing vaults where `CREATE TABLE IF NOT
+/// EXISTS` can't introduce a new column. `table`/`column`/`decl` are
+/// hardcoded constants (never user input) — no injection risk.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let present = {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(map_db_err)?;
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(map_db_err)?;
+        let mut found = false;
+        for n in names {
+            if n.map_err(map_db_err)? == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .map_err(map_db_err)?;
+    }
+    Ok(())
+}
 
 /// Outcome of [`Vault::pin_or_verify`] (T-1 trust-on-first-use key
 /// pinning).
@@ -321,6 +353,9 @@ pub struct PinnedContact {
     pub last_seen_ms: u64,
     /// `true` if a key different from the pinned one was ever presented.
     pub key_changed: bool,
+    /// `true` once the user has confirmed this contact's safety number
+    /// out-of-band (C: verification). Sticky until the key changes.
+    pub verified: bool,
 }
 
 /// Additive extension for T-polish.3 — persistent room scrollback.
@@ -541,6 +576,13 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOM_ADMINS_ADD)
             .map_err(map_db_err)?;
+        // C (verify): additive `verified` column on existing pinned_keys.
+        ensure_column(
+            &conn,
+            "pinned_keys",
+            "verified",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         Ok(Self { conn, aead })
     }
@@ -649,6 +691,12 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_ROOM_ADMINS_ADD)
             .map_err(map_db_err)?;
+        ensure_column(
+            &conn,
+            "pinned_keys",
+            "verified",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -1026,7 +1074,7 @@ impl Vault {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT fingerprint, x25519_pub, first_seen_ms, last_seen_ms, key_changed \
+                "SELECT fingerprint, x25519_pub, first_seen_ms, last_seen_ms, key_changed, verified \
                  FROM pinned_keys WHERE identity_id = ? ORDER BY last_seen_ms DESC",
             )
             .map_err(map_db_err)?;
@@ -1038,12 +1086,13 @@ impl Vault {
                     r.get::<_, i64>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             })
             .map_err(map_db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (fingerprint, x, first, last, changed) = row.map_err(map_db_err)?;
+            let (fingerprint, x, first, last, changed, verified) = row.map_err(map_db_err)?;
             let mut x25519_pub = [0u8; 32];
             if x.len() == x25519_pub.len() {
                 x25519_pub.copy_from_slice(&x);
@@ -1055,9 +1104,42 @@ impl Vault {
                 first_seen_ms: first as u64,
                 last_seen_ms: last as u64,
                 key_changed: changed != 0,
+                verified: verified != 0,
             });
         }
         Ok(out)
+    }
+
+    /// C (verify): mark/unmark a pinned contact as out-of-band verified.
+    /// Returns the number of rows updated — `0` means the contact isn't
+    /// pinned yet (you can only verify a contact you've actually talked to).
+    pub fn set_verified(
+        &self,
+        identity_id: i64,
+        fingerprint: &str,
+        verified: bool,
+    ) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE pinned_keys SET verified = ?3 \
+                 WHERE identity_id = ?1 AND fingerprint = ?2",
+                params![identity_id, fingerprint, i64::from(verified)],
+            )
+            .map_err(map_db_err)
+    }
+
+    /// C (verify): pin/verify status for one contact — `None` if not pinned,
+    /// else `(key_changed, verified)`. Used to badge the peer list/details.
+    pub fn pin_status(&self, identity_id: i64, fingerprint: &str) -> Result<Option<(bool, bool)>> {
+        self.conn
+            .query_row(
+                "SELECT key_changed, verified FROM pinned_keys \
+                 WHERE identity_id = ?1 AND fingerprint = ?2",
+                params![identity_id, fingerprint],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(map_db_err)
     }
 
     /// A0.3: is the pinned contact for `fingerprint` flagged
@@ -2312,6 +2394,28 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn set_verified_and_pin_status_round_trip() {
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("me").unwrap();
+        // Pin a contact (records a pinned_keys row).
+        let peer_x = [9u8; 32];
+        v.pin_or_verify(id, "fp_peer", &peer_x, 1_700_000_000_000)
+            .unwrap();
+        // Freshly pinned → not key-changed, not verified.
+        assert_eq!(v.pin_status(id, "fp_peer").unwrap(), Some((false, false)));
+        // Not pinned → None.
+        assert_eq!(v.pin_status(id, "fp_stranger").unwrap(), None);
+        // Mark verified.
+        assert_eq!(v.set_verified(id, "fp_peer", true).unwrap(), 1);
+        assert_eq!(v.pin_status(id, "fp_peer").unwrap(), Some((false, true)));
+        // Verifying an unpinned contact updates 0 rows.
+        assert_eq!(v.set_verified(id, "fp_stranger", true).unwrap(), 0);
+        // Un-verify.
+        assert_eq!(v.set_verified(id, "fp_peer", false).unwrap(), 1);
+        assert_eq!(v.pin_status(id, "fp_peer").unwrap(), Some((false, false)));
     }
 
     #[test]

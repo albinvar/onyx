@@ -312,7 +312,11 @@ enum ModalState {
     /// for out-of-band comparison. Read-only; any key closes.
     Verify {
         peer_short: String,
+        /// Ed25519 fingerprint — needed to persist the verified flag (`v`).
+        fingerprint: String,
         number: String,
+        /// Whether this contact is already marked verified (drives the hint).
+        already_verified: bool,
     },
     /// B (search): full-text search across all loaded conversation
     /// scrollback. Type to filter; `↑/↓` move; `Enter` jumps to the
@@ -1163,15 +1167,43 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             app.modal = Some(modal);
             return;
         }
-        // Esc closes any modal without submitting. Help + Invite +
-        // Settings + Logs are read-only overlays, so ANY (non-scroll)
-        // key dismisses them too.
+        // C (verify): in the safety-number screen, `v` marks the contact
+        // verified (persists the flag). MUST precede the read-only close arm
+        // below, or `v` would just dismiss the overlay.
+        (ModalState::Verify { fingerprint, .. }, KeyCode::Char('v' | 'V')) => {
+            let fp = fingerprint.clone();
+            match client::one_shot(
+                &app.socket_path,
+                &ApiRequest::SetContactVerified {
+                    fingerprint: fp,
+                    verified: true,
+                },
+            )
+            .await
+            {
+                Ok(ApiResponse::SetContactVerifiedOk { updated: true }) => {
+                    app.last_notice = Some("contact marked verified ✓".to_string());
+                }
+                Ok(ApiResponse::SetContactVerifiedOk { updated: false }) => {
+                    app.last_send_result = Some(Err(
+                        "can't verify yet — exchange a message first so the key is pinned"
+                            .to_string(),
+                    ));
+                }
+                Ok(other) => {
+                    app.last_send_result = Some(Err(format!("unexpected response: {other:?}")));
+                }
+                Err(e) => app.last_send_result = Some(Err(format!("{e:#}"))),
+            }
+            return; // close the modal
+        }
+        // Esc closes any modal without submitting. Help + Settings + Logs +
+        // the read-only safety-number screen close on ANY (non-scroll) key.
         (_, KeyCode::Esc)
         | (
             ModalState::Help
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
-            // C: the safety-number screen is read-only.
             | ModalState::Verify { .. },
             _,
         ) => {
@@ -1466,7 +1498,11 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             },
             KeyCode::Enter | KeyCode::Char('c'),
         ) => {
-            let text = if *selected == 0 { invite_url } else { connect_code };
+            let text = if *selected == 0 {
+                invite_url
+            } else {
+                connect_code
+            };
             // Don't "copy" a placeholder string (they start with '(').
             if !text.starts_with('(') {
                 *copied = copy_to_clipboard(text);
@@ -2063,7 +2099,9 @@ fn build_verify_modal(app: &AppState) -> Result<ModalState, String> {
     match app.selected_entry() {
         Some(SelectedEntry::Peer(p)) => Ok(ModalState::Verify {
             peer_short: p.short_id.clone(),
+            fingerprint: p.fingerprint.clone(),
             number: onyx_core::crypto::safety_number(&mine, &p.pubkey_b32),
+            already_verified: p.verified,
         }),
         Some(SelectedEntry::Room(_)) => {
             Err("safety numbers are for 1:1 peers, not rooms".to_string())
@@ -3104,7 +3142,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         // "Add a contact": single paste field.
         ModalState::AddContact { .. } => 9,
         // C: safety-number display + instructions.
-        ModalState::Verify { .. } => 12,
+        ModalState::Verify { .. } => 15,
         // B: search wants vertical room for the result list.
         ModalState::Search { .. } => area.height.saturating_sub(2).min(22),
         // v0.1.12: hub manager grows with the hub list (+ fixed controls).
@@ -3279,16 +3317,34 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             frame.render_widget(body, rect);
         }
         // C: safety-number verification screen (read-only).
-        ModalState::Verify { peer_short, number } => {
+        ModalState::Verify {
+            peer_short,
+            number,
+            already_verified,
+            ..
+        } => {
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(Span::styled(
-                    " Verify Contact  (any key to close) ",
+                    " Verify Contact  (v = mark verified · any other key closes) ",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ));
+            let status_line = if *already_verified {
+                Line::from(Span::styled(
+                    "  ✓ already verified",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    "  press v once it matches to mark this contact verified ✓",
+                    Style::default().fg(Color::Yellow),
+                ))
+            };
             let body = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -3315,6 +3371,8 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
                     "  Different → do NOT trust this contact.",
                     Style::default().fg(Color::DarkGray),
                 )),
+                Line::from(""),
+                status_line,
             ])
             .block(block);
             frame.render_widget(body, rect);
@@ -3878,6 +3936,28 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             }
             peer_lines.push(kv("seen", fmt_relative(p.last_active_unix_ms)));
             peer_lines.push(kv("fp", short_fingerprint(&p.fingerprint)));
+            // Trust line: key-change warning beats everything (possible MITM).
+            let trust = if p.key_changed {
+                Span::styled(
+                    "⚠ KEY CHANGED",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            } else if p.verified {
+                Span::styled(
+                    "✓ verified",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if p.pinned {
+                Span::styled("📌 pinned (unverified)", Style::default().fg(Color::Gray))
+            } else {
+                Span::styled("— not pinned yet", Style::default().fg(Color::DarkGray))
+            };
+            peer_lines.push(Line::from(vec![
+                Span::styled(" trust: ", Style::default().fg(Color::Gray)),
+                trust,
+            ]));
             boxed(frame, rows[0], "Peer", Color::Cyan, peer_lines);
             boxed(
                 frame,
@@ -4100,6 +4180,16 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 }),
         );
         let mut spans = vec![dot, name];
+        // C (verify): key-change warning ⚠ (possible MITM) beats a verified
+        // ✓; both surface right next to the name.
+        if p.key_changed {
+            spans.push(Span::styled(
+                " ⚠",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        } else if p.verified {
+            spans.push(Span::styled(" ✓", Style::default().fg(Color::Green)));
+        }
         // T-polish.5: unread badge on the right.
         if let Some(&n) = app.unread.get(&p.short_id)
             && n > 0
@@ -4847,6 +4937,9 @@ mod snapshot_tests {
                 connected: true,
                 last_message_preview: Some("how's the audit?".into()),
                 last_active_unix_ms: 1_700_000_000_000,
+                pinned: true,
+                key_changed: false,
+                verified: true,
             },
             PeerInfo {
                 short_id: "k9rfthxz".into(),
@@ -4855,6 +4948,9 @@ mod snapshot_tests {
                 connected: false,
                 last_message_preview: Some("see you at 3?".into()),
                 last_active_unix_ms: 1_699_900_000_000,
+                pinned: true,
+                key_changed: true,
+                verified: false,
             },
         ];
         app.scrollback.insert(
