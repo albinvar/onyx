@@ -195,6 +195,7 @@ async fn spawn_daemon_full(
         // + listen_tcp) — acknowledge it so the guard lets it start.
         allow_clearnet: true,
         dm_hub_fallback,
+        message_retention_secs: None,
     };
 
     tokio::spawn(async move {

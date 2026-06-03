@@ -3684,6 +3684,7 @@ mod tests {
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: false,
+            message_retention_secs: None,
         });
         (state, encode_b32(group_id))
     }
@@ -3801,6 +3802,7 @@ mod tests {
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: true,
+            message_retention_secs: None,
         });
 
         // Independently derive the DM group's session token to compare.
@@ -3875,6 +3877,7 @@ mod tests {
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: true,
+            message_retention_secs: None,
         });
 
         let ok = dm_hub_fallback_send(&peer_pub, "hi", &state).await;

@@ -6,6 +6,34 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 messaging (B) — 2026-06-03 — local message retention (auto-clear)
+
+First slice of disappearing messages: the daemon **actually deletes** persisted
+history older than a window, and the TUI hides it. Local-only (your own copy) —
+mutual/peer-signalled TTL is the documented next slice.
+
+### Added
+- **`/retention <off|30m|1h|7d|3600>`** — set how long room history is kept.
+  Stored in `config.json` (`message_retention_secs`). Hides matching scrollback
+  in the TUI immediately; the daemon deletes the persisted `room_messages`
+  rows on its periodic (60 s) sweep.
+- Vault: `prune_room_messages_older_than` (unit-tested). Daemon: `Config` /
+  `DaemonState` gain `message_retention_secs`; the replay-snapshot task now also
+  runs the retention sweep. TUI: `retention_secs` loaded from config; scrollback
+  filtered on render; `parse_duration_secs`/`fmt_duration_secs` (tested).
+
+### Honest scope
+- **Local-only**: this deletes *your* stored copy and hides it from view; it
+  does NOT tell the peer to delete theirs, and isn't a per-message countdown.
+  Mutual disappearing (TTL travels with the message; both sides expire) needs a
+  wire-format addition (a DM message envelope + `RoomAppMessage` field) — that's
+  the next slice.
+- Currently covers **persisted room history** (DMs aren't persisted to disk —
+  only an in-memory ring that's already capped + lost on restart). `onyxd`
+  (headless) doesn't expose the setting yet (combined `onyx` reads config.json).
+
+---
+
 ## Release v0.1.24 — 2026-06-03
 
 - **Verification, completed**: persisted **verified ✓** flag (press `v` in the

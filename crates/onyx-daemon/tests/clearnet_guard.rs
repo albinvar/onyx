@@ -46,6 +46,7 @@ fn clearnet_config(dir: &std::path::Path, set_flag: impl FnOnce(&mut Config)) ->
         first_contact_reachable: false,
         allow_clearnet: false,
         dm_hub_fallback: false,
+        message_retention_secs: None,
     };
     set_flag(&mut cfg);
     cfg

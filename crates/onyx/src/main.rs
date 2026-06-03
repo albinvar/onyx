@@ -683,6 +683,11 @@ struct FileConfig {
     /// Optional Poisson cover-traffic mean interval, seconds.
     #[serde(default)]
     cover_traffic_mean_secs: Option<u64>,
+    /// Local message retention (auto-clear), seconds. `Some(secs)` → the
+    /// daemon deletes persisted room messages older than this, and the TUI
+    /// hides them. `None`/absent = keep forever. Set via `/retention`.
+    #[serde(default)]
+    message_retention_secs: Option<u64>,
     /// v0.1.14: opt IN to the public hub list. **Default `false`.** When
     /// true (and no explicit `--hub`/config hub is set), the daemon also
     /// uses the hubs in `~/.onyx/public-hubs.json` — a list that
@@ -962,6 +967,8 @@ fn build_daemon_config(
         // v0.1.18: opt-in DM hub fallback; OR the two sources so "on"
         // from CLI or config.json wins. Default false = private.
         dm_hub_fallback: args.dm_hub_fallback || file_cfg.dm_hub_fallback,
+        // Local message retention (auto-clear), from config.json.
+        message_retention_secs: file_cfg.message_retention_secs,
     })
 }
 

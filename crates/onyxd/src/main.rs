@@ -262,6 +262,7 @@ impl TryFrom<Args> for Config {
             first_contact_reachable: a.first_contact_reachable,
             allow_clearnet: a.allow_clearnet,
             dm_hub_fallback: a.dm_hub_fallback,
+            message_retention_secs: None,
         })
     }
 }
