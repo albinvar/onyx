@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI-UX (A) — 2026-06-03 — info/status header
+
+Third and final of the three TUI-UX slices.
+
+### Added
+- **Top info header** — a single always-visible row at the top showing the
+  context of the *selected* conversation:
+  - peer → `@handle · <transport> · <trust> · seen <relative>`, where trust
+    is `✓ verified` / `⚠ key changed` / `• pinned` / `• unverified`
+  - room → `#name · <transport> · N members`
+  - nothing selected → a short hint (`Tab` actions · `^A` add · `^N` room)
+- This context previously lived only in the details pane, which is hidden on
+  narrow terminals (< 92 cols). The header makes "where am I · can I reach
+  them · do I trust them" visible everywhere.
+
+### Notes
+- The header reuses the existing `transport_badge` so its delivery indicator
+  stays consistent with the composer's. The bottom status bar (tor/identity/
+  peer-count/version + keybinds) is unchanged — the header is per-conversation
+  context, the footer is global state.
+
+---
+
 ## v0.2 TUI-UX (A) — 2026-06-03 — context action menu + complete palette
 
 Second of the three TUI-UX slices. Goal: stop making users memorise key

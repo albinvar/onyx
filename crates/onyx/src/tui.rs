@@ -2990,12 +2990,20 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
+    // Slice 3: a one-row info header at the very top — always-visible
+    // context for the selected conversation (transport, trust, members /
+    // last-seen) which otherwise only lives in the wide-only details pane.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
-    let main_area = chunks[0];
-    let status_area = chunks[1];
+    let header_area = chunks[0];
+    let main_area = chunks[1];
+    let status_area = chunks[2];
 
     // UX overhaul: 3-pane layout (Conversations │ Chat │ Details)
     // when the terminal is wide enough; gracefully falls back to the
@@ -3046,6 +3054,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let messages_area = chat_rows[0];
     let composer_area = chat_rows[1];
 
+    render_header(frame, header_area, app);
     render_logo(frame, logo_area);
     render_peers(frame, peers_area, app);
     render_daemon_status(frame, daemon_area, app);
@@ -4953,6 +4962,82 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
+/// Slice 3: the top info header — a single always-visible row of context
+/// for the *selected* conversation: who/what it is, how a message reaches
+/// them (transport badge), and the trust state (peer) or member count
+/// (room) plus last activity. This info otherwise only appears in the
+/// details pane, which is hidden on narrow terminals — so the header makes
+/// "where am I · can I reach them · do I trust them" visible everywhere.
+fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let sep = || Span::styled("  ·  ", theme::muted());
+    let hub_count = match &app.last_status {
+        Some(Ok(s)) => Some(s.hub_count),
+        _ => None,
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    match app.selected_entry() {
+        Some(SelectedEntry::Peer(p)) => {
+            spans.push(Span::styled(" ▸ ", theme::muted()));
+            spans.push(Span::styled(
+                format!("@{}", p.short_id),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some((label, color)) = transport_badge(SelectedEntry::Peer(p), hub_count) {
+                spans.push(sep());
+                spans.push(Span::styled(label, Style::default().fg(color)));
+            }
+            spans.push(sep());
+            let (trust, color) = if p.key_changed {
+                ("⚠ key changed", Color::Red)
+            } else if p.verified {
+                ("✓ verified", Color::Green)
+            } else if p.pinned {
+                ("• pinned", Color::Cyan)
+            } else {
+                ("• unverified", Color::DarkGray)
+            };
+            spans.push(Span::styled(trust, Style::default().fg(color)));
+            let seen = fmt_relative(p.last_active_unix_ms);
+            if seen != "—" {
+                spans.push(sep());
+                spans.push(Span::styled(format!("seen {seen}"), theme::muted()));
+            }
+        }
+        Some(SelectedEntry::Room(r)) => {
+            spans.push(Span::styled(" ▸ ", theme::muted()));
+            spans.push(Span::styled(
+                format!("#{}", r.name),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if let Some((label, color)) = transport_badge(SelectedEntry::Room(r), hub_count) {
+                spans.push(sep());
+                spans.push(Span::styled(label, Style::default().fg(color)));
+            }
+            spans.push(sep());
+            let n = r.members.len();
+            spans.push(Span::styled(
+                format!("{n} member{}", if n == 1 { "" } else { "s" }),
+                theme::muted(),
+            ));
+        }
+        None => {
+            spans.push(Span::styled(" ▸ no conversation selected", theme::muted()));
+            spans.push(sep());
+            spans.push(Span::styled("Tab", theme::keylabel()));
+            spans.push(Span::styled(" actions  ", theme::muted()));
+            spans.push(Span::styled("^A", theme::keylabel()));
+            spans.push(Span::styled(" add contact  ", theme::muted()));
+            spans.push(Span::styled("^N", theme::keylabel()));
+            spans.push(Span::styled(" new room", theme::muted()));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let line = match &app.last_status {
         None => Line::from(Span::styled(" connecting to daemon… ", theme::warn())),
@@ -5412,6 +5497,37 @@ mod snapshot_tests {
         assert!(
             snap.contains("3 members"),
             "second room's member count must render; got:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn header_shows_selected_peer_context() {
+        // Slice 3: the top info header surfaces the selected peer's
+        // transport + trust, always-visible (no details pane needed).
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.selected = 0; // first peer: connected + verified
+        let snap = render_to_string(&app, 90, 24);
+        let header = snap.lines().nth(1).unwrap_or_default();
+        assert!(
+            header.contains("@u5lhmxps"),
+            "header must name the selected peer; got:\n{header}"
+        );
+        assert!(
+            header.contains("verified"),
+            "header must show trust state; got:\n{header}"
+        );
+    }
+
+    #[test]
+    fn header_shows_key_changed_warning() {
+        // The second peer has key_changed = true → header warns.
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.selected = 1; // second peer: key_changed
+        let snap = render_to_string(&app, 90, 24);
+        let header = snap.lines().nth(1).unwrap_or_default();
+        assert!(
+            header.contains("key changed"),
+            "header must warn on a changed key; got:\n{header}"
         );
     }
 
