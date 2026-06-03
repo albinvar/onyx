@@ -231,6 +231,8 @@ async fn dispatch_one_shot(
             identity_kem_pub_b32: encode_b32(&state.identity.kem_public().to_bytes()),
             // v0.1.16: our own onion, once the HS has published.
             onion: state.self_onion.get().cloned(),
+            // How many hubs we can fall back to for offline delivery.
+            hub_count: u32::try_from(state.configured_hubs.len()).unwrap_or(u32::MAX),
         },
         ApiRequest::Identity => ApiResponse::IdentityOk {
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
@@ -986,7 +988,10 @@ async fn handle_invite_to_room(
     if state.hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+            message: "no hubs configured — can't deliver to an offline/not-directly-connected \
+                      peer. In the TUI press Ctrl-G to enable public hubs (or add one), then \
+                      relaunch; or start the daemon with --hub onion:port,b32pubkey."
+                .into(),
         };
     }
 
@@ -1789,7 +1794,10 @@ async fn handle_remove_from_room(
     if state.hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+            message: "no hubs configured — can't deliver to an offline/not-directly-connected \
+                      peer. In the TUI press Ctrl-G to enable public hubs (or add one), then \
+                      relaunch; or start the daemon with --hub onion:port,b32pubkey."
+                .into(),
         };
     }
     let Some(group_id_bytes) = base32::decode(
@@ -2852,7 +2860,10 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
     if state.hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+            message: "no hubs configured — can't deliver to an offline/not-directly-connected \
+                      peer. In the TUI press Ctrl-G to enable public hubs (or add one), then \
+                      relaunch; or start the daemon with --hub onion:port,b32pubkey."
+                .into(),
         };
     }
     let Ok(fp) = onyx_core::crypto::Fingerprint::parse(peer_fingerprint) else {
@@ -2970,7 +2981,10 @@ fn handle_send_bootstrap(
     if hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+            message: "no hubs configured — can't deliver to an offline/not-directly-connected \
+                      peer. In the TUI press Ctrl-G to enable public hubs (or add one), then \
+                      relaunch; or start the daemon with --hub onion:port,b32pubkey."
+                .into(),
         };
     }
 
@@ -3117,7 +3131,10 @@ async fn handle_send_bootstrap_mls(
     if state.hub_outbounds.is_empty() {
         return ApiResponse::Error {
             code: ApiErrorCode::NotReady,
-            message: "no hubs configured; relaunch with --hub onion:port,b32pubkey".into(),
+            message: "no hubs configured — can't deliver to an offline/not-directly-connected \
+                      peer. In the TUI press Ctrl-G to enable public hubs (or add one), then \
+                      relaunch; or start the daemon with --hub onion:port,b32pubkey."
+                .into(),
         };
     }
 

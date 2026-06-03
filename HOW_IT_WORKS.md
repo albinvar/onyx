@@ -92,6 +92,22 @@ That's six different security layers your message traverses on its way to Bob. E
 
 ---
 
+## 1b. Direct vs hub delivery (when each is used)
+
+There are two ways a message reaches the other person. The TUI shows which one applies as a **transport badge** in the composer title.
+
+- **`● direct` (peer-to-peer).** You have a *live* Tor connection to the peer. This happens when you dialed their **connect code** (`onyx://connect/…`, which carries their `.onion` + identity key) — in the TUI: `Ctrl-A` → paste it (they share it via `Ctrl-E`), or `onyx dial`. No hub is involved. **Both of you must be online** and that circuit must be up.
+
+- **`◌ via hub`.** The peer isn't directly connected right now (offline, or you only know them through a hub-routed invite link). The message is sealed and handed to a **hub**, which stores it and forwards it when the peer comes online. A hub never sees plaintext (Layers 3–4) — only ciphertext + delivery timing. **This requires at least one hub configured.**
+
+- **`✕ no route` / `✕ no hub`.** The peer isn't directly connected *and* no hub is configured — so there's nowhere to deliver. Sending returns "no hubs configured."
+
+**Why a direct connection can't cover everything:** a peer-to-peer Tor circuit only exists while both parties are online. To message someone who's offline (or to reach a room whose members aren't all connected to you), you need a hub's store-and-forward. That's the whole reason hubs exist.
+
+**Configuring a hub** (so `via hub` works): in the TUI press `Ctrl-G` and enable **"use public hubs"** (a signed, opt-in list shipped with releases — default off), or add a specific `onion:port,b32pubkey`; then relaunch. Or start the daemon with `--hub …`. Public hubs are off by default because an anonymity tool shouldn't silently route your first-contact metadata through someone else's server.
+
+---
+
 ## 2. The six layers and what each one is for
 
 ### Layer 1: Local Unix-domain socket (TUI ↔ daemon)

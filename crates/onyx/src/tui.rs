@@ -662,6 +662,10 @@ struct StatusSnapshot {
     /// service publishes (still bootstrapping) / no-Tor build. Used to
     /// build the user's connect code for direct P2P.
     onion: Option<String>,
+    /// How many hubs the daemon can fall back to for offline delivery.
+    /// `0` → a not-directly-connected peer's message can't be delivered;
+    /// drives the transport badge + the "no hubs" guidance.
+    hub_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -2447,6 +2451,7 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
             fingerprint,
             tor_state,
             onion,
+            hub_count,
             ..
         }) => {
             app.last_status = Some(Ok(StatusSnapshot {
@@ -2455,6 +2460,7 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
                 fingerprint,
                 tor_state,
                 onion,
+                hub_count,
             }));
         }
         Ok(ApiResponse::Error { code, message }) => {
@@ -4386,6 +4392,35 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(body, area);
 }
 
+/// Transport badge for the composer: how a message to `entry` will be
+/// delivered, given the hub count. `None` when the daemon status isn't
+/// loaded yet (don't guess). A connected peer goes direct (P2P); otherwise
+/// it rides a hub if one is configured, else there's no route.
+fn transport_badge(
+    entry: SelectedEntry<'_>,
+    hub_count: Option<u32>,
+) -> Option<(&'static str, Color)> {
+    let hubs = hub_count?;
+    Some(match entry {
+        SelectedEntry::Peer(p) => {
+            if p.connected {
+                ("● direct", Color::Green)
+            } else if hubs > 0 {
+                ("◌ via hub", Color::Yellow)
+            } else {
+                ("✕ no route", Color::Red)
+            }
+        }
+        SelectedEntry::Room(_) => {
+            if hubs > 0 {
+                ("◌ via hub", Color::Yellow)
+            } else {
+                ("✕ no hub", Color::Red)
+            }
+        }
+    })
+}
+
 fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     // UX overhaul: colored border + a title that names the current
     // target ("Compose → #general" / "→ alice"), so it's always clear
@@ -4395,13 +4430,29 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         Some(SelectedEntry::Peer(p)) => (format!(" Compose → {} ", p.short_id), Color::Green),
         None => (" Compose ".to_string(), Color::DarkGray),
     };
+    // Transport badge: tell the user HOW this message will be delivered
+    // (direct P2P vs via a hub vs no route) before they hit Enter.
+    let hub_count = match &app.last_status {
+        Some(Ok(s)) => Some(s.hub_count),
+        _ => None,
+    };
+    let mut title_spans = vec![Span::styled(
+        title,
+        Style::default().fg(border).add_modifier(Modifier::BOLD),
+    )];
+    if let Some((label, color)) = app
+        .selected_entry()
+        .and_then(|e| transport_badge(e, hub_count))
+    {
+        title_spans.push(Span::styled(
+            format!("{label} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .title(Span::styled(
-            title,
-            Style::default().fg(border).add_modifier(Modifier::BOLD),
-        ));
+        .title(Line::from(title_spans));
 
     let line = if let Some(Err(msg)) = &app.last_send_result {
         Line::from(vec![
@@ -4721,6 +4772,7 @@ mod snapshot_tests {
                 .to_string(),
             tor_state,
             onion: Some("examplepublishedonionaddressforsnapshottests.onion".to_string()),
+            hub_count: 1,
         }));
         app
     }
