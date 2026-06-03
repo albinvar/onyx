@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.23 — 2026-06-03
+
+Umbrella for everything merged since v0.1.22 (see per-item entries below):
+
+- **Vault backup + passphrase rekey** — `onyx vault backup <dest>` and
+  `onyx vault rekey` (atomic re-encrypt; no recovery by design).
+- **Reliable clipboard + invite/connect cleanup carried forward**, plus a
+  **TUI cohesion pass**: corrected stale key hints, composer placeholder.
+- **Transport/online badge** in the composer (`● direct` / `◌ via hub` /
+  `✕ no route`) + a much clearer "no hubs configured" error.
+- **Details pane enrichment** for DM peers (transport, last-seen, short
+  fingerprint).
+- **Docs**: README keymap refreshed; HOW_IT_WORKS gained "Direct vs hub
+  delivery".
+
+Carried-forward honest status: musl binary not phone-verified; piko hub not
+client-tested end-to-end; per-sender room attribution + a persisted verified-✓
+badge are still follow-ups.
+
+---
+
 ## v0.2 TUI — 2026-06-03 — details-pane enrichment (peer)
 
 The right-column details pane for a selected DM peer was bare (just
