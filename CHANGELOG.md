@@ -6,6 +6,25 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 TUI — 2026-06-03 — details-pane enrichment (peer)
+
+The right-column details pane for a selected DM peer was bare (just
+name + state). Enriched with the identity/liveness info we already have.
+
+### Added
+- Peer details now show **transport** (`● direct` / `◌ via hub` / `✕ no
+  route`), **last-seen** (relative: "5m ago"), and a **short fingerprint**
+  (first 3 groups + … — full check via `/verify`). Actions box gains a
+  "verify safety #" hint.
+- `fmt_relative` + `short_fingerprint` helpers (unit-tested).
+
+### Note (follow-up)
+- **Pin status** (pinned / key-changed ⚠) and a persisted **verified ✓**
+  badge aren't shown yet — both need a new `PeerInfo` field / vault flag
+  from the daemon; queued as the next slice.
+
+---
+
 ## v0.2 TUI — 2026-06-03 — transport/online indicator + clearer no-hub error
 
 Direct response to "why didn't P2P work / where did my message go": the TUI
