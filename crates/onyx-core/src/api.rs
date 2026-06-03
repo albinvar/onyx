@@ -391,6 +391,10 @@ pub enum ApiRequest {
     /// the peer to appear via `Tail`/`Peers`), or an error if the daemon
     /// has no Tor runtime (e.g. a no-Tor/TCP-test build).
     DialPeer { onion: String, pubkey_b32: String },
+    /// C (verify): mark/unmark a pinned contact as out-of-band verified
+    /// (after comparing the safety number). `fingerprint` is the peer's
+    /// Ed25519 fingerprint. Replies [`ApiResponse::SetContactVerifiedOk`].
+    SetContactVerified { fingerprint: String, verified: bool },
 }
 
 /// One response line on the wire (daemon → client).
@@ -464,6 +468,9 @@ pub enum ApiResponse {
     /// proceeds asynchronously; the peer surfaces via `Tail`/`Peers`
     /// once connected.
     DialPeerOk,
+    /// Reply to [`ApiRequest::SetContactVerified`]. `updated` is false when
+    /// the contact isn't pinned yet (nothing to mark).
+    SetContactVerifiedOk { updated: bool },
     /// Reply to [`ApiRequest::History`]. Messages are ordered oldest
     /// → newest. May be shorter than `limit` if fewer messages exist
     /// (or empty if the peer has no exchanged messages yet).
@@ -653,6 +660,9 @@ pub enum ApiResponse {
 /// One row in `PeersOk`. Mirrors what the daemon's conversation
 /// registry holds for each live or recently-active peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// connected + pinned + key_changed + verified are independent status flags,
+// not a state machine — each is a distinct fact about the peer.
+#[allow(clippy::struct_excessive_bools)]
 pub struct PeerInfo {
     /// 8-char base32 prefix of the peer's X25519 identity public key.
     /// Used as a stable user-facing handle in `Send { peer_short }`
@@ -670,6 +680,17 @@ pub struct PeerInfo {
     pub last_message_preview: Option<String>,
     /// Daemon wall clock (ms since UNIX epoch) of the last activity.
     pub last_active_unix_ms: u64,
+    /// C (verify): TOFU pin status, joined from the vault. `pinned` =
+    /// we've pinned this peer's identity key; `key_changed` = a different
+    /// key was later presented (possible MITM / rotation — show a warning);
+    /// `verified` = the user confirmed the safety number out-of-band. All
+    /// `#[serde(default)]` for wire back-compat with older daemons.
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub key_changed: bool,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// One past message in a [`ApiResponse::HistoryOk`] reply.
@@ -1207,6 +1228,9 @@ mod tests {
                 connected: true,
                 last_message_preview: Some("hi".into()),
                 last_active_unix_ms: 1_700_000_000_000,
+                pinned: true,
+                key_changed: false,
+                verified: true,
             }],
         };
         let line = encode_response_line(&r).unwrap();
@@ -1264,6 +1288,9 @@ mod tests {
                 connected: true,
                 last_message_preview: None,
                 last_active_unix_ms: 1,
+                pinned: false,
+                key_changed: false,
+                verified: false,
             },
         };
         let disconnected = ApiResponse::EventPeerDisconnected {

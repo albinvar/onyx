@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## v0.2 verification (C) — 2026-06-03 — persisted verified ✓ + pin/key-changed badges
+
+Completes the verification thread: the safety-number check now *sticks*, and
+the TUI surfaces trust state everywhere.
+
+### Added
+- **Persisted "verified ✓" flag** per contact. After comparing the safety
+  number (Ctrl-K → Verify, or `/verify`), press **`v`** to mark the contact
+  verified — stored in the vault (`pinned_keys.verified`, additive migration).
+- **Trust surfaced in the TUI**: the conversation list shows `⚠` (key changed —
+  possible MITM) or `✓` (verified) next to a peer; the details pane shows a
+  **trust** line (`⚠ KEY CHANGED` / `✓ verified` / `📌 pinned` / `— not pinned`).
+- API: `PeerInfo` gains `pinned` / `key_changed` / `verified` (joined from the
+  vault in the Peers handler); new `SetContactVerified` verb.
+- Vault: `set_verified` + `pin_status` (unit-tested).
+
+### Note
+- `⚠ KEY CHANGED` always wins over `✓` — a changed key invalidates a prior
+  verification (re-verify out of band). You can only verify a contact you've
+  actually exchanged a message with (so the key is pinned).
+
+---
+
 ## Release v0.1.23 — 2026-06-03
 
 Umbrella for everything merged since v0.1.22 (see per-item entries below):

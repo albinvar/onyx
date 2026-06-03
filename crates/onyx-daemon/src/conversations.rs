@@ -585,6 +585,11 @@ fn info_of(state: &ConversationState) -> PeerInfo {
         connected: state.connected,
         last_message_preview,
         last_active_unix_ms: state.last_active_unix_ms,
+        // Pin/verify status is joined from the vault by the Peers API
+        // handler (this in-memory registry has no vault access).
+        pinned: false,
+        key_changed: false,
+        verified: false,
     }
 }
 

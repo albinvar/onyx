@@ -245,8 +245,35 @@ async fn dispatch_one_shot(
                 .collect(),
         },
         ApiRequest::Peers => {
-            let entries = state.conversations.lock().await.list();
+            let mut entries = state.conversations.lock().await.list();
+            // C (verify): join TOFU pin status from the vault so the TUI can
+            // badge each peer (pinned / key-changed ⚠ / verified ✓).
+            {
+                let vault = state.vault.lock().await;
+                for e in &mut entries {
+                    if let Ok(Some((key_changed, verified))) =
+                        vault.pin_status(state.identity_id, &e.fingerprint)
+                    {
+                        e.pinned = true;
+                        e.key_changed = key_changed;
+                        e.verified = verified;
+                    }
+                }
+            }
             ApiResponse::PeersOk { entries }
+        }
+        ApiRequest::SetContactVerified {
+            fingerprint,
+            verified,
+        } => {
+            let vault = state.vault.lock().await;
+            match vault.set_verified(state.identity_id, fingerprint, *verified) {
+                Ok(n) => ApiResponse::SetContactVerifiedOk { updated: n > 0 },
+                Err(e) => ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("set verified: {e}"),
+                },
+            }
         }
         ApiRequest::History { peer_short, limit } => {
             // Both sides are small constants; the only failure mode of
