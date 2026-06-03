@@ -6,6 +6,15 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.24 — 2026-06-03
+
+- **Verification, completed**: persisted **verified ✓** flag (press `v` in the
+  Verify screen) + **pin / key-changed ⚠** badges in the conversation list and
+  details pane. `PeerInfo` carries pin status; `SetContactVerified` verb.
+- (Carries the v0.1.23 line forward — see entries below.)
+
+---
+
 ## v0.2 verification (C) — 2026-06-03 — persisted verified ✓ + pin/key-changed badges
 
 Completes the verification thread: the safety-number check now *sticks*, and
