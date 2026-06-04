@@ -3305,6 +3305,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "onyx-metrics"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "onyx-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "onyxd"
 version = "0.0.1"
 dependencies = [
