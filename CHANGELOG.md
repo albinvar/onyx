@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Hub telemetry (opt-in) — 2026-06-04 — P5 public status-site publisher
+
+A Tor-Metrics-style **public** fleet-status page, built so it only ever
+publishes the liveness-only data (no usage, no user data).
+
+### Added
+- `onyx-metrics --publish-dir <dir>` (+ `--publish-interval-secs`, default
+  60): periodically renders the same liveness-only `status.json` + a
+  self-contained `index.html` and writes them **atomically** (temp + rename)
+  into the directory. Point any web server — or an onion service — at that
+  directory to serve a public status page; the publisher never exposes the
+  live store or the Tor ingest. `publish_files`/`atomic_write` (unit-tested).
+
+### Honest scope
+- The published page shows only fleet liveness (up/stale · version · uptime
+  bucket · last-seen · version distribution) — the same already-public data
+  as the local page. It deliberately shows **no** usage/users/traffic: unlike
+  Tor (millions of relays + DP-noised aggregates), Onyx's hub set is tiny, so
+  any usage number would be identifying. Serving it publicly (clearnet domain
+  and/or onion) is a deploy step, not enabled by the binary alone.
+
+---
+
 ## Hub telemetry (opt-in) — 2026-06-04 — P4 docs (METRICS.md)
 
 - **`METRICS.md`**: the threat model + field justification for the opt-in

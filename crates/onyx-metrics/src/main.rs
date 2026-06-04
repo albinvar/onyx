@@ -81,6 +81,19 @@ struct Args {
     /// Custom Tor state directory (Arti keystore + cache).
     #[arg(long, env = "ONYX_METRICS_TOR_STATE_DIR")]
     tor_state_dir: Option<std::path::PathBuf>,
+
+    /// Public status-site output directory. When set, the collector
+    /// periodically writes a static `status.json` + `index.html` here
+    /// (atomically). Point any web server or an onion service at this
+    /// directory to publish a Tor-Metrics-style fleet status page. The
+    /// published data is LIVENESS-ONLY — the same safe fields as the local
+    /// status page — so it is fine to expose publicly.
+    #[arg(long, env = "ONYX_METRICS_PUBLISH_DIR")]
+    publish_dir: Option<std::path::PathBuf>,
+
+    /// How often (seconds) to regenerate the published status files.
+    #[arg(long, env = "ONYX_METRICS_PUBLISH_INTERVAL_SECS", default_value_t = 60)]
+    publish_interval_secs: u64,
 }
 
 /// Allowlist file shape.
@@ -179,6 +192,19 @@ async fn main() -> Result<()> {
         let store = store.clone();
         let stale_after = args.stale_after_secs;
         tokio::spawn(async move { run_http(http, store, stale_after).await });
+    }
+
+    // P5: optional static public status-site publisher. Writes liveness-only
+    // status.json + index.html atomically into --publish-dir so any web
+    // server / onion can serve a public fleet status page.
+    if let Some(dir) = args.publish_dir.clone() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating publish dir {}", dir.display()))?;
+        let store = store.clone();
+        let stale_after = args.stale_after_secs;
+        let interval = std::time::Duration::from_secs(args.publish_interval_secs.max(5));
+        info!(dir = %dir.display(), interval_secs = interval.as_secs(), "public status-site publisher enabled (liveness-only)");
+        tokio::spawn(async move { run_publisher(&dir, &store, stale_after, interval).await });
     }
 
     // Tor hidden service for inbound heartbeats.
@@ -364,6 +390,49 @@ async fn handle_http(
     sock.write_all(resp.as_bytes()).await?;
     sock.flush().await?;
     Ok(())
+}
+
+// ── public static status-site publisher (P5) ───────────────────────────────
+
+/// Periodically render the liveness-only status page + JSON and write them
+/// atomically into `dir`, so a plain web server or an onion can serve a
+/// public fleet-status site without ever touching the live store or ingest.
+async fn run_publisher(
+    dir: &std::path::Path,
+    store: &Arc<Mutex<Store>>,
+    stale_after: u64,
+    interval: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        let records = {
+            let store = store.lock().expect("store mutex poisoned");
+            store.all().unwrap_or_default()
+        };
+        let now = now_secs();
+        let html = render_html(&records, now, stale_after);
+        let json = render_json(&records, now, stale_after);
+        if let Err(e) = publish_files(dir, &html, &json) {
+            warn!(error = %e, "status-site publish failed (will retry next tick)");
+        }
+    }
+}
+
+/// Write `index.html` + `status.json` into `dir`, each atomically.
+fn publish_files(dir: &std::path::Path, html: &str, json: &str) -> std::io::Result<()> {
+    atomic_write(&dir.join("index.html"), html.as_bytes())?;
+    atomic_write(&dir.join("status.json"), json.as_bytes())?;
+    Ok(())
+}
+
+/// Atomically replace `path`: write a sibling temp file then rename over it
+/// (rename is atomic within a filesystem), so a web server never serves a
+/// half-written page.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// True if the hub's last heartbeat is within the freshness window.
@@ -552,5 +621,24 @@ mod tests {
     #[test]
     fn html_escapes_fields() {
         assert_eq!(html_escape("a<b>&\"c"), "a&lt;b&gt;&amp;&quot;c");
+    }
+
+    #[test]
+    fn publish_writes_both_files_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        publish_files(dir.path(), "<html>hi</html>", "{\"ok\":true}").unwrap();
+        let html = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        let json = std::fs::read_to_string(dir.path().join("status.json")).unwrap();
+        assert_eq!(html, "<html>hi</html>");
+        assert_eq!(json, "{\"ok\":true}");
+        // No temp files left behind.
+        assert!(!dir.path().join("index.tmp").exists());
+        assert!(!dir.path().join("status.tmp").exists());
+        // A second publish overwrites cleanly.
+        publish_files(dir.path(), "<html>2</html>", "{}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("index.html")).unwrap(),
+            "<html>2</html>"
+        );
     }
 }
