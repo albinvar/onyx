@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.26 — 2026-06-04
+
+Umbrella for everything merged since v0.1.25 (see per-item entries below):
+
+- **Opt-in hub liveness telemetry (P1–P5)** — a privacy-preserving way to
+  watch your hub fleet's health, built so it can't be used for time-series
+  correlation or deanonymization:
+  - **Liveness-only heartbeat** (`onyx-core::metrics`): version · up ·
+    tor_reachable · coarse uptime bucket · 5-min-snapped timestamp · public
+    hub id. **No** usage counters, by construction.
+  - **Hub reporter** (`onyx-hub --metrics-report`): signed, Tor-only on a
+    fresh isolated circuit, fixed cadence, fail-open, off by default.
+  - **`onyx-metrics` collector**: onion ingest, Ed25519-auth + allowlist,
+    latest-state-only store (no history), localhost dashboard, and a
+    `--publish-dir` static **public** status page (liveness-only).
+  - Threat model in **`METRICS.md`** (+ `ANONYMITY.md` §3.14).
+- **Release:** `onyx-metrics` is now built + cosign-signed for all targets,
+  so operators can pull it through the same verified path as `onyx-hub`.
+
+---
+
 ## Hub telemetry (opt-in) — 2026-06-04 — P5 public status-site publisher
 
 A Tor-Metrics-style **public** fleet-status page, built so it only ever

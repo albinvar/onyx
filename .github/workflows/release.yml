@@ -138,7 +138,7 @@ jobs:
           mkdir -p artifacts
           TARGET=${{ matrix.target }}
           VERSION=${GITHUB_REF_NAME#v}
-          for bin in onyx onyxd onyx-hub; do
+          for bin in onyx onyxd onyx-hub onyx-metrics; do
             src="target/${TARGET}/release/${bin}${{ matrix.ext }}"
             dst="artifacts/${bin}-v${VERSION}-${TARGET}${{ matrix.ext }}"
             cp "$src" "$dst"
@@ -220,7 +220,7 @@ jobs:
           # downloads one binary can verify it without the manifest
           # round-trip. Bundle format (`*.cosign-bundle`) is
           # self-contained — includes cert + sig + Rekor entry.
-          for bin in onyx-v* onyxd-v* onyx-hub-v*; do
+          for bin in onyx-v* onyxd-v* onyx-hub-v* onyx-metrics-v*; do
             [[ -f "$bin" ]] || continue
             echo "── Signing $bin"
             cosign sign-blob \
@@ -287,6 +287,7 @@ jobs:
             dist/onyx-*
             dist/onyxd-*
             dist/onyx-hub-*
+            dist/onyx-metrics-*
             dist/SHA256SUMS.txt
             dist/SHA256SUMS.txt.cosign-bundle
             dist/install.sh
