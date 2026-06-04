@@ -244,6 +244,13 @@ Every transport that bypasses Tor is a test/dev mode: `--no-tor`, `--listen-tcp`
   * **What we do (A1.2):** the daemon **refuses to start** if any clearnet flag is set unless the operator *explicitly acknowledges* it with `--allow-clearnet` (`ONYX_ALLOW_CLEARNET=1`). Safe-by-default — the only way to lose anonymity is to ask for it in writing. When acknowledged, a single unmissable startup `warn!` states "Tor is OFF, NO ANONYMITY, your IP is exposed." Decision logic is a pure, unit-tested function (`clearnet_guard`).
   * **Scope (honest):** a *configuration* guard — it prevents accidentally entering a clearnet mode. It does not, and cannot, detect a Tor-layer bug that leaks clearnet *while in Tor mode* (arti's responsibility); the test/dev clearnet modes still exist by design (the smoke harness sets the ack deliberately).
 
+### 3.14 Hub telemetry (opt-in) — liveness only, designed not to leak
+
+A hub operator can opt in to reporting **liveness** to a central collector (`--metrics-report`), so they can watch their fleet's health. This deliberately reintroduces a *coarse, per-hub, liveness-only* central observer — and is built so it cannot become a user-deanonymization surface.
+
+  * **What we do:** the heartbeat carries only signals that are static or independent of user activity (software version, up/reachable, a coarse uptime *bucket*, a 5-min-snapped timestamp, and the already-public hub id). It carries **no** counter that tracks user activity — because a repeated stream of those would be a time series an adversary could correlate against a target's online windows (and bucketing the values doesn't fix that, since the *sequence* still reveals activity shape). The report is signed, sent **Tor-only on a fresh isolated circuit** (hub IP never exposed), at a fixed cadence, fail-open. The collector stores only the latest state per hub (no history) and authorises by allowlist.
+  * **Scope (honest):** OFF by default. Enabling it is a conscious choice to learn coarse liveness centrally and makes the collector a target; the mitigations shrink the surface to "no IPs, no per-user data, no history, signed, Tor-only, allowlisted" but it is non-zero. Full threat model + field justification: [`METRICS.md`](./METRICS.md).
+
 ## 4. Practical recommendations
 
 Match Onyx to your actual threat model. The right tool depends on which adversary you are realistically facing.

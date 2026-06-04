@@ -6,6 +6,20 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Hub telemetry (opt-in) — 2026-06-04 — P4 docs (METRICS.md)
+
+- **`METRICS.md`**: the threat model + field justification for the opt-in
+  telemetry — the time-series-correlation argument (why usage metrics are
+  excluded, not just bucketed), the complete emitted field set, transport
+  (signed/Tor-only/fixed-cadence/fail-open), the collector (allowlist, no
+  history, localhost status page), and the honest residual risk.
+- `ANONYMITY.md` §3.14 cross-links it; README doc index updated.
+
+This completes the four-phase opt-in hub telemetry work (P1 wire type ·
+P2 reporter · P3 collector · P4 docs).
+
+---
+
 ## Hub telemetry (opt-in) — 2026-06-04 — P3 collector (onyx-metrics)
 
 The central collector for the opt-in liveness heartbeats.
