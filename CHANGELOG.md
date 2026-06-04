@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.25 — 2026-06-03
+
+Umbrella for everything merged since v0.1.24 (see per-item entries below):
+
+- **TUI-UX trio** — the conversation list, command surface, and a new header,
+  reworked for "more info, fewer commands to remember":
+  - **Richer conversation list** — 2-line rows: presence · name · relative
+    last-activity · ⚠/✓ trust · `(N)` unread, plus a dim preview line (last
+    message, or member count for rooms).
+  - **Context action menu (`Tab`)** + **complete palette** — point at a
+    conversation and pick a relevant action; every feature now reachable from
+    `Ctrl-K` (added "View daemon logs").
+  - **Info header** — an always-visible top row with the selected
+    conversation's transport + trust + members/last-seen (previously only in
+    the wide-terminal details pane).
+- **Local message retention** — `/retention <off|30m|1h|7d>` auto-clears
+  persisted room history past the window (local-only; mutual TTL is a
+  documented next slice).
+
+---
+
 ## v0.2 TUI-UX (A) — 2026-06-03 — info/status header
 
 Third and final of the three TUI-UX slices.
