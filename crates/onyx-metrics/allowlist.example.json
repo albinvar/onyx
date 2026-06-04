@@ -1,0 +1,13 @@
+{
+  "_comment": "Enrollment allowlist for onyx-metrics. Only hubs whose Ed25519 reporting key (sig_pub_b32) is listed here are accepted. A hub logs its reporting key at startup when --metrics-report is set; the collector also logs the key of any un-enrolled heartbeat it receives, so you can copy it in here and reload (restart the collector).",
+  "hubs": [
+    {
+      "name": "piko",
+      "sig_pub_b32": "REPLACE_WITH_PIKO_HUB_ED25519_REPORTING_KEY"
+    },
+    {
+      "name": "pi",
+      "sig_pub_b32": "REPLACE_WITH_PI_HUB_ED25519_REPORTING_KEY"
+    }
+  ]
+}

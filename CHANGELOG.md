@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Hub telemetry (opt-in) — 2026-06-04 — P3 collector (onyx-metrics)
+
+The central collector for the opt-in liveness heartbeats.
+
+### Added
+- **`onyx-metrics` crate/binary**: an onion service that receives signed
+  `SignedHeartbeat`s from enrolled hubs over Tor, stores only the *latest
+  state per hub* (no time series — the collector itself can't become a
+  correlation oracle), and serves a plain **localhost** status page.
+  - **Authenticated** (Ed25519 sig) + **authorised** by an `--allowlist`
+    JSON of enrolled reporting keys; un-enrolled / bad-sig / stale-or-future
+    heartbeats are dropped (and unknown keys logged so you can enrol them).
+  - SQLite last-seen store (`store.rs`); status page on `127.0.0.1:9876`
+    (`/` HTML + `/json`), loopback-only by default (non-loopback bind is
+    loudly warned) — view it over an SSH tunnel.
+  - `allowlist.example.json` template. 10 unit tests (classify accept/
+    bad-sig/unenrolled/stale, allowlist parse, html/json render, freshness).
+
+---
+
 ## Hub telemetry (opt-in) — 2026-06-04 — P1 wire type + P2 reporter
 
 Opt-in, privacy-preserving **liveness** telemetry so an operator can see

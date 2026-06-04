@@ -1,0 +1,31 @@
+[package]
+name = "onyx-metrics"
+description = "Onyx metrics collector — receives signed, liveness-only hub heartbeats over Tor and serves a local status page. Stores no user data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "onyx-metrics"
+path = "src/main.rs"
+
+[dependencies]
+onyx-core = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
