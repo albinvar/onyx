@@ -26,6 +26,7 @@ pub mod error;
 pub mod flows;
 pub mod identity;
 pub mod invite;
+pub mod metrics;
 pub mod mls;
 pub mod room;
 pub mod routing;
