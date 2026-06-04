@@ -46,6 +46,7 @@ use crate::state::{GossipMode, HubState, PeerHubConfig};
 mod handler;
 mod peer_link;
 mod rate_limit;
+mod reporter;
 mod state;
 mod store;
 
@@ -202,6 +203,23 @@ struct Args {
     /// with 100 clients that's ~50 KB/s of floor traffic.
     #[arg(long, env = "ONYX_HUB_CONSTANT_RATE_MS")]
     constant_rate_ms: Option<u64>,
+
+    /// Opt-in hub liveness telemetry. When set to a collector `.onion`
+    /// (`onion` or `onion:port`), the hub periodically sends a SIGNED,
+    /// LIVENESS-ONLY heartbeat to that collector over Tor. The report
+    /// contains only software version, up/reachable, a coarse uptime
+    /// bucket, and a 5-min-snapped timestamp — NEVER any counter that
+    /// tracks user activity (connections/frames/etc.), so it cannot be
+    /// used for time-series correlation or deanonymization. Off by
+    /// default; Tor-only; fail-open. See `METRICS.md`.
+    #[arg(long, env = "ONYX_HUB_METRICS_REPORT")]
+    metrics_report: Option<String>,
+
+    /// Interval (seconds) between liveness heartbeats when
+    /// `--metrics-report` is set. A fixed cadence carries no signal
+    /// beyond up/down. Default 300 s (5 min).
+    #[arg(long, env = "ONYX_HUB_METRICS_INTERVAL_SECS", default_value_t = 300)]
+    metrics_interval_secs: u64,
 }
 
 // Linear startup: tracing → vault → identity → Tor → HS → state →
@@ -220,6 +238,10 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Captured up front so the opt-in liveness reporter can report a
+    // (coarse-bucketed) process uptime.
+    let process_start = std::time::Instant::now();
+
     let mut vault = open_or_create_vault(&args.vault, args.passphrase.as_bytes())
         .context("opening hub vault")?;
     let (_identity_id, identity) =
@@ -232,6 +254,12 @@ async fn main() -> anyhow::Result<()> {
         hub_pub_b32 = %identity_pub_b32,
         "hub vault unlocked, identity loaded — clients dial with --hub-onion + --hub-pubkey"
     );
+
+    // Captured for the opt-in liveness reporter (P2): the hub's Ed25519
+    // signing seed (to sign heartbeats) and its public X25519 id (label).
+    // Owned copies so the reporter task doesn't borrow `identity`.
+    let metrics_signing_seed: [u8; 32] = *identity.signing().to_bytes();
+    let metrics_hub_id_b32 = identity_pub_b32.clone();
 
     drop(args.passphrase);
     // v0 hub keeps no per-connection persisted state; release the
@@ -283,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
         .publish_hidden_service(HS_NICKNAME)
         .map_err(|e| anyhow::anyhow!("hidden service publish failed: {e}"))?;
 
+    let onion_present = hs.onion_address().is_some();
     if let Some(addr) = hs.onion_address() {
         info!(
             onion = %addr,
@@ -291,6 +320,28 @@ async fn main() -> anyhow::Result<()> {
         );
     } else {
         warn!("hub HS has no address yet — Arti will produce one shortly");
+    }
+
+    // Metrics P2: opt-in liveness reporter. Spawned only on the real-Tor
+    // path (the --no-tor / --listen-tcp modes return earlier), so there is
+    // no clearnet code path for telemetry. Off unless --metrics-report set.
+    if let Some(raw) = args.metrics_report.as_deref() {
+        let cfg = crate::reporter::parse_reporter_target(
+            raw,
+            std::time::Duration::from_secs(args.metrics_interval_secs.max(1)),
+        )
+        .context("--metrics-report")?;
+        let tor_for_reporter = tor.clone();
+        let hub_id = metrics_hub_id_b32.clone();
+        tokio::spawn(crate::reporter::run_heartbeat_reporter(
+            tor_for_reporter,
+            cfg,
+            metrics_signing_seed,
+            hub_id,
+            onyx_core::VERSION.to_string(),
+            onion_present,
+            process_start,
+        ));
     }
 
     let mut accept = hs

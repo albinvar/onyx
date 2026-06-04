@@ -6,6 +6,36 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Hub telemetry (opt-in) — 2026-06-04 — P1 wire type + P2 reporter
+
+Opt-in, privacy-preserving **liveness** telemetry so an operator can see
+their own hubs' health on a central collector — built so it cannot be used
+for time-series correlation or deanonymization.
+
+### Added
+- **`onyx-core::metrics`** (P1): `HubHeartbeat` — the wire contract. Carries
+  ONLY liveness/health that's already publicly observable for a listed hub
+  (software version, `up`, `tor_reachable`, a coarse uptime bucket
+  `<1h/<1d/<1w/>1w`, a 5-min-snapped timestamp, and the public hub id as a
+  label). It contains **no** counter that tracks user activity — a repeated
+  stream of those would form a correlatable time series; bucketing values
+  doesn't help. `SignedHeartbeat` wraps it with an Ed25519 signature +
+  verifying key; CBOR wire format. 7 unit tests.
+- **Hub reporter** (P2): opt-in `--metrics-report <onion[:port]>`
+  (+ `--metrics-interval-secs`, default 300). Sends a signed heartbeat over
+  Tor on a **fresh isolated circuit**, at a **fixed cadence** (no
+  user-correlated signal), **fail-open** (collector down ⇒ drop, never
+  block the hub), and **Tor-only** (spawned only on the real-Tor path —
+  no clearnet code path). Off by default.
+
+### Honest scope
+- Inert until a collector exists (P3) and the flag is set. Reporting is the
+  operator's explicit choice; it deliberately reintroduces a *coarse,
+  per-hub, liveness-only* central observer and nothing finer. Full threat
+  model lands in `METRICS.md` (P4).
+
+---
+
 ## Release v0.1.25 — 2026-06-03
 
 Umbrella for everything merged since v0.1.24 (see per-item entries below):
