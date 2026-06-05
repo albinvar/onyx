@@ -1430,8 +1430,10 @@ fn dispatch_vault(cmd: VaultCommand, vault_path: &std::path::Path) -> anyhow::Re
 
     match cmd {
         VaultCommand::Backup { dest } => {
-            // A plain file copy: the vault is already encrypted at rest with
-            // your current passphrase, so the copy is a valid backup.
+            // A plain file copy of the vault. NOTE: only the key-material
+            // columns inside it are encrypted; message history, contacts,
+            // and routing metadata are PLAINTEXT (see SECURITY.md known
+            // gaps), so the backup is as sensitive as the live vault.
             std::fs::copy(vault_path, &dest).with_context(|| {
                 format!(
                     "copying vault {} → {}",
@@ -1447,8 +1449,11 @@ fn dispatch_vault(cmd: VaultCommand, vault_path: &std::path::Path) -> anyhow::Re
             }
             println!("backed up vault to {}", dest.display());
             eprintln!(
-                "note: the backup is encrypted with your CURRENT passphrase. \
-                 Restore by copying it back over {} while the daemon is stopped.",
+                "⚠ note: your secret KEYS in this backup are encrypted with your \
+                 current passphrase, but message history and contacts are stored \
+                 in PLAINTEXT (Onyx does not yet encrypt those at rest) — keep the \
+                 backup file secret. Restore by copying it back over {} while the \
+                 daemon is stopped.",
                 vault_path.display()
             );
             Ok(ExitCode::SUCCESS)

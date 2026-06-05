@@ -49,9 +49,17 @@ Can inject, modify, delay traffic.
 
 ### A5. Local non-privileged adversary on the user's device
 Other user accounts, processes without root.
-- **Cannot:** read Onyx data — encrypted at rest with passphrase-derived key.
+- **Cannot:** recover your secret keys — `identities`, `mls_state`, and
+  `replay_state` are AEAD-encrypted with a passphrase-derived key.
+- **⚠️ CAN currently read your message history + contact graph** — `room_messages`,
+  `peer_dial`, `pinned_keys`, `room_member_kems`, `received_files` are stored as
+  **plaintext** in the vault (KNOWN GAP, top open item — see `SECURITY.md`).
+  Onyx does **not** yet encrypt those at rest. Mitigated only by file
+  permissions (`vault.db` is `0600`), not by cryptography.
 - **Cannot:** connect to a running Onyx daemon — local API socket is `chmod 0600`, accessible only to the daemon's UID.
-- **Defense:** at-rest encryption + filesystem permissions on the API socket.
+- **Defense:** key-material at-rest encryption + filesystem permissions
+  (`vault.db` 0600, API socket 0600). **Full at-rest encryption of
+  messages/contacts is not yet implemented.**
 - **Note:** the original `0.1-draft` of this section claimed "per-session token" authentication for the local API. The shipped v0 implementation uses filesystem permissions instead (`crates/onyxd/src/api_server.rs::bind_listener`). The two defend equivalently against this adversary, but the threat model has been corrected to match what is implemented. A token-based handshake is tracked as a future improvement (it would let SO_PEERCRED-less platforms — none of which we currently target — gain equivalent auth).
 
 ### A6. Casual targeted attacker

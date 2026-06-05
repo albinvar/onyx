@@ -209,7 +209,7 @@ rm ~/.local/bin/onyx-hub   # if installed
 rm -rf ~/.onyx             # ☠ deletes vault, identity, scrollback, files
 ```
 
-The vault is encrypted at rest, but if you have any reason to suspect device compromise, also wipe free disk space (`diskutil secureErase` on macOS, `shred` / `dd if=/dev/zero` on Linux) — `zeroize` scrubs RAM but can't reach what's already been swapped or written to disk pages.
+⚠️ **The vault only encrypts your secret keys at rest — not your messages or contacts.** Your identity/MLS/replay keys are AEAD-encrypted with your passphrase, but `room_messages`, contacts/pins, and routing metadata are stored as **plaintext** in `~/.onyx/vault.db` (a known gap; full at-rest encryption is the top open item — see `SECURITY.md`). Anyone with read access to that file can recover your message history and contact graph **without your passphrase**, so treat the file (and any backups) as highly sensitive. If you suspect device compromise, also wipe free disk space (`diskutil secureErase` on macOS, `shred` / `dd if=/dev/zero` on Linux) — `zeroize` scrubs RAM but can't reach what's already been swapped or written to disk pages.
 
 ## §6 Reporting install bugs
 

@@ -65,7 +65,7 @@ Same view as a malicious operator. Can additionally log traffic going forward. C
 Cannot read content (E2E). Cannot impersonate users (signatures). Can delay messages but not undetectably reorder them within a session (sequence numbers). Can perform denial of service.
 
 **A5. Local non-privileged adversary on the user's device (other user accounts, processes without root).**
-Cannot read Onyx data — encrypted at rest with passphrase-derived key. Cannot connect to a running Onyx daemon — local API authenticated with per-session token.
+Cannot recover secret keys (`identities`/`mls_state`/`replay_state` are AEAD-encrypted with a passphrase-derived key). **⚠️ CAN currently read message history + contacts — `room_messages`, `peer_dial`, `pinned_keys`, etc. are stored as plaintext in the vault (KNOWN GAP; full at-rest encryption not yet implemented — see SECURITY.md). Protected today only by `vault.db` being `0600`, not by cryptography.** Cannot connect to a running Onyx daemon — local API socket is `0600` (UID-restricted).
 
 **A6. Casual targeted attacker.**
 Someone trying to deanonymize a specific Onyx user without nation-state resources. Defeated by the combined defenses, assuming the user follows operational security guidance.

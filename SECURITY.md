@@ -22,6 +22,17 @@ Onyx is a pre-1.0 research and engineering project. As of the date above:
 - No reproducible build pipeline exists yet. No signed releases exist yet.
 - No fuzzing of wire-format decoders, vault loaders, or MLS framing has been performed beyond what `cargo test` and `proptest` cover (see `crates/onyx-core/src/*/tests`).
 - No timing-side-channel analysis has been performed.
+- **⚠️ The vault is NOT fully encrypted at rest.** Only key material
+  (`identities`, `mls_state`, `replay_state`) is AEAD-encrypted with your
+  passphrase. Your **message history and contact graph are stored as
+  plaintext** (`room_messages`, `peer_dial`, `pinned_keys`,
+  `room_member_kems`, `received_files`): anyone with read access to
+  `~/.onyx/vault.db` can recover them **without your passphrase**
+  (`sqlite3 vault.db "SELECT text,sender_fp FROM room_messages"`).
+  Protected today only by file permissions (`0600`), not cryptography.
+  This is the **top open security item** (whole-DB encryption, e.g.
+  SQLCipher). Until it lands, the honest statement is: *"Onyx does not
+  encrypt your message history or contacts at rest."*
 
 **Practical consequence:** Onyx is appropriate for learning, experimentation, hobby chat, and demonstrating that Noise + MLS + Tor compose correctly in Rust. It is **not** appropriate for any use where the safety, freedom, or livelihood of the user depends on the protocol's security. Use Signal, Briar, or similar mature tools for those situations.
 
