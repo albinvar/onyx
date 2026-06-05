@@ -47,7 +47,12 @@ const HS_NICKNAME: &str = "onyx-metrics";
 const MAX_FRAME_BYTES: u32 = 4096;
 /// Reject heartbeats whose self-reported timestamp is older than this — a
 /// dead hub's captured beat must not keep it looking alive (replay guard).
-const MAX_REPORT_AGE_SECS: u64 = 3600;
+/// Audit #9: tightened 3600 → 600 s. Hubs report every 300 s and the ts is
+/// snapped to a 5-min boundary, so a freshly-sent beat is at most ~5-6 min
+/// old on arrival; 10 min comfortably covers Tor delivery latency while
+/// shrinking the window in which a captured beat could be replayed to fake
+/// liveness from one hour to ten minutes.
+const MAX_REPORT_AGE_SECS: u64 = 600;
 /// Tolerated clock skew for a heartbeat timestamp in the future.
 const MAX_SKEW_SECS: u64 = 600;
 
@@ -562,6 +567,22 @@ mod tests {
         // far past "now" → heartbeat is implausibly in the future.
         assert_eq!(
             classify(&signed, &allow, 1_700_000_100 - 99_999),
+            Ingest::Stale
+        );
+    }
+
+    #[test]
+    fn classify_replay_window_is_ten_minutes() {
+        // Audit #9: a beat a few minutes old is fine; one older than the
+        // 10-minute replay window is rejected.
+        let (_sk, signed) = signed_now(1_700_000_100);
+        let allow = allow_of(&signed);
+        assert_eq!(
+            classify(&signed, &allow, 1_700_000_100 + 180),
+            Ingest::Accept
+        );
+        assert_eq!(
+            classify(&signed, &allow, 1_700_000_100 + 900),
             Ingest::Stale
         );
     }

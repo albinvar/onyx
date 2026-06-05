@@ -6,6 +6,16 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security (audit #9) — 2026-06-05 — tighten metrics replay window
+
+- `onyx-metrics`: shrink the heartbeat replay-acceptance window from **1 h →
+  10 min** (`MAX_REPORT_AGE_SECS` 3600 → 600). Hubs report every 5 min with a
+  5-min-snapped timestamp, so a fresh beat is ≤~6 min old on arrival; 10 min
+  covers Tor latency while cutting the window in which a captured beat could be
+  replayed to fake a dead hub's liveness. Boundary test added.
+
+---
+
 ## Release v0.1.26 — 2026-06-04
 
 Umbrella for everything merged since v0.1.25 (see per-item entries below):
