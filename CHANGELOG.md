@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security (audit #1, slice 1) — 2026-06-05 — encrypt room messages at rest
+
+First slice of closing the headline audit finding (vault not encrypted at
+rest). **Chosen approach: app-layer AEAD (the existing ChaCha20-Poly1305
+`seal`/`unseal`), NOT SQLCipher** — SQLCipher would re-introduce an OpenSSL
+dependency we deliberately removed for the musl-static / mobile build (F5.2),
+whereas app-layer AEAD reuses crypto we already trust and ship.
+
+### Added
+- `room_messages.text` + `sender_fp` are now **AEAD-sealed at rest** under the
+  vault key. New rows store the sealed blobs in additive `text_enc`/`sfp_enc`
+  columns and write the legacy plaintext columns empty;
+  `sqlite3 vault.db "SELECT text,sender_fp FROM room_messages"` no longer
+  reveals content.
+- **One-time, idempotent, transactional migration** (`seal_legacy_room_messages`,
+  runs on vault open) seals any pre-existing plaintext rows in place and blanks
+  the plaintext columns — backward-compatible (`ensure_column`, no
+  `SCHEMA_VERSION` bump), so existing vaults upgrade safely on next open.
+- Tests: at-rest check (raw columns blank + ciphertext ≠ plaintext + round-trip)
+  and legacy-row migration on reopen.
+
+### Still open
+- Other plaintext tables (`peer_dial`, `pinned_keys`, `room_member_kems`,
+  `rooms.members_b32`, `received_files`) — next slices of audit #1.
+
+---
+
 ## Release v0.1.26 — 2026-06-04
 
 Umbrella for everything merged since v0.1.25 (see per-item entries below):
