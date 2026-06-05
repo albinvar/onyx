@@ -21,6 +21,23 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Docs — 2026-06-06 — DELIVERY.md (reliable-delivery & scale architecture)
+
+Design doc (no code) for the offline-delivery reliability + scale gap. Today
+delivery is best-effort sender-side fan-out to your connected hubs with **no
+end-to-end ACK**, so messages can be lost *silently* (only-shared-hub disk
+loss, hub-set mismatch, eviction under load, TTL) and storage is an N×
+multiplier. The doc architects a **privacy-first** fix: end-to-end **delivery**
+receipts (sealed, hub-indistinguishable, recipient-opt-out; **never read
+receipts**), an **encrypted sender pending-store + retry** that converts silent
+loss into eventual delivery or a *visible* failure, **quorum fan-out** + a
+recipient hub-hint (cuts the N× multiplier + fixes hub-set mismatch), and the
+**routing-id-sharding** path to large scale. Includes the threat-model delta
+(receipts are an activity-timing signal — contained) and a phased plan whose
+pending-store depends on at-rest encryption (audit #1).
+
+---
+
 ## Security (audit #9) — 2026-06-05 — tighten metrics replay window
 
 - `onyx-metrics`: shrink the heartbeat replay-acceptance window from **1 h →
