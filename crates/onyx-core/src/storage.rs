@@ -1,10 +1,22 @@
-//! Encrypted local storage (SQLite + app-level AEAD).
+//! Local storage (SQLite + app-level AEAD on key material only).
 //!
-//! See DESIGN.md §7. The vault holds a SQLite database where sensitive
-//! columns are AEAD-encrypted at the row level using a key derived from
-//! the user's passphrase via Argon2id. Non-sensitive columns (nicknames,
-//! timestamps, fingerprints, schema version) stay plaintext so SQLite
-//! can index them.
+//! See DESIGN.md §7. The vault holds a SQLite database where the
+//! **key-material** columns — `identities` (signing/identity/onion keys),
+//! `mls_state`, `replay_state`, plus the unlock `canary` — are
+//! AEAD-encrypted at the row level using a key derived from the user's
+//! passphrase via Argon2id.
+//!
+//! ## ⚠️ Known gap: this is NOT full encryption at rest
+//!
+//! Everything that is *not* key material is stored as **plaintext**:
+//! `room_messages` (text + sender fingerprint), `peer_dial` (onion + KEM),
+//! `pinned_keys`, `room_member_kems`, `rooms.members_b32`,
+//! `received_files`. Anyone with the vault file can read your message
+//! history and contact graph **without the passphrase**. Do not describe
+//! the vault as "encrypted at rest" — only the secret keys are. Closing
+//! this (whole-DB encryption, e.g. SQLCipher) is the top open security
+//! item; until then the honest statement is "Onyx does not encrypt your
+//! message history or contacts at rest."
 //!
 //! ## Anatomy of an encrypted blob
 //!
@@ -376,12 +388,14 @@ pub struct PinnedContact {
 /// the "two messages at the same timestamp shuffle on every
 /// fetch" issue). `created_at_ms` is wall-clock for display.
 ///
-/// **Privacy posture**: the table holds decrypted plaintext at
-/// rest. This is the deliberate tradeoff for persistent scrollback
-/// — the same tradeoff the per-peer `ChatLine` ring buffer already
-/// makes for DMs (`ANONYMITY.md §3.8` "decrypted plaintext in the
-/// daemon's conversation registry"). Stored in the AEAD-protected
-/// vault file; readable only with the vault passphrase.
+/// **Privacy posture — ⚠️ NOT encrypted at rest.** `text` and
+/// `sender_fp` are stored as **plaintext** SQLite columns: anyone with
+/// the vault file can read your full room history and contact graph
+/// with `sqlite3 vault.db "SELECT text,sender_fp FROM room_messages"`,
+/// no passphrase required. Only the *key-material* tables
+/// (`identities`, `mls_state`, `replay_state`) are AEAD-sealed; this
+/// table is not. Full at-rest encryption (SQLCipher) is the top open
+/// security item — see `SECURITY.md` / `METRICS.md`-adjacent known-gaps.
 const SCHEMA_ROOM_MESSAGES_ADD: &str = "
 CREATE TABLE IF NOT EXISTS room_messages (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
