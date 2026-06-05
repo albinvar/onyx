@@ -607,9 +607,13 @@ impl Vault {
         // legacy rows until `seal_legacy_room_messages` migrates them.
         ensure_column(&conn, "room_messages", "text_enc", "BLOB")?;
         ensure_column(&conn, "room_messages", "sfp_enc", "BLOB")?;
+        // Audit #1 slice 2: AEAD columns for room name + member list.
+        ensure_column(&conn, "rooms", "name_enc", "BLOB")?;
+        ensure_column(&conn, "rooms", "members_enc", "BLOB")?;
 
         let vault = Self { conn, aead };
         vault.seal_legacy_room_messages()?;
+        vault.seal_legacy_rooms()?;
         Ok(vault)
     }
 
@@ -729,6 +733,9 @@ impl Vault {
         // Audit #1: AEAD columns for room-message content (fresh vault).
         ensure_column(&conn, "room_messages", "text_enc", "BLOB")?;
         ensure_column(&conn, "room_messages", "sfp_enc", "BLOB")?;
+        // Audit #1 slice 2: AEAD columns for room name + member list.
+        ensure_column(&conn, "rooms", "name_enc", "BLOB")?;
+        ensure_column(&conn, "rooms", "members_enc", "BLOB")?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -1285,15 +1292,22 @@ impl Vault {
         members_b32: &str,
         created_at_ms: i64,
     ) -> Result<()> {
+        // Audit #1 slice 2: seal the room name + member list at rest; the
+        // plaintext columns are written empty (real content in *_enc).
+        let name_enc = self.encrypt_blob(name.as_bytes())?;
+        let members_enc = self.encrypt_blob(members_b32.as_bytes())?;
         self.conn
             .execute(
-                "INSERT INTO rooms (identity_id, group_id, name, members_b32, created_at_ms) \
-                 VALUES (?, ?, ?, ?, ?) \
+                "INSERT INTO rooms \
+                 (identity_id, group_id, name, members_b32, name_enc, members_enc, created_at_ms) \
+                 VALUES (?, ?, '', '', ?, ?, ?) \
                  ON CONFLICT(identity_id, group_id) DO UPDATE SET \
-                   name = excluded.name, \
-                   members_b32 = excluded.members_b32, \
+                   name = '', \
+                   members_b32 = '', \
+                   name_enc = excluded.name_enc, \
+                   members_enc = excluded.members_enc, \
                    created_at_ms = excluded.created_at_ms",
-                params![identity_id, group_id, name, members_b32, created_at_ms],
+                params![identity_id, group_id, name_enc, members_enc, created_at_ms],
             )
             .map_err(map_db_err)?;
         Ok(())
@@ -1323,27 +1337,55 @@ impl Vault {
     }
 
     pub fn list_rooms(&self, identity_id: i64) -> Result<Vec<RoomRow>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT group_id, name, members_b32, created_at_ms \
-                 FROM rooms WHERE identity_id = ? \
-                 ORDER BY created_at_ms ASC",
-            )
-            .map_err(map_db_err)?;
-        let rows = stmt
-            .query_map(params![identity_id], |r| {
-                Ok(RoomRow {
-                    group_id: r.get(0)?,
-                    name: r.get(1)?,
-                    members_b32: r.get(2)?,
-                    created_at_ms: r.get(3)?,
+        // (group_id, legacy_name, legacy_members, name_enc, members_enc, created)
+        type RawRoom = (
+            Vec<u8>,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            i64,
+        );
+        let raw: Vec<RawRoom> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT group_id, name, members_b32, name_enc, members_enc, created_at_ms \
+                     FROM rooms WHERE identity_id = ? \
+                     ORDER BY created_at_ms ASC",
+                )
+                .map_err(map_db_err)?;
+            let rows = stmt
+                .query_map(params![identity_id], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
                 })
-            })
-            .map_err(map_db_err)?;
+                .map_err(map_db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_db_err)?
+        };
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(map_db_err)?);
+        for (group_id, legacy_name, legacy_members, name_enc, members_enc, created_at_ms) in raw {
+            let name = match name_enc {
+                Some(b) => String::from_utf8_lossy(&self.decrypt_blob(&b)?).into_owned(),
+                None => legacy_name,
+            };
+            let members_b32 = match members_enc {
+                Some(b) => String::from_utf8_lossy(&self.decrypt_blob(&b)?).into_owned(),
+                None => legacy_members,
+            };
+            out.push(RoomRow {
+                group_id,
+                name,
+                members_b32,
+                created_at_ms,
+            });
         }
         Ok(out)
     }
@@ -1423,11 +1465,13 @@ impl Vault {
     /// Idempotent. Returns the number of rows actually changed (0
     /// if the row didn't exist or the name was already equal).
     pub fn rename_room(&self, identity_id: i64, group_id: &[u8], new_name: &str) -> Result<usize> {
+        // Audit #1 slice 2: keep the name sealed.
+        let name_enc = self.encrypt_blob(new_name.as_bytes())?;
         let changed = self
             .conn
             .execute(
-                "UPDATE rooms SET name = ? WHERE identity_id = ? AND group_id = ?",
-                params![new_name, identity_id, group_id],
+                "UPDATE rooms SET name = '', name_enc = ? WHERE identity_id = ? AND group_id = ?",
+                params![name_enc, identity_id, group_id],
             )
             .map_err(map_db_err)?;
         Ok(changed)
@@ -1573,6 +1617,50 @@ impl Vault {
                  SET text_enc = ?, sfp_enc = ?, text = '', sender_fp = '' \
                  WHERE id = ?",
                 params![text_enc, sfp_enc, id],
+            )
+            .map_err(map_db_err)?;
+        }
+        tx.commit().map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Audit #1 slice 2: one-time, idempotent migration that AEAD-seals any
+    /// legacy plaintext `rooms` rows (name + member list) and blanks the
+    /// plaintext columns. Same contract as [`Self::seal_legacy_room_messages`].
+    fn seal_legacy_rooms(&self) -> Result<()> {
+        let legacy: Vec<(i64, Vec<u8>, String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT identity_id, group_id, name, members_b32 \
+                     FROM rooms WHERE name_enc IS NULL",
+                )
+                .map_err(map_db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(map_db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_db_err)?
+        };
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction().map_err(map_db_err)?;
+        for (identity_id, group_id, name, members) in &legacy {
+            let name_enc = self.encrypt_blob(name.as_bytes())?;
+            let members_enc = self.encrypt_blob(members.as_bytes())?;
+            tx.execute(
+                "UPDATE rooms \
+                 SET name_enc = ?, members_enc = ?, name = '', members_b32 = '' \
+                 WHERE identity_id = ? AND group_id = ?",
+                params![name_enc, members_enc, identity_id, group_id],
             )
             .map_err(map_db_err)?;
         }
@@ -1994,6 +2082,65 @@ mod tests {
         assert_eq!(rooms.len(), 2);
         assert_eq!(rooms[0].name, "alpha"); // older
         assert_eq!(rooms[1].name, "beta"); // newer
+    }
+
+    #[test]
+    fn room_name_and_members_encrypted_at_rest() {
+        // Audit #1 slice 2: rooms.name + members_b32 sealed on disk.
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        v.save_room(id, &[7, 7, 7], "secret-room", "fp_a,fp_b", 1)
+            .unwrap();
+        let (name_col, mem_col, enc): (String, String, Option<Vec<u8>>) = v
+            .conn
+            .query_row(
+                "SELECT name, members_b32, name_enc FROM rooms LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(name_col, "", "plaintext name column must be blank");
+        assert_eq!(mem_col, "", "plaintext members column must be blank");
+        assert!(enc.is_some(), "name_enc must be populated");
+        // Reads + rename round-trip.
+        assert_eq!(v.list_rooms(id).unwrap()[0].name, "secret-room");
+        v.rename_room(id, &[7, 7, 7], "renamed").unwrap();
+        assert_eq!(v.list_rooms(id).unwrap()[0].name, "renamed");
+        assert_eq!(v.list_rooms(id).unwrap()[0].members_b32, "fp_a,fp_b");
+    }
+
+    #[test]
+    fn legacy_plaintext_rooms_migrate_on_open() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        tmp.close().unwrap();
+        let id;
+        {
+            let mut v = Vault::create(&path, b"pw", &Argon2Params::FLOOR).unwrap();
+            let (i, _) = v.create_identity("alice").unwrap();
+            id = i;
+            v.conn
+                .execute(
+                    "INSERT INTO rooms (identity_id, group_id, name, members_b32, created_at_ms) \
+                     VALUES (?, ?, ?, ?, ?)",
+                    params![id, [9u8, 9].as_slice(), "legacy-room", "fp_legacy", 5_i64],
+                )
+                .unwrap();
+        }
+        let v = Vault::open(&path, b"pw").unwrap();
+        let (name_col, enc_present): (String, bool) = v
+            .conn
+            .query_row(
+                "SELECT name, name_enc IS NOT NULL FROM rooms LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .unwrap();
+        assert_eq!(name_col, "", "legacy name blanked after migration");
+        assert!(enc_present, "legacy room sealed after migration");
+        let rooms = v.list_rooms(id).unwrap();
+        assert_eq!(rooms[0].name, "legacy-room");
+        assert_eq!(rooms[0].members_b32, "fp_legacy");
     }
 
     #[test]

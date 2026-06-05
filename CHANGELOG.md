@@ -6,6 +6,21 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security (audit #1, slice 2) — 2026-06-06 — encrypt room name + members at rest
+
+- `rooms.name` + `rooms.members_b32` are now **AEAD-sealed at rest** (same
+  pattern as room messages: additive `name_enc`/`members_enc` columns, legacy
+  plaintext blanked, `save_room`/`rename_room` seal, `list_rooms` unseals).
+- One-time idempotent `seal_legacy_rooms` migration on open (no
+  `SCHEMA_VERSION` bump). Tests: at-rest (raw columns blank + enc set +
+  rename round-trip) and legacy-row migration on reopen.
+- **Remaining at-rest tables** (`pinned_keys`, `peer_dial`, `room_member_kems`,
+  `received_files`) are queried *by content* (fingerprint / peer key /
+  sender_fp), so they need a **keyed blind-index** primitive to stay
+  queryable while sealed — that's the next slice.
+
+---
+
 ## Security (audit #9) — 2026-06-05 — tighten metrics replay window
 
 - `onyx-metrics`: shrink the heartbeat replay-acceptance window from **1 h →
