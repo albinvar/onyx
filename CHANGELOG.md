@@ -6,6 +6,40 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.27 — 2026-06-06 — security-hardening release
+
+Umbrella for everything since v0.1.26 (per-item entries below). This is a
+**security-hardening** release driven by a v0.1.26 audit; ~593 tests green.
+
+- **Vault encryption at rest (audit #1, partial).** Your **message history**
+  (`room_messages.text`/`sender_fp`) and **room name + member lists** are now
+  **AEAD-sealed at rest** (ChaCha20-Poly1305 under the vault key — *not*
+  SQLCipher, which would re-break the musl/mobile build). One-time idempotent
+  migrations seal pre-existing plaintext on open. `PRAGMA secure_delete` zeroes
+  freed pages.
+  *Still plaintext (next slice — need a keyed blind index): `pinned_keys`,
+  `peer_dial`, `room_member_kems`, `received_files`.*
+- **Safety numbers fixed (audit #4).** Now bind the **Ed25519** identity, so
+  the verify screen actually detects identity MITM.
+- **Log hygiene (audit #3)** — peer fingerprints/group-ids out of the
+  persistent log. **`verified` cleared on key change (audit #7).** **Metrics
+  replay window 1h→10min (audit #9).**
+- **Honest docs (audit #1/#2).** Every false "encrypted at rest" claim
+  corrected across SECURITY/THREAT_MODEL/DESIGN/INSTALL + the backup CLI.
+- **`DELIVERY.md`** — architecture for reliable delivery (end-to-end receipts
+  + retry, quorum fan-out) and scale. Design only.
+
+### Honest scope — what this release does NOT fix
+- **Connect-flow reliability/UX.** The first-contact footguns surfaced this
+  session (reachability off by default silently dropping hub invites; config
+  changes needing a relaunch; poor Tor connectivity shown as a misleading
+  green status; no end-to-end delivery ACK) are **not** fixed here. The
+  planned remedies — an `onyx doctor` self-check, honest live hub/reachability
+  health in the TUI, the Ctrl-E reachability fix, and delivery receipts — are
+  the next release.
+
+---
+
 ## Security (audit #1, slice 2) — 2026-06-06 — encrypt room name + members at rest
 
 - `rooms.name` + `rooms.members_b32` are now **AEAD-sealed at rest** (same
