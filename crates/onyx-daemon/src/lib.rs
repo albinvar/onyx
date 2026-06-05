@@ -2131,9 +2131,11 @@ async fn handle_dm_app_frame(
             .await;
             match decision {
                 files::AcceptDecision::Accepted => {
-                    info!(sender_fp = %sender_fp, size, chunks, "dm file accepted; awaiting chunks");
+                    // Audit #3 (D-3): keep the peer fingerprint at debug!.
+                    debug!(sender_fp = %sender_fp, size, chunks, "dm file accepted; awaiting chunks");
                 }
-                other => warn!(?other, sender_fp = %sender_fp, "dm file rejected"),
+                // Keep the rejection visible (warn!) but drop the fingerprint.
+                other => warn!(?other, "dm file rejected"),
             }
         }
         onyx_core::room::RoomAppMessage::FileChunk { id, index, bytes } => {
@@ -2430,12 +2432,14 @@ async fn handle_room_app_frame(
             )
             .await;
             match decision {
-                files::AcceptDecision::Accepted => info!(
+                // Audit #3 (D-3): keep the peer fingerprint at debug!.
+                files::AcceptDecision::Accepted => debug!(
                     sender_fp = %sender_fp,
                     size, chunks, mime = %mime,
                     "file transfer accepted; waiting for chunks"
                 ),
-                other => warn!(?other, sender_fp = %sender_fp, "file transfer rejected"),
+                // Keep the rejection visible (warn!) but drop the fingerprint.
+                other => warn!(?other, "file transfer rejected"),
             }
         }
         onyx_core::room::RoomAppMessage::FileChunk { id, index, bytes } => {
@@ -3278,7 +3282,9 @@ async fn process_hub_mls_app(
     };
     if let Some(peer_pub) = dm_peer {
         handle_hub_dm_app_frame(group_id, ciphertext, &peer_pub, state).await;
-        info!(
+        // Audit #3 (D-3): peer fingerprints / group ids must not be written
+        // to the persistent default log — keep them at debug! only.
+        debug!(
             from_fingerprint = %sender_fingerprint,
             ciphertext_bytes = ciphertext.len(),
             "hub: mlsapp/v1 DM frame processed (via_hub)"
@@ -3286,7 +3292,7 @@ async fn process_hub_mls_app(
         return;
     }
     handle_room_app_frame(group_id, ciphertext, sender_x25519, state).await;
-    info!(
+    debug!(
         from_fingerprint = %sender_fingerprint,
         group_id_b32 = %encode_b32(group_id),
         ciphertext_bytes = ciphertext.len(),
@@ -3585,7 +3591,8 @@ async fn process_room_welcome(
                     warn!(error = %e, "hub: mls/v1 Welcome: add_room_admin failed");
                 }
             }
-            info!(
+            // Audit #3 (D-3): group id + inviter fingerprint stay at debug!.
+            debug!(
                 room_name = %name,
                 group_id_b32 = %encode_b32(&group_id_bytes),
                 mls_epoch = group.epoch(),

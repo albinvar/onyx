@@ -2206,16 +2206,27 @@ async fn open_settings_modal(app: &mut AppState) {
 /// peer. The number is derived client-side from my identity key + the
 /// peer's (both already known to the TUI) — no daemon round-trip. Errors if
 /// the identity isn't loaded yet, or the selection is a room / nothing.
+/// Normalize a displayed fingerprint (grouped, e.g. `"jtam lzo4 …"`) to its
+/// raw base32 form so it's a stable, format-independent hash input.
+fn fp_raw(fp: &str) -> String {
+    fp.split_whitespace().collect()
+}
+
 fn build_verify_modal(app: &AppState) -> Result<ModalState, String> {
+    // Audit #4: the safety number MUST bind the Ed25519 identity fingerprint —
+    // the key the MLS credential, the TOFU pin store, and message attribution
+    // all use. The previous code hashed the X25519 `identity_pub_b32`, which is
+    // an independent key half: two parties could show a matching safety number
+    // while their signing identities differed, giving false MITM assurance.
     let mine = match &app.last_status {
-        Some(Ok(snap)) => snap.identity_pub_b32.clone(),
+        Some(Ok(snap)) => fp_raw(&snap.fingerprint),
         _ => return Err("identity not loaded yet — wait for the status line".to_string()),
     };
     match app.selected_entry() {
         Some(SelectedEntry::Peer(p)) => Ok(ModalState::Verify {
             peer_short: p.short_id.clone(),
             fingerprint: p.fingerprint.clone(),
-            number: onyx_core::crypto::safety_number(&mine, &p.pubkey_b32),
+            number: onyx_core::crypto::safety_number(&mine, &fp_raw(&p.fingerprint)),
             already_verified: p.verified,
         }),
         Some(SelectedEntry::Room(_)) => {
@@ -5529,6 +5540,30 @@ mod snapshot_tests {
             header.contains("key changed"),
             "header must warn on a changed key; got:\n{header}"
         );
+    }
+
+    #[test]
+    fn verify_modal_binds_ed25519_fingerprint_not_x25519() {
+        // Audit #4: the safety number must hash the Ed25519 *fingerprints*
+        // (what MLS/pins/attribution use), not the X25519 identity keys.
+        let mut app = mock_app_with_peers_and_scrollback();
+        app.selected = 0;
+        let modal = build_verify_modal(&app).expect("verify modal");
+        let ModalState::Verify { number, .. } = modal else {
+            panic!("expected a Verify modal");
+        };
+        let Some(Ok(snap)) = &app.last_status else {
+            panic!("status not loaded");
+        };
+        let p = &app.peers[0];
+        let from_fingerprints =
+            onyx_core::crypto::safety_number(&fp_raw(&snap.fingerprint), &fp_raw(&p.fingerprint));
+        let from_x25519 = onyx_core::crypto::safety_number(&snap.identity_pub_b32, &p.pubkey_b32);
+        assert_eq!(
+            number, from_fingerprints,
+            "must bind the Ed25519 fingerprint"
+        );
+        assert_ne!(number, from_x25519, "must NOT bind the X25519 identity key");
     }
 
     #[test]
