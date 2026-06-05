@@ -16,6 +16,16 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security (audit #6) — 2026-06-05 — secure_delete on the vault
+
+- The vault connection now runs `PRAGMA secure_delete = ON`, so deletes
+  (retention sweep, `forget_room_messages`) **zero the freed pages** instead
+  of leaving recoverable remnants. Defense-in-depth: with at-rest encryption
+  (audit #1) freed pages are ciphertext anyway, but this also covers legacy
+  plaintext and any not-yet-encrypted column, at negligible cost.
+
+---
+
 ## Security (audit #1, slice 1) — 2026-06-05 — encrypt room messages at rest
 
 First slice of closing the headline audit finding (vault not encrypted at

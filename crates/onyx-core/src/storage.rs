@@ -517,6 +517,12 @@ impl Vault {
     /// [`Error::VerificationFailed`] via the canary check.
     pub fn open(path: &Path, passphrase: &[u8]) -> Result<Self> {
         let conn = Connection::open(path).map_err(map_db_err)?;
+        // Audit #6: zero freed pages on delete so retention/forget actually
+        // erase content from the file (defense-in-depth; with at-rest
+        // encryption freed pages are ciphertext, but this also covers any
+        // legacy plaintext and is cheap).
+        conn.execute_batch("PRAGMA secure_delete = ON;")
+            .map_err(map_db_err)?;
 
         let (schema_version, salt_bytes, mem_kib, iters, parallel, canary): (
             i32,
@@ -693,6 +699,9 @@ impl Vault {
 
     fn initialize(conn: Connection, passphrase: &[u8], params: &Argon2Params) -> Result<Self> {
         params.validate()?;
+        // Audit #6: zero freed pages on delete (see `open`).
+        conn.execute_batch("PRAGMA secure_delete = ON;")
+            .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_V3).map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_REPLAY_STATE_ADD)
             .map_err(map_db_err)?;
