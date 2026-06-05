@@ -597,8 +597,14 @@ impl Vault {
             "verified",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Audit #1: additive AEAD columns for room-message content. NULL on
+        // legacy rows until `seal_legacy_room_messages` migrates them.
+        ensure_column(&conn, "room_messages", "text_enc", "BLOB")?;
+        ensure_column(&conn, "room_messages", "sfp_enc", "BLOB")?;
 
-        Ok(Self { conn, aead })
+        let vault = Self { conn, aead };
+        vault.seal_legacy_room_messages()?;
+        Ok(vault)
     }
 
     /// Change the vault's passphrase in place (no recovery of a forgotten
@@ -711,6 +717,9 @@ impl Vault {
             "verified",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Audit #1: AEAD columns for room-message content (fresh vault).
+        ensure_column(&conn, "room_messages", "text_enc", "BLOB")?;
+        ensure_column(&conn, "room_messages", "sfp_enc", "BLOB")?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -1516,6 +1525,52 @@ impl Vault {
         Ok(u64::try_from(total.unwrap_or(0)).unwrap_or(0))
     }
 
+    /// Audit #1: one-time, idempotent migration that AEAD-seals any legacy
+    /// **plaintext** `room_messages` rows (those written before at-rest
+    /// encryption shipped) under the vault key, then blanks the plaintext
+    /// `text`/`sender_fp` columns. Rows written by the current code already
+    /// have `text_enc` set and are skipped, so this is a no-op on an
+    /// already-migrated (or fresh) vault. Runs inside one transaction, so a
+    /// crash mid-migration leaves the vault consistent and re-runnable.
+    fn seal_legacy_room_messages(&self) -> Result<()> {
+        // Collect legacy rows first so the prepared-statement borrow on
+        // `self.conn` is released before we take a transaction + seal.
+        let legacy: Vec<(i64, String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, sender_fp, text FROM room_messages WHERE text_enc IS NULL")
+                .map_err(map_db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(map_db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_db_err)?
+        };
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction().map_err(map_db_err)?;
+        for (id, sfp, text) in &legacy {
+            let text_enc = self.encrypt_blob(text.as_bytes())?;
+            let sfp_enc = self.encrypt_blob(sfp.as_bytes())?;
+            tx.execute(
+                "UPDATE room_messages \
+                 SET text_enc = ?, sfp_enc = ?, text = '', sender_fp = '' \
+                 WHERE id = ?",
+                params![text_enc, sfp_enc, id],
+            )
+            .map_err(map_db_err)?;
+        }
+        tx.commit().map_err(map_db_err)?;
+        Ok(())
+    }
+
     /// T-polish.3: append one room message to the persistent
     /// scrollback. `direction_outgoing = false` for incoming
     /// (decoded `RoomAppMessage::Text`), `true` for outgoing
@@ -1531,12 +1586,18 @@ impl Vault {
         created_at_ms: i64,
     ) -> Result<()> {
         let dir = i64::from(direction_outgoing);
+        // Audit #1: seal the message text + sender fingerprint at rest under
+        // the vault key. The legacy plaintext `text`/`sender_fp` columns are
+        // written empty (kept only so old/legacy rows still read back via
+        // the migration); the real content lives in the AEAD blobs.
+        let text_enc = self.encrypt_blob(text.as_bytes())?;
+        let sfp_enc = self.encrypt_blob(sender_fp.as_bytes())?;
         self.conn
             .execute(
                 "INSERT INTO room_messages \
-                 (identity_id, group_id, direction, sender_fp, text, created_at_ms) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                params![identity_id, group_id, dir, sender_fp, text, created_at_ms],
+                 (identity_id, group_id, direction, sender_fp, text, text_enc, sfp_enc, created_at_ms) \
+                 VALUES (?, ?, ?, '', '', ?, ?, ?)",
+                params![identity_id, group_id, dir, text_enc, sfp_enc, created_at_ms],
             )
             .map_err(map_db_err)?;
         Ok(())
@@ -1551,30 +1612,55 @@ impl Vault {
         group_id: &[u8],
         limit: usize,
     ) -> Result<Vec<RoomMessageRow>> {
+        // (direction, legacy_sfp, legacy_text, text_enc, sfp_enc, created_at_ms)
+        type RawRow = (i64, String, String, Option<Vec<u8>>, Option<Vec<u8>>, i64);
         let i64_limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT direction, sender_fp, text, created_at_ms \
-                 FROM room_messages \
-                 WHERE identity_id = ? AND group_id = ? \
-                 ORDER BY id DESC LIMIT ?",
-            )
-            .map_err(map_db_err)?;
-        let rows = stmt
-            .query_map(params![identity_id, group_id, i64_limit], |r| {
-                let dir: i64 = r.get(0)?;
-                Ok(RoomMessageRow {
-                    direction_outgoing: dir == 1,
-                    sender_fp: r.get(1)?,
-                    text: r.get(2)?,
-                    created_at_ms: r.get(3)?,
+        // Collect raw rows first (the sealed blobs need the vault key to
+        // decrypt, which we do after the statement borrow is released).
+        // `text_enc`/`sfp_enc` are NULL only for un-migrated legacy rows,
+        // in which case we fall back to the plaintext columns.
+        let raw: Vec<RawRow> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT direction, sender_fp, text, text_enc, sfp_enc, created_at_ms \
+                     FROM room_messages \
+                     WHERE identity_id = ? AND group_id = ? \
+                     ORDER BY id DESC LIMIT ?",
+                )
+                .map_err(map_db_err)?;
+            let rows = stmt
+                .query_map(params![identity_id, group_id, i64_limit], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                        r.get::<_, i64>(5)?,
+                    ))
                 })
-            })
-            .map_err(map_db_err)?;
-        let mut out: Vec<RoomMessageRow> = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(map_db_err)?;
+                .map_err(map_db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_db_err)?
+        };
+        let mut out: Vec<RoomMessageRow> = Vec::with_capacity(raw.len());
+        for (dir, legacy_sfp, legacy_text, text_enc, sfp_enc, created_at_ms) in raw {
+            let text = match text_enc {
+                Some(blob) => String::from_utf8_lossy(&self.decrypt_blob(&blob)?).into_owned(),
+                None => legacy_text,
+            };
+            let sender_fp = match sfp_enc {
+                Some(blob) => String::from_utf8_lossy(&self.decrypt_blob(&blob)?).into_owned(),
+                None => legacy_sfp,
+            };
+            out.push(RoomMessageRow {
+                direction_outgoing: dir == 1,
+                sender_fp,
+                text,
+                created_at_ms,
+            });
+        }
         // Query returned newest-first (DESC); reverse for oldest-
         // first so the caller can append straight to a scrollback.
         out.reverse();
@@ -2151,6 +2237,88 @@ mod tests {
         assert_eq!(hist[1].text, "echo");
         assert!(hist[1].direction_outgoing);
         assert_eq!(hist[2].text, "third");
+    }
+
+    #[test]
+    fn room_message_is_encrypted_at_rest() {
+        // Audit #1: text + sender_fp must be AEAD-sealed on disk, not plaintext.
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let gid = b"room-1";
+        v.append_room_message(id, gid, false, "fp_bob", "top secret", 100)
+            .unwrap();
+        let (text_col, sfp_col, enc): (String, String, Option<Vec<u8>>) = v
+            .conn
+            .query_row(
+                "SELECT text, sender_fp, text_enc FROM room_messages LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            text_col, "",
+            "plaintext text column must be blanked at rest"
+        );
+        assert_eq!(sfp_col, "", "plaintext sender_fp column must be blanked");
+        let enc = enc.expect("text_enc must be populated");
+        assert!(
+            !enc.windows(b"top secret".len()).any(|w| w == b"top secret"),
+            "sealed blob must not contain the plaintext"
+        );
+        // Decrypts back correctly through the public read path.
+        let hist = v.room_history(id, gid, 10).unwrap();
+        assert_eq!(hist[0].text, "top secret");
+        assert_eq!(hist[0].sender_fp, "fp_bob");
+    }
+
+    #[test]
+    fn legacy_plaintext_room_messages_migrate_on_open() {
+        // Audit #1: a vault written before at-rest encryption (plaintext rows,
+        // text_enc NULL) must be sealed in place on the next open — and stay
+        // readable.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        tmp.close().unwrap(); // Vault::create refuses an existing path.
+        let id;
+        {
+            let mut v = Vault::create(&path, b"pw", &Argon2Params::FLOOR).unwrap();
+            let (i, _) = v.create_identity("alice").unwrap();
+            id = i;
+            // Simulate a pre-encryption row: plaintext set, text_enc left NULL.
+            v.conn
+                .execute(
+                    "INSERT INTO room_messages \
+                     (identity_id, group_id, direction, sender_fp, text, created_at_ms) \
+                     VALUES (?, ?, 0, ?, ?, ?)",
+                    params![
+                        id,
+                        b"room-9".as_slice(),
+                        "fp_legacy",
+                        "legacy secret",
+                        5_i64
+                    ],
+                )
+                .unwrap();
+        }
+        // Reopen → seal_legacy_room_messages runs.
+        let v = Vault::open(&path, b"pw").unwrap();
+        let (text_col, enc_present): (String, bool) = v
+            .conn
+            .query_row(
+                "SELECT text, text_enc IS NOT NULL FROM room_messages LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .unwrap();
+        assert_eq!(
+            text_col, "",
+            "legacy plaintext must be blanked after migration"
+        );
+        assert!(enc_present, "legacy row must be sealed after migration");
+        let hist = v.room_history(id, b"room-9", 10).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].text, "legacy secret");
+        assert_eq!(hist[0].sender_fp, "fp_legacy");
     }
 
     #[test]
