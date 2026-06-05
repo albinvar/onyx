@@ -1066,9 +1066,12 @@ impl Vault {
             Some(pinned_bytes) => {
                 // Keep the pinned key; flag the change. Re-pinning a new
                 // key is a deliberate user action, not an auto-accept.
+                // Audit #7: a changed key invalidates any prior out-of-band
+                // verification, so clear `verified` too — otherwise the TUI
+                // could keep showing "verified ✓" on a rotated / MITM'd key.
                 self.conn
                     .execute(
-                        "UPDATE pinned_keys SET last_seen_ms = ?, key_changed = 1 \
+                        "UPDATE pinned_keys SET last_seen_ms = ?, key_changed = 1, verified = 0 \
                          WHERE identity_id = ? AND fingerprint = ?",
                         params![now, identity_id, fingerprint],
                     )
@@ -2467,6 +2470,24 @@ mod tests {
         // Un-verify.
         assert_eq!(v.set_verified(id, "fp_peer", false).unwrap(), 1);
         assert_eq!(v.pin_status(id, "fp_peer").unwrap(), Some((false, false)));
+    }
+
+    #[test]
+    fn key_change_clears_verified_flag() {
+        // Audit #7: a key change must invalidate a prior OOB verification.
+        let mut v = fresh_vault();
+        let (id, _identity) = v.create_identity("me").unwrap();
+        let key_a = [9u8; 32];
+        v.pin_or_verify(id, "fp_peer", &key_a, 1_700_000_000_000)
+            .unwrap();
+        assert_eq!(v.set_verified(id, "fp_peer", true).unwrap(), 1);
+        assert_eq!(v.pin_status(id, "fp_peer").unwrap(), Some((false, true)));
+        // Same fingerprint, DIFFERENT x25519 key → key change.
+        let key_b = [7u8; 32];
+        v.pin_or_verify(id, "fp_peer", &key_b, 1_700_000_001_000)
+            .unwrap();
+        // key_changed must be set AND verified must be cleared.
+        assert_eq!(v.pin_status(id, "fp_peer").unwrap(), Some((true, false)));
     }
 
     #[test]
