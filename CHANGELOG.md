@@ -26,6 +26,19 @@ Full pre-tag gate green. Still queued: Esc quit-confirm, file-send progress.
 
 ---
 
+---
+
+## Fix — 2026-06-06 — received files now appear in the chat (were silent)
+
+A received file was verified and saved to disk (`~/.onyx/files/...`) but the
+daemon only *logged* it — it never pushed anything to the conversation, so
+the TUI showed nothing and it looked like "the file never arrived." Now a
+received DM **or** room file adds a **"📎 received <name> — saved to <path>"**
+line to the chat (persisted, like the sender's "📎 sent"). Files that already
+arrived are in `~/.onyx/files/peer/<short>/`.
+
+---
+
 ## Release v0.1.31 — 2026-06-06 — chat UX: nicknames, select+copy, alignment
 
 Umbrella since v0.1.30 (per-item entries below). Quality-of-life pass on the
