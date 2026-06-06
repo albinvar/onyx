@@ -26,6 +26,23 @@ Full pre-tag gate green. Still queued: Esc quit-confirm, file-send progress.
 
 ---
 
+## Release v0.1.31 — 2026-06-06 — chat UX: nicknames, select+copy, alignment
+
+Umbrella since v0.1.30 (per-item entries below). Quality-of-life pass on the
+chat experience.
+
+- **Nicknames** — `/nick <name>` for a contact (shown instead of the
+  short-id), `/myname <name>` for yourself (instead of "me"). ≤10 chars.
+- **Chat select + copy** — **Ctrl-S** enters selection mode: move a cursor,
+  Space-mark multiple, Enter/c copies to the clipboard.
+- **One-line chat aligned into invisible columns** (fixed-width name).
+- **Disappearing-messages** now visible in the header (⏳ badge).
+
+Full pre-tag gate green. **Deferred to v0.1.32:** DM-file hub-fallback (needs
+careful MLS-ratchet handling + cross-device testing — not shipped blind).
+
+---
+
 ## Feature — 2026-06-06 — chat selection + copy (Ctrl-S)
 
 Select and copy message text from inside the TUI (terminal selection is
