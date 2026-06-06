@@ -5068,6 +5068,10 @@ fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
 /// continuation lines pad to the same width so the text stays column-
 /// aligned. Own messages are green, peers cyan; attachments (📎) magenta;
 /// `[hub]`-delivered lines keep their tag.
+/// v0.1.31: fixed width of the sender-name column in chat, so timestamps
+/// and message text align as invisible columns. Also the nickname cap.
+const NAME_COL: usize = 10;
+
 fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> {
     // Every span built below owns its text (clone / to_string / format!), so
     // the result is 'static — it doesn't borrow `scroll`/`who_label`. That
@@ -5091,15 +5095,19 @@ fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> 
             Style::default().fg(Color::White)
         };
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
-        // `name HH:MM ` prefix width, so continuation rows align under it.
-        let prefix_w = who.chars().count() + 1 + hhmm.chars().count() + 2;
+        // Fixed-width name column → HH:MM and the text line up as invisible
+        // columns regardless of name length (e.g. "me" vs "gctufe2t"). Caps
+        // at NAME_COL chars (matches the nickname cap).
+        let who_disp: String = who.chars().take(NAME_COL).collect();
+        // Total prefix width: name(NAME_COL) + space + HH:MM(5) + 2 spaces.
+        let prefix_w = NAME_COL + 1 + hhmm.chars().count() + 2;
         if last_key.as_ref() == Some(&key) {
             // Same sender + minute → align under the prefix instead of
             // repeating it (keeps a burst readable, still one line each).
             spans.push(Span::raw(" ".repeat(prefix_w)));
         } else {
             spans.push(Span::styled(
-                format!("{who} "),
+                format!("{who_disp:<NAME_COL$} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
