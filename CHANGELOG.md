@@ -26,6 +26,16 @@ Full pre-tag gate green. Still queued: Esc quit-confirm, file-send progress.
 
 ---
 
+## Feature — 2026-06-06 — chat selection + copy (Ctrl-S)
+
+Select and copy message text from inside the TUI (terminal selection is
+awkward over the alt-screen). **Ctrl-S** enters selection mode on the
+current conversation:
+- ↑/↓ (or j/k) move a message cursor (▸), Space marks/unmarks (✓) for a
+  multi-message copy, Enter/c copies (the marked set, or the cursor if none)
+  to the clipboard, Esc exits. Falls back to a clear "no clipboard (SSH?)"
+  notice when copy isn't reachable.
+
 ## Feature — 2026-06-06 — nicknames (peer + your own)
 
 Editable local nicknames (≤10 chars), shown instead of the raw short-id.
