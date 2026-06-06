@@ -3464,7 +3464,7 @@ fn render_send_file_modal(
             let icon = if e.is_dir { "📁 " } else { "📄 " };
             let style = if e.is_dir {
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else if is_marked {
                 Style::default().fg(Color::Green)
@@ -4333,7 +4333,7 @@ fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             ]));
         }
     }
-    boxed(frame, area, "Activity", Color::Blue, lines);
+    boxed(frame, area, "Activity", Color::Yellow, lines);
 }
 
 /// UX overhaul: the right-hand Details column — split into individually
@@ -4913,19 +4913,21 @@ fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
     }
 }
 
-/// A2: turn a conversation's scrollback into styled lines, chat-app style:
-/// a `name · HH:MM` header is drawn whenever the sender OR the minute
-/// changes, then each message is indented beneath it — so a burst from one
-/// sender reads as a single grouped block instead of repeating the name on
-/// every line. Own messages are green, peers cyan; attachment lines (📎)
-/// get a magenta accent and `[hub]`-delivered lines keep their tag.
+/// A2 (v0.1.30: compact one-line layout): turn a conversation's scrollback
+/// into styled lines — **one line per message**: `name HH:MM  [hub] text`.
+/// The earlier two-line (header + indented body + blank spacer) layout
+/// wasted vertical space; this packs each message onto a single row. To
+/// keep a burst from one sender from repeating the name+time, the
+/// `name HH:MM` prefix is shown only when the sender OR minute changes;
+/// continuation lines pad to the same width so the text stays column-
+/// aligned. Own messages are green, peers cyan; attachments (📎) magenta;
+/// `[hub]`-delivered lines keep their tag.
 fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> {
     // Every span built below owns its text (clone / to_string / format!), so
     // the result is 'static — it doesn't borrow `scroll`/`who_label`. That
     // lets callers pass a temporary filtered Vec (retention) safely.
     let mut out: Vec<Line<'static>> = Vec::new();
-    // (is_outgoing, hhmm) of the last header emitted; a new header is drawn
-    // only when this key changes.
+    // (is_outgoing, hhmm) of the last prefix emitted; repeated only on change.
     let mut last_key: Option<(bool, String)> = None;
     for line in scroll {
         let outgoing = matches!(line.direction, MessageDirection::Outgoing);
@@ -4936,28 +4938,30 @@ fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> 
         };
         let hhmm = fmt_hhmm(line.ts_unix_ms);
         let key = (outgoing, hhmm.clone());
-        if last_key.as_ref() != Some(&key) {
-            // Blank spacer between groups (but not above the first).
-            if last_key.is_some() {
-                out.push(Line::from(""));
-            }
-            out.push(Line::from(vec![
-                Span::styled(
-                    who.to_string(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  {hhmm}"), Style::default().fg(Color::DarkGray)),
-            ]));
-            last_key = Some(key);
-        }
         let is_attachment = line.text.starts_with('📎');
         let body_style = if is_attachment {
             Style::default().fg(Color::Magenta)
         } else {
             Style::default().fg(Color::White)
         };
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
-        spans.push(Span::raw("  "));
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+        // `name HH:MM ` prefix width, so continuation rows align under it.
+        let prefix_w = who.chars().count() + 1 + hhmm.chars().count() + 2;
+        if last_key.as_ref() == Some(&key) {
+            // Same sender + minute → align under the prefix instead of
+            // repeating it (keeps a burst readable, still one line each).
+            spans.push(Span::raw(" ".repeat(prefix_w)));
+        } else {
+            spans.push(Span::styled(
+                format!("{who} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("{hhmm}  "),
+                Style::default().fg(Color::DarkGray),
+            ));
+            last_key = Some(key);
+        }
         if line.via_hub {
             spans.push(Span::styled(
                 "[hub] ",
@@ -5571,9 +5575,11 @@ mod snapshot_tests {
                 via_hub: false,
             },
         ];
-        // header(alice) + 2 bodies + spacer + header(me) + 1 body = 6.
-        // (Without grouping it would be one header per message → more.)
-        assert_eq!(build_chat_lines(&scroll, "alice").len(), 6);
+        // v0.1.30: one line per message — 3 messages → exactly 3 lines
+        // (no header/spacer rows). The first two share a sender+minute so
+        // the second aligns under the prefix; the third gets its own prefix.
+        let lines = build_chat_lines(&scroll, "alice");
+        assert_eq!(lines.len(), 3);
     }
 
     // clipboard: piping into a real stdin-consuming command succeeds; a

@@ -6,6 +6,15 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## UX — 2026-06-06 — compact one-line chat + recolor (yellow over blue)
+
+- **Chat is one line per message** now: `name HH:MM  [hub] text` instead of
+  the old two-line header + indented body + blank spacer. A burst from one
+  sender shows the `name HH:MM` prefix once and aligns the rest under it, so
+  it stays readable while using a third of the vertical space.
+- **Recolor**: the right-side **Activity** panel border and the **file
+  picker's directory** rows were a hard-to-read blue → now **yellow**.
+
 ## Fix — 2026-06-06 — DM chat history survives a restart (was: "my chat disappeared")
 
 Direct-session DM messages lived only in the daemon's in-memory ring (cap
