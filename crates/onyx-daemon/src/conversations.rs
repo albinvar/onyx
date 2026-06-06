@@ -154,6 +154,18 @@ impl ConversationRegistry {
         self.events_tx.subscribe()
     }
 
+    /// v0.1.30: broadcast a human-readable progress note to live `Tail`
+    /// subscribers (the TUI Activity feed) — the connection-lifecycle
+    /// steps that otherwise leave the user staring at silence. Best-effort:
+    /// silently dropped if there are no subscribers. `level` is
+    /// `"good" | "info" | "warn" | "bad"`.
+    pub fn emit_note(&self, level: &str, text: impl Into<String>) {
+        let _ = self.events_tx.send(ApiResponse::EventNote {
+            text: text.into(),
+            level: level.to_string(),
+        });
+    }
+
     /// Register a new live conversation. Caller must supply the
     /// receiver end of the outbound channel and consume it in the
     /// peer session task.

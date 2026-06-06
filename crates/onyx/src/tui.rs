@@ -1022,6 +1022,19 @@ impl AppState {
                 );
                 true
             }
+            ApiResponse::EventNote { text, level } => {
+                // v0.1.30: daemon connection-progress note → Activity feed,
+                // so the user sees "establishing… / dialing… / connected"
+                // instead of silence during a slow Tor connect.
+                let lvl = match level.as_str() {
+                    "good" => ActivityLevel::Good,
+                    "warn" => ActivityLevel::Warn,
+                    "bad" => ActivityLevel::Bad,
+                    _ => ActivityLevel::Info,
+                };
+                self.push_activity(lvl, text);
+                true
+            }
             ApiResponse::TailStarted => {
                 self.tail_active = true;
                 true

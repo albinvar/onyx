@@ -6,6 +6,20 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## UX — 2026-06-06 — live connection-progress in the Activity feed
+
+Kills the "is it even connecting?" doubt during the (inherently slow) Tor
+connect. The daemon now emits human-readable progress notes
+(`ApiResponse::EventNote`) that the TUI renders live in the right-side
+Activity panel:
+- first contact via hub: **"new contact <peer> — establishing secure session…"**
+- auto-dial / connect-code dial: **"dialing <peer> over Tor — first contact can take 10–60s…"**
+- success: the existing **"● <peer> connected"**.
+
+So instead of staring at silence you watch each step happen. (Tor itself is
+still slow for first contact — hub round-trip + a fresh hidden-service
+circuit — this makes the wait legible, not faster.)
+
 ## Release v0.1.29 — 2026-06-06 — invite contacts are messageable (the real connect fix)
 
 Point release for the single most important fix this cycle: hub-invite
