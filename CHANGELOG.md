@@ -6,6 +6,24 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fix — 2026-06-06 — DM chat history survives a restart (was: "my chat disappeared")
+
+Direct-session DM messages lived only in the daemon's in-memory ring (cap
+200) and were **never written to disk** — so quitting `onyx` (which stops
+the daemon) and relaunching wiped the whole conversation. Room messages
+already persisted; direct DMs didn't.
+
+- DMs are 2-party MLS groups, so they now persist to the **same
+  AEAD-encrypted `room_messages` store** rooms use (`append_room_message`
+  seals text + sender at rest). Persisted on both send (all four echo
+  paths) and receive.
+- `History` now reads that encrypted store first (keyed by the peer→group
+  mapping), falling back to the ring — so scrollback comes back after a
+  restart.
+
+Lock-order safe (registry lock released before each vault write). Gate:
+build · clippy -D warnings · fmt · daemon lib 75 · all 9 rooms_smoke.
+
 ## UX — 2026-06-06 — live connection-progress in the Activity feed
 
 Kills the "is it even connecting?" doubt during the (inherently slow) Tor
