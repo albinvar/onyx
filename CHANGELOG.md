@@ -6,6 +6,30 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## UX — 2026-06-06 — right-side Activity feed (human-readable events)
+
+A persistent **Activity** panel on the right of the TUI (stacked under the
+conversation Details), so connectivity and delivery problems are visible
+*in the app* instead of buried in `~/.onyx/onyx.log`. Newest-first,
+colour-coded, one event per row:
+
+- **Health deltas** (from each status poll, change-only — no per-tick spam):
+  Tor ready/not-ready, hub connectivity (the big one — **"0/2 hubs reachable
+  — Tor may be blocked/throttled"** in red), your address published, daemon
+  connection lost / reconnected.
+- **Tail events**: peer ● connected / ○ disconnected, ✉ incoming message
+  (noting "via hub").
+- **Actions**: invite accepted → "bootstrap queued at hub for the peer",
+  dialing peer over Tor, and any action failure (red).
+
+Implementation: an `ActivityEvent` ring buffer (cap 200) on `AppState`;
+`push_activity` collapses immediate duplicates; `record_health` diffs the
+latest status against the previous baseline (silent on first poll). Pure
+logic covered by unit tests (baseline-then-hub-loss, daemon down/up,
+dedup+cap). Falls back gracefully on narrow terminals (the feed yields).
+
+---
+
 ## UX — 2026-06-06 — honest health: `onyx doctor` + live TUI status
 
 Two changes that turn the silent connect-flow failures (the ones that wasted

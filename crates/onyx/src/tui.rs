@@ -80,7 +80,7 @@
 //! recent-activity descending (TUI-tracked `last_activity_ms`,
 //! falling back to `created_at_ms` for rooms with no activity yet).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -208,7 +208,23 @@ struct AppState {
     /// scrollback older than this (the daemon deletes the persisted copy on
     /// its sweep). Loaded from config.json; set live via `/retention`.
     retention_secs: Option<u64>,
+    /// v0.1.28: human-readable Activity feed (newest at front), shown in the
+    /// always-visible right-side panel. Populated from health deltas
+    /// (`record_health`), tail events (`apply_event`), and notable send
+    /// results. Capped at [`ACTIVITY_CAP`]; oldest dropped on overflow.
+    activity: VecDeque<ActivityEvent>,
+    /// v0.1.28: last health snapshot `(tor_ready, hubs_connected, hub_count,
+    /// onion_published)` we emitted Activity lines for, so `record_health`
+    /// only logs *changes* (no per-tick spam). `None` until the first poll.
+    prev_health: Option<(bool, u32, u32, bool)>,
+    /// v0.1.28: whether the daemon answered our last status poll, so we log
+    /// "daemon connection lost" / "reconnected" exactly once per transition.
+    prev_daemon_ok: Option<bool>,
 }
+
+/// v0.1.28: cap on the Activity ring buffer. A few screens of history is
+/// plenty for the side panel; older lines fall off the back.
+const ACTIVITY_CAP: usize = 200;
 
 /// T-polish.6: TUI modals for room operations that can't easily
 /// be driven from the composer line. Currently two:
@@ -697,6 +713,31 @@ struct StatusSnapshot {
     hubs_connected: u32,
 }
 
+/// v0.1.28: severity of an [`ActivityEvent`], driving its colour in the
+/// right-side Activity panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityLevel {
+    /// Something went right (peer connected, hubs up, address published).
+    Good,
+    /// Neutral context (a message arrived, a state changed benignly).
+    Info,
+    /// Degraded but not dead (partial hub connectivity, peer dropped).
+    Warn,
+    /// Actively broken (no hubs reachable, daemon gone, send failed).
+    Bad,
+}
+
+/// v0.1.28: one line in the human-readable Activity feed. The feed makes
+/// connectivity / delivery problems (Tor blocked, hub down, message queued)
+/// visible *in the TUI* instead of buried in `~/.onyx/onyx.log` — the exact
+/// gap that turned a first-contact failure into an opaque "nothing happens".
+#[derive(Debug, Clone)]
+struct ActivityEvent {
+    ts_unix_ms: u64,
+    level: ActivityLevel,
+    text: String,
+}
+
 #[derive(Debug, Clone)]
 struct ChatLine {
     direction: MessageDirection,
@@ -734,6 +775,9 @@ impl AppState {
             seen_files: HashSet::new(),
             quit_requested: false,
             retention_secs: None,
+            activity: VecDeque::new(),
+            prev_health: None,
+            prev_daemon_ok: None,
         }
     }
 
@@ -821,6 +865,107 @@ impl AppState {
 
     /// Apply one event coming from the tail subscription. Returns
     /// `true` if the screen needs a re-render.
+    /// v0.1.28: append a human-readable line to the Activity feed. Collapses
+    /// an immediate duplicate of the newest line (so a repeating condition —
+    /// e.g. "0/2 hubs reachable" re-detected each poll — doesn't flood), and
+    /// caps the buffer at [`ACTIVITY_CAP`].
+    fn push_activity(&mut self, level: ActivityLevel, text: impl Into<String>) {
+        let text = text.into();
+        if self
+            .activity
+            .front()
+            .is_some_and(|e| e.text == text && e.level == level)
+        {
+            return;
+        }
+        self.activity.push_front(ActivityEvent {
+            ts_unix_ms: now_unix_ms(),
+            level,
+            text,
+        });
+        if self.activity.len() > ACTIVITY_CAP {
+            self.activity.pop_back();
+        }
+    }
+
+    /// v0.1.28: diff the latest status poll against the previous one and emit
+    /// Activity lines for *changes only* — daemon up/down, Tor ready, hub
+    /// connectivity (the big one: "0/N hubs reachable — Tor may be blocked"),
+    /// and our onion publishing. Called from `refresh_status_and_peers` after
+    /// `last_status` is set.
+    fn record_health(&mut self) {
+        // Compute all Activity lines + the new baselines WITHOUT touching
+        // `self` mutably (the `&self.last_status` borrow would otherwise
+        // conflict with `push_activity`), then apply the mutations after.
+        let mut msgs: Vec<(ActivityLevel, String)> = Vec::new();
+        let mut new_daemon_ok = self.prev_daemon_ok;
+        let mut new_health = self.prev_health;
+        match &self.last_status {
+            Some(Ok(s)) => {
+                if self.prev_daemon_ok == Some(false) {
+                    msgs.push((ActivityLevel::Good, "daemon reconnected".to_string()));
+                }
+                new_daemon_ok = Some(true);
+
+                let tor_ready = matches!(s.tor_state, TorState::Ready);
+                let onion_pub = s.onion.as_deref().is_some_and(|o| !o.is_empty());
+                let cur = (tor_ready, s.hubs_connected, s.hub_count, onion_pub);
+                match self.prev_health {
+                    None => {} // first poll — establish a baseline silently
+                    Some((p_tor, p_hubs, _p_count, p_onion)) => {
+                        if tor_ready != p_tor {
+                            msgs.push(if tor_ready {
+                                (ActivityLevel::Good, "Tor ready".to_string())
+                            } else {
+                                (ActivityLevel::Warn, "Tor not ready".to_string())
+                            });
+                        }
+                        if s.hubs_connected != p_hubs && s.hub_count > 0 {
+                            if s.hubs_connected == 0 {
+                                msgs.push((
+                                    ActivityLevel::Bad,
+                                    format!(
+                                        "0/{} hubs reachable — Tor may be blocked/throttled",
+                                        s.hub_count
+                                    ),
+                                ));
+                            } else if s.hubs_connected < s.hub_count {
+                                msgs.push((
+                                    ActivityLevel::Warn,
+                                    format!("{}/{} hubs connected", s.hubs_connected, s.hub_count),
+                                ));
+                            } else {
+                                msgs.push((
+                                    ActivityLevel::Good,
+                                    format!("{}/{} hubs connected", s.hubs_connected, s.hub_count),
+                                ));
+                            }
+                        }
+                        if onion_pub && !p_onion {
+                            msgs.push((
+                                ActivityLevel::Good,
+                                "your address published — others can reach you".to_string(),
+                            ));
+                        }
+                    }
+                }
+                new_health = Some(cur);
+            }
+            Some(Err(_)) => {
+                if self.prev_daemon_ok != Some(false) {
+                    msgs.push((ActivityLevel::Bad, "daemon connection lost".to_string()));
+                }
+                new_daemon_ok = Some(false);
+            }
+            None => {}
+        }
+        self.prev_daemon_ok = new_daemon_ok;
+        self.prev_health = new_health;
+        for (level, text) in msgs {
+            self.push_activity(level, text);
+        }
+    }
+
     fn apply_event(&mut self, ev: ApiResponse) -> bool {
         match ev {
             ApiResponse::EventMessage {
@@ -841,6 +986,13 @@ impl AppState {
                 if matches!(direction, MessageDirection::Incoming) && !is_selected {
                     *self.unread.entry(peer_short.clone()).or_insert(0) += 1;
                 }
+                if matches!(direction, MessageDirection::Incoming) {
+                    let via = if via_hub { " (via hub)" } else { "" };
+                    self.push_activity(
+                        ActivityLevel::Info,
+                        format!("✉ message from {}{via}", short_id(&peer_short)),
+                    );
+                }
                 self.scrollback
                     .entry(peer_short)
                     .or_default()
@@ -853,6 +1005,10 @@ impl AppState {
                 true
             }
             ApiResponse::EventPeerConnected { peer } => {
+                self.push_activity(
+                    ActivityLevel::Good,
+                    format!("● {} connected", short_id(&peer.short_id)),
+                );
                 self.upsert_peer(peer);
                 true
             }
@@ -860,6 +1016,10 @@ impl AppState {
                 if let Some(p) = self.peers.iter_mut().find(|p| p.short_id == peer_short) {
                     p.connected = false;
                 }
+                self.push_activity(
+                    ActivityLevel::Warn,
+                    format!("○ {} disconnected", short_id(&peer_short)),
+                );
                 true
             }
             ApiResponse::TailStarted => {
@@ -1989,9 +2149,14 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                         "invite accepted ({tier}, {sig}) — sent to peer via hub. \
                          They'll appear here once they come online and reply.",
                     ));
+                    app.push_activity(
+                        ActivityLevel::Info,
+                        "invite accepted — bootstrap queued at hub for the peer",
+                    );
                     tracing::info!(%tier, was_signed, "invite accepted via TUI modal");
                 }
                 Ok(ApiResponse::Error { message, .. }) => {
+                    app.push_activity(ActivityLevel::Bad, format!("action failed: {message}"));
                     app.last_send_result = Some(Err(message));
                 }
                 Ok(ApiResponse::DialPeerOk) => {
@@ -2003,6 +2168,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                     app.last_notice = Some(
                         "dialing peer over Tor — they'll appear here once connected".to_string(),
                     );
+                    app.push_activity(ActivityLevel::Info, "dialing peer over Tor…");
                 }
                 Ok(other) => {
                     app.last_send_result = Some(Err(format!("unexpected response: {other:?}")));
@@ -2727,6 +2893,8 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
             app.last_status = Some(Err(format!("{e:#}")));
         }
     }
+    // v0.1.28: turn the status delta into human-readable Activity lines.
+    app.record_health();
 
     // Peers — best-effort; don't overwrite the previous snapshot on
     // transient failure (the status field above will show the error).
@@ -3079,7 +3247,15 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     render_messages(frame, messages_area, app);
     render_composer(frame, composer_area, app);
     if let Some(d) = details_area {
-        render_details(frame, d, app);
+        // v0.1.28: stack conversation details (top) over the always-visible
+        // Activity feed (bottom) so connectivity/delivery issues are on
+        // screen, not buried in the raw log. On a short pane the feed yields.
+        let drows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(d);
+        render_details(frame, drows[0], app);
+        render_activity(frame, drows[1], app);
     }
     render_status(frame, status_area, app);
 
@@ -4106,6 +4282,45 @@ fn boxed(
             .wrap(Wrap { trim: false }),
         rect,
     );
+}
+
+/// v0.1.28: the always-visible **Activity** feed (right column, below
+/// Details). Newest line first; each row is `HH:MM  text`, coloured by
+/// severity and hard-truncated to the pane width (no wrap, so one event is
+/// always one row). This is the in-TUI surface for the connectivity /
+/// delivery problems that used to be visible only by tailing `onyx.log`.
+fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let inner_w = usize::from(area.width.saturating_sub(2));
+    let cap = usize::from(area.height.saturating_sub(2));
+    let mut lines: Vec<Line> = Vec::new();
+    if app.activity.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (waiting for activity…)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for ev in app.activity.iter().take(cap.max(1)) {
+            let color = match ev.level {
+                ActivityLevel::Good => Color::Green,
+                ActivityLevel::Info => Color::Gray,
+                ActivityLevel::Warn => Color::Yellow,
+                ActivityLevel::Bad => Color::Red,
+            };
+            let prefix = format!(" {} ", fmt_hhmm(ev.ts_unix_ms));
+            let avail = inner_w.saturating_sub(prefix.chars().count());
+            let body: String = if ev.text.chars().count() > avail {
+                let head: String = ev.text.chars().take(avail.saturating_sub(1)).collect();
+                format!("{head}…")
+            } else {
+                ev.text.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(body, Style::default().fg(color)),
+            ]));
+        }
+    }
+    boxed(frame, area, "Activity", Color::Blue, lines);
 }
 
 /// UX overhaul: the right-hand Details column — split into individually
@@ -5219,6 +5434,78 @@ mod snapshot_tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn status_with(
+        tor: TorState,
+        hub_count: u32,
+        hubs_connected: u32,
+        onion: bool,
+    ) -> StatusSnapshot {
+        StatusSnapshot {
+            daemon_version: "0.0.1".into(),
+            identity_pub_b32: "x".into(),
+            fingerprint: "fp".into(),
+            tor_state: tor,
+            onion: onion.then(|| "abc.onion".to_string()),
+            hub_count,
+            hubs_connected,
+        }
+    }
+
+    // v0.1.28: record_health logs only on CHANGE, and the first poll is a
+    // silent baseline (no spurious "Tor ready" / hub spam on startup).
+    #[test]
+    fn record_health_baseline_then_logs_hub_loss() {
+        let mut app = AppState::new(PathBuf::from("./s.sock"));
+        // First poll: 2/2 hubs, Tor ready — baseline, no activity lines.
+        app.last_status = Some(Ok(status_with(TorState::Ready, 2, 2, true)));
+        app.record_health();
+        assert!(app.activity.is_empty(), "first poll is a silent baseline");
+        // Hubs drop to 0/2 → one BAD line about Tor being blocked.
+        app.last_status = Some(Ok(status_with(TorState::Ready, 2, 0, true)));
+        app.record_health();
+        assert_eq!(app.activity.len(), 1);
+        let ev = app.activity.front().unwrap();
+        assert_eq!(ev.level, ActivityLevel::Bad);
+        assert!(ev.text.contains("0/2 hubs"), "got: {}", ev.text);
+        // Re-poll, still 0/2 → no duplicate (delta-only).
+        app.last_status = Some(Ok(status_with(TorState::Ready, 2, 0, true)));
+        app.record_health();
+        assert_eq!(
+            app.activity.len(),
+            1,
+            "no per-tick spam for an unchanged state"
+        );
+    }
+
+    // Daemon down → up logs lost/reconnected exactly once per transition.
+    #[test]
+    fn record_health_daemon_down_then_up() {
+        let mut app = AppState::new(PathBuf::from("./s.sock"));
+        app.last_status = Some(Err("refused".into()));
+        app.record_health();
+        app.last_status = Some(Err("refused".into()));
+        app.record_health();
+        assert_eq!(app.activity.len(), 1, "logged 'connection lost' once");
+        assert_eq!(app.activity.front().unwrap().level, ActivityLevel::Bad);
+        app.last_status = Some(Ok(status_with(TorState::Ready, 1, 1, true)));
+        app.record_health();
+        // newest first: "daemon reconnected" on top.
+        assert_eq!(app.activity.front().unwrap().text, "daemon reconnected");
+    }
+
+    // push_activity collapses an immediate duplicate and caps the buffer.
+    #[test]
+    fn push_activity_dedups_and_caps() {
+        let mut app = AppState::new(PathBuf::from("./s.sock"));
+        app.push_activity(ActivityLevel::Info, "same");
+        app.push_activity(ActivityLevel::Info, "same");
+        assert_eq!(app.activity.len(), 1, "consecutive duplicate collapsed");
+        for i in 0..(ACTIVITY_CAP + 50) {
+            app.push_activity(ActivityLevel::Info, format!("line {i}"));
+        }
+        assert_eq!(app.activity.len(), ACTIVITY_CAP, "buffer capped");
+    }
 
     // A1 (file picker): the listing puts `..` first, then directories,
     // then files — each group sorted case-insensitively — and file rows
