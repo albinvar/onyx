@@ -6,6 +6,33 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## DELIVERY phase 2a — 2026-06-06 — delivery-receipt wire foundation
+
+First slice of reliable delivery (per `DELIVERY.md §7`, DMs-first): the
+**wire types**, byte-compatible and behaviour-free, so the emit/consume +
+pending-store + retry slices land on a stable base.
+
+- `RoomAppMessage::Text` gains an optional `msg_id: Option<ByteBuf>` — a
+  random 16-byte id the sender will mint per message and embed *inside* the
+  sealed envelope (hubs never see it; NOT the routing-id). `#[serde(default,
+  skip_serializing_if)]` keeps the wire **byte-identical** to pre-DELIVERY
+  senders when unset, so older peers and existing tests are unaffected.
+- New `RoomAppMessage::DeliveryReceipt { msg_id }` variant — the
+  acknowledgement the recipient's daemon will auto-emit on decrypt, riding
+  the **same MLS session** (indistinguishable to hubs; `DELIVERY.md §4`).
+  Means "my daemon fetched it", never "the human read it" (no read receipts,
+  ever — `DELIVERY.md` N1).
+- Inbound dispatch now has observe-only arms for `DeliveryReceipt` on both
+  the direct-DM and group/hub paths (full consume = pending-store delete is
+  the next slice).
+
+Round-trip + wire-back-compat unit tests. No behaviour change yet — sends
+still carry no `msg_id` (all `None`). **Next:** mint `msg_id` on DM send +
+recipient auto-emit receipt (phase 2b), then the encrypted pending-store +
+retry loop + loud "not delivered" TUI state (phases 3–4).
+
+---
+
 ## UX — 2026-06-06 — right-side Activity feed (human-readable events)
 
 A persistent **Activity** panel on the right of the TUI (stacked under the

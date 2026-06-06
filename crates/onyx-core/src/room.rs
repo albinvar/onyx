@@ -58,7 +58,29 @@ use crate::error::{Error, Result};
 pub enum RoomAppMessage {
     /// User-typed chat text. The only variant that surfaces to the
     /// TUI / `Tail` subscribers as an `EventMessage`.
-    Text { text: String },
+    ///
+    /// `msg_id` (DELIVERY phase 2) is an optional random 16-byte id the
+    /// sender mints per message and embeds *inside* the sealed envelope
+    /// (hubs never see it — it is NOT the routing-id). The recipient, on
+    /// decrypt, emits a [`Self::DeliveryReceipt`] carrying the same id so
+    /// the sender can mark the message *delivered* (and stop retrying).
+    /// `#[serde(default)]` + `skip_serializing_if` keep the wire
+    /// byte-identical to pre-DELIVERY senders when no id is set, so older
+    /// peers and existing tests are unaffected.
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<ByteBuf>,
+    },
+    /// DELIVERY phase 2: end-to-end delivery acknowledgement. The
+    /// recipient's daemon emits this automatically once it successfully
+    /// decrypts a [`Self::Text`] that carried a `msg_id` — riding the
+    /// **same MLS session**, so to a hub it is just another sealed
+    /// envelope (no new metadata surface; see `DELIVERY.md §4`). It means
+    /// "my daemon fetched message `msg_id`", never "the human read it"
+    /// (Onyx never sends read receipts — `DELIVERY.md` N1). Sent for 1:1
+    /// DMs only in v1; recipient-disableable.
+    DeliveryReceipt { msg_id: ByteBuf },
     /// KEM-public-key advertisement (T6.3.h). The sender tells every
     /// other room member "member `fingerprint` has hybrid KEM pub
     /// `kem_pub`" so they can hub-fallback to that member when the
@@ -143,9 +165,49 @@ mod tests {
     fn text_round_trip() {
         let m = RoomAppMessage::Text {
             text: "hello room".into(),
+            msg_id: None,
         };
         let bytes = m.to_cbor().unwrap();
         assert_eq!(RoomAppMessage::from_cbor(&bytes).unwrap(), m);
+    }
+
+    // DELIVERY phase 2: a Text WITH a msg_id round-trips, and a Text
+    // WITHOUT one encodes byte-identically to the pre-DELIVERY shape
+    // (skip_serializing_if) so older peers/tests are unaffected.
+    #[test]
+    fn text_with_msg_id_round_trips() {
+        let m = RoomAppMessage::Text {
+            text: "hi".into(),
+            msg_id: Some(ByteBuf::from(vec![7u8; 16])),
+        };
+        let bytes = m.to_cbor().unwrap();
+        assert_eq!(RoomAppMessage::from_cbor(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn text_without_msg_id_omits_the_field_on_the_wire() {
+        let with_none = RoomAppMessage::Text {
+            text: "x".into(),
+            msg_id: None,
+        }
+        .to_cbor()
+        .unwrap();
+        let s = String::from_utf8_lossy(&with_none);
+        assert!(
+            !s.contains("msg_id"),
+            "msg_id must be omitted when None (wire back-compat); got {with_none:?}"
+        );
+    }
+
+    #[test]
+    fn delivery_receipt_round_trips_and_is_tagged() {
+        let m = RoomAppMessage::DeliveryReceipt {
+            msg_id: ByteBuf::from(vec![9u8; 16]),
+        };
+        let bytes = m.to_cbor().unwrap();
+        assert_eq!(RoomAppMessage::from_cbor(&bytes).unwrap(), m);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("DeliveryReceipt"), "must carry its kind tag");
     }
 
     #[test]
@@ -160,7 +222,10 @@ mod tests {
 
     #[test]
     fn text_carries_kind_tag() {
-        let m = RoomAppMessage::Text { text: "x".into() };
+        let m = RoomAppMessage::Text {
+            text: "x".into(),
+            msg_id: None,
+        };
         let bytes = m.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(
