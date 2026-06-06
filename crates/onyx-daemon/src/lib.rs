@@ -2006,8 +2006,11 @@ where
                     conversations::PeerOutbound::Dm(text) => {
                         // Task 322: DM text now rides the RoomAppMessage
                         // tagged envelope (so files can share the channel).
-                        let cbor = onyx_core::room::RoomAppMessage::Text { text: text.clone() }
-                            .to_cbor()
+                        let cbor = onyx_core::room::RoomAppMessage::Text {
+                            text: text.clone(),
+                            msg_id: None,
+                        }
+                        .to_cbor()
                             .map_err(|e| anyhow::anyhow!("dm text encode failed: {e}"))?;
                         let ct = {
                             let party = state.mls_party.lock().await;
@@ -2110,11 +2113,21 @@ async fn handle_dm_app_frame(
         format!("(peer/{})", short_id_of_peer_pub(peer_pub))
     });
     match msg {
-        onyx_core::room::RoomAppMessage::Text { text } => {
+        onyx_core::room::RoomAppMessage::Text { text, .. } => {
             state.conversations.lock().await.push_message(
                 peer_pub,
                 MessageDirection::Incoming,
                 text,
+            );
+        }
+        onyx_core::room::RoomAppMessage::DeliveryReceipt { msg_id } => {
+            // DELIVERY phase 2 (wire): a receipt for one of OUR sent
+            // messages. Full consume — delete the matching `pending_outbound`
+            // row so the retry loop stops — lands in the next slice; for now
+            // we observe it so the end-to-end path is exercised.
+            debug!(
+                msg_id_b32 = %encode_b32(&msg_id),
+                "delivery receipt received (direct DM); consume: TODO pending-store"
             );
         }
         onyx_core::room::RoomAppMessage::FileMeta {
@@ -2331,7 +2344,17 @@ async fn handle_room_app_frame(
             |arr| onyx_core::crypto::Fingerprint::from_bytes(arr).to_string(),
         );
     match msg {
-        onyx_core::room::RoomAppMessage::Text { text } => {
+        onyx_core::room::RoomAppMessage::DeliveryReceipt { msg_id } => {
+            // DELIVERY phase 2 (wire): receipt arriving over the group/hub
+            // path. Full consume (pending-store delete) lands next; observe
+            // for now so the end-to-end wire path is exercised.
+            debug!(
+                msg_id_b32 = %encode_b32(&msg_id),
+                group_id_b32 = %encode_b32(group_id),
+                "delivery receipt received (group path); consume: TODO pending-store"
+            );
+        }
+        onyx_core::room::RoomAppMessage::Text { text, .. } => {
             info!(
                 group_id_b32 = %encode_b32(group_id),
                 from_peer_short = %short_id_of_peer_pub(sender_peer_pub),
@@ -3364,7 +3387,7 @@ async fn handle_hub_dm_app_frame(
     };
     // Only Text is surfaced over the hub-DM path; files/KEM-ads are
     // direct-session concerns. Tag via_hub so the [hub] tier shows.
-    if let onyx_core::room::RoomAppMessage::Text { text } = msg {
+    if let onyx_core::room::RoomAppMessage::Text { text, .. } = msg {
         let peer_pub_b32 = encode_b32(peer_pub);
         // A hub-relayed DM may arrive when there is NO live session for
         // this peer (that's the whole point of the fallback). push_message*
@@ -4023,6 +4046,7 @@ mod dm_fallback_receive_tests {
         // Sender encrypts the DM exactly as dm_hub_fallback_send would.
         let cbor = onyx_core::room::RoomAppMessage::Text {
             text: "delivered while you were offline".to_string(),
+            msg_id: None,
         }
         .to_cbor()
         .expect("cbor");

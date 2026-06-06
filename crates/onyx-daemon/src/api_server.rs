@@ -1521,6 +1521,7 @@ async fn dm_hub_fallback_send(peer_pub: &[u8; 32], text: &str, state: &DaemonSta
     //    the MLS lock, loading the DM group fresh.
     let Ok(cbor) = onyx_core::room::RoomAppMessage::Text {
         text: text.to_string(),
+        msg_id: None,
     }
     .to_cbor() else {
         return false;
@@ -2676,6 +2677,7 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
     //    the room's MLS group, snapshot.
     let app_msg = onyx_core::room::RoomAppMessage::Text {
         text: text.to_string(),
+        msg_id: None,
     };
     let Ok(plaintext_bytes) = app_msg.to_cbor() else {
         return ApiResponse::Error {
