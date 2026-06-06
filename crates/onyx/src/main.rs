@@ -2106,7 +2106,7 @@ fn diagnose(
                 log.dial_failed, log.circuit_failed, log.guard_trouble, log.hs_upload_timeout
             ),
             fix: Some(
-                "usually a network throttling/blocking Tor — enable bridges (obfs4) or try another network".into(),
+                "usually the network throttling/blocking Tor — try another network (e.g. phone hotspot). A vanilla `--bridge` helps only if Tor guards are IP-blocked; it does NOT defeat DPI/throttling (obfs4 isn't built yet)".into(),
             ),
         }
     } else {
