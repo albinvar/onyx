@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.30 — 2026-06-06 — chat persistence, usability, blockers
+
+Umbrella since v0.1.29 (per-item entries below). The "make it actually
+usable" pass.
+
+- **DM chat persists** across a restart (was the "my chat disappeared" data
+  loss) — direct DMs now go to the encrypted store rooms already used.
+- **Live connection-progress** in the Activity feed (establishing… →
+  dialing… → connected) so a slow Tor connect isn't silent doubt.
+- **Compact one-line chat** layout + **blue→yellow** recolor (Activity
+  border, file-picker dirs).
+- **File send no longer dead-ends** when metadata can't be stripped
+  (confirm-to-send-as-is, default cancel).
+- **Ctrl-E works over SSH** — shows the link to copy manually when no
+  clipboard is reachable.
+
+Full pre-tag gate green. Still queued: Esc quit-confirm, file-send progress.
+
+---
+
 ## UX — 2026-06-06 — file-send no longer dead-ends + Ctrl-E works over SSH
 
 - **File send: allow-with-confirm when metadata can't be stripped.** Sending
