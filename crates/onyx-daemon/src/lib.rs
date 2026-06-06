@@ -2006,9 +2006,17 @@ where
                     conversations::PeerOutbound::Dm(text) => {
                         // Task 322: DM text now rides the RoomAppMessage
                         // tagged envelope (so files can share the channel).
+                        // DELIVERY phase 2b: mint a random per-message id and
+                        // embed it in the sealed envelope so the recipient can
+                        // ack delivery (RoomAppMessage::DeliveryReceipt). Only
+                        // the direct-DM path mints today; hub-relayed/queued
+                        // sends stay id-less until phases 3–4 wire the
+                        // pending-store. The id is NOT the routing-id; hubs
+                        // never see inside the MLS envelope.
+                        let msg_id: [u8; 16] = onyx_core::crypto::random_array();
                         let cbor = onyx_core::room::RoomAppMessage::Text {
                             text: text.clone(),
-                            msg_id: None,
+                            msg_id: Some(serde_bytes::ByteBuf::from(msg_id.to_vec())),
                         }
                         .to_cbor()
                             .map_err(|e| anyhow::anyhow!("dm text encode failed: {e}"))?;
@@ -2082,6 +2090,10 @@ where
 /// the `peer/<short>` conversation. `KemAdvertisement` is room-only
 /// and ignored on the DM channel. `peer_fp` is the peer's real
 /// fingerprint (from the DM group roster) for file attribution.
+// Linear per-variant dispatch (Text / DeliveryReceipt / FileMeta /
+// FileChunk / KemAdvertisement); each arm is self-contained, so the
+// length is inherent to the message taxonomy, not a refactor smell.
+#[allow(clippy::too_many_lines)]
 async fn handle_dm_app_frame(
     plaintext: &[u8],
     peer_pub: &[u8; 32],
@@ -2113,18 +2125,44 @@ async fn handle_dm_app_frame(
         format!("(peer/{})", short_id_of_peer_pub(peer_pub))
     });
     match msg {
-        onyx_core::room::RoomAppMessage::Text { text, .. } => {
+        onyx_core::room::RoomAppMessage::Text { text, msg_id } => {
             state.conversations.lock().await.push_message(
                 peer_pub,
                 MessageDirection::Incoming,
                 text,
             );
+            // DELIVERY phase 2b: if the sender embedded a msg_id, ack
+            // delivery so they can mark the message delivered (and, once
+            // phases 3–4 land, stop retrying). The receipt rides the SAME
+            // direct DM session as a `DmFrame` (indistinguishable to hubs;
+            // `DELIVERY.md §4`). Best-effort: if there's no live session we
+            // drop it — a late ack is worthless, and queuing one would keep
+            // a dead conversation "pending". A DeliveryReceipt carries no
+            // msg_id-bearing Text, so it never triggers a receipt of its
+            // own (no ack loop).
+            if let Some(msg_id) = msg_id {
+                let handle = state
+                    .conversations
+                    .lock()
+                    .await
+                    .handle_for_peer_pub(peer_pub);
+                if let Some(handle) = handle {
+                    let receipt = onyx_core::room::RoomAppMessage::DeliveryReceipt { msg_id };
+                    if let Err(e) = handle
+                        .outbound_tx
+                        .try_send(conversations::PeerOutbound::DmFrame(receipt))
+                    {
+                        debug!(error = %e, "delivery receipt: no live session to ack on; dropping");
+                    }
+                }
+            }
         }
         onyx_core::room::RoomAppMessage::DeliveryReceipt { msg_id } => {
-            // DELIVERY phase 2 (wire): a receipt for one of OUR sent
-            // messages. Full consume — delete the matching `pending_outbound`
-            // row so the retry loop stops — lands in the next slice; for now
-            // we observe it so the end-to-end path is exercised.
+            // DELIVERY phase 2b: a receipt for one of OUR sent messages. The
+            // full consume — delete the matching `pending_outbound` row so
+            // the retry loop stops + surface "delivered ✓" in the TUI —
+            // lands in phases 3–4; for now we observe it so the end-to-end
+            // ack path is exercised and visible in the log.
             debug!(
                 msg_id_b32 = %encode_b32(&msg_id),
                 "delivery receipt received (direct DM); consume: TODO pending-store"

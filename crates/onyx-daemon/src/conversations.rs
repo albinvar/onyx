@@ -495,6 +495,23 @@ impl ConversationRegistry {
         self.by_short.get(short_id).copied()
     }
 
+    /// DELIVERY phase 2b: look up a live handle by the peer's X25519
+    /// identity key. Used by the inbound DM-app handler to push a
+    /// [`PeerOutbound::DmFrame`] delivery receipt back to the *same*
+    /// peer over its existing direct session. Returns `None` if the peer
+    /// has no live session (the receipt is best-effort — we never queue
+    /// it; an ack that arrives late is worthless and queuing one would
+    /// keep a dead conversation "pending").
+    #[must_use]
+    pub fn handle_for_peer_pub(&self, peer_pub: &[u8; 32]) -> Option<ConversationHandle> {
+        let state = self.by_peer.get(peer_pub)?;
+        if state.connected {
+            Some(state.handle.clone())
+        } else {
+            None
+        }
+    }
+
     /// v0.1.17: queue an outbound message for a peer whose direct session
     /// is currently down, to be flushed (FIFO) when it reconnects. Bounded
     /// at [`OUTBOUND_MAILBOX`]; on overflow the OLDEST queued item is
@@ -645,6 +662,39 @@ mod tests {
         assert_eq!(handle.short_id.len(), 8);
         let h = reg.handle_for_short(&handle.short_id).expect("present");
         assert_eq!(h.peer_pub, handle.peer_pub);
+    }
+
+    // DELIVERY phase 2b: a live peer resolves by peer_pub, and a
+    // DeliveryReceipt pushed through the returned handle reaches the
+    // session task's receiver (the path the inbound DM handler uses to
+    // ack delivery). A disconnected peer resolves to None so the ack is
+    // dropped rather than queued.
+    #[tokio::test]
+    async fn handle_for_peer_pub_carries_delivery_receipt() {
+        use serde_bytes::ByteBuf;
+        let mut reg = ConversationRegistry::new();
+        let peer_pub = [9u8; 32];
+        let (_handle, mut rx) = reg.register(peer_pub, &b32(), "fpr".into());
+
+        let h = reg
+            .handle_for_peer_pub(&peer_pub)
+            .expect("live peer present");
+        let receipt = onyx_core::room::RoomAppMessage::DeliveryReceipt {
+            msg_id: ByteBuf::from(vec![3u8; 16]),
+        };
+        h.outbound_tx
+            .try_send(PeerOutbound::DmFrame(receipt))
+            .expect("queue receipt");
+        match rx.recv().await.expect("receipt delivered") {
+            PeerOutbound::DmFrame(onyx_core::room::RoomAppMessage::DeliveryReceipt { msg_id }) => {
+                assert_eq!(msg_id.as_ref(), &[3u8; 16]);
+            }
+            other => panic!("expected DmFrame(DeliveryReceipt), got {other:?}"),
+        }
+
+        // Disconnecting the peer makes the lookup return None.
+        reg.mark_disconnected(&peer_pub);
+        assert!(reg.handle_for_peer_pub(&peer_pub).is_none());
     }
 
     #[tokio::test]
