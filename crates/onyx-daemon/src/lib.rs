@@ -2086,6 +2086,48 @@ where
 /// Task 322: handle a decrypted DM application frame. The DM channel
 /// carries the `RoomAppMessage` tagged envelope (shared with rooms):
 /// `Text` is surfaced as an incoming chat message; `FileMeta` /
+/// v0.1.30 (chat persistence): persist one DM text message to the
+/// **encrypted** `room_messages` store so chat survives a daemon restart.
+/// DMs are 2-party MLS groups, so we key on the peer→group mapping and
+/// reuse the same AEAD-sealed table rooms use (`append_room_message`
+/// seals text + sender_fp at rest). Best-effort and a no-op until the DM
+/// group exists (pre-first-contact) — nothing to key on yet. Without this,
+/// direct-session DM messages lived only in the in-memory ring and
+/// vanished on every daemon restart (the "my chat disappeared" bug).
+pub(crate) async fn persist_dm_message(
+    state: &DaemonState,
+    peer_pub: &[u8; 32],
+    outgoing: bool,
+    sender_fp: &str,
+    text: &str,
+) {
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(0);
+    let vault = state.vault.lock().await;
+    match vault.lookup_peer_group(state.identity_id, peer_pub) {
+        Ok(Some(group_id)) => {
+            if let Err(e) = vault.append_room_message(
+                state.identity_id,
+                &group_id,
+                outgoing,
+                sender_fp,
+                text,
+                now_ms,
+            ) {
+                warn!(error = %e, "dm: persist to room_messages failed");
+            }
+        }
+        // No DM group yet (first-contact msg/v1, or mapping not recorded) —
+        // nothing to persist against; the message stays in the ring only.
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "dm: lookup_peer_group failed; not persisting"),
+    }
+}
+
 /// `FileChunk` run the same receive pipeline as room files, scoped to
 /// the `peer/<short>` conversation. `KemAdvertisement` is room-only
 /// and ignored on the DM channel. `peer_fp` is the peer's real
@@ -2126,6 +2168,9 @@ async fn handle_dm_app_frame(
     });
     match msg {
         onyx_core::room::RoomAppMessage::Text { text, msg_id } => {
+            // v0.1.30: persist (encrypted) so the chat survives a restart,
+            // then push to the in-memory ring for the live TUI.
+            persist_dm_message(state, peer_pub, false, &sender_fp, &text).await;
             state.conversations.lock().await.push_message(
                 peer_pub,
                 MessageDirection::Incoming,

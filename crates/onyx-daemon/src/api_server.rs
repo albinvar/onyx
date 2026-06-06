@@ -289,6 +289,49 @@ async fn dispatch_one_shot(
             // platforms we care about but we let it bubble defensively.
             let ring_cap = u32::try_from(crate::conversations::RING_CAPACITY).unwrap_or(u32::MAX);
             let limit_clamped = usize::try_from((*limit).min(ring_cap)).unwrap_or(0);
+            // v0.1.30 (chat persistence): prefer the ENCRYPTED persisted
+            // history so DM chat survives a daemon restart — the in-memory
+            // ring is wiped on restart and was the "my chat disappeared"
+            // bug. DMs are 2-party MLS groups, so read room_messages keyed
+            // by the peer→group mapping. Falls back to the ring for peers
+            // with no DM group yet (pre-first-contact) / pre-persist msgs.
+            let peer_pub = state
+                .conversations
+                .lock()
+                .await
+                .peer_pub_for_short(peer_short);
+            if let Some(pp) = peer_pub {
+                let rows = {
+                    let vault = state.vault.lock().await;
+                    match vault.lookup_peer_group(state.identity_id, &pp) {
+                        Ok(Some(gid)) => vault
+                            .room_history(state.identity_id, &gid, limit_clamped)
+                            .ok(),
+                        _ => None,
+                    }
+                };
+                if let Some(rows) = rows
+                    && !rows.is_empty()
+                {
+                    let messages = rows
+                        .into_iter()
+                        .map(|r| onyx_core::api::HistoryEntry {
+                            direction: if r.direction_outgoing {
+                                MessageDirection::Outgoing
+                            } else {
+                                MessageDirection::Incoming
+                            },
+                            text: r.text,
+                            ts_unix_ms: u64::try_from(r.created_at_ms).unwrap_or(0),
+                            via_hub: false,
+                        })
+                        .collect();
+                    return ApiResponse::HistoryOk {
+                        peer_short: peer_short.clone(),
+                        messages,
+                    };
+                }
+            }
             match state
                 .conversations
                 .lock()
@@ -311,6 +354,10 @@ async fn dispatch_one_shot(
             // message so the TUI's scrollback updates immediately
             // (the peer session task does NOT push outgoing messages —
             // it only encrypts + sends them on the wire).
+            // v0.1.30 (chat persistence): our own fingerprint, used to
+            // persist outgoing DMs to the encrypted store so they survive a
+            // daemon restart (see `crate::persist_dm_message`).
+            let our_fp = state.identity.fingerprint().to_string();
             let handle_opt = state
                 .conversations
                 .lock()
@@ -363,6 +410,7 @@ async fn dispatch_one_shot(
                         MessageDirection::Outgoing,
                         text.clone(),
                     );
+                    crate::persist_dm_message(state, &peer_pub, true, &our_fp, text).await;
                     return ApiResponse::SendOk;
                 }
                 let mut reg = state.conversations.lock().await;
@@ -371,6 +419,8 @@ async fn dispatch_one_shot(
                     crate::conversations::PeerOutbound::Dm(text.clone()),
                 ) {
                     reg.push_message(&peer_pub, MessageDirection::Outgoing, text.clone());
+                    drop(reg); // don't hold the conversations lock across the vault write
+                    crate::persist_dm_message(state, &peer_pub, true, &our_fp, text).await;
                     return ApiResponse::SendOk;
                 }
                 return ApiResponse::Error {
@@ -392,6 +442,7 @@ async fn dispatch_one_shot(
                         MessageDirection::Outgoing,
                         text.clone(),
                     );
+                    crate::persist_dm_message(state, &handle.peer_pub, true, &our_fp, text).await;
                     ApiResponse::SendOk
                 }
                 // v0.1.17: a full or just-closed live mailbox also queues
@@ -408,6 +459,9 @@ async fn dispatch_one_shot(
                             MessageDirection::Outgoing,
                             text.clone(),
                         );
+                        drop(reg); // release before the vault write (lock order)
+                        crate::persist_dm_message(state, &handle.peer_pub, true, &our_fp, text)
+                            .await;
                         ApiResponse::SendOk
                     } else {
                         ApiResponse::Error {
