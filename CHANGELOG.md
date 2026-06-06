@@ -6,6 +6,35 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Fix — 2026-06-06 — invite contacts are actually messageable (the real "can't connect" bug)
+
+**The root cause behind "connected but nothing happens".** A hub invite joins
+the encrypted MLS group but exchanged **no address** and left hub-relay **off**,
+so the resulting contact had *no transport to send over* — visible (offline)
+but unmessageable forever. Logs confirmed first contact was succeeding
+(`Welcome processed, MLS group joined` ×3); the failure was entirely
+downstream. This fixes that.
+
+- **First contact now shares an onion + auto-dials.** `BootstrapPayload::MlsWelcome`
+  carries the sender's `reply_onion` (sealed E2E to the recipient, covered by
+  the Ed25519 sig — same disclosure as a connect code). On receiving a DM
+  Welcome the daemon **records the peer's dial target and auto-dials**, so a
+  **direct session forms right after first contact** instead of a dead
+  hub-only contact. That session also triggers the existing KEM-advertisement
+  exchange, which in turn enables hub fallback for later offline delivery.
+- **DM hub fallback now defaults ON** (`onyx` app; was opt-in/off). So a
+  message still goes through when no direct session is up. Config opt-out
+  preserved: `dm_hub_fallback: false` in `config.json` still disables it.
+
+Wire-compatible (`reply_onion` omitted when `None`). **Both devices must run
+≥ this version** for the onion exchange to take effect. Gate green: fmt,
+`clippy --workspace -D warnings`, onyx-core routing tests, daemon lib tests,
+all 9 `rooms_smoke` integration tests. Deferred: carry the peer KEM *in* the
+bootstrap so hub-fallback works even if a direct dial never succeeds; CLI
+`--no-dm-hub-fallback` opt-out; inviter-onion in the invite URL (reverse-dial).
+
+---
+
 ## Release v0.1.28 — 2026-06-06 — observability + reliable-delivery groundwork
 
 Umbrella for everything since v0.1.27 (per-item entries below). Theme:

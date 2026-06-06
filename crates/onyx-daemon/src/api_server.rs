@@ -1307,6 +1307,9 @@ async fn handle_invite_to_room(
         room_name: Some(room.name.clone()),
         member_kems,
         admins,
+        // Rooms reach members via the MLS group + member-KEM graph, not a
+        // single direct dial — no reply onion for room invites.
+        reply_onion: None,
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {
@@ -3282,6 +3285,12 @@ async fn handle_send_bootstrap_mls(
         member_kems: vec![],
         // G-2 (F3.3): a 2-party DM has no admin/authority concept.
         admins: vec![],
+        // v0.1.29 (working-channel fix): include our own onion so the
+        // recipient can open a DIRECT session instead of being left a
+        // hub-only contact with no transport. Sealed E2E to the recipient
+        // (their envelope), covered by the Ed25519 sig — same disclosure as
+        // a connect code. `None` until our hidden service has published.
+        reply_onion: state.self_onion.get().cloned(),
     };
     let Ok(payload_bytes) = payload.to_cbor() else {
         return ApiResponse::Error {
