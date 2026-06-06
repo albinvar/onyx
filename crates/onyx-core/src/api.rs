@@ -662,6 +662,14 @@ pub enum ApiResponse {
     /// session ended, etc.). The conversation handle is gone from
     /// the registry; the client should mark the row stale.
     EventPeerDisconnected { peer_short: String },
+    /// v0.1.30: a human-readable progress note for the live Activity
+    /// feed — connection lifecycle steps that otherwise leave the user
+    /// staring at silence ("establishing session…", "dialing over Tor…",
+    /// "dial failed, retrying…"). Pure UX telemetry over the local
+    /// authenticated socket; carries no secrets. `level` is one of
+    /// `"good" | "info" | "warn" | "bad"` so the TUI can colour it; an
+    /// unknown value renders as info.
+    EventNote { text: String, level: String },
 
     // ── error ───────────────────────────────────────────────────────
     /// Catch-all error. The client matches on `code` for programmatic

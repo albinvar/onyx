@@ -2609,6 +2609,13 @@ fn handle_dial_peer(onion: &str, pubkey_b32: &str, state: &Arc<DaemonState>) -> 
     let onion = onion.to_string();
     let pubkey_b32 = pubkey_b32.to_string();
     tokio::spawn(async move {
+        // v0.1.30: surface dial progress in the Activity feed (Tor circuit +
+        // handshake is slow; the user should see it's working).
+        state
+            .conversations
+            .lock()
+            .await
+            .emit_note("info", "dialing peer over Tor — this can take 10–60s…");
         // v0.1.17: remember this target so the reconnect supervisor (and
         // restart revive) can re-dial it after the circuit drops. Recorded
         // before the dial so even an immediate failure is retryable.

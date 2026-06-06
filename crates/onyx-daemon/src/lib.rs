@@ -3505,7 +3505,7 @@ fn encode_b32(bytes: &[u8]) -> String {
 /// snapshots state, then dispatches to either room-row persistence
 /// (when `room_name = Some`) or the existing DM register-hub-only
 /// path (when `room_name = None`).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_hub_mls_welcome(
     welcome_bytes: &[u8],
     first_message: Option<String>,
@@ -3633,6 +3633,15 @@ async fn process_hub_mls_welcome(
         )
     };
     reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text);
+    // v0.1.30: surface first-contact progress in the TUI Activity feed so the
+    // user isn't left wondering whether anything is happening.
+    reg.emit_note(
+        "good",
+        format!(
+            "new contact {} — establishing secure session…",
+            handle.short_id
+        ),
+    );
     info!(
         from_short = %handle.short_id,
         mls_epoch = group.epoch(),
@@ -3652,6 +3661,13 @@ async fn process_hub_mls_welcome(
     if let Some(onion) = reply_onion.filter(|o| !o.is_empty())
         && let Some(tor) = state.tor.get()
     {
+        state.conversations.lock().await.emit_note(
+            "info",
+            format!(
+                "dialing {} over Tor — first contact can take 10–60s…",
+                handle.short_id
+            ),
+        );
         let tor = tor.clone();
         let state = state.clone();
         let pubkey_b32 = sender_pub_b32.to_string();
