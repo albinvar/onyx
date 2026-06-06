@@ -211,6 +211,11 @@ struct AppState {
     /// v0.1.31: the user's own display name (shown instead of "me" in chat).
     /// Loaded from config.json; set via `/myname`. `None` → "me".
     my_nickname: Option<String>,
+    /// v0.1.31: chat selection mode (Ctrl-S). `Some` = a cursor is moving
+    /// over the *displayed* scrollback of the current conversation so the
+    /// user can copy one or several messages. `None` = normal typing mode.
+    /// Indices are into the displayed (retention-filtered) message list.
+    select: Option<SelectState>,
     /// v0.1.28: human-readable Activity feed (newest at front), shown in the
     /// always-visible right-side panel. Populated from health deltas
     /// (`record_health`), tail events (`apply_event`), and notable send
@@ -241,6 +246,15 @@ const ACTIVITY_CAP: usize = 200;
 ///
 /// `Tab` cycles between fields in InvitePeer; `Esc` closes
 /// without submitting; `Enter` submits.
+/// v0.1.31: chat-selection state (Ctrl-S). `cursor` highlights one message
+/// in the displayed scrollback; `marked` are additional messages tagged for
+/// a multi-message copy. All indices are into the displayed (filtered) list.
+#[derive(Debug, Clone, Default)]
+struct SelectState {
+    cursor: usize,
+    marked: std::collections::HashSet<usize>,
+}
+
 /// v0.1.30: outcome of a clipboard-copy attempt in the Share modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopyState {
@@ -830,6 +844,7 @@ impl AppState {
             quit_requested: false,
             retention_secs: None,
             my_nickname: None,
+            select: None,
             activity: VecDeque::new(),
             prev_health: None,
             prev_daemon_ok: None,
@@ -885,6 +900,29 @@ impl AppState {
             .map(|e| e.scrollback_key())
             .and_then(|k| self.messages_scroll.get(&k).copied())
             .unwrap_or(0)
+    }
+
+    /// v0.1.31: the messages currently DISPLAYED for the selected
+    /// conversation — same retention filter `render_messages` applies — so
+    /// selection-mode indices line up 1:1 with the rendered chat lines.
+    fn displayed_messages(&self) -> Vec<ChatLine> {
+        let Some(key) = self.selected_entry().map(|e| e.scrollback_key()) else {
+            return Vec::new();
+        };
+        let Some(scroll) = self.scrollback.get(&key) else {
+            return Vec::new();
+        };
+        match self.retention_secs {
+            Some(secs) => {
+                let cutoff = now_unix_ms().saturating_sub(secs.saturating_mul(1000));
+                scroll
+                    .iter()
+                    .filter(|l| l.ts_unix_ms >= cutoff)
+                    .cloned()
+                    .collect()
+            }
+            None => scroll.clone(),
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1264,7 +1302,77 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
         return app.quit_requested;
     }
 
+    // v0.1.31: chat selection mode (Ctrl-S). While active, ↑/↓ (or j/k) move
+    // a message cursor, Space marks/unmarks, Enter/c copies (marked, or the
+    // cursor if none), Esc exits. Ctrl-C still quits.
+    if app.select.is_some() {
+        let msgs = app.displayed_messages();
+        let n = msgs.len();
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return true,
+            (KeyCode::Esc, _) => app.select = None,
+            (KeyCode::Up | KeyCode::Char('k'), _) => {
+                if let Some(s) = app.select.as_mut() {
+                    s.cursor = s.cursor.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down | KeyCode::Char('j'), _) => {
+                if let Some(s) = app.select.as_mut() {
+                    if n > 0 {
+                        s.cursor = (s.cursor + 1).min(n - 1);
+                    }
+                }
+            }
+            (KeyCode::Char(' '), _) => {
+                if let Some(s) = app.select.as_mut()
+                    && !s.marked.remove(&s.cursor)
+                {
+                    s.marked.insert(s.cursor);
+                }
+            }
+            (KeyCode::Enter | KeyCode::Char('c'), _) => {
+                let s = app.select.take().unwrap_or_default();
+                let mut idxs: Vec<usize> = if s.marked.is_empty() {
+                    vec![s.cursor]
+                } else {
+                    s.marked.iter().copied().collect()
+                };
+                idxs.sort_unstable();
+                let text = idxs
+                    .iter()
+                    .filter_map(|&i| msgs.get(i))
+                    .map(|l| l.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let count = idxs.len();
+                if !text.is_empty() && copy_to_clipboard(&text) {
+                    app.last_notice = Some(format!("copied {count} message(s)"));
+                } else {
+                    app.last_send_result = Some(Err(
+                        "couldn't reach a clipboard (SSH?) — copy unavailable here".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     match (key.code, key.modifiers) {
+        // v0.1.31: Ctrl-S enters chat selection mode (copy a message or
+        // several). Starts the cursor on the newest message.
+        (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+            let n = app.displayed_messages().len();
+            if n == 0 {
+                app.last_send_result = Some(Err("no messages to select".to_string()));
+            } else {
+                app.select = Some(SelectState {
+                    cursor: n - 1,
+                    marked: std::collections::HashSet::new(),
+                });
+            }
+            return false;
+        }
         // T-polish.6: Ctrl-N opens the create-room modal.
         (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
             app.modal = Some(ModalState::CreateRoom {
@@ -5141,14 +5249,19 @@ fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
 /// and message text align as invisible columns. Also the nickname cap.
 const NAME_COL: usize = 10;
 
-fn build_chat_lines(scroll: &[ChatLine], who_label: &str, me_label: &str) -> Vec<Line<'static>> {
+fn build_chat_lines(
+    scroll: &[ChatLine],
+    who_label: &str,
+    me_label: &str,
+    select: Option<&SelectState>,
+) -> Vec<Line<'static>> {
     // Every span built below owns its text (clone / to_string / format!), so
     // the result is 'static — it doesn't borrow `scroll`/`who_label`. That
     // lets callers pass a temporary filtered Vec (retention) safely.
     let mut out: Vec<Line<'static>> = Vec::new();
     // (is_outgoing, hhmm) of the last prefix emitted; repeated only on change.
     let mut last_key: Option<(bool, String)> = None;
-    for line in scroll {
+    for (idx, line) in scroll.iter().enumerate() {
         let outgoing = matches!(line.direction, MessageDirection::Outgoing);
         let (who, color) = if outgoing {
             (me_label, Color::Green)
@@ -5163,7 +5276,29 @@ fn build_chat_lines(scroll: &[ChatLine], who_label: &str, me_label: &str) -> Vec
         } else {
             Style::default().fg(Color::White)
         };
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(5);
+        // v0.1.31: selection-mode gutter (Ctrl-S). Two-char column so the
+        // rest of the row stays aligned: ▸ = cursor, ✓ = marked.
+        if let Some(sel) = select {
+            let (mark, mstyle) = if sel.cursor == idx {
+                (
+                    "▸ ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if sel.marked.contains(&idx) {
+                (
+                    "✓ ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default())
+            };
+            spans.push(Span::styled(mark, mstyle));
+        }
         // Fixed-width name column → HH:MM and the text line up as invisible
         // columns regardless of name length (e.g. "me" vs "gctufe2t"). Caps
         // at NAME_COL chars (matches the nickname cap).
@@ -5223,7 +5358,23 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     };
     // v0.1.31: own display name (falls back to "me").
     let me_label = app.my_nickname.clone().unwrap_or_else(|| "me".to_string());
-    let block = Block::default().borders(Borders::ALL).title(title);
+    // v0.1.31: in selection mode, the title becomes the keybind hint.
+    let block = if let Some(sel) = &app.select {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(
+                format!(
+                    " SELECT — ↑↓ move · Space mark ({}) · Enter/c copy · Esc ",
+                    sel.marked.len()
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+    } else {
+        Block::default().borders(Borders::ALL).title(title)
+    };
     if app.selected_entry().is_none() {
         // UX overhaul: brand-new user (no peers, no rooms) gets a real
         // welcome + concrete first steps, instead of a bare "nothing
@@ -5308,10 +5459,10 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                         Style::default().fg(Color::DarkGray),
                     ))]
                 } else {
-                    build_chat_lines(&kept, &who_label, &me_label)
+                    build_chat_lines(&kept, &who_label, &me_label, app.select.as_ref())
                 }
             } else {
-                build_chat_lines(scroll, &who_label, &me_label)
+                build_chat_lines(scroll, &who_label, &me_label, app.select.as_ref())
             }
         }
         _ => vec![Line::from(Span::styled(
@@ -5817,7 +5968,7 @@ mod snapshot_tests {
         // v0.1.30: one line per message — 3 messages → exactly 3 lines
         // (no header/spacer rows). The first two share a sender+minute so
         // the second aligns under the prefix; the third gets its own prefix.
-        let lines = build_chat_lines(&scroll, "alice", "me");
+        let lines = build_chat_lines(&scroll, "alice", "me", None);
         assert_eq!(lines.len(), 3);
     }
 
