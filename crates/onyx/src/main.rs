@@ -208,6 +208,11 @@ enum Command {
     Status,
     /// Print the daemon's identity public key + fingerprint as JSON.
     Identity,
+    /// Self-check: is the daemon healthy and are you actually connectable?
+    /// Checks Tor, whether your onion is published, live hub connectivity,
+    /// and first-contact reachability — and prints plain-English PASS/WARN/
+    /// FAIL with the fix for each. Run this first if messaging "does nothing."
+    Doctor,
     /// Open the interactive multi-pane TUI against a daemon that is
     /// ALREADY RUNNING (this subcommand does NOT start one).
     ///
@@ -1339,6 +1344,7 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
         }
         Some(Command::Status) => one_shot_print(&socket, ApiRequest::Status).await,
         Some(Command::Identity) => one_shot_print(&socket, ApiRequest::Identity).await,
+        Some(Command::Doctor) => run_doctor(&socket).await,
         Some(Command::Tui) => {
             tui::run(socket).await?;
             Ok(ExitCode::SUCCESS)
@@ -1922,6 +1928,297 @@ async fn run_accept(
     })
 }
 
+// ── `onyx doctor` — connectivity self-check ────────────────────────────────
+
+/// Verdict for a single doctor check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Health {
+    Pass,
+    Warn,
+    Fail,
+}
+
+/// One line of the doctor report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Check {
+    name: String,
+    health: Health,
+    detail: String,
+    fix: Option<String>,
+}
+
+/// Connectivity signals scraped from the recent daemon log tail. Counts
+/// are over the window we read, not all-time — recent is what matters for
+/// "can I reach a hub *right now*."
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LogSignals {
+    hub_session_ok: usize,    // "Noise XK complete" — a hub session established
+    dial_failed: usize,       // "dial failed"
+    circuit_failed: usize,    // "Too many preemptive onion service circuits failed"
+    guard_trouble: usize,     // guard couldn't connect / died
+    hs_upload_timeout: usize, // "failed to upload descriptor"
+}
+
+/// Count connectivity markers in recent log lines. Pure (unit-tested).
+fn analyze_log(lines: &[String]) -> LogSignals {
+    let mut s = LogSignals::default();
+    for l in lines {
+        if l.contains("Noise XK complete") {
+            s.hub_session_ok += 1;
+        }
+        if l.contains("dial failed") {
+            s.dial_failed += 1;
+        }
+        if l.contains("Too many preemptive onion service circuits failed") {
+            s.circuit_failed += 1;
+        }
+        if l.contains("Could not connect to guard")
+            || l.contains("died under mysterious circumstances")
+        {
+            s.guard_trouble += 1;
+        }
+        if l.contains("failed to upload descriptor") {
+            s.hs_upload_timeout += 1;
+        }
+    }
+    s
+}
+
+/// Build the doctor checklist. Pure (unit-tested) so the verdict logic is
+/// testable without a running daemon.
+#[allow(clippy::too_many_lines)] // linear builder of one Check per line
+fn diagnose(
+    daemon_up: bool,
+    tor: Option<&onyx_core::api::TorState>,
+    onion_published: bool,
+    hub_count: u32,
+    hubs_connected: u32,
+    reachable: bool,
+    log: &LogSignals,
+) -> Vec<Check> {
+    use onyx_core::api::TorState;
+    let mut out = Vec::new();
+    if !daemon_up {
+        out.push(Check {
+            name: "daemon".into(),
+            health: Health::Fail,
+            detail: "not running (no response on the API socket)".into(),
+            fix: Some("start it: run `onyx` (or `onyxd`)".into()),
+        });
+        return out; // everything else depends on the daemon
+    }
+    out.push(Check {
+        name: "daemon".into(),
+        health: Health::Pass,
+        detail: "running".into(),
+        fix: None,
+    });
+
+    // Tor bootstrap
+    let (h, d, f) = match tor {
+        Some(TorState::Ready) => (Health::Pass, "bootstrapped".to_string(), None),
+        Some(TorState::Bootstrapping { percent }) => (
+            Health::Warn,
+            format!("still bootstrapping ({percent}%)"),
+            Some("wait a bit and re-run `onyx doctor`".to_string()),
+        ),
+        Some(TorState::Disabled) => (
+            Health::Warn,
+            "disabled (test build — NO anonymity)".to_string(),
+            None,
+        ),
+        _ => (
+            Health::Warn,
+            "not ready".to_string(),
+            Some("wait for bootstrap; if it never finishes your network may block Tor".to_string()),
+        ),
+    };
+    out.push(Check {
+        name: "tor".into(),
+        health: h,
+        detail: d,
+        fix: f,
+    });
+
+    // Onion published (others can dial you / you can subscribe)
+    out.push(if onion_published {
+        Check {
+            name: "your onion".into(),
+            health: Health::Pass,
+            detail: "published (reachable for direct dial)".into(),
+            fix: None,
+        }
+    } else {
+        Check {
+            name: "your onion".into(),
+            health: Health::Warn,
+            detail: "not published yet".into(),
+            fix: Some(
+                "wait for Tor; if it stays unpublished your network is likely blocking Tor (try bridges)".into(),
+            ),
+        }
+    });
+
+    // Hubs configured
+    out.push(if hub_count >= 1 {
+        Check {
+            name: "hubs configured".into(),
+            health: Health::Pass,
+            detail: format!("{hub_count} hub(s)"),
+            fix: None,
+        }
+    } else {
+        Check {
+            name: "hubs configured".into(),
+            health: Health::Fail,
+            detail: "none — offline/async delivery won't work".into(),
+            fix: Some(
+                "set use_public_hubs=true in config, or add one (Ctrl-G), then relaunch".into(),
+            ),
+        }
+    });
+
+    // Live hub connectivity (the one that bites). Primary signal is the
+    // LIVE count the daemon reports (`hubs_connected`) — a fact, not a
+    // guess. The log only colours the diagnosis when nothing is connected.
+    let failures = log.dial_failed + log.circuit_failed + log.guard_trouble + log.hs_upload_timeout;
+    out.push(if hub_count == 0 {
+        // Already FAILed under "hubs configured"; don't double-fail.
+        Check {
+            name: "hub connectivity".into(),
+            health: Health::Warn,
+            detail: "no hubs configured (see above)".into(),
+            fix: None,
+        }
+    } else if hubs_connected >= 1 {
+        Check {
+            name: "hub connectivity".into(),
+            health: Health::Pass,
+            detail: format!("{hubs_connected}/{hub_count} hub(s) connected right now"),
+            fix: None,
+        }
+    } else if failures > 0 {
+        Check {
+            name: "hub connectivity".into(),
+            health: Health::Fail,
+            detail: format!(
+                "0/{hub_count} connected — Tor can't reach the hubs ({} dial / {} circuit / {} guard / {} descriptor failures recently)",
+                log.dial_failed, log.circuit_failed, log.guard_trouble, log.hs_upload_timeout
+            ),
+            fix: Some(
+                "usually a network throttling/blocking Tor — enable bridges (obfs4) or try another network".into(),
+            ),
+        }
+    } else {
+        Check {
+            name: "hub connectivity".into(),
+            health: Health::Warn,
+            detail: format!("0/{hub_count} connected yet (still connecting, or just started)"),
+            fix: Some("wait a few seconds and re-run `onyx doctor`".into()),
+        }
+    });
+
+    // First-contact reachability
+    out.push(if reachable {
+        Check {
+            name: "reachable by invite".into(),
+            health: Health::Pass,
+            detail: "yes — others can accept your invite while you're offline".into(),
+            fix: None,
+        }
+    } else {
+        Check {
+            name: "reachable by invite".into(),
+            health: Health::Warn,
+            detail: "NO — accepted invites to you will NOT arrive (private default)".into(),
+            fix: Some(
+                "enable: Ctrl-G → reachability (or first_contact_reachable=true) + relaunch — OR share a connect code for direct dial".into(),
+            ),
+        }
+    });
+
+    out
+}
+
+/// Read up to `max` of the most-recent lines of `~/.onyx/onyx.log`.
+fn recent_log_lines(max: usize) -> Vec<String> {
+    let path = onyx_daemon::default_data_dir().join("onyx.log");
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let all: Vec<&str> = s.lines().collect();
+    let start = all.len().saturating_sub(max);
+    all[start..].iter().map(|l| (*l).to_string()).collect()
+}
+
+/// `onyx doctor` — gather state, run [`diagnose`], print a colored
+/// checklist + overall verdict. Exit 1 if any check FAILs.
+async fn run_doctor(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
+    let status = client::one_shot(socket, &ApiRequest::Status).await;
+    let cfg = load_file_config().ok().flatten().unwrap_or_default();
+    let log = analyze_log(&recent_log_lines(400));
+
+    let (daemon_up, tor, onion_pub, hub_count, hubs_connected) = match &status {
+        Ok(ApiResponse::StatusOk {
+            tor_state,
+            onion,
+            hub_count,
+            hubs_connected,
+            ..
+        }) => (
+            true,
+            Some(*tor_state),
+            onion.is_some(),
+            *hub_count,
+            *hubs_connected,
+        ),
+        _ => (false, None, false, 0, 0),
+    };
+    let checks = diagnose(
+        daemon_up,
+        tor.as_ref(),
+        onion_pub,
+        hub_count,
+        hubs_connected,
+        cfg.first_contact_reachable,
+        &log,
+    );
+
+    println!(
+        "\n{}\n",
+        paint("Onyx doctor — connectivity self-check", ANSI_CYAN)
+    );
+    let mut any_fail = false;
+    for c in &checks {
+        let (mark, color) = match c.health {
+            Health::Pass => ("✓", ANSI_GREEN),
+            Health::Warn => ("⚠", ANSI_AMBER),
+            Health::Fail => ("✗", ANSI_RED),
+        };
+        if c.health == Health::Fail {
+            any_fail = true;
+        }
+        println!("  {} {:<20} {}", paint(mark, color), c.name, c.detail);
+        if let Some(fix) = &c.fix {
+            println!("       {} {}", paint("→", ANSI_DIM), paint(fix, ANSI_DIM));
+        }
+    }
+    let any_warn = checks.iter().any(|c| c.health == Health::Warn);
+    let verdict = if any_fail {
+        paint("\n✗ Not ready — fix the ✗ items above.", ANSI_RED)
+    } else if any_warn {
+        paint("\n⚠ Mostly OK — review the ⚠ items.", ANSI_AMBER)
+    } else {
+        paint("\n✓ Looks good — you're connectable.", ANSI_GREEN)
+    };
+    println!("{verdict}\n");
+    Ok(if any_fail {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 /// Send `req`, pretty-print the response as JSON on stdout, return
 /// `1` if the daemon returned an `Error`, `0` otherwise.
 async fn one_shot_print(socket: &std::path::Path, req: ApiRequest) -> anyhow::Result<ExitCode> {
@@ -1932,6 +2229,90 @@ async fn one_shot_print(socket: &std::path::Path, req: ApiRequest) -> anyhow::Re
         ApiResponse::Error { .. } => ExitCode::from(1),
         _ => ExitCode::SUCCESS,
     })
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::{Health, LogSignals, analyze_log, diagnose};
+    use onyx_core::api::TorState;
+
+    fn health(checks: &[super::Check], name: &str) -> Health {
+        checks.iter().find(|c| c.name == name).unwrap().health
+    }
+
+    #[test]
+    fn analyze_log_counts_markers() {
+        let lines: Vec<String> = [
+            "hub: Noise XK complete; sending SUBSCRIBE",
+            "hub dial failed: internal: tor: dial failed",
+            "Too many preemptive onion service circuits failed; waiting a while",
+            "Could not connect to guard [scrubbed]. Retrying",
+            "failed to upload descriptor for service onyx error=Timeout exceeded",
+            "unrelated line",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let s = analyze_log(&lines);
+        assert_eq!(s.hub_session_ok, 1);
+        assert_eq!(s.dial_failed, 1);
+        assert_eq!(s.circuit_failed, 1);
+        assert_eq!(s.guard_trouble, 1);
+        assert_eq!(s.hs_upload_timeout, 1);
+    }
+
+    #[test]
+    fn diagnose_daemon_down_short_circuits() {
+        let checks = diagnose(false, None, false, 0, 0, false, &LogSignals::default());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "daemon");
+        assert_eq!(checks[0].health, Health::Fail);
+    }
+
+    #[test]
+    fn diagnose_healthy_node_all_pass() {
+        let log = LogSignals {
+            hub_session_ok: 2,
+            ..Default::default()
+        };
+        // 2/2 hubs connected live → hub connectivity PASS.
+        let checks = diagnose(true, Some(&TorState::Ready), true, 2, 2, true, &log);
+        assert_eq!(health(&checks, "tor"), Health::Pass);
+        assert_eq!(health(&checks, "your onion"), Health::Pass);
+        assert_eq!(health(&checks, "hubs configured"), Health::Pass);
+        assert_eq!(health(&checks, "hub connectivity"), Health::Pass);
+        assert_eq!(health(&checks, "reachable by invite"), Health::Pass);
+        assert!(checks.iter().all(|c| c.health == Health::Pass));
+    }
+
+    #[test]
+    fn diagnose_flags_unreachable_and_dead_tor() {
+        // Reachability off (the invite footgun) + Tor failing to reach hubs.
+        let log = LogSignals {
+            dial_failed: 5,
+            circuit_failed: 3,
+            ..Default::default()
+        };
+        // 0/2 connected + dial/circuit failures → hub connectivity FAIL.
+        let checks = diagnose(true, Some(&TorState::Ready), false, 2, 0, false, &log);
+        assert_eq!(health(&checks, "reachable by invite"), Health::Warn);
+        assert_eq!(health(&checks, "hub connectivity"), Health::Fail);
+        assert_eq!(health(&checks, "your onion"), Health::Warn);
+    }
+
+    #[test]
+    fn diagnose_no_hubs_is_fail() {
+        let checks = diagnose(
+            true,
+            Some(&TorState::Ready),
+            true,
+            0,
+            0,
+            true,
+            &LogSignals::default(),
+        );
+        assert_eq!(health(&checks, "hubs configured"), Health::Fail);
+    }
 }
 
 #[cfg(test)]

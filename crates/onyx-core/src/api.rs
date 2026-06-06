@@ -443,6 +443,18 @@ pub enum ApiResponse {
         /// `#[serde(default)]` for wire back-compat with older daemons.
         #[serde(default)]
         hub_count: u32,
+        /// v0.1.28 (honest health): how many configured hubs the daemon
+        /// has a LIVE session with right now — i.e. the Noise handshake
+        /// completed and the session is serving. Distinct from
+        /// `hub_count` (which is only how many are *configured*). A
+        /// chronically-failing Tor that can't reach any hub reports
+        /// `hub_count = N, hubs_connected = 0`, so the TUI can stop
+        /// showing a misleading all-green "tor ready". Counts the
+        /// always-on activity session per hub (not the optional
+        /// reachability/identity session). `#[serde(default)]` for wire
+        /// back-compat with older daemons (they report 0).
+        #[serde(default)]
+        hubs_connected: u32,
     },
     /// Reply to [`ApiRequest::Identity`].
     IdentityOk {
@@ -883,6 +895,7 @@ mod tests {
             identity_kem_pub_b32: "long-b32-string-stand-in".into(),
             onion: Some("abc.onion".into()),
             hub_count: 2,
+            hubs_connected: 1,
         };
         let line = encode_response_line(&r).unwrap();
         let parsed = decode_response(line.trim_end_matches('\n')).unwrap();

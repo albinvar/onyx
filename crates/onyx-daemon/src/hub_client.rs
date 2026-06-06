@@ -29,9 +29,40 @@ use onyx_core::routing::RoutingId;
 use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{Session, handshake_initiator, read_frame, write_frame};
 use onyx_core::wire::{FRAME_DELIVER, FRAME_SUBSCRIBE, InnerFrame};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// v0.1.28 (honest health): RAII marker that a hub session is LIVE.
+///
+/// Constructed only *after* the Noise XK handshake completes — so a
+/// chronically-failing dial (the exact symptom we hit on a Tor-hostile
+/// network) is NOT counted as "connected". The increment is published to
+/// `DaemonState.hubs_connected` and surfaced via `StatusOk.hubs_connected`,
+/// and the matching decrement runs on `Drop` — i.e. whenever the session
+/// ends for any reason (clean close, read timeout, circuit death, error,
+/// task abort on shutdown). That symmetry is the whole point: the counter
+/// can never get stuck "up" after a session dies.
+struct ConnectedGuard(Arc<AtomicUsize>);
+
+impl ConnectedGuard {
+    /// Increment the live-session counter. Returns `None` when no counter
+    /// was supplied (the identity/reachability session and tests don't
+    /// count toward the displayed hubs-connected total).
+    fn arm(counter: Option<Arc<AtomicUsize>>) -> Option<Self> {
+        let counter = counter?;
+        counter.fetch_add(1, Ordering::Relaxed);
+        Some(Self(counter))
+    }
+}
+
+impl Drop for ConnectedGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Bounded outbound-queue depth. Sized to absorb a brief burst (CLI
 /// user typing fast / app reconnecting + flushing) without being so
@@ -130,6 +161,10 @@ pub async fn run_hub_session<F, Fut>(
     on_deliver: F,
     self_publish: Option<&SelfPublish>,
     ephemeral_noise: bool,
+    // v0.1.28: optional live-session counter (honest health). Armed only
+    // after the handshake completes; `None` for sessions that shouldn't
+    // count (identity/reachability role, tests).
+    connected_counter: Option<Arc<AtomicUsize>>,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
@@ -168,6 +203,9 @@ where
     // HIGH-1: replay-binds the signed SUBSCRIBE proof to this connection.
     let handshake_hash = session.handshake_hash();
     info!("hub: Noise XK complete; sending SUBSCRIBE");
+    // v0.1.28: we now have a live session — mark it for the health line.
+    // Dropped (decremented) when this fn returns for any reason.
+    let _connected = ConnectedGuard::arm(connected_counter);
 
     // D-1 (the real fix): generate an ephemeral Ed25519 signing key
     // ALONGSIDE the ephemeral Noise static, and use it for the
@@ -253,6 +291,8 @@ pub async fn run_hub_session_tcp<F, Fut>(
     on_deliver: F,
     self_publish: Option<&SelfPublish>,
     ephemeral_noise: bool,
+    // v0.1.28: see `run_hub_session` — armed after the handshake.
+    connected_counter: Option<Arc<AtomicUsize>>,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
@@ -282,6 +322,8 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("hub-tcp Noise handshake failed: {e}"))?;
     let handshake_hash = session.handshake_hash();
+    // v0.1.28: live session — mark for the health line until this returns.
+    let _connected = ConnectedGuard::arm(connected_counter);
 
     // D-1: ephemeral SUBSCRIBE-signing key in privacy mode (mirrors
     // run_hub_session). Without it the SUBSCRIBE proof would carry the

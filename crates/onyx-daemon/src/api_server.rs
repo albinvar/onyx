@@ -233,6 +233,13 @@ async fn dispatch_one_shot(
             onion: state.self_onion.get().cloned(),
             // How many hubs we can fall back to for offline delivery.
             hub_count: u32::try_from(state.configured_hubs.len()).unwrap_or(u32::MAX),
+            // v0.1.28: how many of those have a LIVE session right now.
+            hubs_connected: u32::try_from(
+                state
+                    .hubs_connected
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .unwrap_or(u32::MAX),
         },
         ApiRequest::Identity => ApiResponse::IdentityOk {
             identity_pub_b32: encode_b32(&state.identity.identity_key().public().to_bytes()),
@@ -3685,6 +3692,7 @@ mod tests {
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: false,
             message_retention_secs: None,
+            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         (state, encode_b32(group_id))
     }
@@ -3803,6 +3811,7 @@ mod tests {
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
+            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 
         // Independently derive the DM group's session token to compare.
@@ -3878,6 +3887,7 @@ mod tests {
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
+            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 
         let ok = dm_hub_fallback_send(&peer_pub, "hi", &state).await;

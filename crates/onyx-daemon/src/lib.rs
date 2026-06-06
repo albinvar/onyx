@@ -313,6 +313,16 @@ pub struct DaemonState {
     /// task deletes persisted room messages older than `secs`. Copied from
     /// [`Config`] at construction. `None` = keep forever.
     pub message_retention_secs: Option<u64>,
+    /// v0.1.28 (honest health): count of configured hubs with a LIVE
+    /// session right now. Incremented by each activity-role hub session
+    /// once its Noise handshake completes, decremented when the session
+    /// ends (RAII guard in `hub_client`). Surfaced via `StatusOk.hubs_connected`
+    /// so the TUI/`onyx doctor` can show real reachability instead of a
+    /// misleading green "tor ready" while every hub dial is silently
+    /// failing. Only the always-on activity session bumps it (not the
+    /// optional reachability/identity session), so it tops out at the
+    /// number of configured hubs.
+    pub hubs_connected: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
@@ -695,6 +705,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         dm_hub_fallback: args.dm_hub_fallback,
         // Local message retention (auto-clear), copied from Config.
         message_retention_secs: args.message_retention_secs,
+        // v0.1.28: live hub-connectivity counter (honest health line).
+        hubs_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     drop(args.passphrase);
@@ -2590,6 +2602,14 @@ async fn supervise_hub_session(
                 }
             }
         };
+        // v0.1.28 (honest health): only the always-on activity session
+        // bumps the live-hub counter, so `hubs_connected` tops out at the
+        // number of *configured* hubs (the optional identity/reachability
+        // session would otherwise double-count a hub the user can reach).
+        let connected_counter = match role {
+            HubRole::Activity => Some(state.hubs_connected.clone()),
+            HubRole::Identity => None,
+        };
         let result = match &transport {
             HubTransport::Tor { tor, host, port } => {
                 hub_client::run_hub_session(
@@ -2604,6 +2624,7 @@ async fn supervise_hub_session(
                     on_deliver,
                     self_publish.as_ref(),
                     ephemeral_noise,
+                    connected_counter,
                 )
                 .await
             }
@@ -2618,6 +2639,7 @@ async fn supervise_hub_session(
                     on_deliver,
                     self_publish.as_ref(),
                     ephemeral_noise,
+                    connected_counter,
                 )
                 .await
             }
@@ -3960,6 +3982,7 @@ mod dm_fallback_receive_tests {
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
+            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
