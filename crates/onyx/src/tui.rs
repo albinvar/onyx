@@ -5439,6 +5439,16 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             spans.push(Span::styled(" new room", theme::muted()));
         }
     }
+    // v0.1.31: surface disappearing-messages (retention) so it's visible
+    // instead of an invisible config setting. Global, so shown on every
+    // selection; `/retention <dur|off>` changes it.
+    if let Some(secs) = app.retention_secs {
+        spans.push(sep());
+        spans.push(Span::styled(
+            format!("⏳ disappears {}", fmt_duration_secs(secs)),
+            theme::warn(),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
