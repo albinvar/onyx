@@ -6,6 +6,20 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## UX — 2026-06-06 — file-send no longer dead-ends + Ctrl-E works over SSH
+
+- **File send: allow-with-confirm when metadata can't be stripped.** Sending
+  a file whose format the sanitizer can't identify used to hard-fail
+  (`sanitize_file: could not identify the file format`). Now it pops a
+  yellow **confirm** modal ("⚠ can't strip metadata — send as-is? metadata
+  may leak") that **defaults to cancel**; pressing `y` resends those files
+  with `keep_metadata = true`.
+- **Ctrl-E over SSH:** when no clipboard tool is reachable (the SSH/headless
+  case), the Share modal now says **"✗ couldn't reach a clipboard — select
+  the link above and copy it manually"** instead of silently doing nothing.
+  The full invite link + connect code were always shown; this makes the
+  manual path obvious.
+
 ## UX — 2026-06-06 — compact one-line chat + recolor (yellow over blue)
 
 - **Chat is one line per message** now: `name HH:MM  [hub] text` instead of

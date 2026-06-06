@@ -238,6 +238,18 @@ const ACTIVITY_CAP: usize = 200;
 ///
 /// `Tab` cycles between fields in InvitePeer; `Esc` closes
 /// without submitting; `Enter` submits.
+/// v0.1.30: outcome of a clipboard-copy attempt in the Share modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyState {
+    /// No copy attempted yet.
+    Idle,
+    /// A native/OSC52 copy succeeded.
+    Ok,
+    /// Copy failed (no clipboard tool reachable — typically SSH/headless);
+    /// the modal tells the user to select the link and copy manually.
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 enum ModalState {
     CreateRoom {
@@ -278,6 +290,15 @@ enum ModalState {
         /// Last directory-read error, surfaced in the modal.
         error: Option<String>,
     },
+    /// v0.1.30: file(s) whose metadata could NOT be stripped (unknown /
+    /// unsupported format) — confirm sending them **as-is** (raw bytes;
+    /// metadata may leak). Default action is CANCEL; the user must press
+    /// `y`/Enter to proceed. Re-runs the send with `keep_metadata = true`.
+    ConfirmSendRaw {
+        target: FileTarget,
+        paths: Vec<PathBuf>,
+        keep_filename: bool,
+    },
     /// Slice 2 (action menu): a short, context-aware list of the actions
     /// that make sense for the *currently selected* conversation — opened
     /// with `Tab` so you can point at a peer/room and pick an action
@@ -311,8 +332,10 @@ enum ModalState {
         connect_code: String,
         /// 0 = invite link, 1 = connect code.
         selected: usize,
-        /// Set true after a successful copy (for the badge).
-        copied: bool,
+        /// v0.1.30: copy outcome, so we can show "copy failed — select the
+        /// link above and copy manually" (the SSH/headless case where no
+        /// clipboard tool is reachable) instead of silently doing nothing.
+        copy: CopyState,
     },
     /// Task 324: read-only settings / identity panel — your
     /// fingerprint, KEM pubkey, Tor state, daemon version, and
@@ -562,6 +585,10 @@ async fn send_marked_files(
 ) {
     let mut sent = 0usize;
     let mut errs: Vec<String> = Vec::new();
+    // v0.1.30: files the daemon refused because it couldn't strip metadata
+    // (unknown / unsupported format). Instead of a hard failure we offer to
+    // resend them as-is (a confirm modal, default cancel).
+    let mut needs_confirm: Vec<PathBuf> = Vec::new();
     for path in paths {
         let name = path.file_name().map_or_else(
             || path.to_string_lossy().into_owned(),
@@ -623,13 +650,29 @@ async fn send_marked_files(
                 );
                 sent += 1;
             }
-            Ok(ApiResponse::Error { message, .. }) => errs.push(format!("{name}: {message}")),
+            Ok(ApiResponse::Error { message, .. }) => {
+                // Sanitizer couldn't strip metadata → offer resend-as-is
+                // rather than a dead-end failure (only when not already
+                // keeping metadata, else we'd loop).
+                if !keep_metadata
+                    && (message.contains("could not identify the file format")
+                        || message.contains("can't safely strip"))
+                {
+                    needs_confirm.push(path.clone());
+                } else {
+                    errs.push(format!("{name}: {message}"));
+                }
+            }
             Ok(other) => errs.push(format!("{name}: unexpected response: {other:?}")),
             Err(e) => errs.push(format!("{name}: {e:#}")),
         }
     }
-    app.last_send_result = if errs.is_empty() {
+    app.last_send_result = if errs.is_empty() && needs_confirm.is_empty() {
         Some(Ok(()))
+    } else if errs.is_empty() {
+        // Only sanitize-confirm cases remain → no hard error; the modal
+        // below carries the next step.
+        None
     } else {
         Some(Err(format!(
             "{sent} sent, {} failed: {}",
@@ -637,6 +680,14 @@ async fn send_marked_files(
             errs.join("; ")
         )))
     };
+    // v0.1.30: ask before sending un-sanitizable files as-is.
+    if !needs_confirm.is_empty() {
+        app.modal = Some(ModalState::ConfirmSendRaw {
+            target: target.clone(),
+            paths: needs_confirm,
+            keep_filename,
+        });
+    }
 }
 
 /// A1: append the local "📎 sent <file>" line to a conversation's
@@ -1704,6 +1755,15 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             }
             submit_intent = Some(modal.clone());
         }
+        // v0.1.30: confirm sending un-sanitizable files as-is. Default is
+        // CANCEL (any other key / Esc); the user must press y/Enter.
+        (ModalState::ConfirmSendRaw { .. }, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => {
+            submit_intent = Some(modal.clone());
+        }
+        (ModalState::ConfirmSendRaw { .. }, KeyCode::Char('n' | 'N')) => {
+            app.last_send_result = Some(Err("file send cancelled (metadata not stripped)".into()));
+            return; // modal dropped → closed
+        }
         // Unified "Add a contact": one text field; Enter auto-detects
         // invite-link vs connect-code (validated in the submit dispatch).
         (ModalState::AddContact { input }, KeyCode::Backspace) => {
@@ -1738,7 +1798,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 invite_url,
                 connect_code,
                 selected,
-                copied,
+                copy,
             },
             KeyCode::Enter | KeyCode::Char('c'),
         ) => {
@@ -1749,7 +1809,11 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             };
             // Don't "copy" a placeholder string (they start with '(').
             if !text.starts_with('(') {
-                *copied = copy_to_clipboard(text);
+                *copy = if copy_to_clipboard(text) {
+                    CopyState::Ok
+                } else {
+                    CopyState::Failed
+                };
             }
             app.modal = Some(modal);
             return;
@@ -1997,6 +2061,17 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             send_marked_files(app, target, marked, *keep_filename, *keep_metadata).await;
             return;
         }
+        // v0.1.30: confirmed sending un-sanitizable file(s) as-is — resend
+        // those exact paths with keep_metadata = true (skips the sanitizer).
+        if let ModalState::ConfirmSendRaw {
+            target,
+            paths,
+            keep_filename,
+        } = &submit
+        {
+            send_marked_files(app, target, paths, *keep_filename, true).await;
+            return;
+        }
         let req = match submit {
             ModalState::CreateRoom { name } => Some(ApiRequest::CreateRoom { name }),
             ModalState::InvitePeer {
@@ -2015,6 +2090,9 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             // above and returns early, so this arm is unreachable — it only
             // exists to keep the match exhaustive.
             ModalState::SendFile { .. } => None,
+            // v0.1.30: ConfirmSendRaw also handled above (returns early);
+            // arm exists only to keep the match exhaustive.
+            ModalState::ConfirmSendRaw { .. } => None,
             // Unified "Add a contact": auto-detect the pasted format.
             //  • onyx://invite/…  → SendInvite (hub-routed first contact;
             //    the daemon re-parses + re-verifies + picks the tier; we
@@ -2314,7 +2392,7 @@ async fn open_share_modal(app: &mut AppState) {
         invite_url,
         connect_code,
         selected: 0,
-        copied: false,
+        copy: CopyState::Idle,
     });
 }
 
@@ -3543,6 +3621,10 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         ModalState::InvitePeer { .. } => 17,
         // A1: the file browser wants vertical room for the listing.
         ModalState::SendFile { .. } => area.height.saturating_sub(2).min(24),
+        // v0.1.30: small yes/no confirm for un-sanitizable file sends.
+        ModalState::ConfirmSendRaw { paths, .. } => {
+            u16::try_from(paths.len().min(6) + 7).unwrap_or(9)
+        }
         ModalState::Help => 24,
         ModalState::CommandPalette { .. } => {
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
@@ -3601,6 +3683,64 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             ])
             .block(block);
             frame.render_widget(body, rect);
+        }
+        ModalState::ConfirmSendRaw { paths, .. } => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(
+                    " ⚠ Can't strip metadata ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(
+                        " {} file(s) are an unknown/unsupported format —",
+                        paths.len()
+                    ),
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    " Onyx can't remove metadata that may identify you.",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+            ];
+            for p in paths.iter().take(6) {
+                let name = p.file_name().map_or_else(
+                    || p.to_string_lossy().into_owned(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                lines.push(Line::from(Span::styled(
+                    format!("   • {name}"),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " Send as-is (metadata may leak)?  ",
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    "y",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" send  ·  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "n/Esc",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" cancel (default)", Style::default().fg(Color::DarkGray)),
+            ]));
+            frame.render_widget(Paragraph::new(lines).block(block), rect);
         }
         ModalState::InvitePeer {
             group_id_b32,
@@ -3688,8 +3828,8 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             invite_url,
             connect_code,
             selected,
-            copied,
-        } => render_share_modal(frame, rect, invite_url, connect_code, *selected, *copied),
+            copy,
+        } => render_share_modal(frame, rect, invite_url, connect_code, *selected, *copy),
         ModalState::Settings { info } => render_settings_modal(frame, rect, info),
         ModalState::Logs { lines, scroll } => render_logs_modal(frame, rect, lines, *scroll),
         // Unified "Add a contact": paste an invite link OR a connect code.
@@ -4210,7 +4350,7 @@ fn render_share_modal(
     invite_url: &str,
     connect_code: &str,
     selected: usize,
-    copied: bool,
+    copy: CopyState,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4242,17 +4382,23 @@ fn render_share_modal(
     lines.push(Line::from(""));
     lines.extend(row(1, "Connect code (direct, no hub):", connect_code));
     lines.push(Line::from(""));
+    let (status_text, status_color) = match copy {
+        CopyState::Ok => ("  ✓ copied to clipboard".to_string(), Color::Green),
+        CopyState::Idle => (
+            "  press Enter/c to copy the highlighted one".to_string(),
+            Color::DarkGray,
+        ),
+        // The SSH/headless case: no clipboard tool reachable. The link is
+        // shown in full above, so tell the user to select + copy it manually.
+        CopyState::Failed => (
+            "  ✗ couldn't reach a clipboard (SSH?) — select the link above and copy it manually"
+                .to_string(),
+            Color::Yellow,
+        ),
+    };
     lines.push(Line::from(Span::styled(
-        if copied {
-            "  ✓ copied to clipboard".to_string()
-        } else {
-            "  press Enter/c to copy the highlighted one".to_string()
-        },
-        Style::default().fg(if copied {
-            Color::Green
-        } else {
-            Color::DarkGray
-        }),
+        status_text,
+        Style::default().fg(status_color),
     )));
     let body = Paragraph::new(lines)
         .block(block)
