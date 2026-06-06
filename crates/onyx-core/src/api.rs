@@ -395,6 +395,13 @@ pub enum ApiRequest {
     /// (after comparing the safety number). `fingerprint` is the peer's
     /// Ed25519 fingerprint. Replies [`ApiResponse::SetContactVerifiedOk`].
     SetContactVerified { fingerprint: String, verified: bool },
+    /// v0.1.31: set (or clear, with an empty string) a contact's local
+    /// nickname, keyed by Ed25519 fingerprint. Replies
+    /// [`ApiResponse::SetNicknameOk`].
+    SetNickname {
+        fingerprint: String,
+        nickname: String,
+    },
 }
 
 /// One response line on the wire (daemon → client).
@@ -483,6 +490,9 @@ pub enum ApiResponse {
     /// Reply to [`ApiRequest::SetContactVerified`]. `updated` is false when
     /// the contact isn't pinned yet (nothing to mark).
     SetContactVerifiedOk { updated: bool },
+    /// Reply to [`ApiRequest::SetNickname`]. `updated` is false when no
+    /// pinned contact matched the fingerprint.
+    SetNicknameOk { updated: bool },
     /// Reply to [`ApiRequest::History`]. Messages are ordered oldest
     /// → newest. May be shorter than `limit` if fewer messages exist
     /// (or empty if the peer has no exchanged messages yet).
@@ -711,6 +721,11 @@ pub struct PeerInfo {
     pub key_changed: bool,
     #[serde(default)]
     pub verified: bool,
+    /// v0.1.31: optional local nickname for this contact (≤10 chars). When
+    /// set, the TUI shows it instead of the short-id. `#[serde(default)]`
+    /// for wire back-compat.
+    #[serde(default)]
+    pub nickname: Option<String>,
 }
 
 /// One past message in a [`ApiResponse::HistoryOk`] reply.
@@ -1252,6 +1267,7 @@ mod tests {
                 pinned: true,
                 key_changed: false,
                 verified: true,
+                nickname: None,
             }],
         };
         let line = encode_response_line(&r).unwrap();
@@ -1312,6 +1328,7 @@ mod tests {
                 pinned: false,
                 key_changed: false,
                 verified: false,
+                nickname: None,
             },
         };
         let disconnected = ApiResponse::EventPeerDisconnected {

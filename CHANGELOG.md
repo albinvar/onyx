@@ -26,6 +26,16 @@ Full pre-tag gate green. Still queued: Esc quit-confirm, file-send progress.
 
 ---
 
+## Feature — 2026-06-06 — nicknames (peer + your own)
+
+Editable local nicknames (≤10 chars), shown instead of the raw short-id.
+- **Peer:** `/nick <name>` on the selected peer (empty clears). Shown in the
+  conversation list, the chat title, and as the sender label. Stored in the
+  vault (`pinned_keys.nickname`), surfaced via `PeerInfo.nickname`.
+- **Yourself:** `/myname <name>` — shown instead of `me` in chat. Stored in
+  `config.json` (`my_nickname`).
+Capped at the chat name-column width so the invisible columns stay aligned.
+
 ## UX — 2026-06-06 — file-send no longer dead-ends + Ctrl-E works over SSH
 
 - **File send: allow-with-confirm when metadata can't be stripped.** Sending

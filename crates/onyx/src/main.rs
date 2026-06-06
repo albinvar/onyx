@@ -699,6 +699,10 @@ struct FileConfig {
     /// hides them. `None`/absent = keep forever. Set via `/retention`.
     #[serde(default)]
     message_retention_secs: Option<u64>,
+    /// v0.1.31: the user's own display name, shown instead of "me" in chat.
+    /// `None`/absent = "me". Set via `/myname <name>` (≤10 chars).
+    #[serde(default)]
+    my_nickname: Option<String>,
     /// v0.1.14: opt IN to the public hub list. **Default `false`.** When
     /// true (and no explicit `--hub`/config hub is set), the daemon also
     /// uses the hubs in `~/.onyx/public-hubs.json` — a list that
