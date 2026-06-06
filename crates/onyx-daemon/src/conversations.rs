@@ -619,6 +619,8 @@ fn info_of(state: &ConversationState) -> PeerInfo {
         pinned: false,
         key_changed: false,
         verified: false,
+        // v0.1.31: nickname joined from the vault by the Peers API handler.
+        nickname: None,
     }
 }
 

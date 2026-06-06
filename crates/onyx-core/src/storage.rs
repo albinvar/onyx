@@ -610,6 +610,8 @@ impl Vault {
         // Audit #1 slice 2: AEAD columns for room name + member list.
         ensure_column(&conn, "rooms", "name_enc", "BLOB")?;
         ensure_column(&conn, "rooms", "members_enc", "BLOB")?;
+        // v0.1.31: optional per-contact nickname (local display label).
+        ensure_column(&conn, "pinned_keys", "nickname", "TEXT")?;
 
         let vault = Self { conn, aead };
         vault.seal_legacy_room_messages()?;
@@ -736,6 +738,8 @@ impl Vault {
         // Audit #1 slice 2: AEAD columns for room name + member list.
         ensure_column(&conn, "rooms", "name_enc", "BLOB")?;
         ensure_column(&conn, "rooms", "members_enc", "BLOB")?;
+        // v0.1.31: optional per-contact nickname (local display label).
+        ensure_column(&conn, "pinned_keys", "nickname", "TEXT")?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -1167,6 +1171,43 @@ impl Vault {
                  WHERE identity_id = ?1 AND fingerprint = ?2",
                 params![identity_id, fingerprint, i64::from(verified)],
             )
+            .map_err(map_db_err)
+    }
+
+    /// v0.1.31: set (or clear, with an empty string) a contact's local
+    /// nickname. No-op rowcount if the contact isn't pinned yet.
+    pub fn set_contact_nickname(
+        &self,
+        identity_id: i64,
+        fingerprint: &str,
+        nickname: &str,
+    ) -> Result<usize> {
+        let value: Option<&str> = if nickname.is_empty() {
+            None
+        } else {
+            Some(nickname)
+        };
+        self.conn
+            .execute(
+                "UPDATE pinned_keys SET nickname = ?3 \
+                 WHERE identity_id = ?1 AND fingerprint = ?2",
+                params![identity_id, fingerprint, value],
+            )
+            .map_err(map_db_err)
+    }
+
+    /// v0.1.31: a contact's local nickname, if set. Used to label the peer
+    /// in the list + chat instead of the raw short-id.
+    pub fn contact_nickname(&self, identity_id: i64, fingerprint: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT nickname FROM pinned_keys \
+                 WHERE identity_id = ?1 AND fingerprint = ?2",
+                params![identity_id, fingerprint],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
             .map_err(map_db_err)
     }
 

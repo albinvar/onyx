@@ -265,6 +265,10 @@ async fn dispatch_one_shot(
                         e.key_changed = key_changed;
                         e.verified = verified;
                     }
+                    // v0.1.31: local nickname for the peer list / chat label.
+                    if let Ok(nick) = vault.contact_nickname(state.identity_id, &e.fingerprint) {
+                        e.nickname = nick;
+                    }
                 }
             }
             ApiResponse::PeersOk { entries }
@@ -279,6 +283,21 @@ async fn dispatch_one_shot(
                 Err(e) => ApiResponse::Error {
                     code: ApiErrorCode::Internal,
                     message: format!("set verified: {e}"),
+                },
+            }
+        }
+        ApiRequest::SetNickname {
+            fingerprint,
+            nickname,
+        } => {
+            // v0.1.31: cap at 10 chars (chat name column width) before store.
+            let nick: String = nickname.trim().chars().take(10).collect();
+            let vault = state.vault.lock().await;
+            match vault.set_contact_nickname(state.identity_id, fingerprint, &nick) {
+                Ok(n) => ApiResponse::SetNicknameOk { updated: n > 0 },
+                Err(e) => ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("set nickname: {e}"),
                 },
             }
         }

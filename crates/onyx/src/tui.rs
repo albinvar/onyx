@@ -208,6 +208,9 @@ struct AppState {
     /// scrollback older than this (the daemon deletes the persisted copy on
     /// its sweep). Loaded from config.json; set live via `/retention`.
     retention_secs: Option<u64>,
+    /// v0.1.31: the user's own display name (shown instead of "me" in chat).
+    /// Loaded from config.json; set via `/myname`. `None` → "me".
+    my_nickname: Option<String>,
     /// v0.1.28: human-readable Activity feed (newest at front), shown in the
     /// always-visible right-side panel. Populated from health deltas
     /// (`record_health`), tail events (`apply_event`), and notable send
@@ -826,6 +829,7 @@ impl AppState {
             seen_files: HashSet::new(),
             quit_requested: false,
             retention_secs: None,
+            my_nickname: None,
             activity: VecDeque::new(),
             prev_health: None,
             prev_daemon_ok: None,
@@ -1175,6 +1179,11 @@ pub async fn run(socket_path: PathBuf) -> anyhow::Result<()> {
         .ok()
         .flatten()
         .and_then(|c| c.message_retention_secs);
+    // v0.1.31: your own display name (shown instead of "me").
+    app.my_nickname = crate::load_file_config()
+        .ok()
+        .flatten()
+        .and_then(|c| c.my_nickname);
 
     // Background: tail subscription (reconnects automatically).
     let (tail_tx, tail_rx) = mpsc::channel::<ApiResponse>(256);
@@ -2789,6 +2798,17 @@ fn set_config_retention(secs: Option<u64>) -> anyhow::Result<()> {
     crate::save_file_config(&cfg)
 }
 
+/// v0.1.31: persist the user's own display name (empty clears) to config.
+fn set_config_my_nickname(nick: &str) -> anyhow::Result<()> {
+    let mut cfg = crate::load_file_config()?.unwrap_or_default();
+    cfg.my_nickname = if nick.is_empty() {
+        None
+    } else {
+        Some(nick.to_string())
+    };
+    crate::save_file_config(&cfg)
+}
+
 // The command table is long by nature (one arm per slash command).
 #[allow(clippy::too_many_lines)]
 async fn run_slash_command(app: &mut AppState, line: &str) {
@@ -2854,6 +2874,49 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
                 }
             }
         }
+        // v0.1.31: nickname the selected peer (≤10 chars; empty clears).
+        "nick" | "name" => match app.selected_entry() {
+            Some(SelectedEntry::Peer(p)) => {
+                let fp = p.fingerprint.clone();
+                let nickname: String = arg.trim().chars().take(NAME_COL).collect();
+                run_simple_request(
+                    app,
+                    ApiRequest::SetNickname {
+                        fingerprint: fp,
+                        nickname,
+                    },
+                )
+                .await;
+                app.last_notice = Some(if arg.trim().is_empty() {
+                    "nickname cleared".to_string()
+                } else {
+                    format!("nickname set to {}", arg.trim())
+                });
+            }
+            _ => {
+                app.last_send_result =
+                    Some(Err("select a peer first, then /nick <name>".to_string()));
+            }
+        },
+        // v0.1.31: set your OWN display name (shown instead of "me").
+        "myname" | "iam" => {
+            let nick: String = arg.trim().chars().take(NAME_COL).collect();
+            app.my_nickname = if nick.is_empty() {
+                None
+            } else {
+                Some(nick.clone())
+            };
+            match set_config_my_nickname(&nick) {
+                Ok(()) => {
+                    app.last_notice = Some(if nick.is_empty() {
+                        "your display name cleared (showing \"me\")".to_string()
+                    } else {
+                        format!("your display name → {nick}")
+                    });
+                }
+                Err(e) => app.last_send_result = Some(Err(format!("save config: {e}"))),
+            }
+        }
         "room" | "newroom" => {
             if arg.is_empty() {
                 run_palette_action(app, PaletteAction::CreateRoom).await;
@@ -2908,7 +2971,7 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
         }
         other => {
             app.last_send_result = Some(Err(format!(
-                "unknown command /{other} — try /help /file /search /room /share /add /verify /retention /hubs /settings /clear /quit"
+                "unknown command /{other} — try /help /file /search /room /share /add /verify /nick /myname /retention /hubs /settings /clear /quit"
             )));
         }
     }
@@ -4835,8 +4898,14 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         } else {
             Span::styled("○ ", Style::default().fg(Color::DarkGray))
         };
+        // v0.1.31: show the nickname if set, else the short-id.
+        let label = p
+            .nickname
+            .clone()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| p.short_id.clone());
         let name = Span::styled(
-            p.short_id.clone(),
+            label,
             Style::default()
                 .fg(if p.connected {
                     Color::White
@@ -5072,7 +5141,7 @@ fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
 /// and message text align as invisible columns. Also the nickname cap.
 const NAME_COL: usize = 10;
 
-fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> {
+fn build_chat_lines(scroll: &[ChatLine], who_label: &str, me_label: &str) -> Vec<Line<'static>> {
     // Every span built below owns its text (clone / to_string / format!), so
     // the result is 'static — it doesn't borrow `scroll`/`who_label`. That
     // lets callers pass a temporary filtered Vec (retention) safely.
@@ -5082,7 +5151,7 @@ fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> 
     for line in scroll {
         let outgoing = matches!(line.direction, MessageDirection::Outgoing);
         let (who, color) = if outgoing {
-            ("me", Color::Green)
+            (me_label, Color::Green)
         } else {
             (who_label, Color::Cyan)
         };
@@ -5135,12 +5204,16 @@ fn build_chat_lines(scroll: &[ChatLine], who_label: &str) -> Vec<Line<'static>> 
 // as render_modal / render_details).
 #[allow(clippy::too_many_lines)]
 fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    // v0.1.31: prefer a set nickname over the short-id for the peer label.
     let (title, scrollback_key, who_label) = match app.selected_entry() {
-        Some(SelectedEntry::Peer(p)) => (
-            format!(" #{} ", p.short_id),
-            p.short_id.clone(),
-            p.short_id.clone(),
-        ),
+        Some(SelectedEntry::Peer(p)) => {
+            let label = p
+                .nickname
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| p.short_id.clone());
+            (format!(" #{label} "), p.short_id.clone(), label)
+        }
         Some(SelectedEntry::Room(r)) => (
             format!(" #{} (room, {} members) ", r.name, r.members.len()),
             format!("room/{}", short_id(&r.group_id_b32)),
@@ -5148,6 +5221,8 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         ),
         None => (" Conversation ".to_string(), String::new(), String::new()),
     };
+    // v0.1.31: own display name (falls back to "me").
+    let me_label = app.my_nickname.clone().unwrap_or_else(|| "me".to_string());
     let block = Block::default().borders(Borders::ALL).title(title);
     if app.selected_entry().is_none() {
         // UX overhaul: brand-new user (no peers, no rooms) gets a real
@@ -5233,10 +5308,10 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                         Style::default().fg(Color::DarkGray),
                     ))]
                 } else {
-                    build_chat_lines(&kept, &who_label)
+                    build_chat_lines(&kept, &who_label, &me_label)
                 }
             } else {
-                build_chat_lines(scroll, &who_label)
+                build_chat_lines(scroll, &who_label, &me_label)
             }
         }
         _ => vec![Line::from(Span::styled(
@@ -5742,7 +5817,7 @@ mod snapshot_tests {
         // v0.1.30: one line per message — 3 messages → exactly 3 lines
         // (no header/spacer rows). The first two share a sender+minute so
         // the second aligns under the prefix; the third gets its own prefix.
-        let lines = build_chat_lines(&scroll, "alice");
+        let lines = build_chat_lines(&scroll, "alice", "me");
         assert_eq!(lines.len(), 3);
     }
 
@@ -5882,6 +5957,7 @@ mod snapshot_tests {
                 pinned: true,
                 key_changed: false,
                 verified: true,
+                nickname: None,
             },
             PeerInfo {
                 short_id: "k9rfthxz".into(),
@@ -5893,6 +5969,7 @@ mod snapshot_tests {
                 pinned: true,
                 key_changed: true,
                 verified: false,
+                nickname: None,
             },
         ];
         app.scrollback.insert(
