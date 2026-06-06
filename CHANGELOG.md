@@ -6,6 +6,15 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.29 — 2026-06-06 — invite contacts are messageable (the real connect fix)
+
+Point release for the single most important fix this cycle: hub-invite
+contacts could be *joined* but never *messaged* (no address exchanged +
+hub-relay off). See the item below for the full diagnosis. **Both ends must
+run ≥ v0.1.29.** Full pre-tag gate green.
+
+---
+
 ## Fix — 2026-06-06 — invite contacts are actually messageable (the real "can't connect" bug)
 
 **The root cause behind "connected but nothing happens".** A hub invite joins
