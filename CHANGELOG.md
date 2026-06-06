@@ -6,6 +6,43 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Release v0.1.28 — 2026-06-06 — observability + reliable-delivery groundwork
+
+Umbrella for everything since v0.1.27 (per-item entries below). Theme:
+**make failures visible and self-diagnosing**, driven by a real first-contact
+connection failure this cycle. Full pre-tag gate green (fmt · `clippy
+--workspace --all-targets -D warnings` · `cargo deny` · ~605 tests across the
+workspace).
+
+- **`onyx doctor`** — a PASS/WARN/FAIL connectivity self-check (daemon · Tor ·
+  your onion · hubs configured · live hub connectivity · reachable-by-invite),
+  each with a one-line fix. Turns an opaque "nothing happens" into an answer.
+- **Live hub connectivity** (`StatusOk.hubs_connected`) — the daemon now
+  reports how many configured hubs have a *live* session right now (RAII guard
+  armed only after the Noise handshake). The missing fact: Tor can be fully
+  bootstrapped yet reach **0** hubs.
+- **Honest TUI status line** — replaced the lone green "tor ready" (which
+  implied everything worked) with `tor · hubs N/M · onion ✓/⋯` — red at 0
+  hubs, amber partial, green all-live.
+- **Right-side Activity feed** — a persistent, human-readable event panel
+  (Tor/hub/peer/delivery/daemon events) so problems are on screen instead of
+  buried in `~/.onyx/onyx.log`.
+- **Delivery receipts (phases 2a + 2b)** — wire types + end-to-end acks for
+  the direct DM path: the sender stamps each DM with a random id, the
+  recipient auto-acks on decrypt over the same MLS session (indistinguishable
+  to hubs; never a *read* receipt). Groundwork for the visible
+  `delivered ✓` / `not delivered` state.
+- **Honesty fix** — `onyx doctor`'s bridge advice no longer suggests obfs4
+  (not built; only vanilla bridges are compiled, and those don't defeat DPI).
+
+**HONEST about what this does NOT do (yet):** it does not make a Tor-hostile
+network usable (the dominant real-world failure — obfs4 is still deferred,
+F2.2b), and delivery receipts are not yet *surfaced* in the UI or retried —
+the visible `delivered ✓` / loud `not delivered` ticks land in delivery
+phases 3–4. This release makes the state **visible**, not yet **fixed**.
+
+---
+
 ## DELIVERY phase 2b — 2026-06-06 — receipts flow end-to-end (direct DMs)
 
 Builds on 2a: delivery receipts now actually move over the wire for the
