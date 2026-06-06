@@ -336,6 +336,19 @@ pub enum BootstrapPayload {
         /// reject unauthorized commits from honest members' point of view.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         admins: Vec<String>,
+        /// v0.1.29 (working-channel fix): the SENDER's own `.onion`, so the
+        /// recipient can open a **direct session** instead of being left
+        /// with a hub-only contact that has no transport. For a 2-party DM
+        /// bootstrap the recipient records this as the peer's dial target
+        /// and auto-dials right after joining the group — turning "connected
+        /// but can't message" into a live session. Sent inside the sealed
+        /// envelope (E2E to the recipient, covered by the Ed25519 sig), so
+        /// only your new contact learns it — same disclosure as a connect
+        /// code. `None` for room Welcomes / pre-fix senders.
+        /// `#[serde(default, skip_serializing_if)]` keeps the wire
+        /// byte-identical when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_onion: Option<String>,
     },
     /// "mlsapp/v1" (T6.3.e) — already-encrypted MLS application
     /// message routed via the hub. Wraps a single ciphertext
@@ -807,6 +820,7 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -821,10 +835,42 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
         assert_eq!(p, p2);
+    }
+
+    // v0.1.29 (working-channel fix): reply_onion must round-trip so the
+    // recipient can auto-dial a direct session, and must be omitted from
+    // the wire when None so pre-fix peers/tests stay byte-compatible.
+    #[test]
+    fn bootstrap_payload_round_trip_mls_welcome_with_reply_onion() {
+        let p = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"opaque-welcome".to_vec()),
+            first_message: None,
+            room_name: None,
+            member_kems: vec![],
+            admins: vec![],
+            reply_onion: Some("abcdefghij234567.onion".to_string()),
+        };
+        let bytes = p.to_cbor().expect("encode");
+        assert_eq!(BootstrapPayload::from_cbor(&bytes).expect("decode"), p);
+
+        let none = BootstrapPayload::MlsWelcome {
+            welcome: ByteBuf::from(b"w".to_vec()),
+            first_message: None,
+            room_name: None,
+            member_kems: vec![],
+            admins: vec![],
+            reply_onion: None,
+        };
+        let s = String::from_utf8_lossy(&none.to_cbor().unwrap()).to_string();
+        assert!(
+            !s.contains("reply_onion"),
+            "reply_onion must be omitted when None (wire back-compat)"
+        );
     }
 
     #[test]
@@ -836,6 +882,7 @@ mod tests {
             room_name: Some("#general".to_string()),
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -860,6 +907,7 @@ mod tests {
                 },
             ],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().expect("encode");
         let p2 = BootstrapPayload::from_cbor(&bytes).expect("decode");
@@ -877,6 +925,7 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -899,6 +948,7 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -920,6 +970,7 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -937,6 +988,7 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let bytes = p.to_cbor().unwrap();
         let s = String::from_utf8_lossy(&bytes);
@@ -1002,6 +1054,7 @@ mod tests {
             room_name: None,
             member_kems: vec![],
             admins: vec![],
+            reply_onion: None,
         };
         let payload_bytes = payload.to_cbor().unwrap();
 

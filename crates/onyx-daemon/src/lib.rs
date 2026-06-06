@@ -3308,6 +3308,7 @@ async fn handle_hub_delivery(
             room_name,
             member_kems,
             admins,
+            reply_onion,
         } => {
             process_hub_mls_welcome(
                 welcome.as_ref(),
@@ -3315,6 +3316,7 @@ async fn handle_hub_delivery(
                 room_name,
                 member_kems,
                 admins,
+                reply_onion,
                 sender_x25519,
                 &sender_pub_b32,
                 sender_fingerprint,
@@ -3510,6 +3512,7 @@ async fn process_hub_mls_welcome(
     room_name: Option<String>,
     member_kems: Vec<onyx_core::routing::RoomMemberKem>,
     admins: Vec<String>,
+    reply_onion: Option<String>,
     sender_x25519: [u8; 32],
     sender_pub_b32: &str,
     sender_fingerprint: String,
@@ -3637,6 +3640,28 @@ async fn process_hub_mls_welcome(
         has_first_message,
         "hub: mls/v1 Welcome processed, MLS group joined"
     );
+    drop(reg); // release the conversations lock before the dial task locks it
+
+    // v0.1.29 (working-channel fix): the core bug behind "connected but
+    // can't message" — a hub-met DM peer used to be left hub-only with no
+    // transport. If the sender shared their onion in the Welcome, record it
+    // as this peer's dial target and auto-dial so a DIRECT session forms.
+    // Best-effort: no Tor runtime (TCP-test build) or no/empty onion → stay
+    // hub-only and rely on dm_hub_fallback. The reconnect supervisor keeps
+    // the session alive across circuit drops.
+    if let Some(onion) = reply_onion.filter(|o| !o.is_empty())
+        && let Some(tor) = state.tor.get()
+    {
+        let tor = tor.clone();
+        let state = state.clone();
+        let pubkey_b32 = sender_pub_b32.to_string();
+        let peer_pub = sender_x25519;
+        tokio::spawn(async move {
+            record_dial_target(&state, &onion, &pubkey_b32).await;
+            supervise_dial(tor, state, peer_pub).await;
+        });
+        info!("hub: Welcome carried peer onion — auto-dialing for a direct session");
+    }
 }
 
 /// Persist a freshly-joined room on the recipient side (T6.3.c).

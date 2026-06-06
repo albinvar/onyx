@@ -682,9 +682,15 @@ struct FileConfig {
     /// D-1 reachability switch (default off = private).
     #[serde(default)]
     first_contact_reachable: bool,
-    /// v0.1.18: opt IN to DM hub fallback (default off = private).
+    /// DM hub fallback. **v0.1.29: default ON** (was opt-in/off). A
+    /// hub-met contact has no direct line until a session forms, so
+    /// without this an invite-based contact is unmessageable (the exact
+    /// "connected but nothing happens" bug). `Option`: `None` (field
+    /// absent) → on; an explicit `false` in config.json still disables it
+    /// for the privacy-conscious. Relays a sealed, identity-less DM on the
+    /// rotating DM session token when no direct session is up.
     #[serde(default)]
-    dm_hub_fallback: bool,
+    dm_hub_fallback: Option<bool>,
     /// Optional Poisson cover-traffic mean interval, seconds.
     #[serde(default)]
     cover_traffic_mean_secs: Option<u64>,
@@ -969,9 +975,10 @@ fn build_daemon_config(
         first_contact_reachable,
         // A1.2: must explicitly opt in to clearnet (no-Tor) transport.
         allow_clearnet: args.allow_clearnet,
-        // v0.1.18: opt-in DM hub fallback; OR the two sources so "on"
-        // from CLI or config.json wins. Default false = private.
-        dm_hub_fallback: args.dm_hub_fallback || file_cfg.dm_hub_fallback,
+        // v0.1.29: DM hub fallback defaults ON (so invite-met contacts are
+        // messageable). CLI `--dm-hub-fallback` force-enables; config.json
+        // `dm_hub_fallback: false` is the explicit opt-out; absent → on.
+        dm_hub_fallback: args.dm_hub_fallback || file_cfg.dm_hub_fallback.unwrap_or(true),
         // Local message retention (auto-clear), from config.json.
         message_retention_secs: file_cfg.message_retention_secs,
     })
