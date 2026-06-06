@@ -1992,6 +1992,7 @@ fn diagnose(
     tor: Option<&onyx_core::api::TorState>,
     onion_published: bool,
     hub_count: u32,
+    hubs_connected: u32,
     reachable: bool,
     log: &LogSignals,
 ) -> Vec<Check> {
@@ -2077,13 +2078,23 @@ fn diagnose(
         }
     });
 
-    // Live hub connectivity (the one that bites): recent failures vs successes
+    // Live hub connectivity (the one that bites). Primary signal is the
+    // LIVE count the daemon reports (`hubs_connected`) — a fact, not a
+    // guess. The log only colours the diagnosis when nothing is connected.
     let failures = log.dial_failed + log.circuit_failed + log.guard_trouble + log.hs_upload_timeout;
-    out.push(if log.hub_session_ok > 0 && failures <= log.hub_session_ok {
+    out.push(if hub_count == 0 {
+        // Already FAILed under "hubs configured"; don't double-fail.
+        Check {
+            name: "hub connectivity".into(),
+            health: Health::Warn,
+            detail: "no hubs configured (see above)".into(),
+            fix: None,
+        }
+    } else if hubs_connected >= 1 {
         Check {
             name: "hub connectivity".into(),
             health: Health::Pass,
-            detail: "a hub session connected recently".into(),
+            detail: format!("{hubs_connected}/{hub_count} hub(s) connected right now"),
             fix: None,
         }
     } else if failures > 0 {
@@ -2091,7 +2102,7 @@ fn diagnose(
             name: "hub connectivity".into(),
             health: Health::Fail,
             detail: format!(
-                "Tor can't reach the hubs right now ({} dial / {} circuit / {} guard / {} descriptor failures recently)",
+                "0/{hub_count} connected — Tor can't reach the hubs ({} dial / {} circuit / {} guard / {} descriptor failures recently)",
                 log.dial_failed, log.circuit_failed, log.guard_trouble, log.hs_upload_timeout
             ),
             fix: Some(
@@ -2102,8 +2113,8 @@ fn diagnose(
         Check {
             name: "hub connectivity".into(),
             health: Health::Warn,
-            detail: "no recent hub session in the log (idle, or just started)".into(),
-            fix: None,
+            detail: format!("0/{hub_count} connected yet (still connecting, or just started)"),
+            fix: Some("wait a few seconds and re-run `onyx doctor`".into()),
         }
     });
 
@@ -2147,20 +2158,28 @@ async fn run_doctor(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
     let cfg = load_file_config().ok().flatten().unwrap_or_default();
     let log = analyze_log(&recent_log_lines(400));
 
-    let (daemon_up, tor, onion_pub, hub_count) = match &status {
+    let (daemon_up, tor, onion_pub, hub_count, hubs_connected) = match &status {
         Ok(ApiResponse::StatusOk {
             tor_state,
             onion,
             hub_count,
+            hubs_connected,
             ..
-        }) => (true, Some(*tor_state), onion.is_some(), *hub_count),
-        _ => (false, None, false, 0),
+        }) => (
+            true,
+            Some(*tor_state),
+            onion.is_some(),
+            *hub_count,
+            *hubs_connected,
+        ),
+        _ => (false, None, false, 0, 0),
     };
     let checks = diagnose(
         daemon_up,
         tor.as_ref(),
         onion_pub,
         hub_count,
+        hubs_connected,
         cfg.first_contact_reachable,
         &log,
     );
@@ -2244,7 +2263,7 @@ mod doctor_tests {
 
     #[test]
     fn diagnose_daemon_down_short_circuits() {
-        let checks = diagnose(false, None, false, 0, false, &LogSignals::default());
+        let checks = diagnose(false, None, false, 0, 0, false, &LogSignals::default());
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].name, "daemon");
         assert_eq!(checks[0].health, Health::Fail);
@@ -2256,7 +2275,8 @@ mod doctor_tests {
             hub_session_ok: 2,
             ..Default::default()
         };
-        let checks = diagnose(true, Some(&TorState::Ready), true, 2, true, &log);
+        // 2/2 hubs connected live → hub connectivity PASS.
+        let checks = diagnose(true, Some(&TorState::Ready), true, 2, 2, true, &log);
         assert_eq!(health(&checks, "tor"), Health::Pass);
         assert_eq!(health(&checks, "your onion"), Health::Pass);
         assert_eq!(health(&checks, "hubs configured"), Health::Pass);
@@ -2273,7 +2293,8 @@ mod doctor_tests {
             circuit_failed: 3,
             ..Default::default()
         };
-        let checks = diagnose(true, Some(&TorState::Ready), false, 2, false, &log);
+        // 0/2 connected + dial/circuit failures → hub connectivity FAIL.
+        let checks = diagnose(true, Some(&TorState::Ready), false, 2, 0, false, &log);
         assert_eq!(health(&checks, "reachable by invite"), Health::Warn);
         assert_eq!(health(&checks, "hub connectivity"), Health::Fail);
         assert_eq!(health(&checks, "your onion"), Health::Warn);
@@ -2285,6 +2306,7 @@ mod doctor_tests {
             true,
             Some(&TorState::Ready),
             true,
+            0,
             0,
             true,
             &LogSignals::default(),

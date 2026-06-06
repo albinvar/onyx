@@ -690,6 +690,11 @@ struct StatusSnapshot {
     /// `0` → a not-directly-connected peer's message can't be delivered;
     /// drives the transport badge + the "no hubs" guidance.
     hub_count: u32,
+    /// v0.1.28 (honest health): how many of those hubs have a LIVE session
+    /// right now. Drives the status line's honest "hubs N/M" badge so a
+    /// Tor-blocked node (Tor "ready" but 0 hubs reachable) doesn't read as
+    /// all-green.
+    hubs_connected: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -2699,6 +2704,7 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
             tor_state,
             onion,
             hub_count,
+            hubs_connected,
             ..
         }) => {
             app.last_status = Some(Ok(StatusSnapshot {
@@ -2708,6 +2714,7 @@ async fn refresh_status_and_peers(socket: &Path, app: &mut AppState) {
                 tor_state,
                 onion,
                 hub_count,
+                hubs_connected,
             }));
         }
         Ok(ApiResponse::Error { code, message }) => {
@@ -5065,6 +5072,30 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 }
                 TorState::Disabled => Span::styled("tor disabled", theme::warn()),
             };
+            // v0.1.28 (honest health): "tor ready" alone was misleading —
+            // Tor can be fully bootstrapped while every hub dial silently
+            // fails (a Tor-hostile network), so the user saw all-green yet
+            // nothing could be delivered. Show the LIVE hub-session count
+            // (red 0/M, amber partial, green M/M) and whether our onion has
+            // actually published (inbound reachability), straight from the
+            // daemon's Status. These are facts, not guesses.
+            let hubs = if s.hub_count == 0 {
+                Span::styled("no hubs", theme::warn())
+            } else {
+                let label = format!("hubs {}/{}", s.hubs_connected, s.hub_count);
+                let style = if s.hubs_connected == 0 {
+                    theme::error()
+                } else if s.hubs_connected < s.hub_count {
+                    theme::warn()
+                } else {
+                    theme::ok()
+                };
+                Span::styled(label, style)
+            };
+            let onion = match &s.onion {
+                Some(o) if !o.is_empty() => Span::styled("onion ✓", theme::ok()),
+                _ => Span::styled("onion ⋯", theme::warn()),
+            };
             let live = if app.tail_active {
                 Span::styled("● live", theme::ok())
             } else {
@@ -5074,6 +5105,10 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             Line::from(vec![
                 Span::raw(" "),
                 tor,
+                Span::raw("  ·  "),
+                hubs,
+                Span::raw("  ·  "),
+                onion,
                 Span::raw("  ·  "),
                 live,
                 Span::raw("  ·  "),
@@ -5358,6 +5393,7 @@ mod snapshot_tests {
             tor_state,
             onion: Some("examplepublishedonionaddressforsnapshottests.onion".to_string()),
             hub_count: 1,
+            hubs_connected: 1,
         }));
         app
     }
