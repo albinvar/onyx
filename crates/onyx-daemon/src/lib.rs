@@ -2259,6 +2259,20 @@ async fn handle_dm_app_frame(
             .await
             {
                 info!(path = %path.display(), "dm file received + persisted");
+                // v0.1.32 (FIX): surface received files in the conversation —
+                // they used to land on disk silently with NO chat line, so
+                // the user thought "the file didn't arrive". Show + persist a
+                // "📎 received" line like the sender's "📎 sent".
+                let fname = path
+                    .file_name()
+                    .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned());
+                let label = format!("📎 received {fname} — saved to {}", path.display());
+                persist_dm_message(state, peer_pub, false, &sender_fp, &label).await;
+                state.conversations.lock().await.push_message(
+                    peer_pub,
+                    MessageDirection::Incoming,
+                    label,
+                );
             }
         }
         onyx_core::room::RoomAppMessage::KemAdvertisement { kem_pub, .. } => {
@@ -2576,6 +2590,23 @@ async fn handle_room_app_frame(
             .await
             {
                 info!(path = %path.display(), "file received + persisted");
+                // v0.1.32 (FIX): surface the received room file in scrollback
+                // (was disk-only + silent). Mirrors the room text path.
+                let fname = path
+                    .file_name()
+                    .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned());
+                let label = format!("📎 received {fname} — saved to {}", path.display());
+                let vault = state.vault.lock().await;
+                if let Err(e) = vault.append_room_message(
+                    state.identity_id,
+                    group_id,
+                    false,
+                    &sender_fp,
+                    &label,
+                    now_ms,
+                ) {
+                    warn!(error = %e, "room file: append_room_message failed");
+                }
             }
         }
     }
