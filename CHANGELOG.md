@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## UX — 2026-06-06 — `onyx doctor` connectivity self-check
+
+Turns the silent connect-flow failures (the ones that wasted hours this
+session) into a 5-second answer. `onyx doctor` checks and prints
+plain-English **PASS / WARN / FAIL** with a one-line fix for each:
+- **daemon** running?
+- **tor** bootstrapped?
+- **your onion** published (so others can dial you / you can subscribe)?
+- **hubs configured**?
+- **hub connectivity** — is a hub session actually up *right now*, or is Tor
+  failing to reach them (reads recent dial/circuit/guard/descriptor failures
+  from the log → "usually a network throttling Tor; try bridges")?
+- **reachable by invite** — the footgun: if `first_contact_reachable=false`,
+  accepted invites to you never arrive → it says so + how to fix.
+
+Exits non-zero if any check FAILs (scriptable). Pure `analyze_log` +
+`diagnose` with unit tests; no daemon API change. Next: surface the same
+hub/reachability health live in the TUI status line.
+
+---
+
 ## Release v0.1.27 — 2026-06-06 — security-hardening release
 
 Umbrella for everything since v0.1.26 (per-item entries below). This is a
