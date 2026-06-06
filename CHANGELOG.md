@@ -6,6 +6,34 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## DELIVERY phase 2b — 2026-06-06 — receipts flow end-to-end (direct DMs)
+
+Builds on 2a: delivery receipts now actually move over the wire for the
+direct (both-online) DM path.
+
+- **Sender** mints a random 16-byte `msg_id` per direct-DM message and
+  embeds it in the sealed `RoomAppMessage::Text` (only the direct-session
+  send path mints today; hub-relayed/queued sends stay id-less until the
+  pending-store lands).
+- **Recipient** auto-emits a `RoomAppMessage::DeliveryReceipt { msg_id }`
+  on decrypt, riding the **same** direct DM session as an ordinary
+  `DmFrame` — indistinguishable to a hub (`DELIVERY.md §4`). Best-effort:
+  if there's no live session the ack is dropped, never queued (a late ack
+  is worthless and queuing one would keep a dead conversation "pending"). A
+  receipt carries no `msg_id`-bearing text, so it never triggers an ack of
+  its own — no loops.
+- **Sender** observes the incoming receipt (logged). The *visible* effect —
+  "delivered ✓" per message + stop-retrying — lands with the pending-store
+  (phase 3) and retry/TUI state (phase 4).
+
+New `ConversationRegistry::handle_for_peer_pub` (the lookup the inbound
+handler uses to ack). Unit test for the receipt round-trip through a live
+handle + None on a disconnected peer; all 9 `rooms_smoke` integration
+tests still green. **Deferred:** recipient opt-out flag (emit is
+unconditional for now — default-on is the intended behaviour anyway).
+
+---
+
 ## DELIVERY phase 2a — 2026-06-06 — delivery-receipt wire foundation
 
 First slice of reliable delivery (per `DELIVERY.md §7`, DMs-first): the
