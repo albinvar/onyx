@@ -502,6 +502,22 @@ impl Vault {
         if path.exists() {
             return Err(Error::Internal("vault path already exists"));
         }
+        // SEC-A6: create the DB file 0600 *before* SQLite opens it, so the
+        // vault (which holds the contact graph + any plaintext columns) is
+        // never even briefly world-readable under the default umask. We no
+        // longer rely solely on the parent dir being 0700 (which can regress
+        // on copy/backup/restore). `create_new` also enforces the no-clobber
+        // invariant atomically.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|_| Error::Internal("vault path already exists"))?;
+        }
         let conn = Connection::open(path).map_err(map_db_err)?;
         Self::initialize(conn, passphrase, params)
     }

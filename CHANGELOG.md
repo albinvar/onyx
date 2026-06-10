@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security — 2026-06-10 — local-hardening trio (audit findings #2/#3/#6)
+
+Three local-attack-surface fixes from the shared security audit, shipped
+together because they're small, self-contained, and don't touch the wire
+protocol:
+
+- **#6 vault file perms (Med):** `Vault::create` now creates the SQLite file
+  `0600` *before* SQLite opens it (Unix `O_CREAT|O_EXCL` + `mode(0o600)`), so
+  the encrypted-at-rest DB is never briefly world-readable on a shared box.
+- **#3 received-file write hardening (Med):** assembled files are written with
+  `create_new` (`O_CREAT|O_EXCL`) — no clobber of an existing path and no
+  following a planted symlink out of the files dir; an existing path is treated
+  as already-delivered (idempotent), not overwritten.
+- **#2 image-decode DoS (Med):** the metadata sanitizer now decodes via
+  `ImageReader` with explicit `Limits` (≤16384 px per side, ≤256 MiB alloc), so
+  a tiny highly-compressed image can no longer decode to gigabytes of RGBA and
+  OOM the daemon (decompression bomb). New test asserts oversized dimensions are
+  refused at decode.
+
+Full pre-tag gate green.
+
+---
+
 ## Release v0.1.30 — 2026-06-06 — chat persistence, usability, blockers
 
 Umbrella since v0.1.29 (per-item entries below). The "make it actually
