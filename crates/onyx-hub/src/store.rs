@@ -220,8 +220,16 @@ impl Store {
     /// UPSERT the KeyPackage for `routing_id`. The handler already
     /// validates publisher-ownership of the routing id (T7.3-sec)
     /// before calling this; the store layer trusts its caller.
-    pub fn set_keypackage(&self, routing_id: &RoutingId, kp_bytes: &[u8]) -> anyhow::Result<()> {
-        let now = epoch_ms();
+    /// `published_at_ms` is supplied by the caller so the durable row
+    /// and the in-memory cache entry share an identical timestamp
+    /// (SEC #4: the cache uses it to evict the oldest KP when the
+    /// directory hits its cap).
+    pub fn set_keypackage(
+        &self,
+        routing_id: &RoutingId,
+        kp_bytes: &[u8],
+        published_at_ms: i64,
+    ) -> anyhow::Result<()> {
         self.conn
             .execute(
                 "INSERT INTO keypackage (routing_id, kp_bytes, published_at) \
@@ -229,9 +237,23 @@ impl Store {
                  ON CONFLICT(routing_id) DO UPDATE SET \
                    kp_bytes = excluded.kp_bytes, \
                    published_at = excluded.published_at",
-                params![routing_id.as_slice(), kp_bytes, now],
+                params![routing_id.as_slice(), kp_bytes, published_at_ms],
             )
             .context("set_keypackage")?;
+        Ok(())
+    }
+
+    /// SEC #4: delete the KeyPackage at `routing_id` from the durable
+    /// store. Used when the in-memory directory evicts its oldest entry
+    /// to stay under the cap, so disk and memory stay consistent.
+    /// Idempotent — deleting an absent row is a no-op.
+    pub fn delete_keypackage(&self, routing_id: &RoutingId) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM keypackage WHERE routing_id = ?",
+                params![routing_id.as_slice()],
+            )
+            .context("delete_keypackage")?;
         Ok(())
     }
 
@@ -269,32 +291,33 @@ impl Store {
     /// Load all stored KeyPackages. Used at hub startup to populate
     /// the in-memory KP cache; the hot fetch path then reads from
     /// memory.
-    pub fn load_all_keypackages(&self) -> anyhow::Result<Vec<(RoutingId, Vec<u8>)>> {
+    pub fn load_all_keypackages(&self) -> anyhow::Result<Vec<(RoutingId, Vec<u8>, i64)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT routing_id, kp_bytes FROM keypackage")
+            .prepare("SELECT routing_id, kp_bytes, published_at FROM keypackage")
             .context("prepare load_all_keypackages")?;
         let rows = stmt
             .query_map([], |r| {
                 let rid: Vec<u8> = r.get(0)?;
                 let kp: Vec<u8> = r.get(1)?;
-                Ok((rid, kp))
+                let published_at: i64 = r.get(2)?;
+                Ok((rid, kp, published_at))
             })
             .context("query load_all_keypackages rows")?;
         let mut out = Vec::new();
         for row in rows {
-            let (rid_bytes, kp) = row.context("read load_all_keypackages row")?;
+            let (rid_bytes, kp, published_at) = row.context("read load_all_keypackages row")?;
             let rid: RoutingId = rid_bytes
                 .as_slice()
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("keypackage.routing_id not 16 bytes"))?;
-            out.push((rid, kp));
+            out.push((rid, kp, published_at));
         }
         Ok(out)
     }
 }
 
-fn epoch_ms() -> i64 {
+pub(crate) fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -369,12 +392,13 @@ mod tests {
     fn keypackage_upsert_latest_wins() {
         let s = fresh();
         let rid: RoutingId = [0xBB; 16];
-        s.set_keypackage(&rid, b"v1").unwrap();
-        s.set_keypackage(&rid, b"v2").unwrap();
+        s.set_keypackage(&rid, b"v1", 1).unwrap();
+        s.set_keypackage(&rid, b"v2", 2).unwrap();
         let all = s.load_all_keypackages().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, rid);
         assert_eq!(all[0].1, b"v2");
+        assert_eq!(all[0].2, 2);
     }
 
     #[test]
@@ -419,7 +443,7 @@ mod tests {
 
         let s1 = Store::open(&path).unwrap();
         let rid: RoutingId = [0x33; 16];
-        s1.set_keypackage(&rid, b"hello").unwrap();
+        s1.set_keypackage(&rid, b"hello", 1).unwrap();
         drop(s1);
 
         // Reopen — schema apply must be a no-op, and the data must
@@ -443,12 +467,13 @@ mod tests {
         {
             let s = Store::open(&path).unwrap();
             s.enqueue(&[0xCA; 16], b"queued before restart").unwrap();
-            s.set_keypackage(&[0xCB; 16], b"kp before restart").unwrap();
+            s.set_keypackage(&[0xCB; 16], b"kp before restart", 7)
+                .unwrap();
         }
 
         let mut s = Store::open(&path).unwrap();
         let kps = s.load_all_keypackages().unwrap();
-        assert_eq!(kps, vec![([0xCB; 16], b"kp before restart".to_vec())]);
+        assert_eq!(kps, vec![([0xCB; 16], b"kp before restart".to_vec(), 7)]);
         let drained = s.drain_queue(&[0xCA; 16]).unwrap();
         assert_eq!(drained, vec![b"queued before restart".to_vec()]);
 
@@ -522,7 +547,7 @@ mod tests {
         // table is untouched even when we GC with a future cutoff.
         let s = fresh();
         let rid: RoutingId = [0xD0; 16];
-        s.set_keypackage(&rid, b"kp-bytes").unwrap();
+        s.set_keypackage(&rid, b"kp-bytes", epoch_ms()).unwrap();
         s.enqueue(&rid, b"some-queued-payload").unwrap();
 
         let far_future = epoch_ms() + 1_000_000_000;
@@ -533,5 +558,17 @@ mod tests {
         let kps = s.load_all_keypackages().unwrap();
         assert_eq!(kps.len(), 1);
         assert_eq!(kps[0].1, b"kp-bytes");
+    }
+
+    #[test]
+    fn delete_keypackage_removes_row_and_is_idempotent() {
+        let s = fresh();
+        let rid: RoutingId = [0xE1; 16];
+        s.set_keypackage(&rid, b"kp", 5).unwrap();
+        assert_eq!(s.load_all_keypackages().unwrap().len(), 1);
+        s.delete_keypackage(&rid).unwrap();
+        assert!(s.load_all_keypackages().unwrap().is_empty());
+        // Deleting again is a harmless no-op.
+        s.delete_keypackage(&rid).unwrap();
     }
 }
