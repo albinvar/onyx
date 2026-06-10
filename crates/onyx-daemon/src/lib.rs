@@ -383,6 +383,13 @@ pub struct InflightFile {
 /// transfers per peer. The 11th gets rejected.
 pub const FILES_MAX_INFLIGHT_PER_PEER: usize = 10;
 
+/// SEC-A1: max wall-clock for an inbound peer to complete the Noise XK
+/// handshake. A slowloris client that connects and then dribbles (or
+/// never sends) handshake bytes would otherwise pin an accept task and
+/// a session slot indefinitely. 30s is generous for a real Tor circuit
+/// (a few round-trips) while bounding the abuse window.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// T-files.b: file-transfer configuration. Defaults per
 /// `FILES.md §4`. Operator overrides via CLI / env vars at
 /// daemon startup.
@@ -1084,9 +1091,16 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     info!("accepted inbound stream; starting Noise XK handshake (responder)");
-    let mut session = handshake_responder(&mut stream, state.identity.identity_key())
-        .await
-        .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
+    // SEC-A1: bound the handshake. A slowloris peer that opens a stream
+    // and never finishes the Noise XK would otherwise pin this accept
+    // task + session slot forever; the timeout drops it instead.
+    let mut session = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_responder(&mut stream, state.identity.identity_key()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
+    .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
     let peer_pub = session.peer_static_key();
     let peer_pub_b32 = encode_b32(&peer_pub);
@@ -1447,9 +1461,15 @@ where
 {
     let peer_pub = IdentityPublic::from_bytes(peer_pub_bytes);
 
-    let mut session = handshake_initiator(&mut stream, state.identity.identity_key(), &peer_pub)
-        .await
-        .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
+    // SEC-A1: bound the outbound handshake too — a malicious or dead
+    // responder we dial could otherwise stall us indefinitely.
+    let mut session = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_initiator(&mut stream, state.identity.identity_key(), &peer_pub),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))?
+    .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
 
     let peer_static = session.peer_static_key();
     let learned_peer = encode_b32(&peer_static);

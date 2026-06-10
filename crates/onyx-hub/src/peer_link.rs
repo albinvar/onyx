@@ -47,6 +47,8 @@ use tracing::{info, warn};
 /// [`BACKOFF_MAX`].
 const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// SEC-A1: max wall-clock for the outbound peer-hub Noise XK handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded mailbox per peer-hub outbound. A normal hub gossips
 /// at most a few KP_PUBLISHes per second; this cap is generous.
@@ -111,9 +113,17 @@ async fn run_once(
         host,
         port, "peer-hub: Tor circuit established; starting Noise XK (initiator)"
     );
-    let mut session = handshake_initiator(&mut stream, our_sk, peer_pubkey)
-        .await
-        .context("peer-hub: Noise XK handshake (initiator) failed")?;
+    // SEC-A1: bound the handshake so a dead/stalling peer hub can't pin
+    // this reconnect supervisor task indefinitely.
+    let mut session = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_initiator(&mut stream, our_sk, peer_pubkey),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("peer-hub: Noise XK handshake timed out after {HANDSHAKE_TIMEOUT:?}")
+    })?
+    .context("peer-hub: Noise XK handshake (initiator) failed")?;
     info!(
         host,
         port, "peer-hub: Noise XK complete; draining outbound gossip queue"
