@@ -66,6 +66,16 @@ pub enum AcceptDecision {
 /// T-files.b: 24h window for the per-peer per-day quota.
 const QUOTA_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// SEC-A2: max width/height (px) the image sanitizer will decode.
+/// A tiny compressed file can claim huge dimensions; cap them so a
+/// decompression bomb is rejected instead of OOMing the daemon.
+const MAX_IMAGE_DIM: u32 = 16_384;
+
+/// SEC-A2: max bytes the image decoder may allocate for a single
+/// image (256 MiB). Combined with the dimension cap this bounds the
+/// decoded RGBA buffer regardless of how the source is compressed.
+const MAX_IMAGE_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// T-files.b: enforce the receive-side caps + allocate in-flight
 /// state for an incoming `FileMeta`. Returns the accept decision;
 /// caller does the logging + tail-event emission.
@@ -319,6 +329,9 @@ pub async fn accept_file_chunk(
 /// record in vault. Returns the path written, or None on any
 /// failure (verify fail, disk write fail, vault record fail).
 #[allow(clippy::too_many_arguments)]
+// SEC-A3 added the no-clobber/no-symlink OpenOptions block, pushing
+// this assemble→verify→write→record routine just over the line cap.
+#[allow(clippy::too_many_lines)]
 async fn finalize_file(
     state: &DaemonState,
     sender_fp: &str,
@@ -407,9 +420,33 @@ async fn finalize_file(
     let filename = format!("{hash_prefix}-{sanitized_name}");
     let path = conv_dir.join(&filename);
 
-    if let Err(e) = std::fs::write(&path, &assembled) {
-        warn!(error = %e, path = %path.display(), "file finalize: write failed");
-        return None;
+    // SEC-A3: write with O_CREAT|O_EXCL (`create_new`). This refuses to
+    // clobber an existing file AND — because O_EXCL fails on the final
+    // component rather than following it — won't write *through* a symlink
+    // planted at the (sender-influenced, content-hash-prefixed) path. An
+    // existing file means we already have this exact content (the name is
+    // hash-prefixed), so treat it as idempotent and emit no new event.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            if let Err(e) = f.write_all(&assembled) {
+                warn!(error = %e, path = %path.display(), "file finalize: write failed");
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            debug!(path = %path.display(), "file finalize: already on disk; not overwriting");
+            return None;
+        }
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "file finalize: open failed");
+            return None;
+        }
     }
 
     // Record manifest row.
@@ -691,8 +728,21 @@ fn reencode_raster(
     target_format: image::ImageFormat,
     target_mime: &str,
 ) -> Result<CleanedFile, SanitizeError> {
-    let img =
-        image::load_from_memory(raw).map_err(|e| SanitizeError::DecodeFailed(format!("{e}")))?;
+    // SEC-A2: cap decode dimensions + allocation. The send-size limit only
+    // bounds the *compressed* bytes; a tiny highly-compressed image can
+    // decode to gigabytes of RGBA and OOM the daemon (decompression bomb).
+    // ImageReader::limits enforces a ceiling before/while decoding.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(raw))
+        .with_guessed_format()
+        .map_err(|e| SanitizeError::DecodeFailed(format!("{e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_IMAGE_DIM);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    reader.limits(limits);
+    let img = reader
+        .decode()
+        .map_err(|e| SanitizeError::DecodeFailed(format!("{e}")))?;
     let mut out = Vec::with_capacity(raw.len());
     img.write_to(&mut std::io::Cursor::new(&mut out), target_format)
         .map_err(|e| SanitizeError::EncodeFailed(format!("{e}")))?;
@@ -999,6 +1049,23 @@ mod tests {
         assert!(
             cleaned.bytes.windows(canary.len()).any(|w| w == canary),
             "keep_metadata=true should preserve metadata (it didn't)"
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_oversized_image_dimensions() {
+        // SEC-A2: an image whose dimensions exceed MAX_IMAGE_DIM must be
+        // refused at decode rather than allocating a giant RGBA buffer.
+        // Encode a (MAX_IMAGE_DIM + 1) x 1 PNG — cheap to encode (a few
+        // thousand pixels) but its declared width trips the decode limit.
+        let img = image::DynamicImage::new_rgb8(MAX_IMAGE_DIM + 1, 1);
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let err = sanitize_bytes(&buf, SanitizeOpts::default()).unwrap_err();
+        assert!(
+            matches!(err, SanitizeError::DecodeFailed(_)),
+            "oversized image should be rejected at decode, got {err:?}"
         );
     }
 
