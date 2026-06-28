@@ -6,6 +6,27 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security — 2026-06-10 — handshake timeout + hub connection cap (audit #1)
+
+DoS hardening for the Noise XK handshake path (audit MEDIUM "slowloris").
+
+- **Handshake timeout (30s)** on every Noise XK site: daemon responder
+  (inbound accept) + initiator (outbound dial), hub responder (every inbound
+  connection), and the hub→peer-hub initiator. A client that connects and then
+  dribbles (or never sends) handshake bytes previously pinned an accept task +
+  session slot indefinitely; it's now dropped after 30s (ample for a real Tor
+  circuit, tight against abuse).
+- **Hub global connection cap (2048):** both hub accept loops (Tor + the
+  test-only TCP path) now `try_acquire_owned` a semaphore permit per inbound
+  stream and **drop excess immediately** rather than spawning an unbounded
+  handler. Combined with the handshake timeout this bounds what a
+  connection-flood attacker can pin: the hub refuses new connections (degrades)
+  instead of OOMing.
+
+Full pre-tag gate green.
+
+---
+
 ## Security — 2026-06-10 — local-hardening trio (audit findings #2/#3/#6)
 
 Three local-attack-surface fixes from the shared security audit, shipped

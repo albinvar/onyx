@@ -19,6 +19,13 @@ use tracing::{info, warn};
 
 use crate::state::{HubState, PER_CONN_MAILBOX, RoutingId};
 
+/// SEC-A1: max wall-clock for an inbound connection to finish the
+/// Noise XK handshake before the hub drops it. Without this, a
+/// slowloris client could open many connections and never complete the
+/// handshake, each pinning an accept task + mailbox slot. 30s is ample
+/// for a real Tor circuit while bounding the abuse window.
+const HUB_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Drive the hub side of one client connection. Runs Noise XK as
 /// responder, then a `select!` loop that interleaves frames coming
 /// from the client (SUBSCRIBE / DELIVER) and frames coming from the
@@ -76,9 +83,15 @@ pub async fn hub_handle_connection_with_cover<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut session = handshake_responder(&mut stream, hub_x25519)
-        .await
-        .map_err(|e| anyhow::anyhow!("hub: noise handshake failed: {e}"))?;
+    // SEC-A1: bound the handshake so a slowloris client can't pin a
+    // connection slot by stalling mid-XK.
+    let mut session = tokio::time::timeout(
+        HUB_HANDSHAKE_TIMEOUT,
+        handshake_responder(&mut stream, hub_x25519),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("hub: noise handshake timed out after {HUB_HANDSHAKE_TIMEOUT:?}"))?
+    .map_err(|e| anyhow::anyhow!("hub: noise handshake failed: {e}"))?;
 
     // T8.3.b.4: role detection. After Noise XK, the authenticated
     // peer_static_key tells us whether this is a peer hub (in our

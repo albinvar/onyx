@@ -56,6 +56,15 @@ const HS_NICKNAME: &str = "onyx-hub";
 /// Virtual port on the hidden service.
 const HUB_HS_PORT: u16 = 1;
 
+/// SEC-A1: hard ceiling on simultaneously-handled inbound connections.
+/// Combined with the per-connection handshake timeout this bounds the
+/// resources a connection-flood (or slowloris) attacker can pin: at
+/// most this many handler tasks + mailboxes exist at once; excess
+/// inbound streams are dropped immediately rather than queued, so the
+/// hub degrades (refuses new conns) instead of OOMing. Generous enough
+/// for any realistic legitimate fan-in.
+const MAX_CONCURRENT_CONNECTIONS: usize = 2048;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "onyx-hub",
@@ -532,13 +541,26 @@ async fn main() -> anyhow::Result<()> {
     }
     let cover_secs = args.cover_traffic_mean_secs;
     let constant_rate_ms = args.constant_rate_ms;
+    // SEC-A1: global connection cap. acquire_owned a permit per inbound
+    // stream; if the pool is exhausted, drop the stream rather than
+    // spawn an unbounded handler.
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
+            let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+                warn!(
+                    cap = MAX_CONCURRENT_CONNECTIONS,
+                    "hub at connection cap; dropping inbound stream"
+                );
+                drop(stream);
+                continue;
+            };
             let state = state.clone();
             let hub_secret = hub_secret.clone();
             let span = info_span!("hub-inbound");
             tokio::spawn(
                 async move {
+                    let _permit = permit; // held for the connection lifetime
                     if let Err(e) = hub_handle_connection_with_cover(
                         stream,
                         hub_secret.identity_key(),
@@ -641,6 +663,8 @@ async fn run_listen_tcp_mode(
             "T-cover.hub: cover-traffic emitter enabled per inbound client connection (TCP test mode)"
         );
     }
+    // SEC-A1: global connection cap (mirrors the Tor accept path).
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let accept_loop = async {
         loop {
             let (stream, peer_addr) = match listener.accept().await {
@@ -650,11 +674,21 @@ async fn run_listen_tcp_mode(
                     continue;
                 }
             };
+            let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+                warn!(
+                    cap = MAX_CONCURRENT_CONNECTIONS,
+                    peer = %peer_addr,
+                    "hub at connection cap; dropping inbound TCP stream"
+                );
+                drop(stream);
+                continue;
+            };
             let state = state.clone();
             let hub_secret = hub_secret.clone();
             let span = info_span!("hub-inbound-tcp", peer = %peer_addr);
             tokio::spawn(
                 async move {
+                    let _permit = permit; // held for the connection lifetime
                     if let Err(e) = hub_handle_connection_with_cover(
                         stream,
                         hub_secret.identity_key(),
