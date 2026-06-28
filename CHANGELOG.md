@@ -6,6 +6,29 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security — 2026-06-11 — hub KeyPackage directory cap (audit #4)
+
+DoS hardening for the hub's MLS KeyPackage directory.
+
+- The directory was unbounded by distinct routing-id: an attacker can mint
+  unlimited fresh fingerprints (each a valid intro-inbox id) and publish one
+  KeyPackage per fingerprint, growing both the in-memory map and the durable
+  `keypackage` table without limit (memory + disk DoS).
+- **Cap (`MAX_KEYPACKAGES` = 100k) with oldest-`published_at` eviction.** Each
+  net-new publish past the cap evicts the entry with the oldest publish time
+  from **both** memory and disk; warm-from-store trims an over-cap table down on
+  startup. Eviction is benign — KeyPackages are re-published on every reconnect,
+  so the oldest entry is also the one most likely abandoned, and an active peer
+  keeps its entry fresh and is never evicted under normal load.
+- **No blanket time-TTL**, deliberately: a TTL would break first-contact for a
+  legitimately-idle-but-valid peer (see `store.rs::gc_queue_entries_older_than`).
+  The cap bounds the DoS without that cost.
+
+New tests: oldest-by-`published_at` eviction (`state`) and durable
+`delete_keypackage` (`store`). Full workspace gate green.
+
+---
+
 ## Security — 2026-06-10 — handshake timeout + hub connection cap (audit #1)
 
 DoS hardening for the Noise XK handshake path (audit MEDIUM "slowloris").

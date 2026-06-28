@@ -132,6 +132,32 @@ pub const MAX_SUBSCRIBE_IDS_PER_FRAME: usize = 256;
 /// ≤256 KiB of routing ids per connection.
 pub const MAX_SUBSCRIPTIONS_PER_CONN: usize = 16_384;
 
+/// SEC #4: max distinct KeyPackages the hub's introduction directory
+/// will hold. Each `KP_PUBLISH` whose routing id isn't already present
+/// is a net-new entry; an attacker can mint unlimited fresh
+/// fingerprints (each with its own valid intro-inbox id) and publish a
+/// KP per fingerprint, growing `keypackages` (and the durable
+/// `keypackage` table) without bound — a memory + disk DoS. At the cap,
+/// each new publish evicts the entry with the oldest `published_at`
+/// from BOTH memory and disk. Eviction is benign: KeyPackages are
+/// re-published on every reconnect (`hub_client` self-publish), so the
+/// oldest entry is also the one most likely to be abandoned, and a
+/// still-active peer keeps its entry fresh and is never evicted under
+/// normal load. (A blanket time-TTL is deliberately NOT used — it would
+/// break first-contact for a legitimately-idle-but-valid peer; see
+/// `store.rs::gc_queue_entries_older_than` rustdoc.) 100k entries at a
+/// few KiB each bounds the directory to a few hundred MiB worst case.
+pub const MAX_KEYPACKAGES: usize = 100_000;
+
+/// SEC #4: one entry in the hub's KeyPackage directory — the published
+/// bytes plus the `published_at` timestamp used to pick the eviction
+/// victim when the directory hits [`MAX_KEYPACKAGES`].
+#[derive(Debug, Clone)]
+struct KeyPackageEntry {
+    bytes: Vec<u8>,
+    published_at: i64,
+}
+
 /// All the mutable state the hub keeps.
 ///
 /// **Persistence (T8.0):** `queues` and `keypackages` are write-through-
@@ -165,7 +191,7 @@ pub struct HubState {
     /// **Security note**: as of T7.3-sec, the hub *does* validate
     /// publisher ownership in `handler.rs::FRAME_KP_PUBLISH` before
     /// calling [`Self::publish_keypackage`] — see THREAT_MODEL §8.2 #15.
-    keypackages: HashMap<RoutingId, Vec<u8>>,
+    keypackages: HashMap<RoutingId, KeyPackageEntry>,
     /// Optional SQLite-backed durable store (T8.0). `None` means the
     /// hub is running ephemeral — fine for tests and short-lived
     /// dev runs. Production uses `Self::with_store`.
@@ -220,8 +246,14 @@ impl HubState {
     pub fn with_store(store: Store) -> anyhow::Result<Self> {
         let mut me = Self::default();
         // Warm the KP cache.
-        for (rid, kp) in store.load_all_keypackages()? {
-            me.keypackages.insert(rid, kp);
+        for (rid, bytes, published_at) in store.load_all_keypackages()? {
+            me.keypackages.insert(
+                rid,
+                KeyPackageEntry {
+                    bytes,
+                    published_at,
+                },
+            );
         }
         // Warm the queue cache, seeding the byte accounting so the
         // global cap stays accurate across restarts.
@@ -233,6 +265,11 @@ impl HubState {
             me.queues.insert(rid, payloads);
         }
         me.durable_store = Some(store);
+        // SEC #4: a store warmed from disk may exceed the cap (e.g. the
+        // cap was lowered, or the table predates this guard). Trim the
+        // oldest down to the ceiling now that the store is attached so
+        // the eviction writes through to disk.
+        me.evict_oldest_keypackages_over_cap();
         Ok(me)
     }
 
@@ -733,19 +770,62 @@ impl HubState {
     /// failed disk write logs `warn!` and continues; the in-memory
     /// cache stays consistent.
     pub fn publish_keypackage(&mut self, routing_id: RoutingId, bytes: Vec<u8>) {
+        let published_at = crate::store::epoch_ms();
         if let Some(store) = &self.durable_store {
-            if let Err(e) = store.set_keypackage(&routing_id, &bytes) {
+            if let Err(e) = store.set_keypackage(&routing_id, &bytes, published_at) {
                 warn!(error = %e, "hub store: set_keypackage failed (in-memory cache still consistent)");
             }
         }
-        self.keypackages.insert(routing_id, bytes);
+        self.keypackages.insert(
+            routing_id,
+            KeyPackageEntry {
+                bytes,
+                published_at,
+            },
+        );
+        // SEC #4: enforce the directory cap. A replace (existing id)
+        // doesn't grow the map so this is a no-op; a net-new entry past
+        // the cap evicts the oldest from memory + disk.
+        self.evict_oldest_keypackages_over_cap();
+    }
+
+    /// SEC #4: while the KeyPackage directory exceeds [`MAX_KEYPACKAGES`],
+    /// remove the entry with the oldest `published_at` from both the
+    /// in-memory cache and the durable store. Called after every publish
+    /// (evicts at most one) and once at warm-from-store (may evict
+    /// several). The scan is O(n) per eviction; the publish path is
+    /// rate-limited (`max_frames_per_minute`) so this stays cheap.
+    fn evict_oldest_keypackages_over_cap(&mut self) {
+        self.evict_oldest_keypackages_down_to(MAX_KEYPACKAGES);
+    }
+
+    /// Eviction core, parameterised by `cap` so tests can drive it with
+    /// a small ceiling. See [`Self::evict_oldest_keypackages_over_cap`].
+    fn evict_oldest_keypackages_down_to(&mut self, cap: usize) {
+        while self.keypackages.len() > cap {
+            let Some(victim) = self
+                .keypackages
+                .iter()
+                .min_by_key(|(_, e)| e.published_at)
+                .map(|(rid, _)| *rid)
+            else {
+                break;
+            };
+            self.keypackages.remove(&victim);
+            if let Some(store) = &self.durable_store {
+                if let Err(e) = store.delete_keypackage(&victim) {
+                    warn!(error = %e, "hub store: delete_keypackage (cap eviction) failed");
+                }
+            }
+            warn!(cap, "hub KeyPackage directory at cap; evicted oldest entry");
+        }
     }
 
     /// Return the most recent KeyPackage stored at `routing_id`, or
     /// `None` if nothing has ever been published there.
     #[must_use]
     pub fn fetch_keypackage(&self, routing_id: &RoutingId) -> Option<Vec<u8>> {
-        self.keypackages.get(routing_id).cloned()
+        self.keypackages.get(routing_id).map(|e| e.bytes.clone())
     }
 
     /// HIGH-1: is `routing_id` a known introduction inbox? True iff a
@@ -1107,6 +1187,60 @@ mod tests {
         );
         // And the directory size stays at 1 — we replaced, not appended.
         assert_eq!(state.keypackage_count(), 1);
+    }
+
+    #[test]
+    fn keypackage_cap_evicts_oldest_by_published_at() {
+        // SEC #4: drive the eviction core with a small cap. Insert four
+        // entries with distinct (out-of-order) published_at timestamps,
+        // trim to a cap of 2, and assert the two NEWEST survive.
+        let mut state = HubState::new();
+        let mk = |b: u8| -> RoutingId { [b; 16] };
+        // (routing_id, published_at) — deliberately not insertion-ordered.
+        state.keypackages.insert(
+            mk(1),
+            KeyPackageEntry {
+                bytes: b"oldest".to_vec(),
+                published_at: 100,
+            },
+        );
+        state.keypackages.insert(
+            mk(2),
+            KeyPackageEntry {
+                bytes: b"newest".to_vec(),
+                published_at: 400,
+            },
+        );
+        state.keypackages.insert(
+            mk(3),
+            KeyPackageEntry {
+                bytes: b"older".to_vec(),
+                published_at: 200,
+            },
+        );
+        state.keypackages.insert(
+            mk(4),
+            KeyPackageEntry {
+                bytes: b"newer".to_vec(),
+                published_at: 300,
+            },
+        );
+        assert_eq!(state.keypackage_count(), 4);
+
+        state.evict_oldest_keypackages_down_to(2);
+
+        assert_eq!(state.keypackage_count(), 2);
+        // The two oldest (100, 200) are gone; the two newest (300, 400) stay.
+        assert!(state.fetch_keypackage(&mk(1)).is_none());
+        assert!(state.fetch_keypackage(&mk(3)).is_none());
+        assert_eq!(
+            state.fetch_keypackage(&mk(4)).as_deref(),
+            Some(b"newer".as_slice())
+        );
+        assert_eq!(
+            state.fetch_keypackage(&mk(2)).as_deref(),
+            Some(b"newest".as_slice())
+        );
     }
 
     // ── T8.0 durability ───────────────────────────────────────────────
