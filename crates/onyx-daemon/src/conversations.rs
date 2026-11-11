@@ -69,6 +69,13 @@ pub enum PeerOutbound {
 /// for preview / scrollback rendering.
 pub const RING_CAPACITY: usize = 200;
 
+/// Most conversations that exist only because a hub delivered something
+/// from that sender. Each costs a registry row and a history ring, and a
+/// stranger who can reach one of our routing ids could otherwise mint
+/// them without limit (one per throwaway identity). Past the cap the
+/// least-recently-active hub-only row is dropped.
+pub const MAX_HUB_ONLY_PEERS: usize = 512;
+
 /// Broadcast queue depth for live `Tail` subscribers. Each `Tail`
 /// client gets its own consumer; if a consumer falls behind by more
 /// than this many events, they get dropped (a `Lagged` error from
@@ -109,6 +116,11 @@ struct ConversationState {
     /// OLDEST queued message is dropped (a stale backlog is less useful
     /// than recent messages, and an unbounded queue is a memory-DoS).
     pending: VecDeque<PeerOutbound>,
+    /// `true` while this row has only ever been populated from hub
+    /// deliveries (no direct session has registered). Such rows can be
+    /// created by any stranger able to reach one of our routing ids, so
+    /// they are capped — see [`MAX_HUB_ONLY_PEERS`].
+    hub_only: bool,
 }
 
 /// One line in a conversation's ring buffer. Mirrors the
@@ -215,17 +227,21 @@ impl ConversationRegistry {
         // v0.1.17: preserve any messages queued while this peer was
         // disconnected, so a reconnect flushes them instead of dropping
         // them. A brand-new peer has none.
-        let pending = self
-            .by_peer
-            .get_mut(&peer_pub)
-            .map(|s| std::mem::take(&mut s.pending))
-            .unwrap_or_default();
+        // The recent-message ring is carried over too: re-registering on
+        // every reconnect used to start an empty ring, so `History` lost
+        // the conversation each time the circuit dropped.
+        let (pending, ring) = self.by_peer.get_mut(&peer_pub).map_or_else(
+            || (VecDeque::new(), VecDeque::with_capacity(RING_CAPACITY)),
+            |s| (std::mem::take(&mut s.pending), std::mem::take(&mut s.ring)),
+        );
         let state = ConversationState {
             handle: handle.clone(),
             connected: true,
-            ring: VecDeque::with_capacity(RING_CAPACITY),
+            ring,
             last_active_unix_ms: now_unix_ms(),
             pending,
+            // A direct session exists: no longer a hub-only row.
+            hub_only: false,
         };
         self.by_peer.insert(peer_pub, state);
 
@@ -320,6 +336,7 @@ impl ConversationRegistry {
         if let Some(existing) = self.by_peer.get(&peer_pub) {
             return existing.handle.clone();
         }
+        self.evict_stale_hub_only_peers();
         let short_id = short_id_of(pubkey_b32);
         // Drop the Receiver immediately; the Sender's try_send will
         // return Closed once anyone tries to use it.
@@ -341,6 +358,7 @@ impl ConversationRegistry {
             ring: VecDeque::with_capacity(RING_CAPACITY),
             last_active_unix_ms: now_unix_ms(),
             pending: VecDeque::new(),
+            hub_only: true,
         };
         self.by_peer.insert(peer_pub, state);
 
@@ -353,6 +371,33 @@ impl ConversationRegistry {
             .send(ApiResponse::EventPeerConnected { peer: info });
 
         handle
+    }
+
+    /// Keep the number of hub-only rows under [`MAX_HUB_ONLY_PEERS`] by
+    /// dropping the least-recently-active ones. Rows with a direct session
+    /// (now or ever) are never touched.
+    fn evict_stale_hub_only_peers(&mut self) {
+        loop {
+            let hub_only = self.by_peer.values().filter(|s| s.hub_only).count();
+            if hub_only < MAX_HUB_ONLY_PEERS {
+                return;
+            }
+            let Some(victim) = self
+                .by_peer
+                .iter()
+                .filter(|(_, s)| s.hub_only)
+                .min_by_key(|(_, s)| s.last_active_unix_ms)
+                .map(|(k, _)| *k)
+            else {
+                return;
+            };
+            if let Some(state) = self.by_peer.remove(&victim) {
+                self.by_short.retain(|_, peer| *peer != victim);
+                let _ = self.events_tx.send(ApiResponse::EventPeerDisconnected {
+                    peer_short: state.handle.short_id,
+                });
+            }
+        }
     }
 
     /// Mark a conversation as disconnected (peer closed the stream
@@ -1056,5 +1101,48 @@ mod tests {
         assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 1);
         assert!(preview.ends_with('…'));
         assert_eq!(preview_of("short"), "short");
+    }
+
+    /// Hub-only rows are capped; a flood of throwaway senders evicts the
+    /// least-recently-active hub-only row and never a row that has had a
+    /// direct session.
+    #[tokio::test]
+    async fn hub_only_rows_are_capped_and_direct_rows_survive() {
+        fn key(n: usize) -> [u8; 32] {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            k[31] = 0xEE;
+            k
+        }
+        fn b32_of(k: &[u8; 32]) -> String {
+            base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, k)
+        }
+        let mut reg = ConversationRegistry::new();
+        let friend = [0x77u8; 32];
+        let _rx = reg.register(friend, &b32_of(&friend), "friend-fp".into());
+        reg.mark_disconnected(&friend);
+        for n in 0..(MAX_HUB_ONLY_PEERS + 50) {
+            let k = key(n);
+            reg.register_hub_only(k, &b32_of(&k), format!("fp-{n}"));
+        }
+        let hub_only = reg.by_peer.values().filter(|s| s.hub_only).count();
+        assert_eq!(hub_only, MAX_HUB_ONLY_PEERS);
+        assert!(reg.by_peer.contains_key(&friend), "direct contact kept");
+        assert!(reg.by_short.len() <= reg.by_peer.len());
+    }
+
+    /// Reconnecting must not wipe the recent-message ring.
+    #[tokio::test]
+    async fn reregister_keeps_recent_history() {
+        let mut reg = ConversationRegistry::new();
+        let peer = [0x42u8; 32];
+        let pk = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &peer);
+        let (handle, _rx) = reg.register(peer, &pk, "fp".into());
+        reg.push_message(&peer, MessageDirection::Incoming, "before".into());
+        reg.mark_disconnected(&peer);
+        let _again = reg.register(peer, &pk, "fp".into());
+        let history = reg.history(&handle.short_id, 10).expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "before");
     }
 }
