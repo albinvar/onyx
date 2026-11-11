@@ -95,7 +95,15 @@ impl ConnectCode {
     /// whole string is trimmed first so a pasted code with a trailing
     /// newline still parses.
     pub fn parse(s: &str) -> Result<Self, String> {
-        let s = s.trim();
+        // Codes get pasted from chats and terminals: drop any whitespace
+        // (line wraps, stray spaces) and accept upper case — onion
+        // addresses and base32 keys are case-insensitive by nature.
+        let cleaned: String = s
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        let s = cleaned.as_str();
         let query = s
             .strip_prefix("onyx://connect/v1?")
             .ok_or_else(|| "not an onyx://connect/v1 connect code".to_string())?;
@@ -169,6 +177,19 @@ mod tests {
         assert!(ConnectCode::parse(&format!("onyx://connect/v1?onion=&id={KEY}")).is_err());
     }
 
+    /// A code wrapped across lines or upper-cased by a chat app still works.
+    #[test]
+    fn tolerates_wrapping_and_case() {
+        let wrapped = format!(
+            "ONYX://connect/v1?onion={}\n  &id={}",
+            ONION.to_uppercase(),
+            KEY.to_uppercase()
+        );
+        let parsed = ConnectCode::parse(&wrapped).expect("parses");
+        assert_eq!(parsed.onion, ONION);
+        assert_eq!(parsed.identity_pub_b32, KEY);
+    }
+
     /// A connect code must name a v3 onion: a clearnet host would be
     /// dialled through a Tor exit.
     #[test]
@@ -178,7 +199,6 @@ mod tests {
             "example.com:443",
             "10.0.0.1:22",
             "a.onion",
-            "GQAIIWJUHVRYO477ZDCMOEADAE7V346PBZGDP7VZM6B32F66MMWHRBQD.onion",
             "gqaiiwjuhvryo477zdcmoeadae7v346pbzgdp7vzm6b32f66mmwhrbqd.onion:0",
             "gqaiiwjuhvryo477zdcmoeadae7v346pbzgdp7vzm6b32f66mmwhrbqd.onion:99999",
             "gqaiiwjuhvryo477zdcmoeadae7v346pbzgdp7vzm6b32f66mmwhrbqd.onion.evil.com",

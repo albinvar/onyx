@@ -2834,7 +2834,18 @@ async fn send_composer(app: &mut AppState) {
             // top of the activity-sorted list.
             app.last_activity_ms.insert(key, now);
             app.last_send_result = Some(Ok(()));
-            tracing::info!(
+            // Say so when a member could not be reached at all: the send
+            // "succeeded", but those members will never see this message.
+            if skipped_no_kem > 0 {
+                app.push_activity(
+                    ActivityLevel::Warn,
+                    format!(
+                        "not delivered to {skipped_no_kem} of {total_members} room member(s): \
+                         no route to them yet (they have not announced a relay key)"
+                    ),
+                );
+            }
+            tracing::debug!(
                 delivered_to_direct,
                 delivered_to_hub,
                 skipped_no_kem,
