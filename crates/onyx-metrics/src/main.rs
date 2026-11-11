@@ -89,9 +89,13 @@ struct Args {
     /// Public status-site output directory. When set, the collector
     /// periodically writes a static `status.json` + `index.html` here
     /// (atomically). Point any web server or an onion service at this
-    /// directory to publish a Tor-Metrics-style fleet status page. The
-    /// published data is LIVENESS-ONLY — the same safe fields as the local
-    /// status page — so it is fine to expose publicly.
+    /// directory to publish a fleet status page.
+    ///
+    /// The published files are deliberately poorer than the local status
+    /// page: an operator-chosen name and up/down, nothing else. No hub
+    /// key or id, no software version, no uptime, no per-second "last
+    /// seen" — each of those would help someone choose a relay to attack
+    /// or watch an attack take effect. See `METRICS.md` §"Public page".
     #[arg(long, env = "ONYX_METRICS_PUBLISH_DIR")]
     publish_dir: Option<std::path::PathBuf>,
 
@@ -176,6 +180,7 @@ async fn main() -> Result<()> {
         "metrics collector: allowlist loaded"
     );
 
+    let allow = Arc::new(allow);
     let store = Arc::new(Mutex::new(
         Store::open(std::path::Path::new(&args.db)).context("opening collector store")?,
     ));
@@ -205,10 +210,13 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating publish dir {}", dir.display()))?;
         let store = store.clone();
+        let names = allow.clone();
         let stale_after = args.stale_after_secs;
         let interval = std::time::Duration::from_secs(args.publish_interval_secs.max(5));
-        info!(dir = %dir.display(), interval_secs = interval.as_secs(), "public status-site publisher enabled (liveness-only)");
-        tokio::spawn(async move { run_publisher(&dir, &store, stale_after, interval).await });
+        info!(dir = %dir.display(), interval_secs = interval.as_secs(), "public status-site publisher enabled (name + up/down only)");
+        tokio::spawn(async move {
+            run_publisher(&dir, &store, &names, stale_after, interval).await;
+        });
     }
 
     // Tor hidden service for inbound heartbeats.
@@ -243,7 +251,6 @@ async fn main() -> Result<()> {
         .take_accept_streams()
         .context("HS accept-stream already taken")?;
 
-    let allow = Arc::new(allow);
     info!("onyx-metrics running. Ctrl-C to stop.");
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
@@ -401,12 +408,13 @@ async fn handle_http(
 
 // ── public static status-site publisher (P5) ───────────────────────────────
 
-/// Periodically render the liveness-only status page + JSON and write them
+/// Periodically render the **public** status page + JSON and write them
 /// atomically into `dir`, so a plain web server or an onion can serve a
-/// public fleet-status site without ever touching the live store or ingest.
+/// fleet-status site without ever touching the live store or ingest.
 async fn run_publisher(
     dir: &std::path::Path,
     store: &Arc<Mutex<Store>>,
+    names: &HashMap<String, String>,
     stale_after: u64,
     interval: std::time::Duration,
 ) {
@@ -418,8 +426,9 @@ async fn run_publisher(
             store.all().unwrap_or_default()
         };
         let now = now_secs();
-        let html = render_html(&records, now, stale_after);
-        let json = render_json(&records, now, stale_after);
+        let rows = public_rows(&records, names, now, stale_after);
+        let html = render_public_html(&rows);
+        let json = render_public_json(&rows, now);
         if let Err(e) = publish_files(dir, &html, &json) {
             warn!(error = %e, "status-site publish failed (will retry next tick)");
         }
@@ -447,6 +456,106 @@ fn is_fresh(rec: &HubRecord, now: u64, stale_after: u64) -> bool {
     now.saturating_sub(rec.received_at) <= stale_after
 }
 
+/// Granularity of every time value on the public page. Matches the hubs'
+/// own 5-minute heartbeat snapping, so the page adds no finer clock.
+const PUBLIC_TIME_BUCKET_SECS: u64 = 300;
+
+/// What the public page says about one hub: a name and a boolean.
+///
+/// This is the whole public surface, on purpose. A status page is useful
+/// to someone choosing a hub; it must not be more useful to someone
+/// choosing a hub to attack. So it carries:
+///
+///   * no reporting key and no hub id — nothing that maps a row to an
+///     onion address or to `hubs.json` beyond the name the operator chose;
+///   * no software version — "which hub is unpatched" is a target list;
+///   * no uptime bucket — restarts are how an attacker confirms a crash;
+///   * no `tor_reachable` detail and no seconds-ago counter — together
+///     they are a live readout of whether a flood is working.
+///
+/// Up/down itself cannot be hidden from anyone who can dial the hub, so
+/// publishing it gives away nothing a direct probe would not; but it is
+/// derived from the staleness window (15 min by default) and stamped to a
+/// 5-minute bucket, so the page lags and blurs rather than tracks.
+#[derive(Debug, PartialEq, Eq)]
+struct PublicRow {
+    name: String,
+    up: bool,
+}
+
+/// Reduce full records to public rows, sorted by name so row order does
+/// not reveal enrollment or reporting order.
+fn public_rows(
+    records: &[HubRecord],
+    names: &HashMap<String, String>,
+    now: u64,
+    stale_after: u64,
+) -> Vec<PublicRow> {
+    let mut rows: Vec<PublicRow> = records
+        .iter()
+        // A hub removed from the allowlist disappears from the public page
+        // even if its last record is still in the store.
+        .filter_map(|r| {
+            let name = names.get(&r.sig_pub_b32)?;
+            Some(PublicRow {
+                name: name.clone(),
+                up: is_fresh(r, now, stale_after) && r.tor_reachable,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+fn public_stamp(now: u64) -> u64 {
+    now - now % PUBLIC_TIME_BUCKET_SECS
+}
+
+fn render_public_json(rows: &[PublicRow], now: u64) -> String {
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| serde_json::json!({ "name": r.name, "up": r.up }))
+        .collect();
+    serde_json::json!({ "as_of": public_stamp(now), "hubs": items }).to_string()
+}
+
+fn render_public_html(rows: &[PublicRow]) -> String {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    if rows.is_empty() {
+        body.push_str("<tr><td colspan=\"2\">no hubs reporting</td></tr>");
+    }
+    for r in rows {
+        let (state, color) = if r.up {
+            ("up", "#3fb950")
+        } else {
+            ("not responding", "#f85149")
+        };
+        // write! to a String is infallible; ignore the Result.
+        let _ = write!(
+            body,
+            "<tr><td>{}</td><td style=\"color:{color}\">{state}</td></tr>",
+            html_escape(&r.name)
+        );
+    }
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta http-equiv=\"refresh\" content=\"300\">\
+         <title>Onyx hub status</title>\
+         <style>body{{background:#0d1117;color:#c9d1d9;font-family:ui-monospace,monospace;padding:2rem}}\
+         h1{{font-size:1.1rem}}table{{border-collapse:collapse}}\
+         th,td{{text-align:left;padding:.4rem 1.2rem .4rem 0;border-bottom:1px solid #21262d;font-size:.9rem}}\
+         th{{color:#8b949e}}small{{color:#8b949e}}</style></head><body>\
+         <h1>Onyx hubs</h1>\
+         <table><tr><th>hub</th><th>status</th></tr>{body}</table>\
+         <p><small>Updated in 5-minute steps; a hub is shown as not responding \
+         only after it has been quiet for a while. This page shows nothing \
+         about users or traffic.</small></p></body></html>"
+    )
+}
+
+/// Full operator view — served on the loopback status page only, never
+/// written to `--publish-dir`.
 fn render_json(records: &[HubRecord], now: u64, stale_after: u64) -> String {
     let items: Vec<serde_json::Value> = records
         .iter()
@@ -622,6 +731,74 @@ mod tests {
         let json = render_json(&[rec], 1_700_000_110, 900);
         assert!(json.contains("\"version\":\"0.1.25\""));
         assert!(json.contains("\"fresh\":true"));
+    }
+
+    fn public_rec(sig: &str, reachable: bool, received_at: u64) -> HubRecord {
+        HubRecord {
+            sig_pub_b32: sig.into(),
+            hub_id_b32: "7xseki3hubid".into(),
+            software_version: "0.1.25".into(),
+            up: true,
+            tor_reachable: reachable,
+            uptime: "<1w".into(),
+            coarse_ts: received_at,
+            received_at,
+        }
+    }
+
+    /// The published files must not help anyone pick a relay to attack or
+    /// watch an attack land: name + up/down only, coarse time, sorted.
+    #[test]
+    fn public_page_carries_name_and_state_only() {
+        let now = 1_700_000_417;
+        let mut names = HashMap::new();
+        names.insert("sig-b".to_string(), "piko".to_string());
+        names.insert("sig-a".to_string(), "zeta".to_string());
+        let records = vec![
+            public_rec("sig-a", true, now - 10),
+            public_rec("sig-b", true, now - 5_000), // stale
+            public_rec("sig-gone", true, now - 10), // no longer enrolled
+        ];
+        let rows = public_rows(&records, &names, now, 900);
+        assert_eq!(
+            rows,
+            vec![
+                PublicRow {
+                    name: "piko".into(),
+                    up: false
+                },
+                PublicRow {
+                    name: "zeta".into(),
+                    up: true
+                },
+            ]
+        );
+
+        let html = render_public_html(&rows);
+        let json = render_public_json(&rows, now);
+        for out in [&html, &json] {
+            for secret in ["7xseki3hubid", "0.1.25", "sig-a", "sig-b", "<1w", "ago"] {
+                assert!(!out.contains(secret), "public output leaks {secret}: {out}");
+            }
+            // No second-granular clock: neither `now` nor a receive time.
+            assert!(!out.contains("1700000417"));
+            assert!(!out.contains("1700000407"));
+        }
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["as_of"], 1_700_000_400_u64);
+        let hub = v["hubs"][0].as_object().unwrap();
+        assert_eq!(hub.len(), 2, "exactly name + up, nothing else");
+        assert!(html.contains("piko") && html.contains("not responding"));
+    }
+
+    /// An unreachable onion reads the same as a silent hub.
+    #[test]
+    fn public_page_does_not_distinguish_unreachable_from_silent() {
+        let now = 1_700_000_100;
+        let mut names = HashMap::new();
+        names.insert("s".to_string(), "piko".to_string());
+        let rows = public_rows(&[public_rec("s", false, now)], &names, now, 900);
+        assert!(!rows[0].up);
     }
 
     #[test]

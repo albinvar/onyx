@@ -285,7 +285,10 @@ A hub that opts in sends a signed heartbeat over Tor every few minutes:
 version, coarse uptime, whether its onion is reachable — **liveness only, no
 counts of users, messages or connections**. The collector accepts only keys
 on its allowlist, keeps the latest state per hub (no history), and serves a
-status page on `127.0.0.1:9876`. The allowlist is a JSON file of
+detailed status page on `127.0.0.1:9876` for the operator only. An optional
+public page (`--publish-dir`) shows just a name and up/down in five-minute
+steps — no versions, keys, uptime or precise timing, so it does not double
+as a guide to which relay to attack. The allowlist is a JSON file of
 `{ "hubs": [ { "name": …, "sig_pub_b32": … } ] }`. Read [`METRICS.md`](./METRICS.md) before
 enabling it: even liveness data is a time series someone could correlate.
 

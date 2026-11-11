@@ -46,6 +46,19 @@ Use this file as the single chronological view of where the project is. Implemen
   now times out an idle request after 10 s. **Carry-forward:** ingest
   connections are bounded per connection (30 s, 4 KiB) but not in number.
 
+**Hub monitor — public page no longer a target list**
+
+- `onyx-metrics --publish-dir` used to publish the operator view: each
+  hub's id and reporting key, exact software version, uptime bucket and
+  seconds since its last heartbeat. That told an attacker which relay was
+  unpatched, which onion a row belonged to, and — live — whether an attack
+  on it was working. The published files now carry an operator-chosen
+  name and one up/down boolean, stamped in 5-minute steps, sorted by
+  name; un-enrolled hubs are dropped. The detailed view remains on the
+  loopback status page. Tested (`public_page_carries_name_and_state_only`).
+  **Honest limit:** whether a hub answers is observable by anyone who
+  can dial it; the page only avoids adding to that.
+
 None of this changes the headline: no external audit.
 
 ---

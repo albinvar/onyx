@@ -79,6 +79,35 @@ module docs forbid it.
 - Serves a plain status page on **`127.0.0.1` by default** (`/` HTML + `/json`).
   View it locally or over an SSH tunnel; a non-loopback bind is loudly warned.
 
+### Public page
+
+`--publish-dir` writes a static `index.html` + `status.json` for a public
+status site. These files are **not** a copy of the operator page. They
+contain, per hub, the name the operator gave it in the allowlist and one
+boolean, plus a timestamp rounded to five minutes:
+
+```json
+{ "as_of": 1700000400, "hubs": [ { "name": "piko", "up": true } ] }
+```
+
+Left out on purpose, because each one helps someone *attack* a relay rather
+than *choose* one:
+
+| Not published | Why |
+|---|---|
+| Hub id, reporting key | Maps a row to an onion address and a `hubs.json` entry. |
+| Software version | "Which hub is unpatched" is a target list. |
+| Uptime | A reset uptime tells an attacker their crash attempt worked. |
+| Seconds since last heartbeat, `tor_reachable` | A live readout of whether a flood is landing. |
+
+"Up" means "reported within the staleness window and reachable", so the page
+lags by design (15 minutes by default) and does not distinguish *unreachable*
+from *silent*. A hub removed from the allowlist disappears from the page.
+
+What this cannot hide: whether a hub answers is observable by anyone who
+holds its address and dials it. The public page is meant to add nothing
+beyond that, and to be slower and coarser than probing directly.
+
 ### Enrollment
 A hub's **reporting key** is the Ed25519 verifying key embedded in its
 heartbeats (`hub_sig_pub_b32`). The collector logs the key of any un-enrolled
