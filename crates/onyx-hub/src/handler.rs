@@ -427,10 +427,13 @@ where
     };
     let cover_sleep = tokio::time::sleep(initial_cover_dt);
     tokio::pin!(cover_sleep);
+    // Cancellation-safe reads (see `FrameReader`): live deliveries, pacer
+    // ticks and cover traffic fire while a client frame is still arriving.
+    let mut frames = onyx_core::transport::FrameReader::new();
     loop {
         tokio::select! {
             // Frame from the client.
-            read_result = read_frame(stream, session) => {
+            read_result = frames.read_frame(stream, session) => {
                 // Peer closed (or wire error mid-frame): treat as a
                 // clean disconnect — the caller will unregister us.
                 let Ok(frame) = read_result else { return Ok(()) };

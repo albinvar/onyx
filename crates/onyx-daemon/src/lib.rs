@@ -61,9 +61,7 @@ use onyx_core::identity::Identity;
 use onyx_core::mls::{MlsGroupState, MlsParty};
 use onyx_core::storage::Vault;
 use onyx_core::tor::TorRuntime;
-use onyx_core::transport::{
-    Session, handshake_initiator, handshake_responder, read_frame, write_frame,
-};
+use onyx_core::transport::{Session, handshake_initiator, handshake_responder, write_frame};
 use onyx_core::wire::{FRAME_MLS_APP, FRAME_PING, FRAME_PONG, InnerFrame};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, mpsc};
@@ -2139,11 +2137,15 @@ where
     // First tick fires immediately; consume it so we don't PING the instant
     // the session opens (the handshake just proved liveness).
     keepalive.tick().await;
+    // Cancellation-safe reads: the other select branches (outbound sends,
+    // keepalive ticks) fire while a large frame is still arriving cell by
+    // cell; a plain `read_frame` would lose the partial frame and desync.
+    let mut frames = onyx_core::transport::FrameReader::new();
     loop {
         tokio::select! {
             // Inbound: a frame arrived on the Tor stream — bounded by a
             // read deadline so a dead circuit doesn't hang us forever.
-            res = tokio::time::timeout(READ_DEADLINE, read_frame(stream, session)) => {
+            res = tokio::time::timeout(READ_DEADLINE, frames.read_frame(stream, session)) => {
                 let res = match res {
                     Ok(inner) => inner,
                     Err(_elapsed) => {

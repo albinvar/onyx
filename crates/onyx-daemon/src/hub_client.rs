@@ -27,7 +27,7 @@ use anyhow::Context;
 use onyx_core::crypto::{IdentityPublic, IdentitySecret, SigningKey};
 use onyx_core::routing::RoutingId;
 use onyx_core::tor::TorRuntime;
-use onyx_core::transport::{Session, handshake_initiator, read_frame, write_frame};
+use onyx_core::transport::{Session, handshake_initiator, write_frame};
 use onyx_core::wire::{FRAME_DELIVER, FRAME_SUBSCRIBE, InnerFrame};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -513,10 +513,13 @@ where
         tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
     > = std::collections::VecDeque::new();
 
+    // Cancellation-safe reads (see `FrameReader`): outbound sends in the
+    // other branch must not corrupt a frame that is still arriving.
+    let mut frames = onyx_core::transport::FrameReader::new();
     loop {
         tokio::select! {
             // Inbound frame from the hub.
-            read_res = read_frame(stream, session) => {
+            read_res = frames.read_frame(stream, session) => {
                 let frame = match read_res {
                     Ok(f) => f,
                     Err(e) => {
@@ -641,6 +644,7 @@ pub fn parse_host_port(s: &str, default_port: u16) -> anyhow::Result<(String, u1
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onyx_core::transport::read_frame;
 
     #[test]
     fn parse_host_port_with_explicit_port() {

@@ -486,6 +486,70 @@ where
     session.decrypt_frame(&ct)
 }
 
+/// Cancellation-safe frame reader for long-lived session loops.
+///
+/// [`read_frame`] uses `read_exact`, which is **not** cancellation-safe:
+/// if it is one branch of a `tokio::select!` and another branch completes
+/// while a frame is only partly read, the bytes already consumed are lost
+/// and the stream is permanently out of sync (the next read lands
+/// mid-frame, decryption fails, the session dies). A 4–16 KiB frame spans
+/// many Tor cells, so "partly read" is the normal case, and every session
+/// loop selects against keepalive ticks and outbound traffic.
+///
+/// `FrameReader` keeps the partial frame in its own buffer across calls.
+/// It only awaits `read_buf`, which either appends bytes to that buffer or
+/// does nothing, so dropping the future at any await point loses no data.
+/// Use one `FrameReader` per stream for the lifetime of the loop, and do
+/// not mix it with [`read_frame`] on the same stream afterwards (it may
+/// have buffered bytes beyond the frame it returned).
+#[derive(Debug, Default)]
+pub struct FrameReader {
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Receive and decrypt the next [`InnerFrame`]. Cancellation-safe.
+    ///
+    /// Errors on EOF, an I/O failure, or a frame that fails to decrypt —
+    /// after any error the session must be dropped (Noise nonces are
+    /// strictly ordered; there is no resynchronising).
+    pub async fn read_frame<R>(
+        &mut self,
+        stream: &mut R,
+        session: &mut Session,
+    ) -> Result<InnerFrame>
+    where
+        R: AsyncReadExt + Unpin,
+    {
+        loop {
+            if let Some(len_bytes) = self.buf.first_chunk::<2>() {
+                let len = u16::from_be_bytes(*len_bytes) as usize;
+                if self.buf.len() >= 2 + len {
+                    // Decrypt, then drop the frame from the buffer. No
+                    // await between here and the return, so this step is
+                    // atomic with respect to cancellation.
+                    let frame = session.decrypt_frame(&self.buf[2..2 + len]);
+                    self.buf.drain(..2 + len);
+                    return frame;
+                }
+            }
+            // Cancel-safe: `read_buf` appends what it read or reads nothing.
+            let n = stream
+                .read_buf(&mut self.buf)
+                .await
+                .map_err(|_| Error::Internal("transport: read"))?;
+            if n == 0 {
+                return Err(Error::Internal("transport: stream closed"));
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -773,5 +837,58 @@ mod tests {
             prop_assert_eq!(len, body.len());
             prop_assert_eq!(rest, body.as_slice());
         }
+    }
+
+    /// Regression: a frame that arrives in pieces while the read is
+    /// repeatedly cancelled (as a `select!` does) must still decode, and
+    /// the stream must stay in sync for the frames after it.
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn frame_reader_survives_cancelled_partial_reads() {
+        use tokio::io::AsyncWriteExt;
+
+        let a_sk = IdentitySecret::generate();
+        let b_sk = IdentitySecret::generate();
+        let b_pk = b_sk.public();
+        let (mut a_io, mut b_io) = tokio::io::duplex(65_536);
+        let (a, b) = tokio::join!(
+            handshake_initiator(&mut a_io, &a_sk, &b_pk),
+            handshake_responder(&mut b_io, &b_sk)
+        );
+        let (mut a_sess, mut b_sess) = (a.unwrap(), b.unwrap());
+
+        // Two large frames, encoded back to back.
+        let mut wire = Vec::new();
+        for fill in [7u8, 9u8] {
+            let ct = a_sess
+                .encrypt_frame(&InnerFrame {
+                    frame_type: 0x10,
+                    payload: vec![fill; 12_000],
+                })
+                .unwrap();
+            wire.extend_from_slice(&frame_with_length(&ct).unwrap());
+        }
+
+        let writer = tokio::spawn(async move {
+            // Dribble the bytes so every read sees a partial frame.
+            for chunk in wire.chunks(500) {
+                a_io.write_all(chunk).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            a_io
+        });
+
+        let mut reader = FrameReader::new();
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            // A competing branch that fires constantly, cancelling the read.
+            tokio::select! {
+                frame = reader.read_frame(&mut b_io, &mut b_sess) => got.push(frame.unwrap()),
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        }
+        assert_eq!(got[0].payload, vec![7u8; 12_000]);
+        assert_eq!(got[1].payload, vec![9u8; 12_000]);
+        drop(writer.await.unwrap());
     }
 }
