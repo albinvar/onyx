@@ -3619,13 +3619,13 @@ async fn drain_pending_room_frames(
 /// logged and skipped — the next hub-session reconnect will pick
 /// up the new token via [`current_room_session_tokens`].
 pub(crate) async fn announce_room_subscribe(group_id: &[u8], state: &DaemonState) {
-    let Some(token) = ({
+    let Some(tokens) = ({
         let party = state.mls_party.lock().await;
         match party.load_group(group_id) {
             Ok(Some(g)) => g
                 .export_routing_secret(&party)
                 .ok()
-                .map(|s| onyx_core::routing::session_token(&s, 0)),
+                .map(|s| own_group_tokens(&s, &state.identity.fingerprint())),
             _ => None,
         }
     }) else {
@@ -3635,10 +3635,27 @@ pub(crate) async fn announce_room_subscribe(group_id: &[u8], state: &DaemonState
         return;
     };
     for (idx, hub_outbound) in state.hub_outbounds.iter().enumerate() {
-        if let Err(e) = hub_outbound.try_send(hub_client::HubOutbound::Subscribe(vec![token])) {
+        if let Err(e) = hub_outbound.try_send(hub_client::HubOutbound::Subscribe(tokens.to_vec())) {
             warn!(hub_idx = idx, error = %e, "session-tokens: incremental SUBSCRIBE push failed");
         }
     }
+}
+
+/// The routing ids WE listen on for a group at a given epoch:
+///
+/// * our own member token — where every current peer addresses hub-relayed
+///   traffic for us (see `routing::member_token`), and
+/// * the legacy group-wide token, so a not-yet-upgraded member's relayed
+///   messages still reach us while we are online. Nothing is sent there
+///   any more; drop it once old clients are gone.
+fn own_group_tokens(
+    routing_secret: &[u8; 32],
+    our_fingerprint: &onyx_core::crypto::Fingerprint,
+) -> [onyx_core::routing::RoutingId; 2] {
+    [
+        onyx_core::routing::member_token(routing_secret, our_fingerprint),
+        onyx_core::routing::session_token(routing_secret, 0),
+    ]
 }
 
 /// Derive the per-(room, current-epoch) session-token routing id
@@ -3681,7 +3698,7 @@ async fn current_room_session_tokens(
             warn!("session-tokens: export_routing_secret failed; skipping");
             continue;
         };
-        tokens.push(onyx_core::routing::session_token(&secret, 0));
+        tokens.extend(own_group_tokens(&secret, &state.identity.fingerprint()));
     }
     // v0.1.18: also subscribe to each DM (2-party) group's session token,
     // so an opt-in hub-fallback DM — sealed and routed on that token —
@@ -3701,7 +3718,7 @@ async fn current_room_session_tokens(
         let Ok(secret) = group.export_routing_secret(&party) else {
             continue;
         };
-        tokens.push(onyx_core::routing::session_token(&secret, 0));
+        tokens.extend(own_group_tokens(&secret, &state.identity.fingerprint()));
     }
     tokens
 }

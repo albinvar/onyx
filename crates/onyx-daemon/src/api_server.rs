@@ -1276,10 +1276,7 @@ async fn handle_invite_to_room(
         // they haven't seen the commit. T6.3.g's session-token
         // routing assumed sender + receiver always at the same
         // epoch, which is false during a member-add transition.
-        let old_token = group
-            .export_routing_secret(&party)
-            .ok()
-            .map(|s| onyx_core::routing::session_token(&s, 0));
+        let old_token = group.export_routing_secret(&party).ok();
         // Capture the pre-invite roster — these are the members who
         // need the commit (the new joiner doesn't, they bootstrap
         // from the Welcome). We pull this BEFORE invite() so the
@@ -1515,20 +1512,33 @@ async fn handle_invite_to_room(
     }
 }
 
-/// T6.3.g: derive the per-(room, current-epoch) session-token
-/// routing id from MLS group state. Returns `None` if the group
-/// isn't loadable or the exporter fails — the caller falls back
-/// to per-member introduction-inbox routing.
-async fn compute_room_session_token(
+/// The group's current-epoch routing secret (MLS exporter), from which
+/// each member's routing token is derived. `None` if the group isn't
+/// loadable or the exporter fails.
+async fn compute_room_routing_secret(
     group_id_bytes: &[u8],
     state: &DaemonState,
-) -> Option<onyx_core::routing::RoutingId> {
+) -> Option<[u8; 32]> {
     let party = state.mls_party.lock().await;
     let Ok(Some(group)) = party.load_group(group_id_bytes) else {
         return None;
     };
-    let secret = group.export_routing_secret(&party).ok()?;
-    Some(onyx_core::routing::session_token(&secret, 0))
+    group.export_routing_secret(&party).ok()
+}
+
+/// Where a hub-relayed group envelope for `member_fp` is addressed: that
+/// member's own per-epoch token (see `routing::member_token`). `None` —
+/// the caller skips the member — when there is no routing secret or the
+/// fingerprint does not parse. There is deliberately no fallback to the
+/// member's introduction inbox: that id is derived from their public
+/// fingerprint, so using it would tell the hub who is in the group.
+fn member_route(
+    routing_secret: Option<&[u8; 32]>,
+    member_fp: &str,
+) -> Option<onyx_core::routing::RoutingId> {
+    let secret = routing_secret?;
+    let fp = onyx_core::crypto::Fingerprint::parse(member_fp).ok()?;
+    Some(onyx_core::routing::member_token(secret, &fp))
 }
 
 /// v0.1.18: opt-in DM hub fallback. Seal a single DM `text` to the
@@ -1605,7 +1615,16 @@ async fn dm_hub_fallback_send(peer_pub: &[u8; 32], text: &str, state: &DaemonSta
         if vault.save_mls_state(state.identity_id, &snapshot).is_err() {
             return false;
         }
-        (ct, onyx_core::routing::session_token(&secret, 0))
+        // Address the PEER's own token for this group, not a token we
+        // are subscribed to ourselves (see `routing::member_token`).
+        let Some(peer_fp) = group
+            .peer_signing_key_bytes(&party.signing_public_bytes())
+            .and_then(|key| <[u8; 32]>::try_from(key.as_slice()).ok())
+            .map(onyx_core::crypto::Fingerprint::from_bytes)
+        else {
+            return false;
+        };
+        (ct, onyx_core::routing::member_token(&secret, &peer_fp))
     };
     // 4. Seal MlsApp{group_id, ciphertext} to the peer's KEM and relay.
     let payload = onyx_core::routing::BootstrapPayload::MlsApp {
@@ -1804,10 +1823,7 @@ async fn handle_leave_room(group_id_b32: &str, state: &DaemonState) -> ApiRespon
                 message: "no MLS group with that group_id".into(),
             };
         };
-        let old_token = group
-            .export_routing_secret(&party)
-            .ok()
-            .map(|s| onyx_core::routing::session_token(&s, 0));
+        let old_token = group.export_routing_secret(&party).ok();
         let members_before = crate::members_b32_from_group(&group);
         // remove_members needs our own leaf index, which openmls
         // exposes via group.own_leaf_index(). Fall back to
@@ -1957,10 +1973,7 @@ async fn handle_remove_from_room(
                 message: "no MLS group with that group_id".into(),
             };
         };
-        let old_token = group
-            .export_routing_secret(&party)
-            .ok()
-            .map(|s| onyx_core::routing::session_token(&s, 0));
+        let old_token = group.export_routing_secret(&party).ok();
         let before = crate::members_b32_from_group(&group);
         let Ok(commit) = group.remove_member(&party, fp.as_bytes()) else {
             return ApiResponse::Error {
@@ -2432,14 +2445,14 @@ async fn fanout_room_mls_bytes_with_stats(
     members: &[String],
     state: &DaemonState,
     op_label: &'static str,
-    routing_target_override: Option<onyx_core::routing::RoutingId>,
+    routing_secret_override: Option<[u8; 32]>,
 ) -> (u32, u32, u32) {
     let mut delivered_direct: u32 = 0;
     let mut delivered_hub: u32 = 0;
     let mut skipped_no_kem: u32 = 0;
-    let room_target = match routing_target_override {
-        Some(t) => Some(t),
-        None => compute_room_session_token(group_id_bytes, state).await,
+    let routing_secret = match routing_secret_override {
+        Some(secret) => Some(secret),
+        None => compute_room_routing_secret(group_id_bytes, state).await,
     };
     let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
         let reg = state.conversations.lock().await;
@@ -2474,14 +2487,9 @@ async fn fanout_room_mls_bytes_with_stats(
             skipped_no_kem += 1;
             continue;
         };
-        let target = if let Some(t) = room_target {
-            t
-        } else {
-            let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
-                skipped_no_kem += 1;
-                continue;
-            };
-            onyx_core::routing::introduction_inbox(&target_fp_parsed)
+        let Some(target) = member_route(routing_secret.as_ref(), &fp) else {
+            skipped_no_kem += 1;
+            continue;
         };
         let payload = onyx_core::routing::BootstrapPayload::MlsApp {
             group_id: serde_bytes::ByteBuf::from(group_id_bytes.to_vec()),
@@ -2540,7 +2548,7 @@ async fn fanout_room_mls_bytes(
     members: &[String],
     state: &DaemonState,
     op_label: &'static str,
-    routing_target_override: Option<onyx_core::routing::RoutingId>,
+    routing_secret_override: Option<[u8; 32]>,
 ) {
     let mut delivered_direct: u32 = 0;
     let mut delivered_hub: u32 = 0;
@@ -2554,9 +2562,9 @@ async fn fanout_room_mls_bytes(
     // they don't have the new token's subscription). For app
     // messages routed at the current epoch, override is None and
     // we derive from the current group state.
-    let room_target = match routing_target_override {
-        Some(t) => Some(t),
-        None => compute_room_session_token(group_id_bytes, state).await,
+    let routing_secret = match routing_secret_override {
+        Some(secret) => Some(secret),
+        None => compute_room_routing_secret(group_id_bytes, state).await,
     };
     let direct_targets: Vec<(String, Option<crate::conversations::ConversationHandle>)> = {
         let reg = state.conversations.lock().await;
@@ -2597,14 +2605,9 @@ async fn fanout_room_mls_bytes(
         // caller already loaded it to encrypt, but defensive), fall
         // back to per-member introduction_inbox so the message still
         // routes. The recipient subscribes to both, so either lands.
-        let target = if let Some(t) = room_target {
-            t
-        } else {
-            let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
-                skipped_no_kem += 1;
-                continue;
-            };
-            onyx_core::routing::introduction_inbox(&target_fp_parsed)
+        let Some(target) = member_route(routing_secret.as_ref(), &fp) else {
+            skipped_no_kem += 1;
+            continue;
         };
         let payload = onyx_core::routing::BootstrapPayload::MlsApp {
             group_id: serde_bytes::ByteBuf::from(group_id_bytes.to_vec()),
@@ -2885,15 +2888,10 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
         // (room, member). Fall back to per-member introduction_inbox
         // if the session-token derivation fails — recipient subscribes
         // to both, so either lands.
-        let target = if let Some(t) = compute_room_session_token(&group_id_bytes, state).await {
-            t
-        } else {
-            let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
-                skipped_no_kem += 1;
-                tracing::warn!("fingerprint did not parse");
-                continue;
-            };
-            onyx_core::routing::introduction_inbox(&target_fp_parsed)
+        let routing_secret = compute_room_routing_secret(&group_id_bytes, state).await;
+        let Some(target) = member_route(routing_secret.as_ref(), &fp) else {
+            skipped_no_kem += 1;
+            continue;
         };
         let payload = onyx_core::routing::BootstrapPayload::MlsApp {
             group_id: serde_bytes::ByteBuf::from(group_id_bytes.clone()),
@@ -3993,7 +3991,7 @@ mod tests {
     // this assert fails.
 
     #[tokio::test]
-    async fn dm_hub_fallback_send_seals_to_dm_session_token() {
+    async fn dm_hub_fallback_send_addresses_the_peers_own_token() {
         // Build a DaemonState with a capturing hub channel + fallback on.
         let mut vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
         let (identity_id, identity) = vault.create_identity("me").expect("identity");
@@ -4001,15 +3999,25 @@ mod tests {
 
         // A real MLS DM group we own; persist its snapshot so load_group
         // (inside dm_hub_fallback_send) can resume it.
-        let group = mls_party.create_group().expect("group");
+        // A real two-member DM group: the fallback addresses the PEER's
+        // own token, which is derived from the peer's fingerprint.
+        let peer_identity = onyx_core::identity::Identity::generate();
+        let peer_party = MlsParty::from_identity(&peer_identity).expect("peer party");
+        let mut group = mls_party.create_group().expect("group");
+        group
+            .invite(
+                &mls_party,
+                &peer_party.key_package_bytes().expect("peer kp"),
+            )
+            .expect("invite peer");
         let group_id = group.group_id_bytes();
         {
             let snap = mls_party.snapshot_state().expect("snap");
             vault.save_mls_state(identity_id, &snap).expect("save mls");
         }
 
-        // A fictional peer: map their X25519 identity → this DM group, and
-        // record their hybrid KEM (as the in-session advertisement would).
+        // Map the peer's X25519 identity → this DM group, and record their
+        // hybrid KEM (as the in-session advertisement would).
         let peer_pub = [0x42u8; 32];
         let peer_kem = HybridKemSecret::generate();
         let peer_kem_bytes = peer_kem.public().to_bytes();
@@ -4045,12 +4053,18 @@ mod tests {
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 
-        // Independently derive the DM group's session token to compare.
-        let expected_token = {
+        // Independently derive the PEER's token for this group, and the
+        // tokens we ourselves listen on (which the envelope must NOT use:
+        // the hub would hand it straight back to us and never queue it).
+        let (expected_token, our_own_token, shared_token) = {
             let party = state.mls_party.lock().await;
             let g = party.load_group(&group_id).expect("load").expect("some");
             let secret = g.export_routing_secret(&party).expect("secret");
-            onyx_core::routing::session_token(&secret, 0)
+            (
+                onyx_core::routing::member_token(&secret, &peer_identity.fingerprint()),
+                onyx_core::routing::member_token(&secret, &state.identity.fingerprint()),
+                onyx_core::routing::session_token(&secret, 0),
+            )
         };
 
         // Act.
@@ -4067,8 +4081,10 @@ mod tests {
             crate::hub_client::HubOutbound::Deliver { target, body } => {
                 assert_eq!(
                     target, expected_token,
-                    "DM fallback must route to the DM session token, not the intro inbox"
+                    "DM fallback must route to the peer's own member token"
                 );
+                assert_ne!(target, our_own_token);
+                assert_ne!(target, shared_token);
                 assert!(!body.is_empty(), "sealed envelope body must be non-empty");
             }
             other => panic!("expected HubOutbound::Deliver, got {other:?}"),

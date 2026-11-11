@@ -103,6 +103,38 @@ pub fn session_token(group_secret: &[u8; 32], index: u64) -> RoutingId {
     blake2b_128(&[group_secret.as_slice(), &index.to_be_bytes()])
 }
 
+/// Domain separator for [`member_token`].
+const MEMBER_TOKEN_LABEL: &[u8] = b"onyx/v1/member-token";
+
+/// Derive the routing identifier ONE member of a group listens on for a
+/// given epoch:
+///
+/// `token = BLAKE2b-128(group_secret ‖ "onyx/v1/member-token" ‖ member_fp)`
+///
+/// Hub-relayed group traffic used to go to a single token shared by the
+/// whole group ([`session_token`]`(secret, 0)`), to which every member —
+/// the sender included — subscribed. A hub queues an envelope only when
+/// nobody is subscribed to its id, so with any other member online
+/// (always at least the sender) the envelope was handed to a subscriber
+/// who could not open it and was never queued for the offline member it
+/// was sealed to. Store-and-forward therefore never worked for a DM, and
+/// in a room only while everyone else was offline.
+///
+/// With one token per member, only the intended recipient subscribes, so
+/// the hub's "no subscriber → queue" rule does the right thing. It is
+/// also better for unlinkability: the tokens of one group's members are
+/// unrelated values to the hub, so it can no longer see which
+/// subscriptions belong to the same room. Only group members can compute
+/// them (the secret comes from the MLS exporter).
+#[must_use]
+pub fn member_token(group_secret: &[u8; 32], member: &Fingerprint) -> RoutingId {
+    blake2b_128(&[
+        group_secret.as_slice(),
+        MEMBER_TOKEN_LABEL,
+        member.as_bytes().as_slice(),
+    ])
+}
+
 // ── Signed SUBSCRIBE (HIGH-1) ───────────────────────────────────────────────
 //
 // A hub SUBSCRIBE frame used to be a bare concatenation of 16-byte
@@ -1408,6 +1440,27 @@ mod tests {
             seen_for_short_messages.len(),
             1,
             "all short messages must look identical to the relay"
+        );
+    }
+
+    #[test]
+    fn member_tokens_are_per_member_and_per_epoch() {
+        let secret_a = [1u8; 32];
+        let secret_b = [2u8; 32];
+        let alice = Fingerprint::from_bytes([10u8; 32]);
+        let bob = Fingerprint::from_bytes([11u8; 32]);
+        assert_ne!(
+            member_token(&secret_a, &alice),
+            member_token(&secret_a, &bob)
+        );
+        assert_ne!(
+            member_token(&secret_a, &alice),
+            member_token(&secret_b, &alice)
+        );
+        assert_ne!(member_token(&secret_a, &alice), session_token(&secret_a, 0));
+        assert_eq!(
+            member_token(&secret_a, &alice),
+            member_token(&secret_a, &alice)
         );
     }
 }
