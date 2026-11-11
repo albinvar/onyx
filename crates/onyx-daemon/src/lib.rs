@@ -2890,7 +2890,15 @@ async fn handle_room_app_frame(
             // member's directory entry (delivery DoS, or worse if the
             // poisoned KEM is the attacker's). If the body claims a
             // different fingerprint, drop it as a poisoning attempt.
-            if fingerprint == sender_fp {
+            if fingerprint != sender_fp {
+                // (No fingerprint in the log line — D-3.)
+                warn!(
+                    "room: KEM advertisement names a different member than its sender; \
+                     dropping as a poisoning attempt"
+                );
+            } else if onyx_core::crypto::HybridKemPublic::from_bytes(kem_pub.as_ref()).is_err() {
+                debug!("room: KEM advertisement is not a valid hybrid KEM key; ignoring");
+            } else {
                 let vault = state.vault.lock().await;
                 match vault.save_room_member_kem(
                     state.identity_id,
@@ -2907,12 +2915,6 @@ async fn handle_room_app_frame(
                         "room: KEM advertisement save failed"
                     ),
                 }
-            } else {
-                warn!(
-                    authenticated_fp = %sender_fp,
-                    "room: KEM advertisement body fingerprint != MLS-credential sender; \
-                     dropping as a poisoning attempt"
-                );
             }
         }
         onyx_core::room::RoomAppMessage::FileMeta {
@@ -4074,6 +4076,9 @@ async fn process_hub_mls_welcome(
         // we receive subsequent hub-routed room messages without
         // waiting for the next hub reconnect.
         announce_room_subscribe(&group.group_id_bytes(), state).await;
+        // Tell the room how to reach us through a hub. Only a member can
+        // vouch for its own key, so the joiner must send this itself.
+        api_server::advertise_own_kem_to_room(&group.group_id_bytes(), state).await;
         return;
     }
 

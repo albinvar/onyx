@@ -1488,55 +1488,12 @@ async fn handle_invite_to_room(
         .await;
     }
 
-    // 10. T6.3.h: broadcast a KEM advertisement for the new member to
-    //     existing members so they can hub-fallback to the new member
-    //     when they're offline. Wraps in RoomAppMessage::KemAdvertisement,
-    //     encrypts at the new epoch (which existing members will be at
-    //     once they process the commit above), fans out via the same
-    //     direct-or-hub path. Both messages travel via the same per-
-    //     member channel (FIFO), so existing members process commit
-    //     first → KEM-ad second; epoch ordering is preserved.
-    if !pre_existing_members.is_empty() {
-        let ad = onyx_core::room::RoomAppMessage::KemAdvertisement {
-            fingerprint: peer_fingerprint.to_string(),
-            kem_pub: serde_bytes::ByteBuf::from(kem_pub_bytes.clone()),
-        };
-        if let Ok(ad_plaintext) = ad.to_cbor() {
-            let ad_ciphertext_opt = {
-                let party = state.mls_party.lock().await;
-                match party.load_group(&group_id_bytes) {
-                    Ok(Some(mut g)) => g.encrypt_application(&party, &ad_plaintext).ok(),
-                    _ => None,
-                }
-            };
-            if let Some(ad_ciphertext) = ad_ciphertext_opt {
-                // Snapshot the freshly-advanced MLS state.
-                let snap_opt = {
-                    let party = state.mls_party.lock().await;
-                    party.snapshot_state().ok()
-                };
-                if let Some(snap) = snap_opt {
-                    let vault = state.vault.lock().await;
-                    let _ = vault.save_mls_state(state.identity_id, &snap);
-                }
-                fanout_room_mls_bytes(
-                    &group_id_bytes,
-                    &ad_ciphertext,
-                    &pre_existing_members,
-                    state,
-                    "kem-ad",
-                    // KEM-ad rides on the NEW-epoch token; existing
-                    // members will have subscribed via
-                    // announce_room_subscribe after processing the
-                    // commit above. Hub queues by routing_id so if
-                    // the KEM-ad arrives before the subscribe, the
-                    // recipient drains it on next subscribe.
-                    None,
-                )
-                .await;
-            }
-        }
-    }
+    // (The new member announces its OWN hub-relay key to the room once it
+    // has joined — see `advertise_own_kem_to_room`. The inviter used to
+    // announce it on the joiner's behalf, but since G-1 a KEM
+    // advertisement is only honoured when it names its own sender, so
+    // that message was dropped by every recipient and existing members
+    // never learned the newcomer's key.)
 
     // T6.3.g: our own epoch advanced (we just produced the commit).
     // Push an incremental SUBSCRIBE so we receive room messages at
@@ -3140,6 +3097,68 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Announce our own hybrid KEM public key to every other member of a room
+/// we have just joined.
+///
+/// Existing members need this key to relay to us through a hub when no
+/// direct session exists. They can only learn it from US: a KEM
+/// advertisement is honoured solely when it names its own
+/// MLS-authenticated sender (G-1), so nobody else can vouch for it.
+/// Without this, a member with no direct session to a newcomer could not
+/// deliver to them at all, and the send still reported success.
+///
+/// Best-effort: on any failure the room still works over direct sessions,
+/// and the key is advertised again on the next join.
+pub(crate) async fn advertise_own_kem_to_room(group_id_bytes: &[u8], state: &DaemonState) {
+    let our_fp = state.identity.fingerprint().to_string();
+    let ad = onyx_core::room::RoomAppMessage::KemAdvertisement {
+        fingerprint: our_fp.clone(),
+        kem_pub: serde_bytes::ByteBuf::from(state.identity.kem_public().to_bytes()),
+    };
+    let Ok(plaintext) = ad.to_cbor() else {
+        return;
+    };
+    let encrypted = {
+        let party = state.mls_party.lock().await;
+        let Ok(Some(mut group)) = party.load_group(group_id_bytes) else {
+            return;
+        };
+        let Ok(ciphertext) = group.encrypt_application(&party, &plaintext) else {
+            return;
+        };
+        // Persist the advanced ratchet before the ciphertext leaves.
+        let Ok(snapshot) = party.snapshot_state() else {
+            return;
+        };
+        let members = crate::members_b32_from_group(&group);
+        (ciphertext, snapshot, members)
+    };
+    let (ciphertext, snapshot, members_b32) = encrypted;
+    {
+        let vault = state.vault.lock().await;
+        if vault.save_mls_state(state.identity_id, &snapshot).is_err() {
+            return;
+        }
+    }
+    let recipients: Vec<String> = members_b32
+        .split(',')
+        .filter(|fp| !fp.is_empty() && *fp != our_fp)
+        .map(str::to_owned)
+        .collect();
+    if recipients.is_empty() {
+        return;
+    }
+    fanout_room_mls_bytes(
+        group_id_bytes,
+        &ciphertext,
+        &recipients,
+        state,
+        "kem-ad-self",
+        None,
+    )
+    .await;
 }
 
 /// Build + seal a [`BootstrapPayload::PlainMessage`] for the named
