@@ -735,6 +735,7 @@ fn push_sent_file_line(
             text: label,
             ts_unix_ms: now,
             via_hub: false,
+            sender_fp: None,
         });
     app.last_activity_ms.insert(key, now);
 }
@@ -818,6 +819,9 @@ struct ChatLine {
     /// Rendered as a yellow `[hub]` badge in the conversation pane
     /// so users can read the security tier at a glance.
     via_hub: bool,
+    /// Room messages: the MLS-authenticated sender fingerprint, shown as
+    /// the per-line name. `None` in DMs.
+    sender_fp: Option<String>,
 }
 
 impl AppState {
@@ -1067,6 +1071,7 @@ impl AppState {
                 text,
                 ts_unix_ms,
                 via_hub,
+                sender_fp,
             } => {
                 // T-polish.5: bump activity timestamp + unread
                 // counter (only for incoming; outgoing doesn't
@@ -1094,6 +1099,7 @@ impl AppState {
                         text,
                         ts_unix_ms,
                         via_hub,
+                        sender_fp,
                     });
                 true
             }
@@ -1317,10 +1323,10 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
                 }
             }
             (KeyCode::Down | KeyCode::Char('j'), _) => {
-                if let Some(s) = app.select.as_mut() {
-                    if n > 0 {
-                        s.cursor = (s.cursor + 1).min(n - 1);
-                    }
+                if let Some(s) = app.select.as_mut()
+                    && n > 0
+                {
+                    s.cursor = (s.cursor + 1).min(n - 1);
                 }
             }
             (KeyCode::Char(' '), _) => {
@@ -1873,8 +1879,10 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             submit_intent = Some(modal.clone());
         }
         // v0.1.30: confirm sending un-sanitizable files as-is. Default is
-        // CANCEL (any other key / Esc); the user must press y/Enter.
-        (ModalState::ConfirmSendRaw { .. }, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => {
+        // CANCEL: only an explicit `y` sends. Enter is NOT accepted — the
+        // modal opens straight after the Enter that picked the file, so a
+        // held or repeated Enter used to send the file with its metadata.
+        (ModalState::ConfirmSendRaw { .. }, KeyCode::Char('y' | 'Y')) => {
             submit_intent = Some(modal.clone());
         }
         (ModalState::ConfirmSendRaw { .. }, KeyCode::Char('n' | 'N')) => {
@@ -2301,6 +2309,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                             text: label,
                             ts_unix_ms: now,
                             via_hub: false,
+                            sender_fp: None,
                         });
                     app.last_activity_ms.insert(key, now);
                     app.last_send_result = Some(Ok(()));
@@ -2339,6 +2348,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                             text: label,
                             ts_unix_ms: now,
                             via_hub: false,
+                            sender_fp: None,
                         });
                     app.last_activity_ms.insert(peer_short, now);
                     app.last_send_result = Some(Ok(()));
@@ -2728,11 +2738,11 @@ fn pipe_to_cmd(cmd: &str, args: &[&str], text: &str) -> bool {
     };
     // Write + close stdin (drop the handle) so the child sees EOF, then
     // wait for its exit status.
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).is_err() {
-            let _ = child.wait();
-            return false;
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(text.as_bytes()).is_err()
+    {
+        let _ = child.wait();
+        return false;
     }
     matches!(child.wait(), Ok(status) if status.success())
 }
@@ -2818,6 +2828,7 @@ async fn send_composer(app: &mut AppState) {
                     text: text.clone(),
                     ts_unix_ms: now,
                     via_hub: false,
+                    sender_fp: None,
                 });
             // T-polish.5: bump activity so this room stays at the
             // top of the activity-sorted list.
@@ -2888,11 +2899,11 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
 
 /// Human label for a retention window (inverse of [`parse_duration_secs`]).
 fn fmt_duration_secs(secs: u64) -> String {
-    if secs >= 86_400 && secs % 86_400 == 0 {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
         format!("{}d", secs / 86_400)
-    } else if secs >= 3600 && secs % 3600 == 0 {
+    } else if secs >= 3600 && secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs >= 60 && secs % 60 == 0 {
+    } else if secs >= 60 && secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
@@ -3264,6 +3275,9 @@ fn merge_room_history(
         text: m.text,
         ts_unix_ms: m.ts_unix_ms,
         via_hub: false,
+        // Our own lines keep the "me" label; incoming ones carry the
+        // sender so each line is attributed.
+        sender_fp: matches!(m.direction, MessageDirection::Incoming).then_some(m.sender_fp),
     });
     prepend_history_lines(
         app.scrollback.entry(conv_key.to_string()).or_default(),
@@ -3321,6 +3335,7 @@ fn apply_received_files(
             text: label,
             ts_unix_ms: f.received_at_ms,
             via_hub: false,
+            sender_fp: None,
         });
         // T-polish.5: count new files toward unread when they're
         // not in the active selection.
@@ -3355,6 +3370,7 @@ fn merge_history(app: &mut AppState, peer_short: &str, messages: Vec<HistoryEntr
         text: m.text,
         ts_unix_ms: m.ts_unix_ms,
         via_hub: m.via_hub,
+        sender_fp: None,
     });
     prepend_history_lines(
         app.scrollback.entry(peer_short.to_string()).or_default(),
@@ -5218,27 +5234,64 @@ fn open_search_modal(app: &AppState, initial: &str) -> ModalState {
 /// and message text align as invisible columns. Also the nickname cap.
 const NAME_COL: usize = 10;
 
+/// The name shown for a room message's sender: the contact's nickname
+/// if we have one for that fingerprint, otherwise the first characters of
+/// the fingerprint itself (never the room name — every member would then
+/// look alike).
+fn sender_display_name(fingerprint: &str, names: &HashMap<String, String>) -> String {
+    if let Some(name) = names.get(fingerprint) {
+        return name.clone();
+    }
+    fingerprint
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(8)
+        .collect()
+}
+
+/// Fingerprint → nickname for every contact that has one.
+fn sender_names(app: &AppState) -> HashMap<String, String> {
+    app.peers
+        .iter()
+        .filter_map(|p| {
+            let nick = p.nickname.as_ref().filter(|n| !n.is_empty())?;
+            Some((p.fingerprint.clone(), nick.clone()))
+        })
+        .collect()
+}
+
 fn build_chat_lines(
     scroll: &[ChatLine],
     who_label: &str,
     me_label: &str,
     select: Option<&SelectState>,
+    sender_names: &HashMap<String, String>,
 ) -> Vec<Line<'static>> {
     // Every span built below owns its text (clone / to_string / format!), so
     // the result is 'static — it doesn't borrow `scroll`/`who_label`. That
     // lets callers pass a temporary filtered Vec (retention) safely.
     let mut out: Vec<Line<'static>> = Vec::new();
-    // (is_outgoing, hhmm) of the last prefix emitted; repeated only on change.
-    let mut last_key: Option<(bool, String)> = None;
+    // (name, hhmm) of the last prefix emitted; repeated only on change —
+    // so in a room the prefix reappears whenever the SENDER changes.
+    let mut last_key: Option<(String, String)> = None;
     for (idx, line) in scroll.iter().enumerate() {
         let outgoing = matches!(line.direction, MessageDirection::Outgoing);
-        let (who, color) = if outgoing {
+        // A room line names its authenticated sender; a DM line is
+        // labelled by the conversation.
+        let sender_label = line
+            .sender_fp
+            .as_deref()
+            .filter(|_| !outgoing)
+            .map(|fp| sender_display_name(fp, sender_names));
+        let (who, color): (&str, Color) = if outgoing {
             (me_label, Color::Green)
+        } else if let Some(name) = &sender_label {
+            (name.as_str(), Color::Cyan)
         } else {
             (who_label, Color::Cyan)
         };
         let hhmm = fmt_hhmm(line.ts_unix_ms);
-        let key = (outgoing, hhmm.clone());
+        let key = (who.to_string(), hhmm.clone());
         let is_attachment = line.text.starts_with('📎');
         let body_style = if is_attachment {
             Style::default().fg(Color::Magenta)
@@ -5327,6 +5380,7 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     };
     // v0.1.31: own display name (falls back to "me").
     let me_label = app.my_nickname.clone().unwrap_or_else(|| "me".to_string());
+    let names = sender_names(app);
     // v0.1.31: in selection mode, the title becomes the keybind hint.
     let block = if let Some(sel) = &app.select {
         Block::default()
@@ -5428,10 +5482,10 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                         Style::default().fg(Color::DarkGray),
                     ))]
                 } else {
-                    build_chat_lines(&kept, &who_label, &me_label, app.select.as_ref())
+                    build_chat_lines(&kept, &who_label, &me_label, app.select.as_ref(), &names)
                 }
             } else {
-                build_chat_lines(scroll, &who_label, &me_label, app.select.as_ref())
+                build_chat_lines(scroll, &who_label, &me_label, app.select.as_ref(), &names)
             }
         }
         _ => vec![Line::from(Span::styled(
@@ -5912,6 +5966,34 @@ mod snapshot_tests {
     // A2 (chat rendering): consecutive messages from the same sender in
     // the same minute share ONE `name · HH:MM` header; a sender change
     // starts a new group (with a blank spacer before it).
+    /// Room lines are labelled by their authenticated sender: two
+    /// members writing in the same minute get separate, distinct name
+    /// prefixes (a nickname when known, else the fingerprint prefix) —
+    /// never the shared room label.
+    #[test]
+    fn room_lines_are_labelled_per_sender() {
+        let line = |fp: &str, text: &str| ChatLine {
+            direction: MessageDirection::Incoming,
+            text: text.to_string(),
+            ts_unix_ms: 1_700_000_000_000,
+            via_hub: false,
+            sender_fp: Some(fp.to_string()),
+        };
+        let scroll = vec![
+            line("aaaa bbbb cccc dddd", "from alice"),
+            line("zzzz yyyy xxxx wwww", "from mallory"),
+        ];
+        let mut names = HashMap::new();
+        names.insert("aaaa bbbb cccc dddd".to_string(), "alice".to_string());
+        let rendered: Vec<String> = build_chat_lines(&scroll, "#room", "me", None, &names)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(rendered[0].starts_with("alice"), "{:?}", rendered[0]);
+        assert!(rendered[1].starts_with("zzzzyyyy"), "{:?}", rendered[1]);
+        assert!(rendered.iter().all(|l| !l.contains("#room")));
+    }
+
     #[test]
     fn build_chat_lines_groups_by_sender_and_minute() {
         let scroll = vec![
@@ -5920,24 +6002,27 @@ mod snapshot_tests {
                 text: "hi".into(),
                 ts_unix_ms: 1_700_000_000_000,
                 via_hub: false,
+                sender_fp: None,
             },
             ChatLine {
                 direction: MessageDirection::Incoming,
                 text: "there".into(),
                 ts_unix_ms: 1_700_000_000_010, // same minute → grouped
                 via_hub: false,
+                sender_fp: None,
             },
             ChatLine {
                 direction: MessageDirection::Outgoing,
                 text: "yo".into(),
                 ts_unix_ms: 1_700_000_000_020, // sender change → new group
                 via_hub: false,
+                sender_fp: None,
             },
         ];
         // v0.1.30: one line per message — 3 messages → exactly 3 lines
         // (no header/spacer rows). The first two share a sender+minute so
         // the second aligns under the prefix; the third gets its own prefix.
-        let lines = build_chat_lines(&scroll, "alice", "me", None);
+        let lines = build_chat_lines(&scroll, "alice", "me", None, &HashMap::new());
         assert_eq!(lines.len(), 3);
     }
 
@@ -5963,12 +6048,14 @@ mod snapshot_tests {
                     text: "Hello world".into(),
                     ts_unix_ms: 1000,
                     via_hub: false,
+                    sender_fp: None,
                 },
                 ChatLine {
                     direction: MessageDirection::Outgoing,
                     text: "goodbye".into(),
                     ts_unix_ms: 2000,
                     via_hub: false,
+                    sender_fp: None,
                 },
             ],
         );
@@ -5979,6 +6066,7 @@ mod snapshot_tests {
                 text: "WORLD news".into(),
                 ts_unix_ms: 3000,
                 via_hub: false,
+                sender_fp: None,
             }],
         );
 
@@ -6100,24 +6188,28 @@ mod snapshot_tests {
                     text: "hi (first contact via hub)".into(),
                     ts_unix_ms: 1_700_000_000_000,
                     via_hub: true,
+                    sender_fp: None,
                 },
                 ChatLine {
                     direction: MessageDirection::Incoming,
                     text: "hi".into(),
                     ts_unix_ms: 1_700_000_000_005,
                     via_hub: false,
+                    sender_fp: None,
                 },
                 ChatLine {
                     direction: MessageDirection::Outgoing,
                     text: "hey".into(),
                     ts_unix_ms: 1_700_000_000_010,
                     via_hub: false,
+                    sender_fp: None,
                 },
                 ChatLine {
                     direction: MessageDirection::Incoming,
                     text: "how's the audit?".into(),
                     ts_unix_ms: 1_700_000_000_020,
                     via_hub: false,
+                    sender_fp: None,
                 },
             ],
         );
@@ -6364,6 +6456,7 @@ mod snapshot_tests {
                 text: "live-3".into(),
                 ts_unix_ms: 3_000,
                 via_hub: false,
+                sender_fp: None,
             }],
         );
         // History returns three messages including one that matches
@@ -6427,6 +6520,7 @@ mod snapshot_tests {
                 text: "hi".into(),
                 ts_unix_ms: 2_000,
                 via_hub: false,
+                sender_fp: None,
             }],
         );
         let f1 = onyx_core::api::ReceivedFileInfo {

@@ -139,7 +139,7 @@ See `RELEASES.md` for the complete verification cookbook including what each cos
 If you don't trust any prebuilt binary, build it yourself:
 
 ```sh
-# 1. Install Rust toolchain (1.85+).
+# 1. Install Rust toolchain (1.89+; the repo pins 1.95.0).
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 

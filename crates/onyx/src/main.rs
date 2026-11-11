@@ -613,14 +613,27 @@ async fn main() -> ExitCode {
             // Log to ~/.onyx/onyx.log (next to the vault). Falls back to
             // stderr only if the file can't be opened.
             let log_path = onyx_daemon::default_data_dir().join("onyx.log");
+            // The data dir is 0700 and the log 0600 from the first byte:
+            // it used to be created with the default umask (0644) inside a
+            // directory that was only tightened later.
             if let Some(parent) = log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = onyx_daemon::ensure_data_dir(parent);
             }
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
+            let mut log_options = std::fs::OpenOptions::new();
+            log_options.create(true).append(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                log_options.mode(0o600);
+            }
+            let opened = log_options.open(&log_path);
+            #[cfg(unix)]
+            if opened.is_ok() {
+                // Tighten a log an older build created world-readable.
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600));
+            }
+            match opened {
                 Ok(file) => {
                     eprintln!(
                         "onyx: logs → {} (TUI owns the terminal)",
@@ -796,16 +809,32 @@ fn load_file_config() -> anyhow::Result<Option<FileConfig>> {
 /// user's social graph). Creates `~/.onyx` if needed.
 fn save_file_config(cfg: &FileConfig) -> anyhow::Result<()> {
     let dir = onyx_daemon::default_data_dir();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+    onyx_daemon::ensure_data_dir(&dir)?;
     let path = config_file_path();
     let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    // Write a 0600 temp file and rename it into place: the config is
+    // never world-readable (write-then-chmod left a window) and a crash
+    // mid-write cannot leave a truncated, unparseable config behind.
+    let tmp = path.with_extension("json.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    {
+        use std::io::Write as _;
+        let mut file = options
+            .open(&tmp)
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
+        file.write_all(json.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| anyhow::anyhow!("replacing {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -1321,17 +1350,17 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
             // Fail fast on a wrong --passphrase / ONYX_PASSPHRASE for an
             // existing vault, instead of spawning a daemon that dies at
             // vault-open and a TUI that then hangs on "connecting…".
-            if !passphrase_verified && config.vault.exists() {
-                if let Err(onyx_core::error::Error::VerificationFailed) =
+            if !passphrase_verified
+                && config.vault.exists()
+                && let Err(onyx_core::error::Error::VerificationFailed) =
                     onyx_core::storage::Vault::open(&config.vault, config.passphrase.as_bytes())
-                {
-                    eprintln!(
-                        "onyx: wrong passphrase for vault at {} — \
+            {
+                eprintln!(
+                    "onyx: wrong passphrase for vault at {} — \
                          check --passphrase / ONYX_PASSPHRASE.",
-                        config.vault.display()
-                    );
-                    return Ok(ExitCode::from(2));
-                }
+                    config.vault.display()
+                );
+                return Ok(ExitCode::from(2));
             }
             // Spawn the daemon work in a background task.
             let daemon_handle = tokio::spawn(async move {
@@ -1445,6 +1474,19 @@ fn dispatch_vault(cmd: VaultCommand, vault_path: &std::path::Path) -> anyhow::Re
         return Ok(ExitCode::from(2));
     }
 
+    // Both operations need the vault to themselves: a copy taken while
+    // the daemon is writing can be torn, and a rekey beside a live daemon
+    // destroys its MLS state (see `onyx_daemon::VaultLock`). The lock
+    // check replaces the old "is the daemon running? stop it first" hint,
+    // which only appeared AFTER a rekey had already gone wrong.
+    let _vault_lock = match onyx_daemon::lock_vault(vault_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("onyx: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
     match cmd {
         VaultCommand::Backup { dest } => {
             // A plain file copy of the vault. NOTE: only the key-material
@@ -1513,10 +1555,7 @@ fn dispatch_vault(cmd: VaultCommand, vault_path: &std::path::Path) -> anyhow::Re
                     Ok(ExitCode::from(2))
                 }
                 Err(e) => {
-                    eprintln!(
-                        "onyx: rekey failed ({e}). Is the daemon running? Stop it first \
-                         (it holds the vault open). The vault is unchanged."
-                    );
+                    eprintln!("onyx: rekey failed ({e}). The vault is unchanged.");
                     Ok(ExitCode::from(2))
                 }
             }

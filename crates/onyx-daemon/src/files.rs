@@ -413,7 +413,7 @@ async fn finalize_file(
     // Build storage path. §2.4 + §2.5 + §5 cap-list.
     let cfg = &state.files_config;
     let conv_dir = cfg.storage_dir.join(conversation);
-    if let Err(e) = std::fs::create_dir_all(&conv_dir) {
+    if let Err(e) = create_private_dir_all(&conv_dir) {
         warn!(error = %e, dir = %conv_dir.display(), "file finalize: mkdir failed");
         return None;
     }
@@ -432,11 +432,15 @@ async fn finalize_file(
     // planted at the (sender-influenced, content-hash-prefixed) path. An
     // existing file means we already have this exact content (the name is
     // hash-prefixed), so treat it as idempotent and emit no new event.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Owner-only: received files are private conversation content.
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
         Ok(mut f) => {
             use std::io::Write as _;
             if let Err(e) = f.write_all(&assembled) {
@@ -480,6 +484,20 @@ async fn finalize_file(
 
     info!(size, "file finalize: received + verified + persisted");
     Some(path)
+}
+
+/// `create_dir_all`, with every directory it creates made owner-only
+/// (0700) on Unix. Received files sit under the data directory; with the
+/// default umask the per-conversation directories were world-listable.
+fn create_private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 /// T-files.b cap-list §2.5: sanitize a filename for safe on-disk

@@ -1151,10 +1151,10 @@ async fn wait_for_room_in_list(socket: &Path, group_id_b32: &str) -> RoomInfo {
     let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     loop {
         let resp = one_shot(socket, &ApiRequest::ListRooms).await;
-        if let ApiResponse::ListRoomsOk { rooms } = resp {
-            if let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32) {
-                return r;
-            }
+        if let ApiResponse::ListRoomsOk { rooms } = resp
+            && let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32)
+        {
+            return r;
         }
         if std::time::Instant::now() > deadline {
             panic!("room {group_id_b32} never appeared in bob's ListRooms");

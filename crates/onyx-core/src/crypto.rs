@@ -20,7 +20,7 @@ use blake2::Digest;
 use blake2::digest::consts::{U16, U32};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key as AeadRawKey, Nonce as AeadRawNonce};
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::Signer;
 use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate, EncapsulationKey as MlKemEk};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
@@ -111,7 +111,13 @@ impl VerifyingKey {
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&self.0)
             .map_err(|_| Error::VerificationFailed)?;
         let sig = ed25519_dalek::Signature::from_bytes(&signature.0);
-        vk.verify(message, &sig)
+        // `verify_strict`, not `verify`: it rejects small-order public
+        // keys and non-canonical signatures. With plain `verify`, a
+        // small-order "identity" key accepts forged signatures on a
+        // fraction of all messages — anyone could then speak as that
+        // identity — and signatures are malleable. Fingerprints ARE keys
+        // here, so the stricter check applies to every identity we accept.
+        vk.verify_strict(message, &sig)
             .map_err(|_| Error::VerificationFailed)
     }
 
@@ -1432,5 +1438,24 @@ mod tests {
         for (i, byte) in out.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16).expect("valid hex");
         }
+    }
+
+    /// A small-order public key must never verify anything: with lax
+    /// verification the all-zero-signature forgery below is accepted.
+    #[test]
+    fn small_order_key_is_rejected() {
+        // The identity point (y = 1): a valid curve point of order 1.
+        let mut key = [0u8; 32];
+        key[0] = 1;
+        let Ok(vk) = VerifyingKey::from_bytes(key) else {
+            return; // rejected at parse time is also fine
+        };
+        // R = identity, s = 0 satisfies the lax equation for any message.
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        assert!(
+            vk.verify(b"any message", &Signature::from_bytes(forged))
+                .is_err()
+        );
     }
 }

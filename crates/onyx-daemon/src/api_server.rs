@@ -2609,17 +2609,16 @@ async fn fanout_room_mls_bytes(
             .collect()
     };
     for (fp, maybe_handle) in direct_targets {
-        if let Some(handle) = maybe_handle {
-            if handle
+        if let Some(handle) = maybe_handle
+            && handle
                 .outbound_tx
                 .try_send(crate::conversations::PeerOutbound::RoomFrame(
                     mls_bytes.to_vec(),
                 ))
                 .is_ok()
-            {
-                delivered_direct += 1;
-                continue;
-            }
+        {
+            delivered_direct += 1;
+            continue;
         }
         // Hub fallback.
         let kem_bytes_opt = {
@@ -2888,19 +2887,18 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
     };
     for (fp, maybe_handle) in direct_targets {
         total += 1;
-        if let Some(handle) = maybe_handle {
-            if handle
+        if let Some(handle) = maybe_handle
+            && handle
                 .outbound_tx
                 .try_send(crate::conversations::PeerOutbound::RoomFrame(
                     ciphertext.clone(),
                 ))
                 .is_ok()
-            {
-                delivered_direct += 1;
-                continue;
-            }
-            // Send failed (queue full / closed): fall through to hub.
+        {
+            delivered_direct += 1;
+            continue;
         }
+        // Send failed (queue full / closed): fall through to hub.
         // Hub-fallback path.
         let kem_bytes_opt = {
             let vault = state.vault.lock().await;
@@ -3300,17 +3298,17 @@ async fn handle_send_bootstrap_mls(
     // bucket as the bare Welcome (~1.2-1.5 KB for a 2-party group).
     // 1 KiB is plenty for a paragraph of introduction text.
     const FIRST_MESSAGE_MAX_BYTES: usize = 1024;
-    if let Some(text) = initial_text {
-        if text.len() > FIRST_MESSAGE_MAX_BYTES {
-            return ApiResponse::Error {
-                code: ApiErrorCode::Malformed,
-                message: format!(
-                    "initial_text too long ({} bytes; max {FIRST_MESSAGE_MAX_BYTES}) — keep \
+    if let Some(text) = initial_text
+        && text.len() > FIRST_MESSAGE_MAX_BYTES
+    {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: format!(
+                "initial_text too long ({} bytes; max {FIRST_MESSAGE_MAX_BYTES}) — keep \
                      intro short to avoid bumping the sealed-envelope size bucket on the wire",
-                    text.len()
-                ),
-            };
-        }
+                text.len()
+            ),
+        };
     }
 
     if state.hub_outbounds.is_empty() {

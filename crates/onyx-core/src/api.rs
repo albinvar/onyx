@@ -664,6 +664,14 @@ pub enum ApiResponse {
         ts_unix_ms: u64,
         #[serde(default)]
         via_hub: bool,
+        /// Room messages only: the sender's Ed25519 fingerprint, as
+        /// authenticated by MLS. A room conversation has many senders, so
+        /// without this every incoming line carried the same room label
+        /// and any member could write text that read as another member's.
+        /// `None` for DMs (the conversation is the sender) and from older
+        /// daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_fp: Option<String>,
     },
     /// A new conversation was registered with the daemon (a peer
     /// dialled in, or `onyxd --dial-*` finished its handshake).
@@ -1292,6 +1300,7 @@ mod tests {
                     text: "x".into(),
                     ts_unix_ms: 1_700_000_000_001,
                     via_hub,
+                    sender_fp: None,
                 };
                 let line = encode_response_line(&r).unwrap();
                 assert_eq!(decode_response(line.trim_end_matches('\n')).unwrap(), r);

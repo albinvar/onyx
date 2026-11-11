@@ -633,10 +633,10 @@ impl HubState {
         // unregister_conn will clean up properly when it tears down.
         let mut delivered = 0;
         for conn in &subs {
-            if let Some(tx) = self.senders.get(conn) {
-                if tx.try_send(payload.clone()).is_ok() {
-                    delivered += 1;
-                }
+            if let Some(tx) = self.senders.get(conn)
+                && tx.try_send(payload.clone()).is_ok()
+            {
+                delivered += 1;
             }
         }
 
@@ -734,10 +734,10 @@ impl HubState {
     /// in-memory queue still holds the payload, only durability is
     /// lost for this one entry.
     fn enqueue_durable(&mut self, target: RoutingId, payload: &[u8]) {
-        if let Some(store) = &self.durable_store {
-            if let Err(e) = store.enqueue(&target, payload) {
-                warn!(error = %e, "hub store: enqueue failed (in-memory queue still consistent)");
-            }
+        if let Some(store) = &self.durable_store
+            && let Err(e) = store.enqueue(&target, payload)
+        {
+            warn!(error = %e, "hub store: enqueue failed (in-memory queue still consistent)");
         }
     }
 
@@ -872,10 +872,10 @@ impl HubState {
     /// cache stays consistent.
     pub fn publish_keypackage(&mut self, routing_id: RoutingId, bytes: Vec<u8>) {
         let published_at = crate::store::epoch_ms();
-        if let Some(store) = &self.durable_store {
-            if let Err(e) = store.set_keypackage(&routing_id, &bytes, published_at) {
-                warn!(error = %e, "hub store: set_keypackage failed (in-memory cache still consistent)");
-            }
+        if let Some(store) = &self.durable_store
+            && let Err(e) = store.set_keypackage(&routing_id, &bytes, published_at)
+        {
+            warn!(error = %e, "hub store: set_keypackage failed (in-memory cache still consistent)");
         }
         self.keypackages.insert(
             routing_id,
@@ -940,10 +940,10 @@ impl HubState {
                 break;
             };
             self.keypackages.remove(&victim);
-            if let Some(store) = &self.durable_store {
-                if let Err(e) = store.delete_keypackage(&victim) {
-                    warn!(error = %e, "hub store: delete_keypackage (cap eviction) failed");
-                }
+            if let Some(store) = &self.durable_store
+                && let Err(e) = store.delete_keypackage(&victim)
+            {
+                warn!(error = %e, "hub store: delete_keypackage (cap eviction) failed");
             }
             warn!(cap, "hub KeyPackage directory at cap; evicted oldest entry");
         }

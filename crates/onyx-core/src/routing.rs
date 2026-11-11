@@ -422,6 +422,69 @@ struct BootstrapWire {
     mls_welcome: ByteBuf,
     #[serde(rename = "sig")]
     signature: ByteBuf,
+    /// Length padding (zero bytes). Not signed and never read: it exists
+    /// only to round the sealed envelope up to a size bucket, so the relay
+    /// cannot tell a one-word message from a paragraph. Optional and
+    /// ignored on decode, so padded and unpadded peers interoperate.
+    #[serde(rename = "pad", default, skip_serializing_if = "pad_is_empty")]
+    pad: ByteBuf,
+}
+
+fn pad_is_empty(pad: &ByteBuf) -> bool {
+    pad.as_ref().is_empty()
+}
+
+/// Bytes a relay adds around the sealed envelope when it carries it: the
+/// 16-byte routing-id prefix of a `DELIVER` payload.
+const DELIVER_PREFIX_LEN: usize = 16;
+
+/// How many padding bytes to put in [`BootstrapWire::pad`] so that the
+/// `DELIVER` payload carrying this envelope is exactly a frame-bucket
+/// payload size (252 / 1020 / 4092 / 16380 bytes).
+///
+/// Frame buckets already hide length from a *network* observer, but the
+/// relay terminates that layer and sees the payload length exactly — and
+/// stores it. Padding the sealed body itself is what hides message length
+/// from the relay: every envelope in a bucket is byte-for-byte the same
+/// size there.
+///
+/// `unpadded_cbor_len` is the CBOR length of the wire struct with no `pad`
+/// field. Returns `None` when there is no room for a pad field (already
+/// within a few bytes of the bucket) or the envelope exceeds every bucket.
+fn pad_len_for(unpadded_cbor_len: usize) -> Option<usize> {
+    use crate::crypto::HYBRID_CIPHERTEXT_LEN;
+    use crate::transport::AEAD_TAG_LEN;
+    use crate::wire::max_payload;
+
+    /// CBOR cost of the `pad` map entry around `n` payload bytes: a 4-byte
+    /// key (`"pad"`) plus the byte-string header.
+    const fn entry_overhead(n: usize) -> usize {
+        4 + if n < 24 {
+            1
+        } else if n < 256 {
+            2
+        } else {
+            3
+        }
+    }
+
+    let fixed = DELIVER_PREFIX_LEN + HYBRID_CIPHERTEXT_LEN + AEAD_TAG_LEN;
+    let unpadded = fixed + unpadded_cbor_len;
+    let target = [
+        max_payload::SMALL,
+        max_payload::MEDIUM,
+        max_payload::LARGE,
+        max_payload::XLARGE,
+    ]
+    .into_iter()
+    .find(|bucket| *bucket >= unpadded)?;
+    let room = target - unpadded;
+    // Largest pad whose entry fits the room exactly; if the header-size
+    // step makes "exactly" unreachable, land one byte short.
+    (0..=room)
+        .rev()
+        .find(|n| n + entry_overhead(*n) <= room)
+        .filter(|n| *n > 0)
 }
 
 /// What the recipient gets back after a successful `open_bootstrap`. The
@@ -554,16 +617,27 @@ pub fn seal_bootstrap(
     )?;
     let signature = sender_signing.sign(&sig_input);
 
-    let wire = BootstrapWire {
+    let mut wire = BootstrapWire {
         sender_signing_pk: ByteBuf::from(sender_signing_pk.to_bytes().to_vec()),
         sender_identity_pk: ByteBuf::from(sender_identity_pk.to_bytes().to_vec()),
         mls_welcome: ByteBuf::from(mls_welcome.to_vec()),
         signature: ByteBuf::from(signature.to_bytes().to_vec()),
+        pad: ByteBuf::new(),
     };
 
-    let mut cbor = Vec::new();
-    ciborium::into_writer(&wire, &mut cbor)
-        .map_err(|_| Error::Internal("bootstrap: CBOR encode failed"))?;
+    let encode = |wire: &BootstrapWire| -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        ciborium::into_writer(wire, &mut out)
+            .map_err(|_| Error::Internal("bootstrap: CBOR encode failed"))?;
+        Ok(out)
+    };
+    let mut cbor = encode(&wire)?;
+    // Round the envelope up to a size bucket so the relay sees only the
+    // bucket, not the message length (see `pad_len_for`).
+    if let Some(pad) = pad_len_for(cbor.len()) {
+        wire.pad = ByteBuf::from(vec![0u8; pad]);
+        cbor = encode(&wire)?;
+    }
 
     seal_with_hybrid(&cbor, recipient_kem_pub, &recipient_kem_bytes)
 }
@@ -1161,6 +1235,7 @@ mod tests {
                     .to_bytes()
                     .to_vec(),
             ),
+            pad: ByteBuf::new(),
         };
         let mut cbor = Vec::new();
         ciborium::into_writer(&wire, &mut cbor).unwrap();
@@ -1204,6 +1279,7 @@ mod tests {
             // The genuine signature alice produced — but it was bound
             // to BOB's kem pubkey, not carol's.
             signature: ByteBuf::from(extract_signature(&sealed_for_bob, &bob_kem)),
+            pad: ByteBuf::new(),
         };
         let mut cbor = Vec::new();
         ciborium::into_writer(&reflected_wire, &mut cbor).unwrap();
@@ -1287,5 +1363,51 @@ mod tests {
             let bob_kem = HybridKemSecret::generate();
             let _ = open_bootstrap(&bytes, &bob_kem);
         }
+    }
+
+    /// The relay sees the DELIVER payload length exactly, so sealed
+    /// envelopes must land on a frame-bucket size: messages of very
+    /// different lengths are indistinguishable there, and still open.
+    #[test]
+    fn sealed_envelopes_are_padded_to_a_bucket() {
+        use crate::wire::max_payload;
+        let buckets = [
+            max_payload::SMALL,
+            max_payload::MEDIUM,
+            max_payload::LARGE,
+            max_payload::XLARGE,
+        ];
+        let sender = crate::identity::Identity::generate();
+        let recipient = crate::identity::Identity::generate();
+        let mut seen_for_short_messages = std::collections::HashSet::new();
+        for len in [
+            0usize, 1, 7, 23, 24, 100, 255, 256, 600, 1500, 2400, 5000, 12_000,
+        ] {
+            let payload = vec![0xA5u8; len];
+            let sealed = seal_bootstrap(
+                sender.signing(),
+                sender.identity_key(),
+                &payload,
+                &recipient.kem_public(),
+            )
+            .unwrap();
+            let on_relay = DELIVER_PREFIX_LEN + sealed.len();
+            // Exact bucket, or one byte short where the CBOR header step
+            // makes exact unreachable.
+            assert!(
+                buckets.iter().any(|b| on_relay == *b || on_relay + 1 == *b),
+                "len {len}: relay-visible size {on_relay} is not a bucket"
+            );
+            if len <= 1500 {
+                seen_for_short_messages.insert(on_relay);
+            }
+            let opened = open_bootstrap(&sealed, recipient.kem_secret()).unwrap();
+            assert_eq!(opened.mls_welcome, payload);
+        }
+        assert_eq!(
+            seen_for_short_messages.len(),
+            1,
+            "all short messages must look identical to the relay"
+        );
     }
 }

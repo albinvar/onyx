@@ -432,6 +432,7 @@ impl ConversationRegistry {
             text,
             ts_unix_ms,
             via_hub,
+            sender_fp: None,
         });
         true
     }
@@ -448,12 +449,7 @@ impl ConversationRegistry {
     /// Room messages are **not** added to any per-peer ring buffer
     /// — `History` is DM-scoped today. Persistent room scrollback
     /// is its own follow-up (CHANNELS.md §8 deferred bullet).
-    pub fn push_room_message(
-        &mut self,
-        group_id: &[u8],
-        _sender_peer_pub: [u8; 32],
-        text: String,
-    ) -> bool {
+    pub fn push_room_message(&mut self, group_id: &[u8], sender_fp: &str, text: String) -> bool {
         let ts_unix_ms = now_unix_ms();
         let peer_short = format!("room/{}", short_id_of_group(group_id));
         let _ = self.events_tx.send(ApiResponse::EventMessage {
@@ -462,6 +458,7 @@ impl ConversationRegistry {
             text,
             ts_unix_ms,
             via_hub: false,
+            sender_fp: Some(sender_fp.to_string()),
         });
         true
     }

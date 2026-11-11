@@ -119,6 +119,54 @@ pub fn ensure_data_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Exclusive ownership of a vault for as long as the value is alive.
+///
+/// The vault is a single SQLite file whose MLS state is one blob that the
+/// running daemon rewrites from memory. Two processes on one vault each
+/// hold their own in-memory ratchets and overwrite each other's state
+/// (rolling ratchets back); a rekey run beside a live daemon leaves the
+/// daemon writing blobs under the OLD key into a file whose canary now
+/// answers to the NEW one, which destroys the MLS state on next start.
+/// SQLite's own locking does not prevent either — it only locks during a
+/// transaction. So every process that opens a vault for writing takes
+/// this lock first: the daemon holds it for its lifetime, and `onyx vault
+/// rekey` / `backup` refuse to run while it is held.
+#[derive(Debug)]
+pub struct VaultLock {
+    _file: std::fs::File,
+}
+
+/// Take the exclusive lock for the vault at `vault_path` (an advisory
+/// lock on a sibling `<vault>.lock` file; released when the returned
+/// value is dropped or the process exits). Fails immediately, without
+/// waiting, if another process holds it.
+pub fn lock_vault(vault_path: &std::path::Path) -> anyhow::Result<VaultLock> {
+    let mut lock_path = vault_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("opening vault lock {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(VaultLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "the vault at {} is in use by another onyx process (a running daemon?). \
+             Stop it first.",
+            vault_path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", lock_path.display()))
+        }
+    }
+}
+
 /// A single configured hub. The daemon spawns one hub-client task
 /// per entry of [`Config::hubs`] (T8.1+).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,6 +635,8 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     }
 
     // ── Vault + identity + MLS state ────────────────────────────────────
+    // One writer per vault, for the life of the daemon (see `VaultLock`).
+    let _vault_lock = lock_vault(&args.vault)?;
     let mut vault =
         open_or_create_vault(&args.vault, args.passphrase.as_bytes()).context("opening vault")?;
 
@@ -2752,11 +2802,11 @@ async fn handle_room_app_frame(
                     warn!(error = %e, "room: append_room_message failed");
                 }
             }
-            let _ = state.conversations.lock().await.push_room_message(
-                group_id,
-                *sender_peer_pub,
-                text,
-            );
+            let _ = state
+                .conversations
+                .lock()
+                .await
+                .push_room_message(group_id, &sender_fp, text);
         }
         onyx_core::room::RoomAppMessage::KemAdvertisement {
             fingerprint,

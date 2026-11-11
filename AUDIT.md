@@ -81,7 +81,7 @@ Audit a **single immutable commit**, not a moving branch. Recommended:
 ## 4. Codebase map
 
 ~34.8k lines of Rust across 5 crates; 465 `#[test]`/`#[tokio::test]` cases.
-Edition 2024, MSRV 1.85. Supply-chain policy lives in `deny.toml` (cargo-deny
+Edition 2024, MSRV 1.89. Supply-chain policy lives in `deny.toml` (cargo-deny
 wired into `.github/workflows/ci.yml`).
 
 | Crate | LOC | Role |
@@ -173,7 +173,7 @@ any **metadata** a hub or observer can use to deanonymize.
 ## 8. How to build, test, and verify
 
 ```sh
-cargo build --workspace --locked          # MSRV 1.85, edition 2024
+cargo build --workspace --locked          # MSRV 1.89, edition 2024
 cargo test  --workspace                    # 465 tests
 cargo clippy --workspace --all-targets
 cargo deny check                           # supply-chain policy (deny.toml)
