@@ -391,6 +391,9 @@ pub struct DialTarget {
     /// `reply_onion`): it is never persisted, never overwrites an existing
     /// target, and is abandoned after [`MAX_UNCONFIRMED_DIAL_ATTEMPTS`].
     pub confirmed: bool,
+    /// Consecutive RESUME attempts this peer has refused after
+    /// authenticating (see `note_resume_result`).
+    pub resume_failures: u32,
 }
 
 /// How many failed dials an **unconfirmed** target gets before the
@@ -827,6 +830,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                         onion,
                         pubkey_b32,
                         confirmed: true,
+                        resume_failures: 0,
                     },
                 );
             }
@@ -1220,13 +1224,16 @@ where
     // Take the MLS party lock for the duration of the exchange + the
     // snapshot. Drop it before taking the vault lock to keep our lock
     // order consistent (MLS first, vault second).
-    // The only group this peer may RESUME is the DM group we recorded for
-    // their Noise-authenticated static key.
-    let expected_group = {
+    // A peer may only RESUME a DM group shared with the identity we have
+    // pinned to their Noise-authenticated static key. No pin → no resume
+    // (they bootstrap instead).
+    let resume_identity: Option<[u8; 32]> = {
         let vault = state.vault.lock().await;
         vault
-            .lookup_peer_group(state.identity_id, &peer_pub)
-            .map_err(|e| anyhow::anyhow!("peer-group lookup failed: {e}"))?
+            .pinned_fingerprint_for_x25519(state.identity_id, &peer_pub)
+            .map_err(|e| anyhow::anyhow!("pin lookup failed: {e}"))?
+            .and_then(|fp| onyx_core::crypto::Fingerprint::parse(&fp).ok())
+            .map(|fp| *fp.as_bytes())
     };
     let (snapshot, group_id, was_bootstrap, group) = {
         // SEC: the MLS exchange is bounded, and the flow locks
@@ -1239,7 +1246,7 @@ where
                 &mut stream,
                 &mut session,
                 &state.mls_party,
-                expected_group.as_deref(),
+                resume_identity.as_ref(),
                 reply_text.as_bytes(),
             ),
         )
@@ -1421,6 +1428,7 @@ async fn record_dial_target(
                 onion: onion.to_string(),
                 pubkey_b32: pubkey_b32.to_string(),
                 confirmed,
+                resume_failures: 0,
             },
         );
     }
@@ -1436,6 +1444,49 @@ async fn persist_dial_target(state: &DaemonState, peer_pub: &[u8; 32], onion: &s
     let vault = state.vault.lock().await;
     if let Err(e) = vault.record_peer_dial(state.identity_id, peer_pub, onion, key) {
         warn!(error = %e, "dial target: vault persist failed (reconnect still works this session)");
+    }
+}
+
+/// After this many consecutive failed RESUMEs with an authenticated peer,
+/// stop insisting on the old group and bootstrap a fresh one.
+const MAX_RESUME_FAILURES: u32 = 3;
+
+/// Track RESUME outcomes for a peer we dial, and self-heal when the peer
+/// keeps refusing: it no longer has (or will not resume) the DM group we
+/// recorded — restored from an older backup, lost its state, or holds a
+/// different record of the pair. Insisting on RESUME then fails forever;
+/// after [`MAX_RESUME_FAILURES`] we forget the mapping so the next dial
+/// bootstraps a new group. Only an authenticated peer can cause this (the
+/// failure is counted after Noise XK succeeds), and all it gets is a new
+/// group with the same peer.
+async fn note_resume_result(state: &DaemonState, peer_pub: &[u8; 32], ok: bool) {
+    let give_up = {
+        let mut targets = state.dial_targets.lock().await;
+        let Some(target) = targets.get_mut(peer_pub) else {
+            return;
+        };
+        if ok {
+            target.resume_failures = 0;
+            false
+        } else {
+            target.resume_failures += 1;
+            if target.resume_failures >= MAX_RESUME_FAILURES {
+                target.resume_failures = 0;
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if give_up {
+        let vault = state.vault.lock().await;
+        if vault.forget_peer_group(state.identity_id, peer_pub).is_ok() {
+            drop(vault);
+            state.conversations.lock().await.emit_note(
+                "warn",
+                "A contact could not resume your existing secure session; starting a fresh one.",
+            );
+        }
     }
 }
 
@@ -1760,7 +1811,7 @@ where
     let (snapshot, group_id, was_bootstrap, group) = {
         // SEC: bounded, and `mls_party` is not held across network I/O
         // (see `handle_inbound`).
-        let outcome = tokio::time::timeout(
+        let exchange = tokio::time::timeout(
             MLS_EXCHANGE_TIMEOUT,
             initiator_exchange(
                 &mut stream,
@@ -1771,8 +1822,22 @@ where
             ),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("MLS exchange timed out after {MLS_EXCHANGE_TIMEOUT:?}"))?
-        .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
+        .map_err(|_| anyhow::anyhow!("MLS exchange timed out after {MLS_EXCHANGE_TIMEOUT:?}"))
+        .and_then(|r| r.map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}")));
+        let outcome = match exchange {
+            Ok(outcome) => {
+                note_resume_result(state, &peer_static, true).await;
+                outcome
+            }
+            Err(e) => {
+                // The peer authenticated (Noise succeeded) but would not
+                // continue the group we tried to resume.
+                if existing_group_id.is_some() {
+                    note_resume_result(state, &peer_static, false).await;
+                }
+                return Err(e);
+            }
+        };
         let party = state.mls_party.lock().await;
         // D-3: never log the peer's greeting (fingerprint + peer text).
         tracing::debug!(

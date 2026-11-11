@@ -235,9 +235,10 @@ where
 /// * `FRAME_MLS_RESUME` → resume path (load the group named by the
 ///   payload, exchange).
 ///
-/// `expected_group` is the DM group the caller has on record for the
-/// Noise-authenticated peer (`None` if there is none); it is the only
-/// group id that peer is allowed to resume.
+/// `resume_identity` is the Ed25519 identity the caller has pinned to the
+/// Noise-authenticated peer's static key (`None` if there is no pin). A
+/// RESUME is honoured only for a two-member group shared with exactly
+/// that identity.
 ///
 /// **Locking.** `party` is locked only around each individual MLS
 /// operation, never across a network read or write. Holding it across the
@@ -247,7 +248,7 @@ pub async fn responder_exchange<S>(
     stream: &mut S,
     session: &mut Session,
     party: &Mutex<MlsParty>,
-    expected_group: Option<&[u8]>,
+    resume_identity: Option<&[u8; 32]>,
     reply: &[u8],
 ) -> Result<ExchangeOutcome>
 where
@@ -261,7 +262,7 @@ where
                 stream,
                 session,
                 party,
-                expected_group,
+                resume_identity,
                 &first.payload,
                 reply,
             )
@@ -352,28 +353,40 @@ async fn responder_resume<S>(
     stream: &mut S,
     session: &mut Session,
     party: &Mutex<MlsParty>,
-    expected_group: Option<&[u8]>,
+    resume_identity: Option<&[u8; 32]>,
     group_id: &[u8],
     reply: &[u8],
 ) -> Result<ExchangeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Resume is bound to the Noise-authenticated peer: the only group a
-    // peer may resume is the DM group we recorded for THEIR static key.
-    // Without this a peer could (a) probe whether we hold an arbitrary
-    // group id — unknown ids closed immediately, known ids kept waiting —
-    // and (b) resume a ROOM's group id and have us treat the room as their
-    // DM. A mismatch and an unknown group fail identically, before any
-    // further read, so the two are indistinguishable to the peer.
+    // Resume is bound to the Noise-authenticated peer: a peer may only
+    // resume a two-member group whose OTHER member is the identity we
+    // have pinned to their static key (`peer_signing_key_bytes` is `None`
+    // unless the group has exactly two members). Without this a peer
+    // could (a) probe whether we hold an arbitrary group id — unknown ids
+    // closed immediately, known ids kept waiting — and (b) resume a
+    // ROOM's group id and have us treat the room as their DM. Unknown,
+    // not-a-DM and someone-else's-DM all fail identically, before any
+    // further read, so they are indistinguishable to the peer.
+    //
+    // Keyed on the pinned identity rather than on "the one group id we
+    // recorded for this peer": two peers that bootstrapped towards each
+    // other at the same moment can each end up recording the other's
+    // group, and an exact-id rule would then refuse every resume forever.
     const REFUSED: Error = Error::Internal("flows::responder: resume refused");
-    if expected_group != Some(group_id) {
+    let Some(peer_identity) = resume_identity else {
         return Err(REFUSED);
-    }
-    let mut group = party.lock().await.load_group(group_id)?.ok_or(REFUSED)?;
-    if group.member_count() != 2 {
-        return Err(REFUSED);
-    }
+    };
+    let mut group = {
+        let party = party.lock().await;
+        let group = party.load_group(group_id)?.ok_or(REFUSED)?;
+        let other = group.peer_signing_key_bytes(&party.signing_public_bytes());
+        if other.as_deref() != Some(peer_identity.as_slice()) {
+            return Err(REFUSED);
+        }
+        group
+    };
 
     // Receive + decrypt application message.
     let app_frame = read_frame(stream, session).await?;
@@ -541,7 +554,8 @@ mod tests {
         let (mut a_io, mut b_io) = tokio::io::duplex(65_536);
 
         let group_id_for_alice = group_id_bytes.clone();
-        let group_id_for_bob = group_id_bytes.clone();
+        // Bob has Alice's identity pinned to her Noise key.
+        let alice_fp_for_bob = *alice_id2.fingerprint().as_bytes();
         let alice2 = tokio::spawn(async move {
             let mut session = handshake_initiator(&mut a_io, &alice_noise_sk2, &bob_x_pub_round2)
                 .await
@@ -570,7 +584,7 @@ mod tests {
                 &mut b_io,
                 &mut session,
                 &party,
-                Some(&group_id_for_bob),
+                Some(&alice_fp_for_bob),
                 b"hello alice 2 (resumed)",
             )
             .await
@@ -629,7 +643,7 @@ mod tests {
             m_io
         });
         let mut session = handshake_responder(&mut b_io, &bob_sk).await.unwrap();
-        // No recorded DM group for this peer → refused without reading on.
+        // No pinned identity for this peer → refused without reading on.
         let refused = responder_exchange(&mut b_io, &mut session, &bob_party, None, b"x").await;
         assert!(refused.is_err());
         drop(mallory.await.unwrap());
