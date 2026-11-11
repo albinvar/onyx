@@ -396,7 +396,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!(
             max_frames_per_minute = args.max_frames_per_minute,
-            "per-connection rate limit installed (DELIVER + KP_PUBLISH; SUBSCRIBE unlimited)"
+            "per-key rate limit installed (SUBSCRIBE, DELIVER, KP_PUBLISH, KP_FETCH, gossip)"
         );
         state.with_rate_limit(args.max_frames_per_minute)
     };

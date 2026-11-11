@@ -310,10 +310,10 @@ impl HubState {
 
     /// Install a per-connection rate limiter (T8.x-ratelimit). Each
     /// connection lazily gets a token bucket capped at
-    /// `frames_per_minute` for DELIVER + KP_PUBLISH; sustained rate
-    /// is `frames_per_minute / 60` per second, burst tolerance is
-    /// the full bucket capacity. SUBSCRIBE frames are not limited
-    /// (cheap; no heavy work).
+    /// `frames_per_minute` shared by SUBSCRIBE, DELIVER, KP_PUBLISH,
+    /// KP_FETCH and peer-hub gossip; sustained rate is
+    /// `frames_per_minute / 60` per second, burst tolerance is the full
+    /// bucket capacity.
     #[must_use]
     pub fn with_rate_limit(mut self, frames_per_minute: u32) -> Self {
         self.rate_limiter = Some(RateLimiter::with_frames_per_minute(frames_per_minute));
