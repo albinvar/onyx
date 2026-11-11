@@ -1007,7 +1007,7 @@ impl AppState {
         match &self.last_status {
             Some(Ok(s)) => {
                 if self.prev_daemon_ok == Some(false) {
-                    msgs.push((ActivityLevel::Good, "daemon reconnected".to_string()));
+                    msgs.push((ActivityLevel::Good, "Onyx is responding again".to_string()));
                 }
                 new_daemon_ok = Some(true);
 
@@ -1055,13 +1055,15 @@ impl AppState {
                 }
                 new_health = Some(cur);
             }
-            Some(Err(_)) => {
-                if self.prev_daemon_ok != Some(false) {
-                    msgs.push((ActivityLevel::Bad, "daemon connection lost".to_string()));
-                }
+            // Only a loss after a working link is news. While starting up,
+            // the first polls race the daemon's socket; reporting that as
+            // "lost" then "back" greeted every user with a red line about
+            // nothing.
+            Some(Err(_)) if self.prev_daemon_ok == Some(true) => {
+                msgs.push((ActivityLevel::Bad, "Onyx stopped responding".to_string()));
                 new_daemon_ok = Some(false);
             }
-            None => {}
+            Some(Err(_)) | None => {}
         }
         self.prev_daemon_ok = new_daemon_ok;
         self.prev_health = new_health;
@@ -3528,6 +3530,19 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let main_area = chunks[1];
     let status_area = chunks[2];
 
+    // Nobody to talk to yet: one start screen across the whole body. An
+    // empty list, an empty chat, an empty composer and a "getting started"
+    // panel each repeated the same three shortcuts and said nothing else.
+    if app.peers.is_empty() && app.rooms.is_empty() {
+        render_topbar(frame, topbar_area, app);
+        render_start(frame, main_area, app);
+        render_status(frame, status_area, app);
+        if let Some(modal) = &app.modal {
+            render_modal(frame, area, modal);
+        }
+        return;
+    }
+
     // Three columns when there is room (conversations │ chat │ details),
     // two on a narrow terminal so nothing gets crushed.
     let wide = main_area.width >= 100;
@@ -4907,6 +4922,94 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 /// Width of the conversations column.
 const SIDEBAR_WIDTH: u16 = 28;
 
+/// The start screen, shown until there is a first conversation.
+///
+/// It answers the only two questions a new user has — "is it working?"
+/// and "how do I reach someone?" — and nothing else. Everything further
+/// is one key away (`F1`).
+fn render_start(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let (state, state_style, ready) = match &app.last_status {
+        Some(Ok(s)) => match s.tor_state {
+            TorState::Ready if s.onion.as_deref().is_some_and(|o| !o.is_empty()) => {
+                ("You are online.".to_string(), theme::ok(), true)
+            }
+            TorState::Ready => (
+                "Almost there — publishing your address on Tor.".to_string(),
+                theme::warn(),
+                false,
+            ),
+            TorState::Bootstrapping { percent } => (
+                format!("Starting Tor ({percent}%). The first start takes about a minute."),
+                theme::warn(),
+                false,
+            ),
+            TorState::Disabled => (
+                "Tor is off. This is a test mode with no anonymity.".to_string(),
+                theme::error(),
+                true,
+            ),
+        },
+        Some(Err(_)) => (
+            "Onyx is not responding. Retrying…".to_string(),
+            theme::error(),
+            false,
+        ),
+        None => ("Starting…".to_string(), theme::warn(), false),
+    };
+    let key_style = if ready {
+        theme::keychip()
+    } else {
+        theme::muted()
+    };
+    let action = |key: &str, what: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{key:<9}"), key_style),
+            Span::styled(what.to_string(), theme::text()),
+        ])
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(state, state_style)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "To talk to someone, one of you gives the other a connect code.",
+            theme::text(),
+        )),
+        Line::from(""),
+        action("Ctrl-E", "show your code, to send to a friend"),
+        action("Ctrl-A", "paste a code a friend sent you"),
+        Line::from(""),
+    ];
+    if !ready {
+        lines.push(Line::from(Span::styled(
+            "Your code will be ready once Onyx is online.",
+            theme::muted(),
+        )));
+    } else if !app.first_contact_reachable {
+        lines.push(Line::from(Span::styled(
+            "Only people you give your code to can reach you.",
+            theme::muted(),
+        )));
+    }
+    // Centre the block: left-aligned text in a column placed mid-screen.
+    let width = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(area.width.saturating_sub(4)));
+    let width = u16::try_from(width).unwrap_or(area.width);
+    let height = u16::try_from(lines.len())
+        .unwrap_or(area.height)
+        .min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 3,
+        width: width.min(area.width),
+        height,
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rect);
+}
+
 /// The top bar: the brand on the left, and on the right the three things
 /// a user needs to know at a glance — is Tor up, are the hubs reachable,
 /// and is this screen actually connected to the daemon. (These used to
@@ -4936,22 +5039,24 @@ fn daemon_status_spans(app: &AppState) -> Vec<Span<'static>> {
     // would be one more glyph to read past.
     let sep = || Span::raw("    ");
     match &app.last_status {
-        None => vec![Span::styled("◌ starting… ", theme::warn())],
+        None => vec![Span::styled("starting… ", theme::warn())],
         Some(Err(_)) => vec![Span::styled(
-            "✗ daemon unreachable — reconnecting… ",
+            "Onyx is not responding — retrying… ",
             theme::error(),
         )],
         Some(Ok(s)) => {
             let tor = match s.tor_state {
-                TorState::Ready => Span::styled("◉ tor ready", theme::ok()),
+                TorState::Ready => Span::styled("● Tor", theme::ok()),
                 TorState::Bootstrapping { percent } => {
-                    Span::styled(format!("◌ tor starting {percent}%"), theme::warn())
+                    Span::styled(format!("◌ Tor starting {percent}%"), theme::warn())
                 }
-                TorState::Disabled => Span::styled("○ tor OFF (clearnet)", theme::error()),
+                TorState::Disabled => Span::styled("○ Tor off — no anonymity", theme::error()),
             };
-            let hubs = if s.hub_count == 0 {
-                Span::styled("no hubs", theme::muted())
-            } else {
+            // Only what needs saying: running without a hub is the private
+            // default, not a fault, and a working link to the daemon is the
+            // normal case — neither earns a place on the bar.
+            let mut out = vec![tor];
+            if s.hub_count > 0 {
                 let style = if s.hubs_connected == s.hub_count {
                     theme::ok()
                 } else if s.hubs_connected == 0 {
@@ -4959,21 +5064,21 @@ fn daemon_status_spans(app: &AppState) -> Vec<Span<'static>> {
                 } else {
                     theme::warn()
                 };
-                Span::styled(format!("hubs {}/{}", s.hubs_connected, s.hub_count), style)
-            };
-            let link = if app.tail_active {
-                Span::styled("● live", theme::ok())
-            } else {
-                Span::styled("○ reconnecting", theme::warn())
-            };
-            vec![
-                tor,
-                sep(),
-                hubs,
-                sep(),
-                link,
-                Span::styled(format!("  v{} ", s.daemon_version), theme::muted()),
-            ]
+                out.push(sep());
+                out.push(Span::styled(
+                    format!("hubs {}/{}", s.hubs_connected, s.hub_count),
+                    style,
+                ));
+            }
+            if !app.tail_active {
+                out.push(sep());
+                out.push(Span::styled("reconnecting…", theme::warn()));
+            }
+            out.push(Span::styled(
+                format!("    v{} ", s.daemon_version),
+                theme::muted(),
+            ));
+            out
         }
     }
 }
@@ -4984,27 +5089,6 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(theme::border());
-    if app.peers.is_empty() && app.rooms.is_empty() {
-        let hint = |key: &str, what: &str| -> Line<'static> {
-            Line::from(vec![
-                Span::styled(format!(" {key:<3}"), theme::keychip()),
-                Span::styled(format!(" {what}"), theme::muted()),
-            ])
-        };
-        let body = Paragraph::new(vec![
-            Line::from(Span::styled(" Conversations", theme::header())),
-            Line::from(""),
-            Line::from(Span::styled(" none yet", theme::muted())),
-            Line::from(""),
-            hint("^A", "add a contact"),
-            hint("^E", "share your code"),
-            hint("^N", "new room"),
-        ])
-        .block(block);
-        frame.render_widget(body, area);
-        return;
-    }
-
     // Task 324: group into "Direct messages" / "Channels" sections
     // with headers. Headers are non-selectable list rows, so we map
     // the entry index (`app.selected`, into peers++rooms) to the
@@ -5435,54 +5519,7 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             .border_style(theme::border())
     };
     if app.selected_entry().is_none() {
-        // UX overhaul: brand-new user (no peers, no rooms) gets a real
-        // welcome + concrete first steps, instead of a bare "nothing
-        // selected". Once they have conversations, it's just the
-        // "pick one" hint.
-        let brand_new = app.peers.is_empty() && app.rooms.is_empty();
-        let body = if brand_new {
-            let step = |k: &str, d: &str| -> Line<'static> {
-                Line::from(vec![
-                    Span::styled(
-                        format!("   {k:<8}"),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(d.to_string(), Style::default().fg(Color::White)),
-                ])
-            };
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Welcome to Onyx 🖤",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  You're not connected to anyone yet. To start:",
-                    Style::default().fg(Color::Gray),
-                )),
-                Line::from(""),
-                step("Ctrl-E", "Share your contact — invite link + connect code"),
-                step("Ctrl-A", "Add a contact — paste a friend's link or code"),
-                Line::from(""),
-                step("Ctrl-N", "create a room / channel"),
-                step("Ctrl-K", "command palette — run anything by name"),
-                step("F1", "see every keyboard shortcut"),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Note: rooms & file-sharing need a hub configured",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    "  (--hub …). See README for setup.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        } else {
+        let body = {
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -5739,104 +5776,36 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let line = match &app.last_status {
-        None => Line::from(Span::styled(" connecting to daemon… ", theme::warn())),
+        None => Line::from(Span::styled(" starting… ", theme::warn())),
         Some(Err(e)) => Line::from(vec![
-            Span::styled(" daemon unreachable: ", theme::error()),
+            Span::styled(" Onyx is not responding: ", theme::error()),
             Span::styled(e.clone(), theme::text()),
             Span::styled("  · Esc to quit", theme::muted()),
         ]),
-        Some(Ok(s)) => {
-            let tor = match s.tor_state {
-                TorState::Ready => Span::styled("tor ready", theme::ok()),
-                TorState::Bootstrapping { percent } => {
-                    Span::styled(format!("tor bootstrapping {percent}%"), theme::warn())
-                }
-                TorState::Disabled => Span::styled("tor disabled", theme::warn()),
-            };
-            // v0.1.28 (honest health): "tor ready" alone was misleading —
-            // Tor can be fully bootstrapped while every hub dial silently
-            // fails (a Tor-hostile network), so the user saw all-green yet
-            // nothing could be delivered. Show the LIVE hub-session count
-            // (red 0/M, amber partial, green M/M) and whether our onion has
-            // actually published (inbound reachability), straight from the
-            // daemon's Status. These are facts, not guesses.
-            let hubs = if s.hub_count == 0 {
-                Span::styled("no hubs", theme::warn())
-            } else {
-                let label = format!("hubs {}/{}", s.hubs_connected, s.hub_count);
-                let style = if s.hubs_connected == 0 {
-                    theme::error()
-                } else if s.hubs_connected < s.hub_count {
-                    theme::warn()
-                } else {
-                    theme::ok()
-                };
-                Span::styled(label, style)
-            };
-            let onion = match &s.onion {
-                Some(o) if !o.is_empty() => Span::styled("onion ✓", theme::ok()),
-                _ => Span::styled("onion ⋯", theme::warn()),
-            };
-            let live = if app.tail_active {
-                Span::styled("● live", theme::ok())
-            } else {
-                Span::styled("○ no tail", theme::error())
-            };
-            let live_count = app.peers.iter().filter(|p| p.connected).count();
-            Line::from(vec![
+        // State lives in the top bar. The bottom line is for keys only,
+        // and only the handful that open everything else.
+        Some(Ok(_)) => {
+            let empty = app.peers.is_empty() && app.rooms.is_empty();
+            let mut spans = vec![
                 Span::raw(" "),
-                tor,
-                Span::raw("  ·  "),
-                hubs,
-                Span::raw("  ·  "),
-                onion,
-                Span::raw("  ·  "),
-                live,
-                Span::raw("  ·  "),
-                Span::styled("you ", theme::muted()),
-                Span::styled(short_id(&s.fingerprint), theme::you()),
-                Span::raw("  ·  "),
-                Span::styled(
-                    format!(
-                        "{live_count} peer{}",
-                        if live_count == 1 { "" } else { "s" }
-                    ),
-                    theme::muted(),
-                ),
-                Span::raw("  ·  "),
-                Span::styled(format!("v{}", s.daemon_version), theme::muted()),
-                Span::raw("   "),
-                // Always-visible keybind hints (the two contact flows +
-                // palette/help, which reach everything else).
                 kb("F1"),
-                Span::styled("help ", theme::keylabel()),
-                kb("^K"),
-                Span::styled("palette ", theme::keylabel()),
-                kb("^E"),
-                Span::styled("share ", theme::keylabel()),
-                kb("^A"),
-                Span::styled("add ", theme::keylabel()),
-                kb("^F"),
-                Span::styled("file", theme::keylabel()),
-            ])
+                Span::styled("help   ", theme::keylabel()),
+                kb("Ctrl-K"),
+                Span::styled("commands   ", theme::keylabel()),
+            ];
+            if !empty {
+                spans.extend([
+                    kb("Ctrl-E"),
+                    Span::styled("share   ", theme::keylabel()),
+                    kb("Ctrl-A"),
+                    Span::styled("add   ", theme::keylabel()),
+                    kb("Ctrl-F"),
+                    Span::styled("file   ", theme::keylabel()),
+                ]);
+            }
+            spans.extend([kb("Esc"), Span::styled("quit", theme::keylabel())]);
+            Line::from(spans)
         }
-    };
-    // v0.1.16: persistent "you're not addable by invite" banner. When
-    // first_contact_reachable is off (the privacy default), strangers
-    // can't reach you via a hub — so surface the two ways to connect
-    // anyway: share your connect code (^Y) for direct P2P, or turn on
-    // reachability (^G). Only while the daemon is actually up, so we
-    // don't mask the connecting / unreachable messages.
-    let line = if !app.first_contact_reachable && matches!(app.last_status, Some(Ok(_))) {
-        Line::from(vec![
-            Span::styled(" ⚠ not addable by invite ", theme::warn()),
-            Span::styled("— share your contact ", theme::text()),
-            kb("^E"),
-            Span::styled("or enable reachability ", theme::text()),
-            kb("^G"),
-        ])
-    } else {
-        line
     };
     // v0.1.15: a sticky notice (e.g. accept-invite confirmation) takes
     // over the status line so flows that produce no visible conversation
@@ -5948,16 +5917,25 @@ mod snapshot_tests {
     #[test]
     fn record_health_daemon_down_then_up() {
         let mut app = AppState::new(PathBuf::from("./s.sock"));
+        // Startup: the first polls can miss the daemon's socket. Not news.
+        app.last_status = Some(Err("refused".into()));
+        app.record_health();
+        app.last_status = Some(Ok(status_with(TorState::Ready, 1, 1, true)));
+        app.record_health();
+        assert!(app.activity.is_empty(), "no lost/back pair at startup");
+        // A real loss after a working link is reported once, then recovery.
         app.last_status = Some(Err("refused".into()));
         app.record_health();
         app.last_status = Some(Err("refused".into()));
         app.record_health();
-        assert_eq!(app.activity.len(), 1, "logged 'connection lost' once");
+        assert_eq!(app.activity.len(), 1, "loss logged once");
         assert_eq!(app.activity.front().unwrap().level, ActivityLevel::Bad);
         app.last_status = Some(Ok(status_with(TorState::Ready, 1, 1, true)));
         app.record_health();
-        // newest first: "daemon reconnected" on top.
-        assert_eq!(app.activity.front().unwrap().text, "daemon reconnected");
+        assert_eq!(
+            app.activity.front().unwrap().text,
+            "Onyx is responding again"
+        );
     }
 
     // push_activity collapses an immediate duplicate and caps the buffer.
@@ -6312,22 +6290,24 @@ mod snapshot_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tui-snapshot.txt"), &snap).unwrap();
         assert!(snap.contains("◈ onyx"));
-        // Flat layout: the conversations column carries its own heading
-        // and an empty state made of the three ways to get started.
+        // With nobody to talk to there is one start screen: state, the
+        // two ways to connect, and each shortcut named exactly once.
+        assert!(snap.contains("connect code"), "start screen:\n{snap}");
+        assert_eq!(snap.matches("Ctrl-E").count(), 1, "said once:\n{snap}");
+        assert_eq!(snap.matches("Ctrl-A").count(), 1, "said once:\n{snap}");
         assert!(
-            snap.contains("Conversations"),
-            "list heading missing:\n{snap}"
+            !snap.contains("⚠"),
+            "no warning on a healthy start:\n{snap}"
         );
-        assert!(snap.contains("none yet"));
-        assert!(snap.contains("add a contact"));
+        assert!(!snap.contains("Getting Started"));
         // No outer frame: the first row is the top bar, not a border.
         assert!(
             snap.lines().next().is_some_and(|l| l.contains("◈ onyx")),
             "top bar should be the first row:\n{snap}"
         );
         assert!(
-            snap.contains("tor ready"),
-            "daemon box should show tor state:\n{snap}"
+            snap.contains("● Tor"),
+            "top bar should show tor state:\n{snap}"
         );
     }
 
@@ -6497,7 +6477,7 @@ mod snapshot_tests {
         assert!(snap.contains("u5lhmxps"));
         assert!(snap.contains("how's the audit?"));
         assert!(snap.contains("looking good"));
-        assert!(snap.contains("● live"));
+        assert!(snap.contains("● Tor"));
         // T5.2.f: hub-relayed messages must visibly carry the
         // weaker-security-tier indicator. If this assertion ever
         // regresses, users would silently lose the ability to read

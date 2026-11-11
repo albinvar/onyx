@@ -72,6 +72,21 @@ Use this file as the single chronological view of where the project is. Implemen
   as one unbroken line; any key returns. **Note:** that line stays in the
   terminal's scrollback.
 
+**Interface — start screen and quieter chrome**
+
+- With no conversations the screen showed an empty list, an empty chat,
+  a disabled composer and a "Getting Started" panel, each repeating the
+  same shortcuts, under a yellow "⚠ not addable by invite" line that
+  replaced the key hints for every user on the (private) default. Now
+  there is one start screen: whether you are online, the two keys that
+  connect you to someone, and one plain sentence about reachability.
+- Top bar says only what needs saying: Tor state; hubs only when some are
+  configured; the daemon link only when it is down. The bottom line is
+  key hints only.
+- The activity list no longer opens with "daemon connection lost /
+  reconnected" from the startup race; a loss is reported only after a
+  working link. Wording no longer says "daemon".
+
 None of this changes the headline: no external audit.
 
 ---

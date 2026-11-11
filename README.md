@@ -6,17 +6,16 @@ Optional relays ("hubs") hold sealed envelopes for people who are offline and
 never see plaintext. Written in Rust.
 
 ```
- onyx   tor ready   onion published   1 hub   you 4f2a 91c3            v0.1.x
- ─────────────────────────────────────────────────────────────────────────────
- Direct messages             mira
-   ● mira            2m        09:14  mira   are you there?
-   ○ jonas           3d        09:15  you    yes — one sec
- Rooms                         09:15  mira   sent while you were away   via hub
-   ◆ field-notes     1h
-                             ─────────────────────────────────────────────────
-                             > type a message, or / for commands
- ─────────────────────────────────────────────────────────────────────────────
- F1 help   Ctrl-K commands   Ctrl-E share   Ctrl-A add contact
+ ◈ onyx                                                  ● Tor    hubs 1/1    v0.1.x
+   Direct                  │ ▸ mira  ·  ● direct  ·  ✓ verified
+▸ ● mira        2m ✓       │──────────────────────────────────────────────────────
+  ○ jonas       3d         │ mira   09:14  are you there?
+   Rooms                   │ me     09:15  yes — one sec
+  ◆ field-notes 1h         │ mira   09:15  [hub] sent while you were away
+                           │
+                           │ Compose → mira ● direct ─────────────────────────────
+                           │ > _
+ F1 help   Ctrl-K commands   Ctrl-E share   Ctrl-A add   Ctrl-F file   Esc quit
 ```
 
 *(schematic of the terminal interface)*
