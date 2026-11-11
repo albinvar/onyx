@@ -2677,6 +2677,18 @@ fn handle_dial_peer(onion: &str, pubkey_b32: &str, state: &Arc<DaemonState>) -> 
                 .to_string(),
         };
     };
+    if !onyx_core::connect::is_valid_onion_target(onion) {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "not a valid v3 .onion address — Onyx only dials onion services".to_string(),
+        };
+    }
+    let Ok(peer_pub) = crate::decode_b32_32(pubkey_b32) else {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "peer key is not a base32 X25519 public key".to_string(),
+        };
+    };
     let tor = tor.clone();
     let state = state.clone();
     let onion = onion.to_string();
@@ -2689,16 +2701,12 @@ fn handle_dial_peer(onion: &str, pubkey_b32: &str, state: &Arc<DaemonState>) -> 
             .lock()
             .await
             .emit_note("info", "dialing peer over Tor — this can take 10–60s…");
-        // v0.1.17: remember this target so the reconnect supervisor (and
-        // restart revive) can re-dial it after the circuit drops. Recorded
-        // before the dial so even an immediate failure is retryable.
-        crate::record_dial_target(&state, &onion, &pubkey_b32).await;
-        // Decode the peer key to drive the supervised reconnect loop. A
-        // bad key can't be dialed anyway — log and stop.
-        match crate::decode_b32_32(&pubkey_b32) {
-            Ok(peer_pub) => crate::supervise_dial(tor, state, peer_pub).await,
-            Err(e) => warn!(error = %e, "DialPeer: --dial-pubkey did not decode; not dialing"),
-        }
+        // The user asked for this dial → the target is trusted and
+        // persisted so the supervisor (and a restart) can re-dial it.
+        // One supervisor per peer: a repeat DialPeer just updates the
+        // address the existing supervisor uses.
+        crate::record_dial_target(&state, &onion, &pubkey_b32, true).await;
+        crate::spawn_dial_supervisor(&tor, &state, peer_pub).await;
     });
     ApiResponse::DialPeerOk
 }
@@ -3781,6 +3789,7 @@ mod tests {
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: false,
             message_retention_secs: None,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3900,6 +3909,7 @@ mod tests {
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3976,6 +3986,7 @@ mod tests {
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

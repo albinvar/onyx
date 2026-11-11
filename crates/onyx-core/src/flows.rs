@@ -40,6 +40,7 @@
 //! [`crate::mls`]'s module docs for the binding story.
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::mls::{MlsGroupState, MlsParty};
@@ -75,7 +76,7 @@ pub struct ExchangeOutcome {
 pub async fn initiator_exchange<S>(
     stream: &mut S,
     session: &mut Session,
-    party: &MlsParty,
+    party: &Mutex<MlsParty>,
     existing_group_id: Option<&[u8]>,
     message: &[u8],
 ) -> Result<ExchangeOutcome>
@@ -92,7 +93,7 @@ where
 async fn initiator_bootstrap<S>(
     stream: &mut S,
     session: &mut Session,
-    party: &MlsParty,
+    party: &Mutex<MlsParty>,
     greeting: &[u8],
 ) -> Result<ExchangeOutcome>
 where
@@ -123,8 +124,12 @@ where
     //    (the new member learns the new epoch from the Welcome).
     //    Room invites take a different path; see
     //    `handle_invite_to_room` in `onyx-daemon`.
-    let mut group = party.create_group()?;
-    let (_commit_unused, welcome_bytes) = group.invite(party, &kp_frame.payload)?;
+    let (mut group, welcome_bytes) = {
+        let party = party.lock().await;
+        let mut group = party.create_group()?;
+        let (_commit_unused, welcome_bytes) = group.invite(&party, &kp_frame.payload)?;
+        (group, welcome_bytes)
+    };
     write_frame(
         stream,
         session,
@@ -136,7 +141,7 @@ where
     .await?;
 
     // 4. First encrypted application message.
-    let app_ct = group.encrypt_application(party, greeting)?;
+    let app_ct = group.encrypt_application(&*party.lock().await, greeting)?;
     write_frame(
         stream,
         session,
@@ -154,7 +159,7 @@ where
             "flows::initiator: expected FRAME_MLS_APP reply",
         ));
     }
-    let peer_message = group.decrypt_application(party, &reply_frame.payload)?;
+    let peer_message = group.decrypt_application(&*party.lock().await, &reply_frame.payload)?;
 
     Ok(ExchangeOutcome {
         group,
@@ -166,7 +171,7 @@ where
 async fn initiator_resume<S>(
     stream: &mut S,
     session: &mut Session,
-    party: &MlsParty,
+    party: &Mutex<MlsParty>,
     group_id: &[u8],
     message: &[u8],
 ) -> Result<ExchangeOutcome>
@@ -175,9 +180,13 @@ where
 {
     // Load the group BEFORE announcing — if we can't load it, fail
     // locally rather than starting a session the peer can't complete.
-    let mut group = party.load_group(group_id)?.ok_or(Error::Internal(
-        "flows::initiator: resume requested but group not in storage",
-    ))?;
+    let mut group = party
+        .lock()
+        .await
+        .load_group(group_id)?
+        .ok_or(Error::Internal(
+            "flows::initiator: resume requested but group not in storage",
+        ))?;
 
     // 1. Announce resume.
     write_frame(
@@ -191,7 +200,7 @@ where
     .await?;
 
     // 2. Send encrypted application message.
-    let app_ct = group.encrypt_application(party, message)?;
+    let app_ct = group.encrypt_application(&*party.lock().await, message)?;
     write_frame(
         stream,
         session,
@@ -209,7 +218,7 @@ where
             "flows::initiator: expected FRAME_MLS_APP reply on resume",
         ));
     }
-    let peer_message = group.decrypt_application(party, &reply_frame.payload)?;
+    let peer_message = group.decrypt_application(&*party.lock().await, &reply_frame.payload)?;
 
     Ok(ExchangeOutcome {
         group,
@@ -225,10 +234,20 @@ where
 ///   Welcome, exchange).
 /// * `FRAME_MLS_RESUME` → resume path (load the group named by the
 ///   payload, exchange).
+///
+/// `expected_group` is the DM group the caller has on record for the
+/// Noise-authenticated peer (`None` if there is none); it is the only
+/// group id that peer is allowed to resume.
+///
+/// **Locking.** `party` is locked only around each individual MLS
+/// operation, never across a network read or write. Holding it across the
+/// exchange let any peer who completed Noise and then went silent freeze
+/// every other MLS operation in the daemon.
 pub async fn responder_exchange<S>(
     stream: &mut S,
     session: &mut Session,
-    party: &MlsParty,
+    party: &Mutex<MlsParty>,
+    expected_group: Option<&[u8]>,
     reply: &[u8],
 ) -> Result<ExchangeOutcome>
 where
@@ -237,7 +256,17 @@ where
     let first = read_frame(stream, session).await?;
     match first.frame_type {
         FRAME_MLS_REQUEST_KP => responder_bootstrap(stream, session, party, reply).await,
-        FRAME_MLS_RESUME => responder_resume(stream, session, party, &first.payload, reply).await,
+        FRAME_MLS_RESUME => {
+            responder_resume(
+                stream,
+                session,
+                party,
+                expected_group,
+                &first.payload,
+                reply,
+            )
+            .await
+        }
         _ => Err(Error::InvalidEncoding(
             "flows::responder: unexpected first frame type (want REQUEST_KP or RESUME)",
         )),
@@ -247,14 +276,14 @@ where
 async fn responder_bootstrap<S>(
     stream: &mut S,
     session: &mut Session,
-    party: &MlsParty,
+    party: &Mutex<MlsParty>,
     reply: &[u8],
 ) -> Result<ExchangeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Send our KeyPackage.
-    let kp_bytes = party.key_package_bytes()?;
+    let kp_bytes = party.lock().await.key_package_bytes()?;
     write_frame(
         stream,
         session,
@@ -272,7 +301,21 @@ where
             "flows::responder: expected FRAME_MLS_WELCOME",
         ));
     }
-    let mut group = party.join_from_welcome(&welcome_frame.payload)?;
+    let mut group = {
+        let party = party.lock().await;
+        let group = party.join_from_welcome(&welcome_frame.payload)?;
+        // A direct-session bootstrap is a DM: exactly the two of us. A
+        // peer that stuffs a third leaf into the "DM" (to borrow that
+        // member's identity for attribution) is refused, and the group is
+        // dropped so it leaves nothing behind.
+        if group.member_count() != 2 {
+            let _ = party.forget_group(&group.group_id_bytes());
+            return Err(Error::InvalidEncoding(
+                "flows::responder: bootstrap Welcome is not a 2-member group",
+            ));
+        }
+        group
+    };
 
     // Receive + decrypt initiator's first application message.
     let app_frame = read_frame(stream, session).await?;
@@ -281,10 +324,13 @@ where
             "flows::responder: expected FRAME_MLS_APP after WELCOME",
         ));
     }
-    let peer_message = group.decrypt_application(party, &app_frame.payload)?;
-
-    // Encrypt + send our reply.
-    let reply_ct = group.encrypt_application(party, reply)?;
+    let (peer_message, reply_ct) = {
+        let party = party.lock().await;
+        let peer_message = group.decrypt_application(&party, &app_frame.payload)?;
+        // Encrypt our reply.
+        let reply_ct = group.encrypt_application(&party, reply)?;
+        (peer_message, reply_ct)
+    };
     write_frame(
         stream,
         session,
@@ -305,21 +351,29 @@ where
 async fn responder_resume<S>(
     stream: &mut S,
     session: &mut Session,
-    party: &MlsParty,
+    party: &Mutex<MlsParty>,
+    expected_group: Option<&[u8]>,
     group_id: &[u8],
     reply: &[u8],
 ) -> Result<ExchangeOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Load the named group from our storage. If we don't have it,
-    // the connection cannot continue — surface as Internal so the
-    // caller closes the connection. (A real client would probably
-    // fall back to bootstrap; v0 just fails loudly so state drift
-    // doesn't go silent.)
-    let mut group = party.load_group(group_id)?.ok_or(Error::Internal(
-        "flows::responder: resume request names a group we don't have",
-    ))?;
+    // Resume is bound to the Noise-authenticated peer: the only group a
+    // peer may resume is the DM group we recorded for THEIR static key.
+    // Without this a peer could (a) probe whether we hold an arbitrary
+    // group id — unknown ids closed immediately, known ids kept waiting —
+    // and (b) resume a ROOM's group id and have us treat the room as their
+    // DM. A mismatch and an unknown group fail identically, before any
+    // further read, so the two are indistinguishable to the peer.
+    const REFUSED: Error = Error::Internal("flows::responder: resume refused");
+    if expected_group != Some(group_id) {
+        return Err(REFUSED);
+    }
+    let mut group = party.lock().await.load_group(group_id)?.ok_or(REFUSED)?;
+    if group.member_count() != 2 {
+        return Err(REFUSED);
+    }
 
     // Receive + decrypt application message.
     let app_frame = read_frame(stream, session).await?;
@@ -328,10 +382,13 @@ where
             "flows::responder: expected FRAME_MLS_APP after RESUME",
         ));
     }
-    let peer_message = group.decrypt_application(party, &app_frame.payload)?;
-
-    // Encrypt + send our reply.
-    let reply_ct = group.encrypt_application(party, reply)?;
+    let (peer_message, reply_ct) = {
+        let party = party.lock().await;
+        let peer_message = group.decrypt_application(&party, &app_frame.payload)?;
+        // Encrypt our reply.
+        let reply_ct = group.encrypt_application(&party, reply)?;
+        (peer_message, reply_ct)
+    };
     write_frame(
         stream,
         session,
@@ -373,7 +430,7 @@ mod tests {
             let mut session = handshake_initiator(&mut alice_io, &alice_sk, &bob_pk)
                 .await
                 .unwrap();
-            let alice_party = MlsParty::new(b"alice".to_vec()).unwrap();
+            let alice_party = Mutex::new(MlsParty::new(b"alice".to_vec()).unwrap());
             let outcome = initiator_exchange(
                 &mut alice_io,
                 &mut session,
@@ -392,10 +449,11 @@ mod tests {
 
         let bob_task = tokio::spawn(async move {
             let mut session = handshake_responder(&mut bob_io, &bob_sk).await.unwrap();
-            let bob_party = MlsParty::new(b"bob".to_vec()).unwrap();
-            let outcome = responder_exchange(&mut bob_io, &mut session, &bob_party, b"hello alice")
-                .await
-                .unwrap();
+            let bob_party = Mutex::new(MlsParty::new(b"bob".to_vec()).unwrap());
+            let outcome =
+                responder_exchange(&mut bob_io, &mut session, &bob_party, None, b"hello alice")
+                    .await
+                    .unwrap();
             (
                 outcome.group.epoch(),
                 outcome.peer_message,
@@ -445,13 +503,13 @@ mod tests {
             let mut session = handshake_initiator(&mut a_io, &alice_noise_sk1, &bob_x_pub_round1)
                 .await
                 .unwrap();
-            let party = MlsParty::from_identity(&alice_id1).unwrap();
+            let party = Mutex::new(MlsParty::from_identity(&alice_id1).unwrap());
             let outcome = initiator_exchange(&mut a_io, &mut session, &party, None, b"hello bob 1")
                 .await
                 .unwrap();
             assert!(outcome.was_bootstrap);
             let group_id = outcome.group.group_id_bytes();
-            let snap = party.snapshot_state().unwrap();
+            let snap = party.lock().await.snapshot_state().unwrap();
             (group_id, (*snap).clone())
         });
 
@@ -459,12 +517,13 @@ mod tests {
             let mut session = handshake_responder(&mut b_io, &bob_noise_sk1)
                 .await
                 .unwrap();
-            let party = MlsParty::from_identity(&bob_id1).unwrap();
-            let outcome = responder_exchange(&mut b_io, &mut session, &party, b"hello alice 1")
-                .await
-                .unwrap();
+            let party = Mutex::new(MlsParty::from_identity(&bob_id1).unwrap());
+            let outcome =
+                responder_exchange(&mut b_io, &mut session, &party, None, b"hello alice 1")
+                    .await
+                    .unwrap();
             assert!(outcome.was_bootstrap);
-            let snap = party.snapshot_state().unwrap();
+            let snap = party.lock().await.snapshot_state().unwrap();
             (*snap).clone()
         });
 
@@ -482,11 +541,13 @@ mod tests {
         let (mut a_io, mut b_io) = tokio::io::duplex(65_536);
 
         let group_id_for_alice = group_id_bytes.clone();
+        let group_id_for_bob = group_id_bytes.clone();
         let alice2 = tokio::spawn(async move {
             let mut session = handshake_initiator(&mut a_io, &alice_noise_sk2, &bob_x_pub_round2)
                 .await
                 .unwrap();
-            let party = MlsParty::from_identity_and_state(&alice_id2, &alice_state).unwrap();
+            let party =
+                Mutex::new(MlsParty::from_identity_and_state(&alice_id2, &alice_state).unwrap());
             let outcome = initiator_exchange(
                 &mut a_io,
                 &mut session,
@@ -503,11 +564,17 @@ mod tests {
             let mut session = handshake_responder(&mut b_io, &bob_noise_sk2)
                 .await
                 .unwrap();
-            let party = MlsParty::from_identity_and_state(&bob_id2, &bob_state).unwrap();
-            let outcome =
-                responder_exchange(&mut b_io, &mut session, &party, b"hello alice 2 (resumed)")
-                    .await
-                    .unwrap();
+            let party =
+                Mutex::new(MlsParty::from_identity_and_state(&bob_id2, &bob_state).unwrap());
+            let outcome = responder_exchange(
+                &mut b_io,
+                &mut session,
+                &party,
+                Some(&group_id_for_bob),
+                b"hello alice 2 (resumed)",
+            )
+            .await
+            .unwrap();
             (outcome.peer_message, outcome.was_bootstrap)
         });
 
@@ -522,5 +589,49 @@ mod tests {
         assert!(!bob_bootstrap, "bob resumed; bootstrap flag must be false");
         assert_eq!(bob_peer, b"hello bob 2 (resumed)");
         assert_eq!(alice_peer, b"hello alice 2 (resumed)");
+    }
+
+    /// Resume is bound to the Noise peer: a RESUME naming a group the
+    /// responder holds but has NOT recorded for this peer is refused
+    /// exactly like an unknown group (no membership oracle, no resuming a
+    /// room as a DM).
+    #[allow(clippy::similar_names)]
+    #[tokio::test]
+    async fn resume_of_unrecorded_group_is_refused() {
+        let bob_sk = IdentitySecret::generate();
+        let bob_pk = bob_sk.public();
+        let mallory_sk = IdentitySecret::generate();
+        let bob_party = Mutex::new(MlsParty::new(b"bob".to_vec()).unwrap());
+        // A group Bob really holds (stands in for a room both are in).
+        let held_gid = bob_party
+            .lock()
+            .await
+            .create_group()
+            .unwrap()
+            .group_id_bytes();
+
+        let (mut m_io, mut b_io) = tokio::io::duplex(65_536);
+        let gid = held_gid.clone();
+        let mallory = tokio::spawn(async move {
+            let mut session = handshake_initiator(&mut m_io, &mallory_sk, &bob_pk)
+                .await
+                .unwrap();
+            write_frame(
+                &mut m_io,
+                &mut session,
+                &InnerFrame {
+                    frame_type: FRAME_MLS_RESUME,
+                    payload: gid,
+                },
+            )
+            .await
+            .unwrap();
+            m_io
+        });
+        let mut session = handshake_responder(&mut b_io, &bob_sk).await.unwrap();
+        // No recorded DM group for this peer → refused without reading on.
+        let refused = responder_exchange(&mut b_io, &mut session, &bob_party, None, b"x").await;
+        assert!(refused.is_err());
+        drop(mallory.await.unwrap());
     }
 }

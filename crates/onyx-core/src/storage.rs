@@ -1159,6 +1159,33 @@ impl Vault {
         }
     }
 
+    /// Reverse pin lookup: the fingerprint a given X25519 identity key is
+    /// already pinned under, if any.
+    ///
+    /// `pin_or_verify` only answers "has this fingerprint changed its
+    /// key?". It cannot see the opposite claim — a *different* fingerprint
+    /// presenting a key that already belongs to a pinned contact — which
+    /// is exactly what a sealed-envelope sender can assert (the envelope
+    /// signature proves the fingerprint, not ownership of the X25519 key).
+    /// Callers that key conversations on the X25519 key must check this
+    /// first.
+    pub fn pinned_fingerprint_for_x25519(
+        &self,
+        identity_id: i64,
+        x25519: &[u8; 32],
+    ) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT fingerprint FROM pinned_keys \
+                 WHERE identity_id = ? AND x25519_pub = ? \
+                 ORDER BY first_seen_ms ASC LIMIT 1",
+                params![identity_id, x25519.as_slice()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_db_err)
+    }
+
     /// T-1: list every pinned contact for `identity_id`, newest contact
     /// first. Powers `onyx contact list`.
     pub fn list_pinned(&self, identity_id: i64) -> Result<Vec<PinnedContact>> {

@@ -303,6 +303,11 @@ pub struct DaemonState {
     /// `peer_dial` table so it survives a daemon restart. Leaf lock —
     /// never held across `mls_party`/`vault` (lock-order policy above).
     pub dial_targets: Arc<Mutex<std::collections::HashMap<[u8; 32], DialTarget>>>,
+    /// Peers that currently have a reconnect supervisor task. Guarantees
+    /// **one supervisor per peer**: repeated `DialPeer` calls or repeated
+    /// Welcomes from the same sender used to each spawn another
+    /// never-ending redial loop. Leaf lock.
+    pub dial_supervised: Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
     /// v0.1.18: opt-in DM hub fallback (default false = private). Read by
     /// the `Send` handler / send-queue to decide whether an undeliverable
     /// DM may be sealed and relayed via a hub. Copied from [`Config`] at
@@ -334,7 +339,18 @@ pub struct DaemonState {
 pub struct DialTarget {
     pub onion: String,
     pub pubkey_b32: String,
+    /// `true` once a Noise XK handshake with this peer key has succeeded
+    /// at this address (or the local operator supplied it). An
+    /// **unconfirmed** target came from a remote party (a Welcome's
+    /// `reply_onion`): it is never persisted, never overwrites an existing
+    /// target, and is abandoned after [`MAX_UNCONFIRMED_DIAL_ATTEMPTS`].
+    pub confirmed: bool,
 }
+
+/// How many failed dials an **unconfirmed** target gets before the
+/// supervisor gives up and forgets it. Bounds the "make the victim redial
+/// my address forever" presence beacon to a handful of attempts.
+const MAX_UNCONFIRMED_DIAL_ATTEMPTS: u32 = 6;
 
 /// T6.3.i: per-group out-of-order room-frame retry buffer. Map
 /// from `group_id` (raw MLS bytes) to a FIFO of ciphertexts that
@@ -389,6 +405,12 @@ pub const FILES_MAX_INFLIGHT_PER_PEER: usize = 10;
 /// a session slot indefinitely. 30s is generous for a real Tor circuit
 /// (a few round-trips) while bounding the abuse window.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Max wall-clock for the post-Noise MLS bootstrap/resume exchange. Bounds
+/// a peer that authenticates and then stalls mid-exchange (it would
+/// otherwise pin the session task indefinitely). Generous for the few Tor
+/// round-trips the exchange needs.
+const MLS_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// T-files.b: file-transfer configuration. Defaults per
 /// `FILES.md §4`. Operator overrides via CLI / env vars at
@@ -708,6 +730,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         // v0.1.17: populated when we dial a peer (handle_dial_peer /
         // startup --dial-onion) and revived from the vault below.
         dial_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
         // v0.1.18: opt-in DM hub fallback, copied from Config.
         dm_hub_fallback: args.dm_hub_fallback,
         // Local message retention (auto-clear), copied from Config.
@@ -738,7 +761,21 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         if !revived.is_empty() {
             let mut targets = state.dial_targets.lock().await;
             for (peer_pub, onion, pubkey_b32) in revived {
-                targets.insert(peer_pub, DialTarget { onion, pubkey_b32 });
+                // Persisted targets are confirmed by construction, but an
+                // older build persisted unvalidated ones — re-check the
+                // address shape before we ever hand it to Tor.
+                if !onyx_core::connect::is_valid_onion_target(&onion) {
+                    warn!("dropping a persisted dial target that is not a v3 .onion address");
+                    continue;
+                }
+                targets.insert(
+                    peer_pub,
+                    DialTarget {
+                        onion,
+                        pubkey_b32,
+                        confirmed: true,
+                    },
+                );
             }
             info!(
                 count = targets.len(),
@@ -981,7 +1018,10 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     if let (Some(onion), Some(pubkey_b32)) = (&args.dial_onion, &args.dial_pubkey) {
         // v0.1.17: record the explicit startup target so it joins the
         // supervised set below (and persists for restart-revive).
-        record_dial_target(&state, onion, pubkey_b32).await;
+        // Operator-supplied on the command line → trusted, persisted.
+        if !record_dial_target(&state, onion, pubkey_b32, true).await {
+            anyhow::bail!("--dial-onion must be a v3 .onion address with a base32 --dial-pubkey");
+        }
     }
     // v0.1.17: spawn a reconnect supervisor for EVERY known dial target —
     // the explicit `--dial-onion` arg just recorded AND any peers revived
@@ -992,11 +1032,9 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
     {
         let targets: Vec<[u8; 32]> = state.dial_targets.lock().await.keys().copied().collect();
         for peer_pub in targets {
-            let tor_sup = tor.clone();
-            let state_sup = state.clone();
-            dial_supervisors.push(tokio::spawn(async move {
-                supervise_dial(tor_sup, state_sup, peer_pub).await;
-            }));
+            if let Some(handle) = spawn_dial_supervisor(&tor, &state, peer_pub).await {
+                dial_supervisors.push(handle);
+            }
         }
     }
     let mode_result = run_accept_mode(&tor, state.clone()).await;
@@ -1120,11 +1158,33 @@ where
     // Take the MLS party lock for the duration of the exchange + the
     // snapshot. Drop it before taking the vault lock to keep our lock
     // order consistent (MLS first, vault second).
+    // The only group this peer may RESUME is the DM group we recorded for
+    // their Noise-authenticated static key.
+    let expected_group = {
+        let vault = state.vault.lock().await;
+        vault
+            .lookup_peer_group(state.identity_id, &peer_pub)
+            .map_err(|e| anyhow::anyhow!("peer-group lookup failed: {e}"))?
+    };
     let (snapshot, group_id, was_bootstrap, group) = {
+        // SEC: the MLS exchange is bounded, and the flow locks
+        // `mls_party` only around each MLS operation — never across a
+        // network read — so a peer that completes Noise and then stalls
+        // can no longer freeze every other MLS operation in the daemon.
+        let outcome = tokio::time::timeout(
+            MLS_EXCHANGE_TIMEOUT,
+            responder_exchange(
+                &mut stream,
+                &mut session,
+                &state.mls_party,
+                expected_group.as_deref(),
+                reply_text.as_bytes(),
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("MLS exchange timed out after {MLS_EXCHANGE_TIMEOUT:?}"))?
+        .map_err(|e| anyhow::anyhow!("MLS responder flow failed: {e}"))?;
         let party = state.mls_party.lock().await;
-        let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
-            .await
-            .map_err(|e| anyhow::anyhow!("MLS responder flow failed: {e}"))?;
         // D-3: never log the peer's greeting — it carries their
         // fingerprint and is otherwise peer-controlled text.
         info!(
@@ -1256,7 +1316,6 @@ async fn run_tcp_dial_mode(
     mode_result
 }
 
-#[allow(clippy::too_many_lines)]
 /// v0.1.17: remember how to re-dial this peer. Records the dial address
 /// both in the in-memory `dial_targets` map (read by the reconnect
 /// supervisor) and, best-effort, in the vault's `peer_dial` table so the
@@ -1264,28 +1323,99 @@ async fn run_tcp_dial_mode(
 /// initiate an outbound dial (`handle_dial_peer`, startup `--dial-onion`).
 /// A bad pubkey is logged and skipped — recording is an optimization,
 /// never a reason to refuse the dial itself.
-async fn record_dial_target(state: &DaemonState, onion: &str, pubkey_b32: &str) {
+///
+/// `confirmed` says who vouches for the address:
+/// * `true` — the local operator supplied it (CLI flag, `DialPeer`).
+///   Recorded, and mirrored to the vault.
+/// * `false` — a remote party supplied it (a Welcome's `reply_onion`).
+///   Recorded in memory only, and ONLY if we have no target for this peer
+///   yet, so a stranger can neither overwrite a real contact's address nor
+///   leave a redial target behind across restarts. It is promoted by
+///   [`confirm_dial_target`] once a Noise handshake succeeds there.
+///
+/// Returns `false` (nothing recorded) when the address is not a v3
+/// `.onion`, the key is not 32 base32 bytes, or an unconfirmed target
+/// would overwrite an existing one.
+async fn record_dial_target(
+    state: &DaemonState,
+    onion: &str,
+    pubkey_b32: &str,
+    confirmed: bool,
+) -> bool {
+    if !onyx_core::connect::is_valid_onion_target(onion) {
+        warn!("refusing dial target: not a v3 .onion address");
+        return false;
+    }
     let Ok(peer_pub) = decode_b32_32(pubkey_b32) else {
-        warn!("record_dial_target: peer pubkey did not decode to 32 bytes; not persisting");
-        return;
+        warn!("refusing dial target: peer pubkey did not decode to 32 bytes");
+        return false;
     };
     {
         let mut targets = state.dial_targets.lock().await;
+        if !confirmed && targets.contains_key(&peer_pub) {
+            debug!("keeping the existing dial target; not overwriting it with an unconfirmed one");
+            return false;
+        }
         targets.insert(
             peer_pub,
             DialTarget {
                 onion: onion.to_string(),
                 pubkey_b32: pubkey_b32.to_string(),
+                confirmed,
             },
         );
     }
-    // Mirror to the vault (best-effort: a write failure just means we
-    // won't auto-revive this peer after a restart — the in-memory entry
-    // still drives reconnect within this process lifetime).
-    let vault = state.vault.lock().await;
-    if let Err(e) = vault.record_peer_dial(state.identity_id, &peer_pub, onion, pubkey_b32) {
-        warn!(error = %e, "record_dial_target: vault persist failed (reconnect still works this session)");
+    if confirmed {
+        persist_dial_target(state, &peer_pub, onion, pubkey_b32).await;
     }
+    true
+}
+
+/// Mirror a confirmed dial target to the vault (best-effort: a write
+/// failure only means no auto-revive after a restart).
+async fn persist_dial_target(state: &DaemonState, peer_pub: &[u8; 32], onion: &str, key: &str) {
+    let vault = state.vault.lock().await;
+    if let Err(e) = vault.record_peer_dial(state.identity_id, peer_pub, onion, key) {
+        warn!(error = %e, "dial target: vault persist failed (reconnect still works this session)");
+    }
+}
+
+/// Promote this peer's dial target to confirmed after a successful Noise
+/// XK handshake at that address — the peer has now proven it holds the
+/// key the target was recorded under. No-op if already confirmed.
+async fn confirm_dial_target(state: &DaemonState, peer_pub: &[u8; 32]) {
+    let promoted = {
+        let mut targets = state.dial_targets.lock().await;
+        match targets.get_mut(peer_pub) {
+            Some(t) if !t.confirmed => {
+                t.confirmed = true;
+                Some(t.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(t) = promoted {
+        persist_dial_target(state, peer_pub, &t.onion, &t.pubkey_b32).await;
+    }
+}
+
+/// Start the reconnect supervisor for `peer_pub` unless one is already
+/// running. Returns the task handle, or `None` if a supervisor for this
+/// peer exists — one per peer, always.
+pub(crate) async fn spawn_dial_supervisor(
+    tor: &Arc<TorRuntime>,
+    state: &Arc<DaemonState>,
+    peer_pub: [u8; 32],
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !state.dial_supervised.lock().await.insert(peer_pub) {
+        return None;
+    }
+    let tor = tor.clone();
+    let state = state.clone();
+    Some(tokio::spawn(async move {
+        supervise_dial(tor, state.clone(), peer_pub).await;
+        state.dial_supervised.lock().await.remove(&peer_pub);
+    }))
 }
 
 /// v0.1.17: supervise a direct DM dial — keep it alive across dropped
@@ -1315,11 +1445,7 @@ async fn record_dial_target(state: &DaemonState, onion: &str, pubkey_b32: &str) 
 /// - **Backoff.** 500ms, doubling to a 30s cap (mirrors the hub
 ///   reconnect loop). A session that stayed up a while resets the
 ///   backoff so a long-lived link that finally drops reconnects fast.
-pub(crate) async fn supervise_dial(
-    tor: Arc<TorRuntime>,
-    state: Arc<DaemonState>,
-    peer_pub: [u8; 32],
-) {
+async fn supervise_dial(tor: Arc<TorRuntime>, state: Arc<DaemonState>, peer_pub: [u8; 32]) {
     const BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(500);
     const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
     // A session that survived at least this long is treated as "healthy"
@@ -1329,6 +1455,8 @@ pub(crate) async fn supervise_dial(
 
     let mut backoff = BACKOFF_START;
     let peer_short = short_id_of_peer_pub(&peer_pub);
+    // Failed dials so far against a target nobody has confirmed yet.
+    let mut unconfirmed_failures: u32 = 0;
 
     loop {
         // Look up the current dial address (it can be updated if the user
@@ -1368,6 +1496,25 @@ pub(crate) async fn supervise_dial(
         // If the session was healthy for a while, reset backoff.
         if attempt_start.elapsed() >= HEALTHY_SESSION {
             backoff = BACKOFF_START;
+        }
+
+        // A target supplied by a remote party gets a bounded number of
+        // tries. `run_dial_session` confirms it on the first successful
+        // handshake; until then we will not redial it indefinitely (that
+        // would be a presence beacon to whoever sent it).
+        let still_unconfirmed = state
+            .dial_targets
+            .lock()
+            .await
+            .get(&peer_pub)
+            .is_some_and(|t| !t.confirmed);
+        if still_unconfirmed {
+            unconfirmed_failures += 1;
+            if unconfirmed_failures >= MAX_UNCONFIRMED_DIAL_ATTEMPTS {
+                state.dial_targets.lock().await.remove(&peer_pub);
+                debug!(peer = %peer_short, "supervise_dial: unconfirmed target never answered; forgetting it");
+                return;
+            }
         }
 
         // Anti-MITM stop: after a session we know the peer's pinned
@@ -1493,6 +1640,8 @@ where
         peer_identity_pub_b32 = %learned_peer,
         "peer X25519 matches --dial-pubkey ✓"
     );
+    // The peer proved it holds this key at the address we dialled.
+    confirm_dial_target(state, &peer_static).await;
 
     // Do we have a prior MLS group with this peer? If yes, try to
     // resume; if no, bootstrap.
@@ -1551,16 +1700,22 @@ where
     );
 
     let (snapshot, group_id, was_bootstrap, group) = {
-        let party = state.mls_party.lock().await;
-        let outcome = initiator_exchange(
-            &mut stream,
-            &mut session,
-            &party,
-            existing_group_id.as_deref(),
-            greeting.as_bytes(),
+        // SEC: bounded, and `mls_party` is not held across network I/O
+        // (see `handle_inbound`).
+        let outcome = tokio::time::timeout(
+            MLS_EXCHANGE_TIMEOUT,
+            initiator_exchange(
+                &mut stream,
+                &mut session,
+                &state.mls_party,
+                existing_group_id.as_deref(),
+                greeting.as_bytes(),
+            ),
         )
         .await
+        .map_err(|_| anyhow::anyhow!("MLS exchange timed out after {MLS_EXCHANGE_TIMEOUT:?}"))?
         .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
+        let party = state.mls_party.lock().await;
         // D-3: never log the peer's greeting (fingerprint + peer text).
         info!(
             peer_reply_bytes = outcome.peer_message.len(),
@@ -1633,6 +1788,73 @@ async fn pin_check_peer(state: &DaemonState, fingerprint: &str, x25519: &[u8; 32
             );
         }
         Err(e) => warn!(error = %e, "contact: pin/verify failed"),
+    }
+}
+
+/// Gate for a sealed-envelope sender whose payload will be attributed by
+/// the envelope's `(fingerprint, X25519)` pair. Returns `true` to proceed.
+///
+/// The fingerprint is authentic (the envelope is signed by it); the
+/// X25519 key is whatever the sender wrote. Conversations are keyed on
+/// that key, so without this gate a stranger could sign with a throwaway
+/// identity, claim an existing contact's X25519 key, and have their text
+/// land inside that contact's conversation. We refuse when:
+///
+/// * the key is already pinned to a **different** fingerprint, or a live
+///   conversation holds it under a different identity (impersonation), or
+/// * the fingerprint is pinned to a **different** key (key change — the
+///   contact is flagged; nothing is surfaced until the user re-verifies),
+/// * the pin store cannot be read (fail closed).
+///
+/// On success the pair is pinned (first contact) or confirmed.
+async fn admit_hub_sender(state: &DaemonState, fingerprint: &str, x25519: &[u8; 32]) -> bool {
+    let known_as = state
+        .conversations
+        .lock()
+        .await
+        .fingerprint_for_peer(x25519)
+        .filter(|fp| !fp.starts_with("(peer/"));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    let verdict = {
+        let vault = state.vault.lock().await;
+        match vault.pinned_fingerprint_for_x25519(state.identity_id, x25519) {
+            Err(_) => Err("pin store unreadable"),
+            Ok(Some(pinned)) if pinned != fingerprint => Err("key belongs to another contact"),
+            Ok(_) if known_as.as_deref().is_some_and(|fp| fp != fingerprint) => {
+                Err("key belongs to another contact")
+            }
+            Ok(_) => match vault.pin_or_verify(state.identity_id, fingerprint, x25519, now_ms) {
+                Ok(onyx_core::storage::PinOutcome::New | onyx_core::storage::PinOutcome::Match) => {
+                    Ok(())
+                }
+                Ok(onyx_core::storage::PinOutcome::Mismatch { .. }) => {
+                    Err("contact's identity key changed")
+                }
+                Err(_) => Err("pin store unreadable"),
+            },
+        }
+    };
+    match verdict {
+        Ok(()) => true,
+        Err(reason) => {
+            // No identifiers in the default log (D-3); the reason is enough.
+            warn!(
+                reason,
+                "hub: refused an envelope whose sender identity is inconsistent with our pins"
+            );
+            state.conversations.lock().await.emit_note(
+                "warn",
+                format!(
+                    "Blocked a relayed message: {reason}. Possible impersonation — verify \
+                     the contact's safety number before trusting new messages."
+                ),
+            );
+            false
+        }
     }
 }
 
@@ -3388,13 +3610,25 @@ async fn handle_hub_delivery(
     let sender_pub_b32 = encode_b32(&sender_x25519);
     let sender_fingerprint = opened.sender_signing_pk.fingerprint().to_string();
 
+    // 2b. Sender-identity gate. The envelope signature proves the
+    //     sender's FINGERPRINT; the X25519 key beside it is only
+    //     self-asserted. Payloads that are attributed by the envelope
+    //     sender (a plain message, a Welcome) are refused unless that
+    //     (fingerprint, key) pair is consistent with what we have pinned.
+    //     `MlsApp` is exempt: its sender is authenticated by MLS inside
+    //     an existing group, not by the envelope.
+    if !matches!(payload, onyx_core::routing::BootstrapPayload::MlsApp { .. })
+        && !admit_hub_sender(state, &sender_fingerprint, &sender_x25519).await
+    {
+        return;
+    }
+
     match payload {
         onyx_core::routing::BootstrapPayload::PlainMessage { text } => {
             // 3. Register the sender as a hub-only peer (idempotent),
             //    then push the message tagged as via-hub so the TUI
-            //    can render the weaker security tier visibly.
-            // T-1: pin/verify the sender's identity key first.
-            pin_check_peer(state, &sender_fingerprint, &sender_x25519).await;
+            //    can render the weaker security tier visibly. (The
+            //    sender's identity key was pinned/verified in 2b.)
             let mut reg = state.conversations.lock().await;
             let handle = reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
             reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text.clone());
@@ -3664,11 +3898,8 @@ async fn process_hub_mls_welcome(
         return;
     }
 
-    // T-1: pin/verify the (now-authenticated) inviter's identity key.
-    // Placed here — after the signer-in-roster check, before the
-    // room-vs-DM branch — so it fires for BOTH room invites and 2-party
-    // DM bootstraps (the per-branch registration paths diverge below).
-    pin_check_peer(state, &sender_fingerprint, &sender_x25519).await;
+    // (T-1: the inviter's identity key was pinned/verified by
+    // `admit_hub_sender` in `handle_hub_delivery`, before the join.)
 
     // Persist the post-join MLS state so the group survives a daemon
     // restart.
@@ -3760,8 +3991,17 @@ async fn process_hub_mls_welcome(
     // Best-effort: no Tor runtime (TCP-test build) or no/empty onion → stay
     // hub-only and rely on dm_hub_fallback. The reconnect supervisor keeps
     // the session alive across circuit drops.
+    //
+    // The address comes from a remote party, so it is recorded
+    // UNCONFIRMED: validated as a v3 onion, never overwriting a target we
+    // already hold for this key, not persisted, and abandoned after a few
+    // failed attempts (see `record_dial_target`).
     if let Some(onion) = reply_onion.filter(|o| !o.is_empty())
         && let Some(tor) = state.tor.get()
+        && record_dial_target(state, &onion, sender_pub_b32, false).await
+        && spawn_dial_supervisor(tor, state, sender_x25519)
+            .await
+            .is_some()
     {
         state.conversations.lock().await.emit_note(
             "info",
@@ -3770,15 +4010,7 @@ async fn process_hub_mls_welcome(
                 handle.short_id
             ),
         );
-        let tor = tor.clone();
-        let state = state.clone();
-        let pubkey_b32 = sender_pub_b32.to_string();
-        let peer_pub = sender_x25519;
-        tokio::spawn(async move {
-            record_dial_target(&state, &onion, &pubkey_b32).await;
-            supervise_dial(tor, state, peer_pub).await;
-        });
-        info!("hub: Welcome carried peer onion — auto-dialing for a direct session");
+        debug!("hub: Welcome carried peer onion — dialing for a direct session");
     }
 }
 
@@ -4184,6 +4416,7 @@ mod dm_fallback_receive_tests {
             tor: std::sync::OnceLock::new(),
             self_onion: std::sync::OnceLock::new(),
             dial_targets: Arc::new(Mutex::new(HashMap::new())),
+            dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4283,5 +4516,56 @@ mod dm_fallback_receive_tests {
             ),
             "received message must be Incoming"
         );
+    }
+
+    /// End-to-end through `handle_hub_delivery`: a stranger signs a
+    /// sealed envelope with their own identity but claims an existing
+    /// contact's X25519 key. Conversations are keyed on that key, so
+    /// before the sender-identity gate the text landed inside the
+    /// contact's conversation. It must be refused, while the genuine
+    /// contact's envelope is still delivered.
+    #[tokio::test]
+    async fn hub_envelope_claiming_a_contacts_key_is_refused() {
+        use onyx_core::routing::{BootstrapPayload, seal_bootstrap};
+
+        let mut vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+        let (id, me) = vault.create_identity("me").expect("id");
+        let party = MlsParty::from_identity(&me).expect("party");
+        let our_kem_pub = me.kem_public();
+        let our_kem =
+            onyx_core::crypto::HybridKemSecret::from_bytes(&me.kem_secret().to_bytes()).unwrap();
+        let state = daemon_state_for(vault, id, me, party);
+        let target = [7u8; 16];
+
+        let bob = Identity::generate();
+        let mallory = Identity::generate();
+        let seal = |signer: &Identity, claimed_x: &Identity, text: &str| {
+            let payload = BootstrapPayload::PlainMessage {
+                text: text.to_string(),
+            }
+            .to_cbor()
+            .unwrap();
+            seal_bootstrap(
+                signer.signing(),
+                claimed_x.identity_key(),
+                &payload,
+                &our_kem_pub,
+            )
+            .unwrap()
+        };
+
+        // Genuine first contact from Bob → pinned + delivered.
+        handle_hub_delivery(target, seal(&bob, &bob, "hi from bob"), &state, &our_kem).await;
+        // Mallory signs as herself but claims Bob's X25519 key.
+        handle_hub_delivery(target, seal(&mallory, &bob, "forged"), &state, &our_kem).await;
+        // Bob again → still delivered.
+        handle_hub_delivery(target, seal(&bob, &bob, "bob again"), &state, &our_kem).await;
+
+        let bob_x = bob.identity_key().public().to_bytes();
+        let reg = state.conversations.lock().await;
+        let short = short_id_of_peer_pub(&bob_x);
+        let history = reg.history(&short, 10).expect("bob's conversation exists");
+        let texts: Vec<&str> = history.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["hi from bob", "bob again"]);
     }
 }

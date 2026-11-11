@@ -43,13 +43,14 @@
 //! reference Rust implementation) but is not formally audited as a
 //! whole. Worth flagging in any future security review.
 
-use openmls::credentials::{BasicCredential, CredentialWithKey};
+use openmls::credentials::{BasicCredential, Credential, CredentialWithKey};
 use openmls::framing::{MlsMessageIn, MlsMessageOut, ProcessedMessageContent, ProtocolMessage};
 use openmls::group::{GroupId, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig, StagedWelcome};
 use openmls::key_packages::KeyPackage;
 use openmls::prelude::tls_codec::Serialize as TlsSerialize;
 use openmls::prelude::{
-    Ciphersuite, DeserializeBytes, KeyPackageIn, MlsMessageBodyIn, ProtocolVersion,
+    Ciphersuite, DeserializeBytes, KeyPackageIn, LeafNode, MlsMessageBodyIn, Proposal,
+    ProtocolVersion, Sender,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -117,16 +118,30 @@ pub struct MlsParty {
 }
 
 impl MlsParty {
-    /// Create a new party with the given byte label as the
-    /// `BasicCredential` identity and a freshly-generated Ed25519
-    /// signing key. **For tests and one-off use only** — production
-    /// daemons should use [`Self::from_identity`] so the MLS
-    /// credential is provably the same identity that authenticated
-    /// at the Noise layer.
-    pub fn new(identity_label: Vec<u8>) -> Result<Self> {
+    /// Create a new party with a freshly-generated Ed25519 signing key.
+    /// **For tests and one-off use only** — production daemons use
+    /// [`Self::from_identity`] so the MLS credential is the same identity
+    /// the Noise layer authenticated.
+    ///
+    /// `_label` is accepted for call-site readability only. The credential
+    /// identity is always the signature public key: Onyx rejects any member
+    /// whose credential identity differs from its signature key (see
+    /// [`credential_bound_to_key`]), so a free-form label would not be a
+    /// usable party.
+    pub fn new(_label: Vec<u8>) -> Result<Self> {
         let signature_keys = SignatureKeyPair::new(SignatureScheme::ED25519)
             .map_err(internal("mls: signature key generation failed"))?;
-        Self::assemble(identity_label, signature_keys)
+        Self::assemble(signature_keys.to_public_vec(), signature_keys)
+    }
+
+    /// **Test-only**: a party whose credential identity deliberately does
+    /// NOT match its signature key — i.e. the impersonation attempt the
+    /// identity-binding checks must reject.
+    #[cfg(test)]
+    pub(crate) fn new_with_forged_identity(claimed_identity: Vec<u8>) -> Result<Self> {
+        let signature_keys = SignatureKeyPair::new(SignatureScheme::ED25519)
+            .map_err(internal("mls: signature key generation failed"))?;
+        Self::assemble(claimed_identity, signature_keys)
     }
 
     /// Create a party whose MLS credential is bound to the given
@@ -280,6 +295,27 @@ pub fn peek_group_id(ciphertext: &[u8]) -> Result<Vec<u8>> {
     Ok(pm.group_id().as_slice().to_vec())
 }
 
+/// Identity binding: is this credential's identity field exactly the
+/// signature public key it is paired with?
+///
+/// Onyx identities ARE Ed25519 keys (the fingerprint is the verifying-key
+/// bytes), and [`MlsParty::from_identity`] sets the `BasicCredential`
+/// identity to those same bytes. MLS itself does not tie the identity
+/// field to the signature key — it is whatever the member wrote — so a
+/// member could sign with their own key while *claiming* someone else's
+/// fingerprint as identity. Every place a leaf enters a group we know
+/// (KeyPackage validation, Welcome join, add/update proposals, commit
+/// update paths) enforces this predicate, and attribution reads the
+/// signature key, never the identity field.
+fn credential_bound_to_key(credential: &Credential, signature_key: &[u8]) -> bool {
+    BasicCredential::try_from(credential.clone()).is_ok_and(|bc| bc.identity() == signature_key)
+}
+
+/// [`credential_bound_to_key`] for a leaf node.
+fn leaf_identity_bound(leaf: &LeafNode) -> bool {
+    credential_bound_to_key(leaf.credential(), leaf.signature_key().as_slice())
+}
+
 pub fn signing_key_from_kp_bytes(kp_bytes: &[u8]) -> Result<[u8; 32]> {
     let kp_in = KeyPackageIn::tls_deserialize_exact_bytes(kp_bytes)
         .map_err(|_| Error::InvalidEncoding("mls: peer KeyPackage not TLS-encoded"))?;
@@ -287,9 +323,31 @@ pub fn signing_key_from_kp_bytes(kp_bytes: &[u8]) -> Result<[u8; 32]> {
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::Mls10)
         .map_err(|_| Error::VerificationFailed)?;
+    if !leaf_identity_bound(kp.leaf_node()) {
+        // Signed with one key while claiming another identity.
+        return Err(Error::VerificationFailed);
+    }
     let sig_bytes = kp.leaf_node().signature_key().as_slice();
     <[u8; 32]>::try_from(sig_bytes)
         .map_err(|_| Error::InvalidEncoding("mls: KeyPackage signing key not 32 bytes"))
+}
+
+/// Parse an incoming group message, accepting **only** `PrivateMessage`.
+///
+/// Onyx groups use the pure-ciphertext wire-format policy, so members
+/// always send handshake and application messages encrypted. A
+/// `PublicMessage` is what external commits and external proposals arrive
+/// as; Onyx uses neither, and accepting them let a non-member join by
+/// external commit without any admin's add. Refuse at the framing layer.
+fn private_protocol_message(ciphertext: &[u8]) -> Result<ProtocolMessage> {
+    let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
+        .map_err(|_| Error::InvalidEncoding("mls: incoming message not TLS-encoded"))?;
+    match mls_in.extract() {
+        MlsMessageBodyIn::PrivateMessage(pm) => Ok(pm.into()),
+        _ => Err(Error::InvalidEncoding(
+            "mls: incoming message is not a PrivateMessage",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -435,9 +493,19 @@ impl MlsParty {
         };
         let staged = StagedWelcome::new_from_welcome(&self.provider, &join_config(), welcome, None)
             .map_err(internal("mls: welcome staging failed"))?;
-        let group = staged
+        let mut group = staged
             .into_group(&self.provider)
             .map_err(internal("mls: group construction from welcome failed"))?;
+        // Identity binding: refuse a group whose roster contains any member
+        // claiming an identity other than its own signature key, and leave
+        // no trace of it in storage.
+        if !group
+            .members()
+            .all(|m| credential_bound_to_key(&m.credential, &m.signature_key))
+        {
+            let _ = group.delete(self.provider.storage());
+            return Err(Error::VerificationFailed);
+        }
         Ok(MlsGroupState { group })
     }
 }
@@ -501,6 +569,9 @@ impl MlsGroupState {
         let kp = kp_in
             .validate(party.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(internal("mls: peer KeyPackage validation failed"))?;
+        if !leaf_identity_bound(kp.leaf_node()) {
+            return Err(Error::VerificationFailed);
+        }
 
         let (commit, welcome_out, _group_info) = self
             .group
@@ -609,12 +680,9 @@ impl MlsGroupState {
     }
 
     /// Like [`Self::process_incoming`] but also returns the sender's
-    /// MLS credential identity (task 321). For our `BasicCredential`s
-    /// that identity field is exactly the sender's Ed25519 fingerprint
-    /// bytes (see [`MlsParty::from_identity`]), so the caller can
-    /// attribute the message to a real fingerprint instead of a
-    /// transport-key placeholder. `None` when the credential isn't a
-    /// BasicCredential we can read.
+    /// leaf signature key (task 321) — the sender's Ed25519 fingerprint
+    /// bytes — so the caller can attribute the message to a real,
+    /// cryptographically bound fingerprint. Always `Some` on success.
     pub fn process_incoming_with_sender(
         &mut self,
         party: &MlsParty,
@@ -634,49 +702,64 @@ impl MlsGroupState {
     /// [`Error::Unauthorized`] is returned, so an honest client ignores an
     /// unauthorized membership change. Application messages and non-
     /// membership commits (e.g. a self key-update) are unaffected. The
-    /// `committer_identity` bytes are the leaf credential identity (= the
-    /// committer's Ed25519 fingerprint). See `ROOM-AUTHORITY.md`.
+    /// `committer_identity` bytes are the committer's leaf **signature key**
+    /// (= their Ed25519 fingerprint), resolved from the roster — never the
+    /// self-asserted credential identity field. See `ROOM-AUTHORITY.md`.
     pub fn process_incoming_with_authority(
         &mut self,
         party: &MlsParty,
         ciphertext: &[u8],
         authorize_membership: impl FnOnce(&[u8]) -> bool,
     ) -> Result<(IncomingRoomMessage, Option<Vec<u8>>)> {
-        let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
-            .map_err(|_| Error::InvalidEncoding("mls: incoming message not TLS-encoded"))?;
-        let protocol_msg: ProtocolMessage = match mls_in.extract() {
-            MlsMessageBodyIn::PrivateMessage(pm) => pm.into(),
-            MlsMessageBodyIn::PublicMessage(pm) => pm.into(),
-            _ => {
-                return Err(Error::InvalidEncoding(
-                    "mls: incoming message is not a PrivateMessage / PublicMessage",
-                ));
-            }
-        };
+        let protocol_msg = private_protocol_message(ciphertext)?;
         let processed = self
             .group
             .process_message(&party.provider, protocol_msg)
             .map_err(|_| Error::VerificationFailed)?;
-        // Snapshot the sender's credential-identity bytes before the
-        // message is consumed by `into_content()`.
-        let sender_identity: Option<Vec<u8>> =
-            BasicCredential::try_from(processed.credential().clone())
-                .ok()
-                .map(|bc| bc.identity().to_vec());
+        // Attribute to the sender's leaf SIGNATURE KEY, resolved against
+        // the pre-merge roster. Never the credential identity field: that
+        // is self-asserted. Non-member senders (external joins/proposals)
+        // are refused outright — Onyx never uses them.
+        let Sender::Member(leaf_index) = processed.sender() else {
+            return Err(Error::Unauthorized("mls: sender is not a group member"));
+        };
+        let sender_key: Vec<u8> = self
+            .group
+            .member_at(*leaf_index)
+            .map(|m| m.signature_key)
+            .ok_or(Error::VerificationFailed)?;
+        let sender_identity = Some(sender_key.clone());
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(am) => Ok((
                 IncomingRoomMessage::Application(am.into_bytes()),
                 sender_identity,
             )),
             ProcessedMessageContent::StagedCommitMessage(staged) => {
-                // G-2 (F3.3b): only ADD/REMOVE commits are gated; a commit
-                // that just rotates keys (self key-update) changes no
-                // membership and is always allowed.
-                let changes_membership = staged.add_proposals().next().is_some()
-                    || staged.remove_proposals().next().is_some();
-                if changes_membership
-                    && !authorize_membership(sender_identity.as_deref().unwrap_or(&[]))
-                {
+                // Identity binding: every leaf this commit introduces or
+                // replaces must claim its own signature key as identity.
+                let adds_bound = staged
+                    .add_proposals()
+                    .all(|p| leaf_identity_bound(p.add_proposal().key_package().leaf_node()));
+                let updates_bound = staged
+                    .update_proposals()
+                    .all(|p| leaf_identity_bound(p.update_proposal().leaf_node()));
+                let path_bound = staged
+                    .update_path_leaf_node()
+                    .is_none_or(leaf_identity_bound);
+                if !(adds_bound && updates_bound && path_bound) {
+                    return Err(Error::Unauthorized(
+                        "mls: commit carries a leaf whose identity is not its signature key",
+                    ));
+                }
+                // G-2 (F3.3b): a commit that only rotates keys (Update
+                // proposals / a bare update path) needs no authority.
+                // ANYTHING else — add, remove, PSK, group-context
+                // extensions, re-init, external-init — is gated, so new
+                // proposal kinds are denied-by-default for non-admins.
+                let needs_authority = staged
+                    .queued_proposals()
+                    .any(|p| !matches!(p.proposal(), Proposal::Update(_)));
+                if needs_authority && !authorize_membership(&sender_key) {
                     // Reject WITHOUT merging — our group state does not
                     // advance, so we ignore the unauthorized change.
                     return Err(Error::Unauthorized("mls: committer is not a room admin"));
@@ -695,18 +778,7 @@ impl MlsGroupState {
     /// Decrypt an incoming application message. Tampered ciphertext or
     /// a wrong-key sender surface as [`Error::VerificationFailed`].
     pub fn decrypt_application(&mut self, party: &MlsParty, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let mls_in = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext)
-            .map_err(|_| Error::InvalidEncoding("mls: incoming message not TLS-encoded"))?;
-
-        let protocol_msg: ProtocolMessage = match mls_in.extract() {
-            MlsMessageBodyIn::PrivateMessage(pm) => pm.into(),
-            MlsMessageBodyIn::PublicMessage(pm) => pm.into(),
-            _ => {
-                return Err(Error::InvalidEncoding(
-                    "mls: incoming message is not a PrivateMessage / PublicMessage",
-                ));
-            }
-        };
+        let protocol_msg = private_protocol_message(ciphertext)?;
 
         let processed = self
             .group
@@ -758,6 +830,12 @@ impl MlsGroupState {
             .members()
             .map(|m| m.signature_key.as_slice().to_vec())
             .collect()
+    }
+
+    /// Number of members currently in the group.
+    #[must_use]
+    pub fn member_count(&self) -> usize {
+        self.group.members().count()
     }
 
     /// Per-epoch 32-byte routing-token base secret. Identical across
@@ -1003,6 +1081,72 @@ mod tests {
             accepted.is_ok(),
             "an authorized membership commit must merge, got {accepted:?}"
         );
+    }
+
+    /// Identity binding: a KeyPackage signed with one key while claiming
+    /// another member's fingerprint as identity is refused everywhere a
+    /// KeyPackage is validated (hub directory, invite paths).
+    #[test]
+    fn forged_identity_keypackage_is_rejected() {
+        let victim = identity_from_seed([210u8; 32], [211u8; 32]);
+        let victim_fp = victim.fingerprint().as_bytes().to_vec();
+        let mallory = MlsParty::new_with_forged_identity(victim_fp).unwrap();
+        let kp = mallory.key_package_bytes().unwrap();
+        assert!(matches!(
+            signing_key_from_kp_bytes(&kp),
+            Err(Error::VerificationFailed)
+        ));
+
+        let alice = MlsParty::new(b"alice".to_vec()).unwrap();
+        let mut group = alice.create_group().unwrap();
+        assert!(matches!(
+            group.invite(&alice, &kp),
+            Err(Error::VerificationFailed)
+        ));
+    }
+
+    /// Identity binding: a Welcome into a group whose roster contains a
+    /// member with a forged identity is refused, and leaves no group
+    /// behind in storage.
+    #[test]
+    fn welcome_with_forged_identity_member_is_rejected() {
+        let victim = identity_from_seed([212u8; 32], [213u8; 32]);
+        let victim_fp = victim.fingerprint().as_bytes().to_vec();
+        // Mallory creates the group herself, so her forged leaf is in the
+        // roster without passing anyone's KeyPackage check.
+        let mallory = MlsParty::new_with_forged_identity(victim_fp).unwrap();
+        let bob = MlsParty::new(b"bob".to_vec()).unwrap();
+        let mut mallory_group = mallory.create_group().unwrap();
+        let gid = mallory_group.group_id_bytes();
+        let (_commit, welcome) = mallory_group
+            .invite(&mallory, &bob.key_package_bytes().unwrap())
+            .unwrap();
+        assert!(matches!(
+            bob.join_from_welcome(&welcome),
+            Err(Error::VerificationFailed)
+        ));
+        assert!(bob.load_group(&gid).unwrap().is_none());
+    }
+
+    /// Attribution reads the leaf signature key, so the sender returned
+    /// for an application message is the real signer.
+    #[test]
+    fn sender_is_attributed_by_signature_key() {
+        let id_a = identity_from_seed([214u8; 32], [215u8; 32]);
+        let id_b = identity_from_seed([216u8; 32], [217u8; 32]);
+        let alice = MlsParty::from_identity(&id_a).unwrap();
+        let bob = MlsParty::from_identity(&id_b).unwrap();
+        let mut alice_group = alice.create_group().unwrap();
+        let (_c, welcome) = alice_group
+            .invite(&alice, &bob.key_package_bytes().unwrap())
+            .unwrap();
+        let mut bob_group = bob.join_from_welcome(&welcome).unwrap();
+        let ct = bob_group.encrypt_application(&bob, b"hi").unwrap();
+        let (msg, sender) = alice_group
+            .process_incoming_with_sender(&alice, &ct)
+            .unwrap();
+        assert_eq!(msg, IncomingRoomMessage::Application(b"hi".to_vec()));
+        assert_eq!(sender.unwrap(), id_b.fingerprint().as_bytes().to_vec());
     }
 
     #[test]
