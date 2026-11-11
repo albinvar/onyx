@@ -171,7 +171,6 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     info!(
-        host = %host,
         port = port,
         subscriptions = subscribe_to.len(),
         ephemeral_noise,

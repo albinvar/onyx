@@ -54,11 +54,7 @@ pub async fn serve_api(
     tor_state: TorState,
 ) -> anyhow::Result<()> {
     let listener = bind_listener(&socket_path).await?;
-    info!(
-        path = %socket_path.display(),
-        mode = "0600",
-        "API socket bound — `onyx` CLI can connect"
-    );
+    info!(mode = "0600", "API socket bound — `onyx` CLI can connect");
 
     let result = accept_loop(listener, state, tor_state).await;
 
@@ -93,7 +89,6 @@ async fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
             let mode = meta.permissions().mode();
             if mode & 0o077 != 0 {
                 warn!(
-                    path = %parent.display(),
                     mode = format!("{:#o}", mode & 0o7777),
                     "API socket parent directory is accessible by group/other; the local \
                      UID guarantee then rests only on the socket's own 0600 mode, which is \
@@ -105,10 +100,7 @@ async fn bind_listener(socket_path: &Path) -> anyhow::Result<UnixListener> {
     }
 
     if tokio::fs::try_exists(socket_path).await.unwrap_or(false) {
-        warn!(
-            path = %socket_path.display(),
-            "API socket file exists from a prior run; removing before bind"
-        );
+        warn!("API socket file exists from a prior run; removing before bind");
         tokio::fs::remove_file(socket_path)
             .await
             .map_err(|e| anyhow::anyhow!("removing stale socket {}: {e}", socket_path.display()))?;
@@ -277,8 +269,14 @@ async fn dispatch_one_shot(
             fingerprint,
             verified,
         } => {
+            let Some(fingerprint) = canonical_fingerprint(fingerprint) else {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "fingerprint did not parse".into(),
+                };
+            };
             let vault = state.vault.lock().await;
-            match vault.set_verified(state.identity_id, fingerprint, *verified) {
+            match vault.set_verified(state.identity_id, &fingerprint, *verified) {
                 Ok(n) => ApiResponse::SetContactVerifiedOk { updated: n > 0 },
                 Err(e) => ApiResponse::Error {
                     code: ApiErrorCode::Internal,
@@ -292,8 +290,14 @@ async fn dispatch_one_shot(
         } => {
             // v0.1.31: cap at 10 chars (chat name column width) before store.
             let nick: String = nickname.trim().chars().take(10).collect();
+            let Some(fingerprint) = canonical_fingerprint(fingerprint) else {
+                return ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "fingerprint did not parse".into(),
+                };
+            };
             let vault = state.vault.lock().await;
-            match vault.set_contact_nickname(state.identity_id, fingerprint, &nick) {
+            match vault.set_contact_nickname(state.identity_id, &fingerprint, &nick) {
                 Ok(n) => ApiResponse::SetNicknameOk { updated: n > 0 },
                 Err(e) => ApiResponse::Error {
                     code: ApiErrorCode::Internal,
@@ -806,6 +810,9 @@ async fn handle_list_contacts(state: &DaemonState) -> ApiResponse {
 /// indefinitely.
 const DEFAULT_INVITE_TTL_SECS: u64 = 30 * 86_400;
 
+/// How long a KeyPackage fetch waits on one hub before trying the next.
+const KP_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// T-2: build a signed (v2) invite URL inside the daemon, where the
 /// identity signing key actually lives. The CLI / API caller just
 /// hands us the booleans + optional TTL and we mint, optionally
@@ -905,6 +912,15 @@ async fn handle_build_invite(
     }
 }
 
+/// The vault's canonical spelling of a fingerprint (grouped lowercase
+/// base32), or `None` if `input` is not a fingerprint. Every vault lookup
+/// keyed on a caller-supplied fingerprint goes through this.
+fn canonical_fingerprint(input: &str) -> Option<String> {
+    onyx_core::crypto::Fingerprint::parse(input)
+        .ok()
+        .map(|fp| fp.to_string())
+}
+
 /// A0.3: refuse to send to a peer whose pinned identity key has
 /// changed since first contact (a possible MITM / key rotation). T-1
 /// pins + warns; the T-2 accept path cross-checks at first contact;
@@ -913,17 +929,27 @@ async fn handle_build_invite(
 ///
 /// Returns `Some(Error)` (the response the caller should return
 /// immediately) when the contact is flagged; `None` when the send may
-/// proceed. A vault read error fails OPEN with a `warn!` rather than
-/// blocking all sends on a transient DB hiccup — the key-change
-/// detection itself already happened at pin time (T-1); this is the
-/// belt-and-suspenders enforcement layer, and bricking messaging on a
-/// read error would be a worse failure than the residual it guards.
+/// proceed. A vault read error, or a fingerprint that does not parse,
+/// fails CLOSED: if the pin state cannot be established the send is
+/// refused.
 async fn pin_block(state: &DaemonState, fingerprint: &str) -> Option<ApiResponse> {
     // Unverified `(peer/<x25519>)` placeholders are never pinned (T-3),
     // so they can't be "compromised"; skip the lookup.
     if fingerprint.starts_with("(peer/") {
         return None;
     }
+    // Look the pin up under its CANONICAL spelling. Pins are stored in
+    // grouped lowercase; `Fingerprint::parse` also accepts ungrouped,
+    // uppercase and `fpr:`-prefixed input, so an exact-string lookup of
+    // the caller's spelling found no row and let a send to a key-changed
+    // contact through. An unparseable fingerprint is refused outright.
+    let Some(canonical) = canonical_fingerprint(fingerprint) else {
+        return Some(ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "refusing to send: the recipient fingerprint did not parse".into(),
+        });
+    };
+    let fingerprint = canonical.as_str();
     let compromised = {
         let vault = state.vault.lock().await;
         vault.is_pin_compromised(state.identity_id, fingerprint)
@@ -946,7 +972,7 @@ async fn pin_block(state: &DaemonState, fingerprint: &str) -> Option<ApiResponse
             // risk delivering to the wrong key. A transient vault error →
             // the user retries; a persistent one needs fixing before
             // sending is safe anyway.
-            warn!(error = %e, fingerprint = %fingerprint, "pin_block: vault read failed; failing CLOSED (refusing send)");
+            warn!(error = %e, "pin_block: vault read failed; failing CLOSED (refusing send)");
             Some(ApiResponse::Error {
                 code: ApiErrorCode::Internal,
                 message: format!(
@@ -1019,24 +1045,12 @@ async fn handle_send_invite(
         };
     }
 
-    // Gate 3: pin-store cross-check (T-1).
+    // Gate 3: pin-store cross-check (T-1). Uses the same fail-closed
+    // `pin_block` as every other send path (the previous hand-rolled loop
+    // skipped the check entirely on a vault read error).
     let invite_fp = invite.fingerprint.to_string();
-    {
-        let vault = state.vault.lock().await;
-        if let Ok(contacts) = vault.list_pinned(state.identity_id) {
-            for c in &contacts {
-                if c.fingerprint == invite_fp && c.key_changed {
-                    return ApiResponse::Error {
-                        code: ApiErrorCode::Malformed,
-                        message: format!(
-                            "fingerprint {invite_fp} is already pinned AND its identity key has \
-                             changed since first contact (T-1). Refusing — verify out of band \
-                             and clear the pin before re-accepting."
-                        ),
-                    };
-                }
-            }
-        }
+    if let Some(block) = pin_block(state, &invite_fp).await {
+        return block;
     }
 
     // Gate 4: dispatch to the right tier and translate the response.
@@ -1140,6 +1154,17 @@ async fn handle_invite_to_room(
             message: "peer_fingerprint did not parse".into(),
         };
     };
+    // Canonical form from here on: the vault stores fingerprints in
+    // grouped lowercase, and every comparison/lookup below must use the
+    // same spelling the pin store does.
+    let peer_fingerprint = fp.to_string();
+    let peer_fingerprint = peer_fingerprint.as_str();
+    // A0.3: a contact whose pinned key changed must not be handed the
+    // room (its name, roster, admin set and every future message). This
+    // path had no pin gate at all.
+    if let Some(block) = pin_block(state, peer_fingerprint).await {
+        return block;
+    }
     let Some(kem_pub_bytes) = base32::decode(
         base32::Alphabet::Rfc4648Lower { padding: false },
         peer_kem_pub_b32,
@@ -1428,7 +1453,7 @@ async fn handle_invite_to_room(
             message: last_err.unwrap_or_else(|| "no hub accepted the Welcome envelope".into()),
         };
     }
-    tracing::info!(
+    tracing::debug!(
         op = "invite_to_room",
         accepted,
         total = state.hub_outbounds.len(),
@@ -1613,6 +1638,16 @@ async fn dm_hub_fallback_send(peer_pub: &[u8; 32], text: &str, state: &DaemonSta
         let Ok(secret) = group.export_routing_secret(&party) else {
             return false;
         };
+        // Persist the advanced sender ratchet before the ciphertext is
+        // used. Every other encrypt site does; without it a crash rewinds
+        // the ratchet and the next message reuses a generation.
+        let Ok(snapshot) = party.snapshot_state() else {
+            return false;
+        };
+        let vault = state.vault.lock().await;
+        if vault.save_mls_state(state.identity_id, &snapshot).is_err() {
+            return false;
+        }
         (ct, onyx_core::routing::session_token(&secret, 0))
     };
     // 4. Seal MlsApp{group_id, ciphertext} to the peer's KEM and relay.
@@ -1746,10 +1781,7 @@ async fn handle_delete_room(group_id_b32: &str, state: &DaemonState) -> ApiRespo
             message: format!("delete_room: {e}"),
         };
     }
-    tracing::info!(
-        group_id_b32,
-        "room: forgotten locally (T-polish.1 DeleteRoom)"
-    );
+    tracing::debug!("room: forgotten locally (T-polish.1 DeleteRoom)");
     ApiResponse::RoomOpOk
 }
 
@@ -1772,7 +1804,7 @@ async fn handle_rename_room(
     let vault = state.vault.lock().await;
     match vault.rename_room(state.identity_id, &group_id_bytes, new_name) {
         Ok(changed) => {
-            tracing::info!(group_id_b32, new_name, changed, "room: renamed");
+            tracing::debug!(changed, "room: renamed");
             ApiResponse::RoomOpOk
         }
         Err(e) => ApiResponse::Error {
@@ -1877,8 +1909,7 @@ async fn handle_leave_room(group_id_b32: &str, state: &DaemonState) -> ApiRespon
     // T-polish.3: also drop the persisted scrollback on leave.
     let _ = vault.forget_room_messages(state.identity_id, &group_id_bytes);
     let _ = vault.delete_room(state.identity_id, &group_id_bytes);
-    tracing::info!(
-        group_id_b32,
+    tracing::debug!(
         notified = members_count,
         "room: left (T-polish.2 LeaveRoom)"
     );
@@ -1926,6 +1957,11 @@ async fn handle_remove_from_room(
             message: "peer_fingerprint did not parse".into(),
         };
     };
+    // Canonical form from here on: the vault stores fingerprints in
+    // grouped lowercase, and every comparison/lookup below must use the
+    // same spelling the pin store does.
+    let peer_fingerprint = fp.to_string();
+    let peer_fingerprint = peer_fingerprint.as_str();
     let our_fp = state.identity.fingerprint().to_string();
     if peer_fingerprint == our_fp {
         return ApiResponse::Error {
@@ -1988,6 +2024,49 @@ async fn handle_remove_from_room(
         (commit, before, after, old_token, meta)
     };
 
+    // Persist the post-remove MLS state + refreshed roster BEFORE the
+    // commit leaves this machine, and refuse to continue if that fails.
+    // Fan-out-then-persist meant a crash or failed save restored the
+    // pre-removal epoch on restart: we would keep encrypting at an epoch
+    // the "removed" member can still read, having already reported
+    // success.
+    let snapshot = {
+        let party = state.mls_party.lock().await;
+        party.snapshot_state()
+    };
+    let saved = match snapshot {
+        Ok(snap) => {
+            let vault = state.vault.lock().await;
+            let saved = vault.save_mls_state(state.identity_id, &snap);
+            if saved.is_ok()
+                && let Some((name, created_at_ms)) = &room_meta
+            {
+                let _ = vault.save_room(
+                    state.identity_id,
+                    &group_id_bytes,
+                    name,
+                    &members_after,
+                    *created_at_ms,
+                );
+            }
+            // Note: we deliberately do NOT drop cached member KEMs here.
+            // `forget_room_member_kems` would drop ALL of them (breaking
+            // hub-fallback to the remaining members); the evicted member's
+            // stale KEM is harmless because future fan-outs iterate the
+            // refreshed roster, which no longer includes them.
+            saved.is_ok()
+        }
+        Err(_) => false,
+    };
+    if !saved {
+        return ApiResponse::Error {
+            code: ApiErrorCode::Internal,
+            message: "member removed in memory but the new group state could not be saved; \
+                      restart the daemon and retry the removal"
+                .into(),
+        };
+    }
+
     // Fan the commit out to all members the room had BEFORE removal
     // (except us) — including the evicted member so its daemon
     // processes the commit and drops the group.
@@ -2009,43 +2088,17 @@ async fn handle_remove_from_room(
         .await;
     }
 
-    // Persist post-remove MLS state + refreshed roster.
-    let snapshot_opt = {
-        let party = state.mls_party.lock().await;
-        party.snapshot_state().ok()
-    };
-    {
-        let vault = state.vault.lock().await;
-        if let Some(snap) = snapshot_opt {
-            let _ = vault.save_mls_state(state.identity_id, &snap);
-        }
-        if let Some((name, created_at_ms)) = &room_meta {
-            let _ = vault.save_room(
-                state.identity_id,
-                &group_id_bytes,
-                name,
-                &members_after,
-                *created_at_ms,
-            );
-        }
-        // Note: we deliberately do NOT drop cached member KEMs here.
-        // `forget_room_member_kems` would drop ALL of them (breaking
-        // hub-fallback to the remaining members); the evicted member's
-        // stale KEM is harmless because future fan-outs iterate the
-        // refreshed roster, which no longer includes them.
-    }
+    // The epoch advanced, so the room's hub routing token changed. Move
+    // our subscription to the new token now; staying on the old one keeps
+    // us listening where the removed member can still deliver.
+    crate::announce_room_subscribe(&group_id_bytes, state).await;
 
     let members: Vec<String> = members_after
         .split(',')
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    tracing::info!(
-        group_id_b32,
-        removed = %peer_fingerprint,
-        remaining = members.len(),
-        "room: removed member (task 325)"
-    );
+    tracing::debug!(remaining = members.len(), "room: removed member (task 325)");
     ApiResponse::RemoveFromRoomOk {
         group_id_b32: group_id_b32.to_string(),
         members,
@@ -2232,12 +2285,10 @@ async fn handle_send_file_to_room(
     }
 
     let file_id_b32 = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &file_id);
-    tracing::info!(
+    tracing::debug!(
         op = "send_file_to_room",
-        group_id_b32,
         file_id_b32 = %file_id_b32,
         size,
-        mime = %cleaned.mime,
         chunks = chunks_count,
         stripped = cleaned.stripped,
         "file sent"
@@ -2357,12 +2408,10 @@ async fn handle_send_file_to_peer(
     }
 
     let file_id_b32 = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &file_id);
-    tracing::info!(
+    tracing::debug!(
         op = "send_file_to_peer",
-        peer_short,
         file_id_b32 = %file_id_b32,
         size,
-        mime = %cleaned.mime,
         chunks = chunks_count,
         stripped = cleaned.stripped,
         "dm file sent"
@@ -2863,7 +2912,6 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             skipped_no_kem += 1;
             tracing::warn!(
                 op = "send_room",
-                missing_member = %fp,
                 "no cached KEM pub for member; hub-fallback skipped \
                  (KEM-pub exchange is a T6.3 follow-up)"
             );
@@ -2873,7 +2921,6 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             skipped_no_kem += 1;
             tracing::warn!(
                 op = "send_room",
-                missing_member = %fp,
                 "cached KEM pub did not decode as HybridKemPublic; skipping"
             );
             continue;
@@ -2888,7 +2935,7 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
         } else {
             let Ok(target_fp_parsed) = onyx_core::crypto::Fingerprint::parse(&fp) else {
                 skipped_no_kem += 1;
-                tracing::warn!(missing_member = %fp, "fingerprint did not parse");
+                tracing::warn!("fingerprint did not parse");
                 continue;
             };
             onyx_core::routing::introduction_inbox(&target_fp_parsed)
@@ -2898,7 +2945,7 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             ciphertext: serde_bytes::ByteBuf::from(ciphertext.clone()),
         };
         let Ok(payload_bytes) = payload.to_cbor() else {
-            tracing::warn!(missing_member = %fp, "MlsApp CBOR encode failed; skipping");
+            tracing::warn!("MlsApp CBOR encode failed; skipping");
             continue;
         };
         let Ok(sealed) = onyx_core::routing::seal_bootstrap(
@@ -2907,7 +2954,7 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             &payload_bytes,
             &kem_pub,
         ) else {
-            tracing::warn!(missing_member = %fp, "seal_bootstrap failed; skipping");
+            tracing::warn!("seal_bootstrap failed; skipping");
             continue;
         };
         let mut any_accepted = false;
@@ -2926,7 +2973,6 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
             delivered_hub += 1;
         } else {
             tracing::warn!(
-                missing_member = %fp,
                 "no hub accepted the MlsApp envelope; recipient won't get this message \
                  until a hub session recovers"
             );
@@ -2934,7 +2980,6 @@ async fn handle_send_room(group_id_b32: &str, text: &str, state: &DaemonState) -
     }
     tracing::info!(
         op = "send_room",
-        group_id_b32,
         delivered_to_direct = delivered_direct,
         delivered_to_hub = delivered_hub,
         skipped_no_kem,
@@ -3012,6 +3057,7 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
 
     let mut last_send_err: Option<String> = None;
     let mut last_recv_err: bool = false;
+    let mut bad_kp_from_a_hub = false;
     for (idx, hub_outbound) in state.hub_outbounds.iter().enumerate() {
         let (responder_tx, responder_rx) = tokio::sync::oneshot::channel();
         if let Err(e) = hub_outbound.try_send(crate::hub_client::HubOutbound::FetchKp {
@@ -3021,7 +3067,16 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
             last_send_err = Some(format!("hub #{idx} outbound queue: {e}"));
             continue;
         }
-        match responder_rx.await {
+        // Bounded wait: a hub that accepts the fetch and never answers
+        // (or one whose session is not up, so the request just sits in
+        // its queue) must not hold `hub_fetch_lock` forever and block
+        // every later fetch on every hub. On timeout we move on; the
+        // late response, if any, lands on a dropped responder.
+        let Ok(answer) = tokio::time::timeout(KP_FETCH_TIMEOUT, responder_rx).await else {
+            last_recv_err = true;
+            continue;
+        };
+        match answer {
             Ok(Some(kp_bytes)) => {
                 // SECURITY: validate the returned KP's signing key
                 // matches peer_fingerprint before surfacing. Same
@@ -3032,24 +3087,20 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
                     party.peer_signing_pk_from_kp_bytes(&kp_bytes)
                 };
                 let Ok(signing_bytes) = extracted else {
-                    return ApiResponse::Error {
-                        code: ApiErrorCode::Malformed,
-                        message: "fetched KP did not validate as a KeyPackage".into(),
-                    };
+                    // One hub serving a bad KeyPackage must not veto
+                    // the others — try the next hub.
+                    bad_kp_from_a_hub = true;
+                    continue;
                 };
                 let Ok(vk) = onyx_core::crypto::VerifyingKey::from_bytes(signing_bytes) else {
-                    return ApiResponse::Error {
-                        code: ApiErrorCode::Malformed,
-                        message: "fetched KP signing key is not a valid Ed25519 point".into(),
-                    };
+                    // One hub serving a bad KeyPackage must not veto
+                    // the others — try the next hub.
+                    bad_kp_from_a_hub = true;
+                    continue;
                 };
                 if vk.fingerprint() != fp {
-                    return ApiResponse::Error {
-                        code: ApiErrorCode::Malformed,
-                        message: "fetched KP signing key does not match peer_fingerprint \
-                                  — refusing (potential hub-directory tampering)"
-                            .into(),
-                    };
+                    bad_kp_from_a_hub = true;
+                    continue;
                 }
                 return ApiResponse::FetchPeerKeyPackageOk {
                     kp_b64: base64_encode(&kp_bytes),
@@ -3063,7 +3114,14 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
             }
         }
     }
-    if let Some(msg) = last_send_err {
+    if bad_kp_from_a_hub {
+        ApiResponse::Error {
+            code: ApiErrorCode::Malformed,
+            message: "a hub returned a KeyPackage that does not belong to this fingerprint \
+                      (possible hub-directory tampering) and no other hub had a valid one"
+                .into(),
+        }
+    } else if let Some(msg) = last_send_err {
         ApiResponse::Error {
             code: ApiErrorCode::NotReady,
             message: msg,
@@ -3071,7 +3129,7 @@ async fn handle_fetch_peer_keypackage(peer_fingerprint: &str, state: &DaemonStat
     } else if last_recv_err {
         ApiResponse::Error {
             code: ApiErrorCode::Internal,
-            message: "every hub session ended before responding".into(),
+            message: "no hub answered the KeyPackage request in time".into(),
         }
     } else {
         ApiResponse::Error {
@@ -3445,7 +3503,7 @@ async fn handle_send_bootstrap_mls(
         }
     }
     if accepted > 0 {
-        tracing::info!(
+        tracing::debug!(
             op = "send_bootstrap_mls",
             accepted,
             total = state.hub_outbounds.len(),
@@ -3847,6 +3905,61 @@ mod tests {
             ),
             other => panic!("expected refusal of key-changed peer, got {other:?}"),
         }
+    }
+
+    /// Regression: the pin gate used an exact-string lookup, but pins are
+    /// stored in grouped lowercase while the API accepts ungrouped /
+    /// uppercase / `fpr:`-prefixed fingerprints. Any non-canonical
+    /// spelling found no row and the send went through. Every spelling of
+    /// a key-changed contact must be refused, on the bootstrap, MLS
+    /// bootstrap and room-invite paths.
+    #[tokio::test]
+    async fn pin_gate_ignores_fingerprint_spelling() {
+        let group_id = [9u8; 32];
+        let (state, _gid) = room_state_with_members("", &group_id);
+        let victim = fresh_fp();
+        {
+            let vault = state.vault.lock().await;
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[1u8; 32], 1_000)
+                .expect("first pin");
+            vault
+                .pin_or_verify(state.identity_id, &victim, &[2u8; 32], 2_000)
+                .expect("mismatching pin sets key_changed");
+        }
+        let ungrouped: String = victim.chars().filter(|c| !c.is_whitespace()).collect();
+        let spellings = [
+            ungrouped.clone(),
+            ungrouped.to_uppercase(),
+            format!("fpr: {victim}"),
+        ];
+        for spelling in spellings {
+            assert_ne!(spelling, victim, "test must use a non-canonical spelling");
+            let requests = [
+                ApiRequest::SendBootstrap {
+                    peer_fingerprint: spelling.clone(),
+                    peer_kem_pub_b32: "aaaa".to_string(),
+                    text: "hi".to_string(),
+                },
+                ApiRequest::SendBootstrapMls {
+                    peer_fingerprint: spelling.clone(),
+                    peer_kem_pub_b32: "aaaa".to_string(),
+                    peer_kp_b64: "aaaa".to_string(),
+                    initial_text: None,
+                },
+            ];
+            for req in requests {
+                match dispatch_one_shot(&req, &state, TorState::Disabled).await {
+                    ApiResponse::Error { message, .. } => assert!(
+                        message.to_lowercase().contains("changed"),
+                        "spelling {spelling:?}: expected a key-changed refusal, got: {message}"
+                    ),
+                    other => panic!("spelling {spelling:?}: expected refusal, got {other:?}"),
+                }
+            }
+        }
+        // A string that is not a fingerprint at all is refused, not waved through.
+        assert!(pin_block(&state, "not-a-fingerprint").await.is_some());
     }
 
     // ── v0.1.18: opt-in DM hub fallback ─────────────────────────────────

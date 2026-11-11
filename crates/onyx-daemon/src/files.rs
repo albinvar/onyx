@@ -152,6 +152,15 @@ pub async fn accept_file_meta(
         if per_peer.len() >= FILES_MAX_INFLIGHT_PER_PEER && !per_peer.contains_key(&id_arr) {
             return AcceptDecision::RejectInflightCap;
         }
+        // A repeated FileMeta for a transfer already in flight is a
+        // duplicate, not an update: keep the ORIGINAL manifest and
+        // deadline. Replacing it let a sender reserve 1 byte against the
+        // global budget, then re-declare the same id at the maximum size
+        // (the budget check above skips known ids) and refresh the
+        // stall deadline indefinitely.
+        if per_peer.contains_key(&id_arr) {
+            return AcceptDecision::Accepted;
+        }
         per_peer.insert(
             id_arr,
             InflightFile {
@@ -397,10 +406,7 @@ async fn finalize_file(
     // robust against any future caller that routes peer-influenced
     // input through — defense against a latent path-traversal.
     if !is_valid_conversation_key(conversation) {
-        warn!(
-            conversation,
-            "file finalize: invalid conversation key; refusing to build storage path"
-        );
+        warn!("file finalize: invalid conversation key; refusing to build storage path");
         return None;
     }
 
@@ -434,7 +440,7 @@ async fn finalize_file(
         Ok(mut f) => {
             use std::io::Write as _;
             if let Err(e) = f.write_all(&assembled) {
-                warn!(error = %e, path = %path.display(), "file finalize: write failed");
+                warn!(error = %e, "file finalize: write failed");
                 let _ = std::fs::remove_file(&path);
                 return None;
             }
@@ -444,7 +450,7 @@ async fn finalize_file(
             return None;
         }
         Err(e) => {
-            warn!(error = %e, path = %path.display(), "file finalize: open failed");
+            warn!(error = %e, "file finalize: open failed");
             return None;
         }
     }
@@ -472,13 +478,7 @@ async fn finalize_file(
         }
     }
 
-    info!(
-        sender_fp,
-        path = %path.display(),
-        size,
-        mime,
-        "file finalize: received + verified + persisted"
-    );
+    info!(size, "file finalize: received + verified + persisted");
     Some(path)
 }
 

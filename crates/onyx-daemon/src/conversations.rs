@@ -185,7 +185,6 @@ impl ConversationRegistry {
         match self.by_short.get(&short_id) {
             Some(existing) if *existing != peer_pub => {
                 warn!(
-                    short_id = %short_id,
                     "conversations: short-id collision with a different peer; keeping the \
                      original owner (possible grinding attack — the new peer is still \
                      addressable by full key)"

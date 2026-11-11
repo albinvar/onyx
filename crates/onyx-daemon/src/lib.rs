@@ -406,6 +406,11 @@ pub const FILES_MAX_INFLIGHT_PER_PEER: usize = 10;
 /// (a few round-trips) while bounding the abuse window.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Max concurrent inbound peer sessions on the hidden service. A personal
+/// node talks to a handful of peers; this leaves ample headroom while
+/// bounding what a stream flood can pin.
+const MAX_INBOUND_SESSIONS: usize = 128;
+
 /// Max wall-clock for the post-Noise MLS bootstrap/resume exchange. Bounds
 /// a peer that authenticates and then stalls mid-exchange (it would
 /// otherwise pin the session task indefinitely). Generous for the few Tor
@@ -1092,14 +1097,23 @@ async fn run_accept_mode(tor: &TorRuntime, state: Arc<DaemonState>) -> anyhow::R
 
     info!("onyxd running in accept mode. Ctrl-C to stop.");
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_SESSIONS));
     let accept_loop = async {
         while let Some(stream) = accept.next().await {
+            // Bound concurrent inbound sessions: anyone who knows the onion
+            // could otherwise open streams without limit, each holding a
+            // task (and up to 30s of handshake wait). Excess is dropped.
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                debug!("inbound: at the concurrent-session cap; dropping stream");
+                continue;
+            };
             let state = state.clone();
             // D-3: don't put our own fingerprint on the span — it would
             // propagate to every child log line in the default log.
             let span = info_span!("inbound");
             tokio::spawn(
                 async move {
+                    let _permit = permit;
                     if let Err(e) = handle_inbound(stream, state).await {
                         warn!(error = %e, "inbound handler failed");
                     }
@@ -1128,7 +1142,7 @@ async fn handle_inbound<S>(mut stream: S, state: Arc<DaemonState>) -> anyhow::Re
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    info!("accepted inbound stream; starting Noise XK handshake (responder)");
+    tracing::debug!("accepted inbound stream; starting Noise XK handshake (responder)");
     // SEC-A1: bound the handshake. A slowloris peer that opens a stream
     // and never finishes the Noise XK would otherwise pin this accept
     // task + session slot forever; the timeout drops it instead.
@@ -1187,7 +1201,7 @@ where
         let party = state.mls_party.lock().await;
         // D-3: never log the peer's greeting — it carries their
         // fingerprint and is otherwise peer-controlled text.
-        info!(
+        tracing::debug!(
             peer_message_bytes = outcome.peer_message.len(),
             mls_epoch = outcome.group.epoch(),
             was_bootstrap = outcome.was_bootstrap,
@@ -1241,10 +1255,7 @@ async fn run_tcp_listen_mode(
     info!(local_addr = %local_addr, "TCP listener bound; accepting connections");
 
     let identity_pub_b32 = encode_b32(&state.identity.identity_key().public().to_bytes());
-    info!(
-        identity_pub_b32 = %identity_pub_b32,
-        "share `--dial-tcp {local_addr} --dial-pubkey {identity_pub_b32}` with a peer to chat"
-    );
+    info!("share `--dial-tcp {local_addr} --dial-pubkey {identity_pub_b32}` with a peer to chat");
 
     let api_task = tokio::spawn(api_server::serve_api(
         api_socket_path,
@@ -1262,7 +1273,7 @@ async fn run_tcp_listen_mode(
                     continue;
                 }
             };
-            info!(peer = %peer_addr, "accepted TCP connection");
+            info!("accepted TCP connection");
             let st = accept_state.clone();
             let span = info_span!("inbound-tcp", peer = %peer_addr);
             tokio::spawn(
@@ -1523,7 +1534,6 @@ async fn supervise_dial(tor: Arc<TorRuntime>, state: Arc<DaemonState>, peer_pub:
         // so we don't keep dialing a possibly-impersonated peer.
         if pin_compromised_for_peer(&state, &peer_pub).await {
             warn!(
-                peer = %peer_short,
                 "supervise_dial: peer identity key is flagged CHANGED (possible MITM) — \
                  stopping auto-reconnect. Re-verify out of band, then re-add the contact."
             );
@@ -1717,7 +1727,7 @@ where
         .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
         let party = state.mls_party.lock().await;
         // D-3: never log the peer's greeting (fingerprint + peer text).
-        info!(
+        tracing::debug!(
             peer_reply_bytes = outcome.peer_message.len(),
             mls_epoch = outcome.group.epoch(),
             was_bootstrap = outcome.was_bootstrap,
@@ -1748,7 +1758,9 @@ async fn persist_mls_snapshot(state: &DaemonState, snapshot: &[u8]) -> anyhow::R
     vault
         .save_mls_state(state.identity_id, snapshot)
         .map_err(|e| anyhow::anyhow!("MLS state save failed: {e}"))?;
-    info!(state_bytes = snapshot.len(), "MLS state persisted to vault");
+    // debug, not info: this now runs per message, and a per-message
+    // line in the default log is a timing record of the conversation.
+    debug!(state_bytes = snapshot.len(), "MLS state persisted to vault");
     Ok(())
 }
 
@@ -1781,7 +1793,6 @@ async fn pin_check_peer(state: &DaemonState, fingerprint: &str, x25519: &[u8; 32
         Ok(onyx_core::storage::PinOutcome::Match) => {}
         Ok(onyx_core::storage::PinOutcome::Mismatch { .. }) => {
             warn!(
-                fingerprint = %fingerprint,
                 "contact: peer identity key CHANGED from the pinned first-contact key — \
                  possible key rotation OR man-in-the-middle. Re-verify the fingerprint out \
                  of band before trusting this conversation (`onyx contact list` flags it)."
@@ -1867,7 +1878,7 @@ async fn record_peer_group(
     vault
         .record_peer_group(state.identity_id, peer_x25519, group_id)
         .map_err(|e| anyhow::anyhow!("peer-group record failed: {e}"))?;
-    info!(
+    tracing::debug!(
         group_id_bytes = group_id.len(),
         "recorded peer→group mapping for future resume"
     );
@@ -1943,7 +1954,7 @@ where
         pair
     };
     let short_id = handle.short_id.clone();
-    info!(peer = %short_id, "conversation registered with registry");
+    tracing::debug!("conversation registered with registry");
 
     // v0.1.17 (send-queue): flush any messages queued while this peer was
     // disconnected (reconnect window). FIFO order, and BEFORE the select
@@ -1963,7 +1974,6 @@ where
             };
             if compromised {
                 warn!(
-                    peer = %short_id,
                     dropped = pending.len(),
                     "send-queue: peer key is flagged CHANGED — dropping queued messages \
                      rather than delivering to a possibly-impersonated peer"
@@ -1972,11 +1982,14 @@ where
                 let n = pending.len();
                 for item in pending {
                     if handle.outbound_tx.try_send(item).is_err() {
-                        warn!(peer = %short_id, "send-queue: flush dropped a message (mailbox full)");
+                        warn!("send-queue: flush dropped a message (mailbox full)");
                         break;
                     }
                 }
-                info!(peer = %short_id, flushed = n, "send-queue: flushed queued messages on reconnect");
+                tracing::debug!(
+                    flushed = n,
+                    "send-queue: flushed queued messages on reconnect"
+                );
             }
         }
     }
@@ -2039,7 +2052,7 @@ where
         let mut reg = state.conversations.lock().await;
         reg.mark_disconnected(&peer_pub);
     }
-    info!(peer = %short_id, "conversation marked disconnected");
+    tracing::debug!("conversation marked disconnected");
 
     persist_final_state(&state).await?;
 
@@ -2198,6 +2211,10 @@ where
                                     .decrypt_application(&party, &frame.payload)
                                     .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?
                             };
+                            // The receive ratchet just advanced — make it
+                            // durable now, not only when the session ends
+                            // (a crash would otherwise roll it back).
+                            persist_final_state(state).await?;
                             // Task 322: the DM channel now carries the
                             // `RoomAppMessage` tagged envelope (Text /
                             // FileMeta / FileChunk), not raw UTF-8. Derive
@@ -2234,7 +2251,7 @@ where
                         }
                     }
                     Err(e) => {
-                        info!(error = %e, "peer side closed; ending session");
+                        tracing::debug!(error = %e, "peer side closed; ending session");
                         return Ok(());
                     }
                 }
@@ -2247,6 +2264,8 @@ where
                     debug!("outbound channel closed; ending session");
                     return Ok(());
                 };
+                let persist_before_send =
+                    !matches!(outbound, conversations::PeerOutbound::RoomFrame(_));
                 let (frame_payload, log_kind) = match outbound {
                     conversations::PeerOutbound::Dm(text) => {
                         // Task 322: DM text now rides the RoomAppMessage
@@ -2296,6 +2315,14 @@ where
                         (ct, "room ciphertext")
                     }
                 };
+                // Persist the advanced send ratchet BEFORE the ciphertext
+                // leaves: a crash after sending but before saving would
+                // rewind the ratchet and reuse a generation (and its key)
+                // on the next send. Room frames arrive pre-encrypted and
+                // were persisted by their sender path.
+                if persist_before_send {
+                    persist_final_state(state).await?;
+                }
                 write_frame(
                     stream,
                     session,
@@ -2405,7 +2432,6 @@ async fn handle_dm_app_frame(
     // resolution needs identity-key pinning (T-1).
     let sender_fp = peer_fp.unwrap_or_else(|| {
         warn!(
-            peer_short = %short_id_of_peer_pub(peer_pub),
             "dm: no authenticated Ed25519 fingerprint for this peer; attributing the \
              message under a non-identity (peer/<x25519>) placeholder — sender identity \
              is NOT verified"
@@ -2504,7 +2530,7 @@ async fn handle_dm_app_frame(
             )
             .await
             {
-                info!(path = %path.display(), "dm file received + persisted");
+                tracing::debug!("dm file received + persisted");
                 // v0.1.32 (FIX): surface received files in the conversation —
                 // they used to land on disk silently with NO chat line, so
                 // the user thought "the file didn't arrive". Show + persist a
@@ -2623,7 +2649,6 @@ async fn handle_room_app_frame(
             // do NOT stash for retry (retrying re-rejects). Our group state
             // did not advance, so we ignore the unauthorized change.
             warn!(
-                group_id_b32 = %encode_b32(group_id),
                 "G-2: rejected an unauthorized room membership commit (committer is not a \
                  room admin); ignoring it"
             );
@@ -2655,7 +2680,7 @@ async fn handle_room_app_frame(
     let plaintext = match incoming {
         onyx_core::mls::IncomingRoomMessage::Application(pt) => pt,
         onyx_core::mls::IncomingRoomMessage::Commit => {
-            refresh_room_roster_after_commit(group_id, sender_peer_pub, epoch, state).await;
+            refresh_room_roster_after_commit(group_id, epoch, state).await;
             // T6.3.i: a commit just advanced our epoch — drain the
             // per-group pending-frame buffer and retry each frame.
             // The ones that were waiting for this epoch now succeed.
@@ -2698,9 +2723,7 @@ async fn handle_room_app_frame(
             );
         }
         onyx_core::room::RoomAppMessage::Text { text, .. } => {
-            info!(
-                group_id_b32 = %encode_b32(group_id),
-                from_peer_short = %short_id_of_peer_pub(sender_peer_pub),
+            tracing::debug!(
                 mls_epoch = epoch,
                 text_bytes = text.len(),
                 "room: incoming text message"
@@ -2758,21 +2781,17 @@ async fn handle_room_app_frame(
                     &sender_fp,
                     kem_pub.as_ref(),
                 ) {
-                    Ok(()) => info!(
-                        group_id_b32 = %encode_b32(group_id),
-                        member_fp = %sender_fp,
+                    Ok(()) => tracing::debug!(
                         kem_bytes = kem_pub.len(),
                         "room: KEM advertisement persisted"
                     ),
                     Err(e) => warn!(
                         error = %e,
-                        member_fp = %sender_fp,
                         "room: KEM advertisement save failed"
                     ),
                 }
             } else {
                 warn!(
-                    claimed_fp = %fingerprint,
                     authenticated_fp = %sender_fp,
                     "room: KEM advertisement body fingerprint != MLS-credential sender; \
                      dropping as a poisoning attempt"
@@ -2835,7 +2854,7 @@ async fn handle_room_app_frame(
             )
             .await
             {
-                info!(path = %path.display(), "file received + persisted");
+                tracing::debug!("file received + persisted");
                 // v0.1.32 (FIX): surface the received room file in scrollback
                 // (was disk-only + silent). Mirrors the room text path.
                 let fname = path
@@ -2980,8 +2999,14 @@ async fn supervise_hub_session(
         let on_deliver = move |target, body| {
             let tx = tx.clone();
             async move {
-                if let Err(e) = tx.try_send((target, body)) {
-                    debug!(error = %e, "hub: inbound-delivery queue full/closed; shedding envelope");
+                // Backpressure, not shedding. A hub hands a live delivery
+                // over exactly once, so dropping it here loses the message
+                // for good (the old "the hub retains it" assumption was
+                // false). When the worker is backed up we stop reading
+                // this session; the hub's per-connection mailbox fills and
+                // it queues the rest for our next subscribe.
+                if tx.send((target, body)).await.is_err() {
+                    debug!("hub: inbound-delivery worker gone; dropping envelope");
                 }
             }
         };
@@ -3404,7 +3429,6 @@ pub(crate) async fn announce_room_subscribe(group_id: &[u8], state: &DaemonState
         }
     }) else {
         warn!(
-            group_id_b32 = %encode_b32(group_id),
             "session-tokens: cannot derive token for incremental SUBSCRIBE; deferring to next reconnect"
         );
         return;
@@ -3449,17 +3473,11 @@ async fn current_room_session_tokens(
     let party = state.mls_party.lock().await;
     for row in &rows {
         let Ok(Some(group)) = party.load_group(&row.group_id) else {
-            warn!(
-                group_id_b32 = %encode_b32(&row.group_id),
-                "session-tokens: load_group failed; skipping"
-            );
+            warn!("session-tokens: load_group failed; skipping");
             continue;
         };
         let Ok(secret) = group.export_routing_secret(&party) else {
-            warn!(
-                group_id_b32 = %encode_b32(&row.group_id),
-                "session-tokens: export_routing_secret failed; skipping"
-            );
+            warn!("session-tokens: export_routing_secret failed; skipping");
             continue;
         };
         tokens.push(onyx_core::routing::session_token(&secret, 0));
@@ -3493,12 +3511,7 @@ async fn current_room_session_tokens(
 /// subsequent local `list_rooms` / `send_room` queries see the
 /// new roster. Pure side-effect helper; failures warn but never
 /// propagate.
-async fn refresh_room_roster_after_commit(
-    group_id: &[u8],
-    sender_peer_pub: &[u8; 32],
-    epoch: u64,
-    state: &Arc<DaemonState>,
-) {
+async fn refresh_room_roster_after_commit(group_id: &[u8], epoch: u64, state: &Arc<DaemonState>) {
     let new_members_b32 = {
         let party = state.mls_party.lock().await;
         match party.load_group(group_id) {
@@ -3521,9 +3534,7 @@ async fn refresh_room_roster_after_commit(
             warn!(error = %e, "room frame: roster refresh failed");
         }
     }
-    info!(
-        group_id_b32 = %encode_b32(group_id),
-        from_peer_short = %short_id_of_peer_pub(sender_peer_pub),
+    tracing::debug!(
         mls_epoch = epoch,
         "room: commit merged; group epoch advanced"
     );
@@ -3632,8 +3643,7 @@ async fn handle_hub_delivery(
             let mut reg = state.conversations.lock().await;
             let handle = reg.register_hub_only(sender_x25519, &sender_pub_b32, sender_fingerprint);
             reg.push_message_via_hub(&handle.peer_pub, MessageDirection::Incoming, text.clone());
-            info!(
-                from_short = %handle.short_id,
+            tracing::debug!(
                 text_bytes = text.len(),
                 "hub: msg/v1 delivered into registry"
             );
@@ -3789,11 +3799,11 @@ async fn handle_hub_dm_app_frame(
 
 fn open_or_create_vault(path: &std::path::Path, passphrase: &[u8]) -> anyhow::Result<Vault> {
     if path.exists() {
-        info!(path = %path.display(), "opening existing vault");
+        info!("opening existing vault");
         Vault::open(path, passphrase)
             .map_err(|e| anyhow::anyhow!("vault open failed (wrong passphrase?): {e}"))
     } else {
-        info!(path = %path.display(), "creating new vault");
+        info!("creating new vault");
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -3887,7 +3897,6 @@ async fn process_hub_mls_welcome(
     });
     if !signer_in_roster {
         warn!(
-            sender_fp = %sender_fingerprint,
             "hub: mls/v1 Welcome signer is not a member of the group it invited us to; \
              dropping (possible unsolicited group-add)"
         );
@@ -3934,12 +3943,11 @@ async fn process_hub_mls_welcome(
                 ) {
                     warn!(
                         error = %e,
-                        member = %entry.fingerprint,
                         "hub: mls/v1 Welcome: save_room_member_kem failed"
                     );
                 }
             }
-            info!(
+            tracing::debug!(
                 count = member_kems.len(),
                 "hub: mls/v1 Welcome carried roster KEMs; persisted"
             );
@@ -3975,10 +3983,8 @@ async fn process_hub_mls_welcome(
             handle.short_id
         ),
     );
-    info!(
-        from_short = %handle.short_id,
+    tracing::debug!(
         mls_epoch = group.epoch(),
-        group_id_b32 = %group_id_b32,
         has_first_message,
         "hub: mls/v1 Welcome processed, MLS group joined"
     );
