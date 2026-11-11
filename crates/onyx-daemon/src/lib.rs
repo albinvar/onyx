@@ -2151,6 +2151,7 @@ where
         }
     }
 
+    let mut unacked = UnackedDms::default();
     let session_result = drive_peer_session(
         &mut stream,
         &mut session,
@@ -2158,12 +2159,20 @@ where
         &peer_pub,
         &state,
         &mut outbound_rx,
+        &mut unacked,
     )
     .await;
 
     {
         let mut reg = state.conversations.lock().await;
         reg.mark_disconnected(&peer_pub);
+        // Anything this session wrote but the peer never acknowledged may
+        // have gone into a circuit that was already dead (a write to a
+        // dying Tor stream succeeds locally). Queue it for the next
+        // session instead of losing it silently.
+        for item in unacked.into_retries() {
+            reg.enqueue_pending(&peer_pub, item);
+        }
     }
     tracing::debug!("conversation marked disconnected");
 
@@ -2221,6 +2230,54 @@ async fn derive_peer_fingerprint(
     vk.fingerprint().to_base32_grouped()
 }
 
+/// DM texts written to the current session that the peer has not yet
+/// acknowledged.
+///
+/// A write into a Tor stream succeeds locally even when the circuit is
+/// already dead, and the session only notices after its read deadline —
+/// so for up to a minute after a peer vanishes, sends were accepted and
+/// then lost without a trace. Tracking unacknowledged texts and
+/// re-sending them on the next session closes that window.
+#[derive(Debug, Default)]
+struct UnackedDms {
+    items: std::collections::VecDeque<(std::time::Instant, [u8; 16], String)>,
+    /// The peer has acknowledged at least one message this session, i.e.
+    /// it speaks delivery receipts.
+    peer_acks: bool,
+}
+
+impl UnackedDms {
+    /// Upper bound on tracked messages (oldest dropped beyond it).
+    const MAX: usize = 64;
+    /// For a peer that has NOT shown it sends receipts (an older build),
+    /// only messages this recent are retried — it cannot de-duplicate,
+    /// so re-sending its whole backlog would show duplicates.
+    const RECENT: std::time::Duration = std::time::Duration::from_secs(90);
+
+    fn sent(&mut self, msg_id: [u8; 16], text: String) {
+        if self.items.len() >= Self::MAX {
+            self.items.pop_front();
+        }
+        self.items
+            .push_back((std::time::Instant::now(), msg_id, text));
+    }
+
+    fn acknowledge(&mut self, msg_id: [u8; 16]) {
+        self.peer_acks = true;
+        self.items.retain(|(_, id, _)| *id != msg_id);
+    }
+
+    /// The messages to re-send on the next session, oldest first.
+    fn into_retries(self) -> Vec<conversations::PeerOutbound> {
+        let peer_acks = self.peer_acks;
+        self.items
+            .into_iter()
+            .filter(|(sent_at, _, _)| peer_acks || sent_at.elapsed() < Self::RECENT)
+            .map(|(_, msg_id, text)| conversations::PeerOutbound::DmRetry { msg_id, text })
+            .collect()
+    }
+}
+
 // One linear select!-loop driving a peer's DM session (inbound
 // decrypt+dispatch, outbound encrypt+send). Over the 100-line budget
 // but cohesive — same rationale as the room/render handlers.
@@ -2232,6 +2289,7 @@ async fn drive_peer_session<S>(
     peer_pub: &[u8; 32],
     state: &Arc<DaemonState>,
     outbound_rx: &mut mpsc::Receiver<conversations::PeerOutbound>,
+    unacked: &mut UnackedDms,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -2350,7 +2408,11 @@ where
                                         onyx_core::crypto::Fingerprint::from_bytes(a).to_string()
                                     })
                             };
-                            handle_dm_app_frame(&plaintext, peer_pub, peer_fp, state).await;
+                            if let Some(acked) =
+                                handle_dm_app_frame(&plaintext, peer_pub, peer_fp, state).await
+                            {
+                                unacked.acknowledge(acked);
+                            }
                         } else {
                             // Room-tier (T6.3.d): load the matching room
                             // group, decrypt against it, emit a room-
@@ -2384,29 +2446,37 @@ where
                 let persist_before_send =
                     !matches!(outbound, conversations::PeerOutbound::RoomFrame(_));
                 let (frame_payload, log_kind) = match outbound {
-                    conversations::PeerOutbound::Dm(text) => {
-                        // Task 322: DM text now rides the RoomAppMessage
-                        // tagged envelope (so files can share the channel).
-                        // DELIVERY phase 2b: mint a random per-message id and
-                        // embed it in the sealed envelope so the recipient can
-                        // ack delivery (RoomAppMessage::DeliveryReceipt). Only
-                        // the direct-DM path mints today; hub-relayed/queued
-                        // sends stay id-less until phases 3–4 wire the
-                        // pending-store. The id is NOT the routing-id; hubs
-                        // never see inside the MLS envelope.
-                        let msg_id: [u8; 16] = onyx_core::crypto::random_array();
+                    outbound @ (conversations::PeerOutbound::Dm(_)
+                    | conversations::PeerOutbound::DmRetry { .. }) => {
+                        // DM text rides the RoomAppMessage tagged envelope.
+                        // Every text carries a random id the recipient
+                        // acknowledges (`DeliveryReceipt`); until that
+                        // arrives the message stays on the unacknowledged
+                        // list, and whatever is still there when this
+                        // session ends is re-sent on the next one. A retry
+                        // keeps its original id so the recipient shows it
+                        // once. The id is not a routing id; a hub never
+                        // sees inside the MLS envelope.
+                        let (msg_id, text) = match outbound {
+                            conversations::PeerOutbound::DmRetry { msg_id, text } => (msg_id, text),
+                            conversations::PeerOutbound::Dm(text) => {
+                                (onyx_core::crypto::random_array(), text)
+                            }
+                            _ => unreachable!("arm matches only Dm / DmRetry"),
+                        };
                         let cbor = onyx_core::room::RoomAppMessage::Text {
-                            text,
+                            text: text.clone(),
                             msg_id: Some(serde_bytes::ByteBuf::from(msg_id.to_vec())),
                         }
                         .to_cbor()
-                            .map_err(|e| anyhow::anyhow!("dm text encode failed: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("dm text encode failed: {e}"))?;
                         let ct = {
                             let party = state.mls_party.lock().await;
                             group
                                 .encrypt_application(&party, &cbor)
                                 .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
                         };
+                        unacked.sent(msg_id, text);
                         (ct, "dm text")
                     }
                     conversations::PeerOutbound::DmFrame(msg) => {
@@ -2531,13 +2601,13 @@ async fn handle_dm_app_frame(
     peer_pub: &[u8; 32],
     peer_fp: Option<String>,
     state: &Arc<DaemonState>,
-) {
+) -> Option<[u8; 16]> {
     let Ok(msg) = onyx_core::room::RoomAppMessage::from_cbor(plaintext) else {
         debug!(
             plaintext_bytes = plaintext.len(),
             "dm: decrypted but RoomAppMessage decode failed; dropping"
         );
-        return;
+        return None;
     };
     let conversation = format!("peer/{}", short_id_of_peer_pub(peer_pub));
     // T-3 / §8.2 #5: when we have no authenticated Ed25519 fingerprint
@@ -2557,14 +2627,30 @@ async fn handle_dm_app_frame(
     });
     match msg {
         onyx_core::room::RoomAppMessage::Text { text, msg_id } => {
-            // v0.1.30: persist (encrypted) so the chat survives a restart,
-            // then push to the in-memory ring for the live TUI.
-            persist_dm_message(state, peer_pub, false, &sender_fp, &text).await;
-            state.conversations.lock().await.push_message(
-                peer_pub,
-                MessageDirection::Incoming,
-                text,
-            );
+            // A message the sender retried (its first copy was never
+            // acknowledged) may be one we already have: surface each id
+            // once, but acknowledge every copy so the sender stops.
+            let id: Option<[u8; 16]> = msg_id
+                .as_ref()
+                .and_then(|id| <[u8; 16]>::try_from(id.as_ref()).ok());
+            let is_new = match id {
+                Some(id) => state
+                    .conversations
+                    .lock()
+                    .await
+                    .first_delivery(peer_pub, id),
+                None => true,
+            };
+            if is_new {
+                // v0.1.30: persist (encrypted) so the chat survives a
+                // restart, then push to the in-memory ring for the TUI.
+                persist_dm_message(state, peer_pub, false, &sender_fp, &text).await;
+                state.conversations.lock().await.push_message(
+                    peer_pub,
+                    MessageDirection::Incoming,
+                    text,
+                );
+            }
             // DELIVERY phase 2b: if the sender embedded a msg_id, ack
             // delivery so they can mark the message delivered (and, once
             // phases 3–4 land, stop retrying). The receipt rides the SAME
@@ -2592,15 +2678,10 @@ async fn handle_dm_app_frame(
             }
         }
         onyx_core::room::RoomAppMessage::DeliveryReceipt { msg_id } => {
-            // DELIVERY phase 2b: a receipt for one of OUR sent messages. The
-            // full consume — delete the matching `pending_outbound` row so
-            // the retry loop stops + surface "delivered ✓" in the TUI —
-            // lands in phases 3–4; for now we observe it so the end-to-end
-            // ack path is exercised and visible in the log.
-            debug!(
-                msg_id_b32 = %encode_b32(&msg_id),
-                "delivery receipt received (direct DM); consume: TODO pending-store"
-            );
+            // A receipt for one of OUR sent messages: hand the id back to
+            // the session loop, which drops it from its unacknowledged
+            // list (so it is not re-sent after a reconnect).
+            return <[u8; 16]>::try_from(msg_id.as_ref()).ok();
         }
         onyx_core::room::RoomAppMessage::FileMeta {
             id,
@@ -2688,6 +2769,7 @@ async fn handle_dm_app_frame(
             }
         }
     }
+    None
 }
 
 /// Decrypt an MLS app frame whose group_id is *not* this peer's DM
@@ -4695,5 +4777,36 @@ mod dm_fallback_receive_tests {
         let history = reg.history(&short, 10).expect("bob's conversation exists");
         let texts: Vec<&str> = history.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(texts, vec!["hi from bob", "bob again"]);
+    }
+
+    /// Unacknowledged DMs are re-sent with their original id; an
+    /// acknowledged one is not. A peer that never acknowledges (older
+    /// build) only gets recent messages retried.
+    #[test]
+    fn unacked_dms_retry_only_what_was_never_acknowledged() {
+        let mut unacked = UnackedDms::default();
+        unacked.sent([1; 16], "one".into());
+        unacked.sent([2; 16], "two".into());
+        unacked.acknowledge([1; 16]);
+        assert_eq!(
+            unacked.into_retries(),
+            vec![conversations::PeerOutbound::DmRetry {
+                msg_id: [2; 16],
+                text: "two".into()
+            }]
+        );
+
+        // No receipts seen and the message is old → not retried.
+        let mut silent_peer = UnackedDms::default();
+        silent_peer.sent([3; 16], "old".into());
+        silent_peer.items[0].0 -= UnackedDms::RECENT + std::time::Duration::from_secs(1);
+        assert!(silent_peer.into_retries().is_empty());
+
+        // Bounded.
+        let mut many = UnackedDms::default();
+        for n in 0..(UnackedDms::MAX + 10) {
+            many.sent([u8::try_from(n % 250).unwrap(); 16], format!("m{n}"));
+        }
+        assert_eq!(many.items.len(), UnackedDms::MAX);
     }
 }

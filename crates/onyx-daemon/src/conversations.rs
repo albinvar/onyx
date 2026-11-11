@@ -53,6 +53,11 @@ pub enum PeerOutbound {
     /// `RoomAppMessage::Text` and encrypts in this peer's DM group
     /// before sending.
     Dm(String),
+    /// A DM text being sent AGAIN after its first attempt was never
+    /// acknowledged (the session died first). Carries the original
+    /// message id so the recipient can recognise a duplicate if the first
+    /// copy did in fact arrive.
+    DmRetry { msg_id: [u8; 16], text: String },
     /// A DM application frame (task 322: file transfer). The
     /// peer-session task CBOR-encodes it and encrypts in this peer's
     /// DM group, exactly like `Dm`. The DM channel reuses the
@@ -68,6 +73,10 @@ pub enum PeerOutbound {
 /// How many of the most recent messages we keep in memory per peer
 /// for preview / scrollback rendering.
 pub const RING_CAPACITY: usize = 200;
+
+/// How many recent incoming DM message ids are remembered per peer for
+/// duplicate suppression.
+pub const SEEN_MSG_IDS: usize = 256;
 
 /// Most conversations that exist only because a hub delivered something
 /// from that sender. Each costs a registry row and a history ring, and a
@@ -121,6 +130,9 @@ struct ConversationState {
     /// created by any stranger able to reach one of our routing ids, so
     /// they are capped — see [`MAX_HUB_ONLY_PEERS`].
     hub_only: bool,
+    /// Ids of the most recent DM texts received from this peer, so a
+    /// retried message is surfaced once. Bounded at [`SEEN_MSG_IDS`].
+    seen_msg_ids: VecDeque<[u8; 16]>,
 }
 
 /// One line in a conversation's ring buffer. Mirrors the
@@ -230,9 +242,21 @@ impl ConversationRegistry {
         // The recent-message ring is carried over too: re-registering on
         // every reconnect used to start an empty ring, so `History` lost
         // the conversation each time the circuit dropped.
-        let (pending, ring) = self.by_peer.get_mut(&peer_pub).map_or_else(
-            || (VecDeque::new(), VecDeque::with_capacity(RING_CAPACITY)),
-            |s| (std::mem::take(&mut s.pending), std::mem::take(&mut s.ring)),
+        let (pending, ring, seen_msg_ids) = self.by_peer.get_mut(&peer_pub).map_or_else(
+            || {
+                (
+                    VecDeque::new(),
+                    VecDeque::with_capacity(RING_CAPACITY),
+                    VecDeque::new(),
+                )
+            },
+            |s| {
+                (
+                    std::mem::take(&mut s.pending),
+                    std::mem::take(&mut s.ring),
+                    std::mem::take(&mut s.seen_msg_ids),
+                )
+            },
         );
         let state = ConversationState {
             handle: handle.clone(),
@@ -242,6 +266,7 @@ impl ConversationRegistry {
             pending,
             // A direct session exists: no longer a hub-only row.
             hub_only: false,
+            seen_msg_ids,
         };
         self.by_peer.insert(peer_pub, state);
 
@@ -359,6 +384,7 @@ impl ConversationRegistry {
             last_active_unix_ms: now_unix_ms(),
             pending: VecDeque::new(),
             hub_only: true,
+            seen_msg_ids: VecDeque::new(),
         };
         self.by_peer.insert(peer_pub, state);
 
@@ -398,6 +424,24 @@ impl ConversationRegistry {
                 });
             }
         }
+    }
+
+    /// Record an incoming DM message id. Returns `true` the first time an
+    /// id is seen for this peer and `false` for a repeat (a retry of a
+    /// message that had already arrived), so the caller surfaces each
+    /// message exactly once.
+    pub fn first_delivery(&mut self, peer_pub: &[u8; 32], msg_id: [u8; 16]) -> bool {
+        let Some(state) = self.by_peer.get_mut(peer_pub) else {
+            return true;
+        };
+        if state.seen_msg_ids.contains(&msg_id) {
+            return false;
+        }
+        if state.seen_msg_ids.len() >= SEEN_MSG_IDS {
+            state.seen_msg_ids.pop_front();
+        }
+        state.seen_msg_ids.push_back(msg_id);
+        true
     }
 
     /// Mark a conversation as disconnected (peer closed the stream
@@ -1144,5 +1188,24 @@ mod tests {
         let history = reg.history(&handle.short_id, 10).expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].text, "before");
+    }
+
+    /// A retried message id is reported as a repeat, and the memory of
+    /// seen ids survives a reconnect.
+    #[tokio::test]
+    async fn first_delivery_detects_retries_across_reconnects() {
+        let mut reg = ConversationRegistry::new();
+        let peer = [0x43u8; 32];
+        let pk = base32::encode(base32::Alphabet::Rfc4648Lower { padding: false }, &peer);
+        let _rx = reg.register(peer, &pk, "fp".into());
+        assert!(reg.first_delivery(&peer, [7; 16]));
+        assert!(!reg.first_delivery(&peer, [7; 16]));
+        reg.mark_disconnected(&peer);
+        let _rx = reg.register(peer, &pk, "fp".into());
+        assert!(
+            !reg.first_delivery(&peer, [7; 16]),
+            "remembered across reconnect"
+        );
+        assert!(reg.first_delivery(&peer, [8; 16]));
     }
 }
