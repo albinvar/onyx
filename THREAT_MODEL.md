@@ -319,6 +319,57 @@ A deeper architectural/protocol pass following §8.4. **Still not the formal thi
 
 **Bottom line (unchanged honesty):** the confidentiality core held across two review passes; the open items above are real anonymity/trust/federation hardening, several requiring protocol-level work. None are claimed fixed until they are. The formal external audit (§8.2 #7) is still the headline gap.
 
+### 8.6 Security review — 2026-11-11, full-codebase pass (manual + agent)
+
+A read of the whole workspace, then remediation. **Not the external audit (§8.2 #7), which stays open.** Unlike §8.3–§8.5, this pass found problems in the confidentiality and attribution paths themselves, not only in configuration and DoS — so the earlier "the confidentiality core held" summaries should be read as "held against what those passes looked at". Every row below was confirmed by reading the code path; rows marked *tested* have a regression test, and the transport row was additionally demonstrated by running the test against the old code.
+
+**Fixed in this pass**
+
+| ID | Sev | Finding | Resolution |
+|----|-----|---------|------------|
+| L-1 | HIGH | Outgoing DM plaintext, peer fingerprints (in the logged MLS greeting), room names and group ids written to the plaintext on-disk log at info | Content is never logged; identifiers removed from all info/warn/error lines in the daemon; per-message lines are debug. |
+| C-1 | HIGH | Remote daemon kill: peer-list preview truncated at a byte offset, panicking inside a multi-byte character (`panic = "abort"`) | Character-boundary truncation. *Tested.* |
+| V-1 | HIGH | `onyx vault rekey` left message history and room metadata under an underivable key | `SEALED_COLUMNS` drives the re-seal. *Tested.* |
+| I-1 | HIGH | MLS sender/committer identity read from the self-asserted credential identity field → room impersonation and admin-gate bypass | Attribution by leaf signature key; identity≠key leaves refused at KeyPackage validation, Welcome join, proposals and update paths. *Tested.* |
+| I-2 | HIGH | Sealed-envelope sender X25519 is self-asserted and conversations are keyed on it → injection into an existing contact's conversation | `admit_hub_sender`: refuse when the key is pinned/live under another fingerprint, or the fingerprint's key changed; fail closed. *Tested end to end.* |
+| I-3 | HIGH | Stranger's Welcome → persistent auto-dial to an attacker-chosen host (presence beacon; clearnet via exit) | v3-onion-only dial targets; remote-supplied targets unconfirmed, not persisted, never overwrite, dropped after 6 failures; one supervisor per peer. |
+| I-4 | HIGH | `mls_party` lock held across untimed network reads → a silent authenticated peer froze the daemon | Per-operation locking + 60s exchange bound. |
+| H-4 | HIGH | Hub: KeyPackage-directory flood evicted a victim's entry, making their intro inbox subscribable/drainable; early non-owner subscribers survived the owner's publish | Ownership from a separate persisted `known_inbox` set; publish drops non-owner subscribers. *Tested.* |
+| H-5 | HIGH | Hub: "fair eviction" inverted by a one-envelope-per-id spray to delete real users' queued mail | Own-queue-only eviction; new ids refused at the cap. *Tested.* |
+| H-6 | HIGH | Hub: SUBSCRIBE unmetered (memory exhaustion, full-map scan per disconnect); no idle timeout (2048 silent connections = offline) | Rate-limited + hub-wide cap + reverse index; 15-minute idle bound with client keepalive. *Tested (index).* |
+| T-4 | HIGH | Session frames read with a non-cancellation-safe `read_exact` inside `select!` → stream desync under concurrent activity | `transport::FrameReader`. *Tested; old path shown to fail.* |
+| R-1 | HIGH | Installer accepted a signature from any workflow/ref in the repo, treated a missing checksum as a warning, and the one-liner ran an unverified script | Exact `release.yml@refs/tags/<tag>` identity; mandatory signed manifest; downgrade refusal; verify-then-run documented as the recommended path. |
+| R-2 | MED | Signing + write permissions granted to build jobs; tag-pinned actions; signed builds restored a shared cache; floating toolchain | Permissions scoped to the signing job; actions pinned by commit; no cache; exact toolchain. *Not verified against a live workflow run.* |
+| G-3 | MED | Admin gate covered only add/remove; `PublicMessage` (external commits/proposals) accepted | `PublicMessage` refused; gate covers every proposal kind except Update. |
+| G-4 | MED | Responder RESUME not bound to the Noise peer (group-membership oracle; room group resumed as a DM) | Only the recorded DM group for that static key; unknown and mismatched fail identically. *Tested.* |
+| P-4 | MED | Key-change send block bypassed by fingerprint spelling; no gate on room invite; invite gate failed open | Canonical lookup, gate added, fail closed. *Tested.* |
+| P-5 | MED | Replay guard hashed a hub-written prefix and recorded before verifying | Body-only hash; verify-then-record. *Tested.* |
+| M-2 | MED | Relay saw (and stored) exact message lengths | Sealed envelopes padded to a frame bucket. *Tested.* |
+| V-2 | MED | No single-writer guarantee on the vault; rekey beside a running daemon destroyed MLS state | `VaultLock`. |
+| A-10 | MED | Inbound deliveries shed under load (permanent loss); KeyPackage fetch could hold its lock forever; no inbound-session cap; FileMeta re-send bypassed the receive budget; ratchet state persisted only at session end | Backpressure; 45s bound; cap 128; duplicate metas ignored; persisted per message. |
+| U-1 | MED | Room messages rendered with no sender | Per-line authenticated sender. *Tested.* |
+| S-1 | LOW | Lax Ed25519 verification | `verify_strict`. *Tested.* |
+| F-1 | LOW | Log/config/received files created with default permissions | 0600/0700 from creation. |
+
+**Verified not exploitable:** a Welcome reusing an existing group id — openmls 0.8.1 returns `GroupAlreadyExists` (read in the vendored source).
+
+**Residuals — real, not fixed (honest accounting)**
+
+| ID | Sev | Finding | Why still open |
+|----|-----|---------|----------------|
+| E-1 | HIGH (anon) | **No recipient-side forward secrecy for sealed envelopes.** They are sealed to a static hybrid KEM key that never rotates. A hub that records traffic plus a later vault compromise reveals the sender of every recorded envelope, and the content of plain first-contact messages and Welcome intro text. | Needs KEM-key rotation with a published/advertised schedule and a grace window — protocol work. The `routing.rs` "PFS: yes" table means sender-side only. |
+| O-1 | HIGH (anon) | **One permanent onion address for all contacts.** Any current or former contact (or anyone given the address) can probe whether the service is up, and target it for guard discovery. No per-contact address, client authorization, or rotation. | Needs per-contact onion services or Tor client authorization (restricted discovery) and a migration story. |
+| W-1 | MED | **Unsolicited Welcomes are still auto-joined** in reachable mode: a stranger can create rooms under names they choose. The auto-dial is now bounded, the join is not gated. | Needs a pending-invite queue and a UI to accept/decline. |
+| K-1 | MED | **A stale KeyPackage can be re-published by anyone** (latest-wins; no proof the publisher holds the key, no freshness check) → first-contact DoS. | Needs a signed, handshake-bound KP_PUBLISH — a wire change old clients cannot produce. |
+| H-7 | MED | **Session-token subscriptions remain unauthenticated** (§8.3 residual #1), with concrete consequences: a sole malicious subscriber consumes mail without it being queued; peer hubs learn token ids via gossip. | Binding tokens to a group-derived capability is protocol work. |
+| H-8 | MED | Hub delivery is at-most-once with delete-before-send; gossip has no dedup (storage amplification in a mesh); SQLite writes run under the global lock; in-memory queue GC is missing. | Each is a contained change; not reached in this pass. |
+| V-3 | MED | Vault: contact graph, onions, room membership, file manifest and timestamps are plaintext; pins/verified/admin sets are unauthenticated; sealed blobs have no AAD. | Whole-database encryption (#389). |
+| M-3 | LOW (anon) | One activity session subscribes to all of a user's room and DM tokens (linkable as one user); a DM that never commits keeps the same token forever. | Needs per-token circuits and intra-epoch token rotation. |
+| D-5 | LOW | Clearnet test modes ship in release binaries and can be enabled by environment variable (guarded by `--allow-clearnet`). | Should be feature-gated out of release builds. |
+| X-1 | LOW | Passphrase accepted on argv and not zeroized end to end; received files get no quarantine attribute and dangerous-type detection is magic-byte only. | Not reached. |
+
+**Bottom line:** several of the fixed rows were exploitable by an ordinary peer or by a relay operator with no special position, and had survived three earlier internal passes. That is the strongest available evidence for the standing disclaimer: internal review finds what it looks for. The external audit remains the single most important open item, and E-1 and O-1 are the two architectural gaps between the current design and the "no party can map who talks to whom or when" goal.
+
 ---
 
 *See `DESIGN.md` for the full system specification and `SECURITY.md` for the enforcement principles and disclosure policy.*

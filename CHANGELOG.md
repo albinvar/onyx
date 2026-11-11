@@ -6,6 +6,118 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Security — 2026-11-11 — full-codebase audit + remediation (internal)
+
+A read-through of the whole workspace (crypto core, daemon, hub, CLI/TUI,
+release chain) followed by fixes, one finding-group per commit. **Internal
+review, not the external audit** — that is still the headline open item
+(THREAT_MODEL §8.2 #7). Findings and residuals are tabulated in
+THREAT_MODEL §8.6; this entry records what changed and why.
+
+**Would have hurt a real user today**
+
+- **Outgoing DM plaintext was written to `~/.onyx/onyx.log`** at info level,
+  along with peers' fingerprints (inside the logged MLS greeting), room
+  names, group ids and peer key prefixes. Message content is no longer
+  logged anywhere; identifiers are gone from every info/warn/error line in
+  the daemon; per-message lines are debug (the log no longer records
+  who/which room/when).
+- **Any peer could crash the daemon with one message.** The peer-list
+  preview used `String::truncate(64)`, which panics inside a multi-byte
+  character; release builds abort on panic. A user's own long non-Latin
+  message crashed their own daemon.
+- **`onyx vault rekey` destroyed message history and room names.** It
+  re-sealed three tables and overwrote the salt, leaving the later-added
+  sealed columns under an underivable key. A single `SEALED_COLUMNS` list
+  now drives the re-seal.
+- **Sessions desynced under load.** Frames were read with `read_exact`
+  inside `select!` (not cancellation-safe): a keepalive tick or outbound
+  send landing mid-frame lost the partial bytes and killed the session.
+  New `transport::FrameReader`, used by all three session loops. Proven by
+  a test that fails on the old path and passes on the new one. A likely
+  cause of dropped sessions and failed file transfers.
+
+**Identity binding (one root cause, five findings)**
+
+- MLS sender/committer identity came from the credential's *identity
+  field*, which nothing tied to the signature key: a room member could sign
+  as themselves while claiming an admin's fingerprint (impersonation +
+  admin-gate bypass). Attribution now reads the leaf signature key, and a
+  leaf whose identity differs from its key is refused at every entry point.
+- `PublicMessage` framing is refused (closes external commits/proposals);
+  the admin gate covers every proposal kind except Update.
+- A sealed hub envelope proves the sender's fingerprint but its X25519 key
+  is self-asserted, and conversations are keyed on that key — a stranger
+  could inject text into an existing contact's conversation. New
+  bidirectional pin check (`admit_hub_sender`).
+- A stranger's Welcome made the daemon dial an address of their choosing,
+  forever, across restarts. Dial targets must now be v3 `.onion`; a
+  remote-supplied target is unconfirmed (not persisted, cannot overwrite,
+  dropped after 6 failed attempts) until a Noise handshake succeeds there.
+- The MLS lock was held across network reads during bootstrap, so a peer
+  that authenticated and went silent froze the daemon. Now locked per
+  operation with a 60s bound; RESUME is bound to the Noise peer.
+
+**Hub**
+
+- Intro-inbox ownership survived only as long as the KeyPackage did, and
+  the directory evicts: flooding it made a victim's inbox subscribable and
+  drainable by anyone. Ownership now comes from a separate persisted set,
+  and a publish drops non-owner subscribers.
+- "Fair eviction" could be inverted to delete real users' queued mail. It
+  is now own-queue-only.
+- SUBSCRIBE is rate-limited and globally capped; idle connections are
+  closed after 15 minutes; rate-limit GC runs on the Tor path; an oversized
+  gossip frame no longer drops federation links.
+- Store is 0600 with secure_delete; arrival time stored to the hour;
+  per-frame logs are debug.
+
+**Metadata**
+
+- Sealed envelopes are padded to a frame bucket, so the relay sees the
+  bucket and not the message length.
+
+**Trust gates**
+
+- The key-change send block looked pins up by the caller's spelling of the
+  fingerprint; non-canonical spellings bypassed it. Room invites had no
+  gate at all. Both fixed; the invite gate no longer fails open.
+- The replay guard hashed a hub-written prefix and recorded entries before
+  verifying them; a hub could bypass it two ways. Now body-only and
+  verify-then-record.
+- Ed25519 verification is strict.
+
+**Robustness**
+
+- Exclusive vault lock (daemon lifetime; required by rekey/backup).
+- Deliveries are back-pressured, not dropped; KeyPackage fetch is bounded;
+  inbound sessions and hub-only conversations are capped; a repeated
+  FileMeta cannot bypass the receive budget; ratchet state is persisted per
+  message; member removal persists before fan-out.
+- Room messages show their authenticated sender per line.
+
+**Release chain**
+
+- Installer pins the cosign identity to `release.yml` at the exact tag,
+  requires the signed manifest, refuses downgrades, never installs an
+  unverified hub list. Signing permissions are scoped to the signing job,
+  actions are pinned by commit, signed builds use no cache, the toolchain
+  is an exact version.
+
+**Checked against upstream source:** openmls 0.8.1 already rejects a
+Welcome that reuses an existing group id, so that suspected takeover is
+not exploitable.
+
+**Not fixed in this pass (see THREAT_MODEL §8.6 for the full list):**
+recipient-side forward secrecy for sealed envelopes (static KEM key);
+one permanent onion address shared by all contacts; unsolicited Welcomes
+are still auto-joined; a stale KeyPackage can be re-published by anyone;
+the vault's contact graph and timestamps are still plaintext and its pin
+state unauthenticated (#389); post-quantum protection still covers first
+contact only.
+
+---
+
 ## Security — 2026-06-11 — hub KeyPackage directory cap (audit #4)
 
 DoS hardening for the hub's MLS KeyPackage directory.

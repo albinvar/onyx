@@ -8,15 +8,28 @@
 //!
 //! ## ⚠️ Known gap: this is NOT full encryption at rest
 //!
-//! Everything that is *not* key material is stored as **plaintext**:
-//! `room_messages` (text + sender fingerprint), `peer_dial` (onion + KEM),
-//! `pinned_keys`, `room_member_kems`, `rooms.members_b32`,
-//! `received_files`. Anyone with the vault file can read your message
-//! history and contact graph **without the passphrase**. Do not describe
-//! the vault as "encrypted at rest" — only the secret keys are. Closing
-//! this (whole-DB encryption, e.g. SQLCipher) is the top open security
-//! item; until then the honest statement is "Onyx does not encrypt your
-//! message history or contacts at rest."
+//! Sealed (AEAD, vault key): the unlock `canary`, `identities` (all
+//! secret keys), `mls_state`, `replay_state`, message text and sender
+//! (`room_messages.text_enc` / `sfp_enc`, used for DMs and rooms), and
+//! room names and rosters (`rooms.name_enc` / `members_enc`). The list
+//! lives in [`SEALED_COLUMNS`]; `rekey` re-seals exactly that list.
+//!
+//! **Plaintext**, readable from the file without the passphrase: the
+//! contact graph (`mls_peer_groups`, `pinned_keys` incl. nicknames,
+//! `peer_kem`), peers' onion addresses (`peer_dial`), room membership as
+//! seen through `room_member_kems` and `room_admins`, the received-file
+//! manifest (`received_files`: names, paths, sizes, senders), our own
+//! fingerprint, and every timestamp and row order.
+//!
+//! The plaintext trust state is also **unauthenticated**: someone who can
+//! write the file can mark a contact verified, replace a pinned key, or
+//! empty a room's admin set. Sealed blobs carry no associated data, so
+//! they can be swapped between rows or rolled back.
+//!
+//! Do not describe the vault as "encrypted at rest". The honest statement
+//! is: secret keys and message content are sealed; who you talk to, when,
+//! and what you have verified are not. Whole-database encryption
+//! (SQLCipher, #389) is the fix.
 //!
 //! ## Anatomy of an encrypted blob
 //!
