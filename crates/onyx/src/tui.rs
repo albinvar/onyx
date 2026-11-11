@@ -4855,8 +4855,7 @@ const SIDEBAR_WIDTH: u16 = 28;
 fn render_topbar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     let mut left = vec![
         Span::styled(" ◈ ", theme::logo()),
-        Span::styled("ONYX", theme::logo()),
-        Span::styled(format!("  {}", theme::TAGLINE), theme::muted()),
+        Span::styled("onyx", theme::logo()),
     ];
     let right = daemon_status_spans(app);
     let used: usize = left
@@ -4874,7 +4873,9 @@ fn render_topbar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 /// percentage while starting), hub reachability, link to the daemon, and
 /// the version.
 fn daemon_status_spans(app: &AppState) -> Vec<Span<'static>> {
-    let sep = || Span::styled("  ·  ", theme::muted());
+    // Status items are set apart by space alone; a dot between each
+    // would be one more glyph to read past.
+    let sep = || Span::raw("    ");
     match &app.last_status {
         None => vec![Span::styled("◌ starting… ", theme::warn())],
         Some(Err(_)) => vec![Span::styled(
@@ -4932,7 +4933,7 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
             ])
         };
         let body = Paragraph::new(vec![
-            Line::from(Span::styled(" CONVERSATIONS", theme::header())),
+            Line::from(Span::styled(" Conversations", theme::header())),
             Line::from(""),
             Line::from(Span::styled(" none yet", theme::muted())),
             Line::from(""),
@@ -4954,7 +4955,7 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     };
     let mut items: Vec<ListItem<'_>> = Vec::with_capacity(app.peers.len() + app.rooms.len() + 2);
     if !app.peers.is_empty() {
-        items.push(header("DIRECT"));
+        items.push(header("Direct"));
     }
     // v0.1.32: one line per conversation (minimal). The last-message
     // preview is dropped from the list — the chat pane shows it.
@@ -5011,7 +5012,7 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         items.push(ListItem::new(Line::from(head)));
     }
     if !app.rooms.is_empty() {
-        items.push(header("ROOMS"));
+        items.push(header("Rooms"));
     }
     for r in &app.rooms {
         let room_key = format!("room/{}", short_id(&r.group_id_b32));
@@ -6225,21 +6226,18 @@ mod snapshot_tests {
         let dir = snapshot_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tui-snapshot.txt"), &snap).unwrap();
-        assert!(snap.contains("ONYX"));
+        assert!(snap.contains("◈ onyx"));
         // Flat layout: the conversations column carries its own heading
         // and an empty state made of the three ways to get started.
         assert!(
-            snap.contains("CONVERSATIONS"),
+            snap.contains("Conversations"),
             "list heading missing:\n{snap}"
         );
         assert!(snap.contains("none yet"));
         assert!(snap.contains("add a contact"));
-        // The top bar carries the brand and the tagline; daemon health
-        // lives there too (asserted just below).
-        assert!(snap.contains("anonymous"), "tagline missing:\n{snap}");
         // No outer frame: the first row is the top bar, not a border.
         assert!(
-            snap.lines().next().is_some_and(|l| l.contains("ONYX")),
+            snap.lines().next().is_some_and(|l| l.contains("◈ onyx")),
             "top bar should be the first row:\n{snap}"
         );
         assert!(

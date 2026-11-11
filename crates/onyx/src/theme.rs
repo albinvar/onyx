@@ -181,11 +181,6 @@ pub fn selection() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-// ── Brand ───────────────────────────────────────────────────────────────
-
-/// One-line tagline shown beside the wordmark in the top bar.
-pub const TAGLINE: &str = "anonymous · e2e · tor";
-
 #[cfg(test)]
 mod tests {
     use super::*;
