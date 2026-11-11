@@ -11,6 +11,11 @@
 # script greps the daemon logs for handshake evidence. Exit 0 ONLY if
 # both daemons report a connected peer.
 set -u  # NOT -e: we want to reach the verdict + cleanup even on a step fail.
+# This test asserts on per-session log lines ("conversation registered",
+# "MLS round-trip complete"). Those are debug-level since the 2026-11
+# log-hygiene change (the default log must not record who connected when),
+# so the daemons under test run with debug logging.
+export RUST_LOG="${RUST_LOG:-onyx_daemon=debug,onyx_core=debug,info}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OND="$ROOT/target/release/onyxd"

@@ -11,6 +11,11 @@
 # 0700 dir in $HOME (same constraint learned in v0.1.16). RELEASE build
 # only — debug arti is too slow and false-times-out.
 set -u
+# This test asserts on per-session log lines ("conversation registered",
+# "MLS round-trip complete"). Those are debug-level since the 2026-11
+# log-hygiene change (the default log must not record who connected when),
+# so the daemons under test run with debug logging.
+export RUST_LOG="${RUST_LOG:-onyx_daemon=debug,onyx_core=debug,info}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OND="$ROOT/target/release/onyxd"
 ONX="$ROOT/target/release/onyx"

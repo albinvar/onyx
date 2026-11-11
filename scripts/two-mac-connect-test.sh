@@ -8,6 +8,11 @@
 # arti's fs-mistrust rejects world-writable /tmp, so state lives under a
 # 0700 dir in $HOME. RELEASE build only (debug arti times out).
 set -u
+# This test asserts on per-session log lines ("conversation registered",
+# "MLS round-trip complete"). Those are debug-level since the 2026-11
+# log-hygiene change (the default log must not record who connected when),
+# so the daemons under test run with debug logging.
+export RUST_LOG="${RUST_LOG:-onyx_daemon=debug,onyx_core=debug,info}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OND="$ROOT/target/release/onyxd"
 ONX="$ROOT/target/release/onyx"
