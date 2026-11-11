@@ -69,6 +69,16 @@ impl Drop for ConnectedGuard {
 /// large that a hung hub eats unbounded daemon memory.
 pub const OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
+/// Idle time after which the client pings the hub. Keeps the session
+/// inside the hub's idle timeout and lets both ends notice a dead circuit.
+const HUB_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A hub that answers pings but then sends nothing for this long is
+/// treated as unreachable: the session ends and the supervisor reconnects.
+/// Without this a blackholed circuit stayed "connected" forever and sends
+/// were reported OK into a dead link.
+const HUB_SILENCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(150);
+
 /// One outbound action the daemon wants the hub-client task to take.
 ///
 /// Single channel for both deliveries and KP fetches keeps the
@@ -516,10 +526,19 @@ where
     // Cancellation-safe reads (see `FrameReader`): outbound sends in the
     // other branch must not corrupt a frame that is still arriving.
     let mut frames = onyx_core::transport::FrameReader::new();
+    let mut keepalive = tokio::time::interval(HUB_KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // the first tick is immediate; skip it
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut last_outbound = tokio::time::Instant::now();
+    // Older hubs ignore PING. Only enforce the silence limit against a hub
+    // that has answered one, so a new client still works with an old hub.
+    let mut hub_answers_pings = false;
     loop {
         tokio::select! {
             // Inbound frame from the hub.
             read_res = frames.read_frame(stream, session) => {
+                last_inbound = tokio::time::Instant::now();
                 let frame = match read_res {
                     Ok(f) => f,
                     Err(e) => {
@@ -563,18 +582,59 @@ where
                         // task was cancelled; that's fine.
                         let _ = responder.send(answer);
                     }
+                    onyx_core::wire::FRAME_PONG => {
+                        // The hub answers keepalives: from now on a silent
+                        // link is a dead link (see the keepalive branch).
+                        hub_answers_pings = true;
+                    }
+                    onyx_core::wire::FRAME_PAD => {
+                        // Hub cover / constant-rate padding. Consumed
+                        // silently — a log line per PAD would both flood
+                        // the log and record the padding schedule.
+                    }
                     other => {
-                        warn!(
+                        // debug, not warn: a hostile hub could otherwise
+                        // grow our log without bound, one line per frame.
+                        debug!(
                             frame_type = format!("{other:#06x}"),
                             "hub: unexpected frame type from hub"
                         );
                     }
                 }
             }
+            // Keepalive + dead-link detection. Fires only after a minute
+            // with no outbound frame, so a constant-rate link (one frame
+            // per slot) never emits an off-slot PING.
+            _ = keepalive.tick() => {
+                if hub_answers_pings && last_inbound.elapsed() > HUB_SILENCE_LIMIT {
+                    return Err(anyhow::anyhow!(
+                        "hub sent nothing for {}s — link presumed dead, reconnecting",
+                        HUB_SILENCE_LIMIT.as_secs()
+                    ));
+                }
+                if last_outbound.elapsed() >= HUB_KEEPALIVE_INTERVAL {
+                    write_frame(
+                        stream,
+                        session,
+                        &InnerFrame { frame_type: onyx_core::wire::FRAME_PING, payload: Vec::new() },
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("hub: keepalive write failed: {e}"))?;
+                    last_outbound = tokio::time::Instant::now();
+                }
+            }
             // Outbound action from the daemon.
             Some(outbound) = outbound_rx.recv() => {
+                last_outbound = tokio::time::Instant::now();
                 match outbound {
                     HubOutbound::Deliver { target, body } => {
+                        // A body that fits no frame bucket cannot be sent.
+                        // Skip it; failing the write here tore the whole
+                        // hub session down over one oversized message.
+                        if InnerFrame::smallest_bucket(16 + body.len()).is_none() {
+                            warn!(body_bytes = body.len(), "hub: outbound DELIVER too large for any frame; dropping");
+                            continue;
+                        }
                         let mut wire_payload = Vec::with_capacity(16 + body.len());
                         wire_payload.extend_from_slice(&target);
                         wire_payload.extend_from_slice(&body);

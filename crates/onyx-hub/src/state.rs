@@ -149,6 +149,18 @@ pub const MAX_SUBSCRIPTIONS_PER_CONN: usize = 16_384;
 /// few KiB each bounds the directory to a few hundred MiB worst case.
 pub const MAX_KEYPACKAGES: usize = 100_000;
 
+/// Hub-wide ceiling on live `(routing id, connection)` subscriptions.
+/// The per-connection cap alone still allowed
+/// `connections × MAX_SUBSCRIPTIONS_PER_CONN` distinct ids (tens of
+/// millions, each with its own set allocation) — enough to exhaust a
+/// small hub's memory at no cost, since SUBSCRIBE was not rate-limited.
+pub const MAX_TOTAL_SUBSCRIPTIONS: usize = 1_000_000;
+
+/// Ceiling on routing ids remembered as introduction inboxes (see
+/// [`HubState::is_known_intro_inbox`]). 16 bytes each; at the cap, new
+/// ids are no longer recorded (existing ones keep their protection).
+pub const MAX_KNOWN_INBOXES: usize = 1_000_000;
+
 /// SEC #4: one entry in the hub's KeyPackage directory — the published
 /// bytes plus the `published_at` timestamp used to pick the eviction
 /// victim when the directory hits [`MAX_KEYPACKAGES`].
@@ -178,10 +190,25 @@ pub struct HubState {
     next_conn_id: ConnId,
     senders: HashMap<ConnId, mpsc::Sender<Vec<u8>>>,
     subscribers: HashMap<RoutingId, HashSet<ConnId>>,
-    /// A-2: distinct-subscription count per connection, enforced
-    /// against [`MAX_SUBSCRIPTIONS_PER_CONN`]. Incremented only on a
-    /// genuinely-new (id, conn) pair; cleared in `unregister_conn`.
-    sub_count: HashMap<ConnId, usize>,
+    /// The routing ids each connection is subscribed to — the reverse
+    /// index of `subscribers`. Enforces [`MAX_SUBSCRIPTIONS_PER_CONN`]
+    /// (A-2) and lets `unregister_conn` touch only this connection's own
+    /// ids instead of scanning every subscription in the hub.
+    conn_subs: HashMap<ConnId, HashSet<RoutingId>>,
+    /// Introduction inboxes each connection has PROVEN it owns (its
+    /// signed-SUBSCRIBE signer key derives them). Only an owner may stay
+    /// subscribed to an id once it is known to be an introduction inbox.
+    conn_owned: HashMap<ConnId, HashSet<RoutingId>>,
+    /// Live `(id, conn)` subscription count, against
+    /// [`MAX_TOTAL_SUBSCRIPTIONS`].
+    total_subscriptions: usize,
+    /// Every routing id that has EVER had an ownership-verified
+    /// KeyPackage published here. Deliberately outlives the KeyPackage
+    /// itself: the directory is capped and evicts, and if "is this an
+    /// introduction inbox?" were answered from the directory, flooding it
+    /// with throwaway KeyPackages would evict a victim's entry and make
+    /// their inbox subscribable (and its queue drainable) by anyone.
+    known_inboxes: HashSet<RoutingId>,
     queues: HashMap<RoutingId, Vec<Vec<u8>>>,
     /// MLS KeyPackage directory. Maps a routing id (typically the
     /// publisher's introduction-inbox id) to the latest KeyPackage
@@ -264,7 +291,15 @@ impl HubState {
                 + payloads.len() * QUEUE_ENTRY_OVERHEAD_BYTES;
             me.queues.insert(rid, payloads);
         }
+        // Introduction-inbox ids: everything recorded, plus every id that
+        // currently has a KeyPackage (covers stores that predate the
+        // `known_inbox` table).
+        me.known_inboxes = store.load_known_inboxes()?.into_iter().collect();
+        let from_directory: Vec<RoutingId> = me.keypackages.keys().copied().collect();
         me.durable_store = Some(store);
+        for rid in from_directory {
+            me.remember_inbox(rid);
+        }
         // SEC #4: a store warmed from disk may exceed the cap (e.g. the
         // cap was lowered, or the table predates this guard). Trim the
         // oldest down to the ceiling now that the store is attached so
@@ -423,6 +458,14 @@ impl HubState {
     /// Internal: send the pre-encoded gossip payload to every peer
     /// outbound channel, optionally skipping one source pubkey.
     fn broadcast_to_peers(&self, frame: &InnerFrame, skip: Option<&[u8; 32]>, op: &'static str) {
+        // A gossip frame adds a header to the client's payload; a
+        // near-maximum client frame therefore no longer fits any bucket.
+        // Drop it here — handing it to a peer link makes that link's
+        // write fail and tears the federation session down.
+        if frame.payload.len() > onyx_core::wire::max_payload::XLARGE {
+            tracing::debug!(op, "hub: payload too large to gossip; not forwarding");
+            return;
+        }
         let mut accepted = 0usize;
         let total = self.peer_outbounds.len();
         for (pk, tx) in &self.peer_outbounds {
@@ -464,25 +507,30 @@ impl HubState {
     /// duplicate anyway, so this is belt-and-braces.)
     pub fn subscribe(&mut self, conn: ConnId, ids: &[RoutingId]) -> Vec<Vec<u8>> {
         let mut drained = Vec::new();
-        // A-2: bound the distinct subscriptions one connection can
-        // pin. Tracked in a local + written back to avoid holding a
-        // `&mut sub_count` borrow across the `subscribers`/`queues`
-        // mutations below.
-        let mut count = self.sub_count.get(&conn).copied().unwrap_or(0);
         for id in ids {
-            if count >= MAX_SUBSCRIPTIONS_PER_CONN {
-                warn!(
-                    conn,
-                    cap = MAX_SUBSCRIPTIONS_PER_CONN,
-                    "hub: connection hit per-conn subscription cap; refusing further ids"
-                );
-                break;
-            }
-            // `insert` returns true only when the (id, conn) pair is
-            // genuinely new, so re-subscribing to the same id (e.g. an
-            // epoch re-subscribe) doesn't double-count against the cap.
-            if self.subscribers.entry(*id).or_default().insert(conn) {
-                count += 1;
+            let already = self.conn_subs.get(&conn).is_some_and(|s| s.contains(id));
+            if !already {
+                // A-2: bound the distinct subscriptions one connection can
+                // pin, and the hub-wide total.
+                let count = self.conn_subs.get(&conn).map_or(0, HashSet::len);
+                if count >= MAX_SUBSCRIPTIONS_PER_CONN {
+                    warn!(
+                        conn,
+                        cap = MAX_SUBSCRIPTIONS_PER_CONN,
+                        "hub: connection hit per-conn subscription cap; refusing further ids"
+                    );
+                    break;
+                }
+                if self.total_subscriptions >= MAX_TOTAL_SUBSCRIPTIONS {
+                    warn!(
+                        cap = MAX_TOTAL_SUBSCRIPTIONS,
+                        "hub: at the hub-wide subscription cap; refusing further ids"
+                    );
+                    break;
+                }
+                self.subscribers.entry(*id).or_default().insert(conn);
+                self.conn_subs.entry(conn).or_default().insert(*id);
+                self.total_subscriptions += 1;
             }
             if let Some(q) = self.queues.remove(id) {
                 // Draining frees the bytes from the global accounting —
@@ -506,8 +554,63 @@ impl HubState {
                 }
             }
         }
-        self.sub_count.insert(conn, count);
         drained
+    }
+
+    /// [`Self::subscribe`] for a connection whose signed SUBSCRIBE proved
+    /// ownership of `signer_inbox`. Records the proof so the connection
+    /// keeps its subscription to that inbox when a KeyPackage is published
+    /// there (see [`Self::publish_keypackage`]).
+    pub fn subscribe_as(
+        &mut self,
+        conn: ConnId,
+        signer_inbox: RoutingId,
+        ids: &[RoutingId],
+    ) -> Vec<Vec<u8>> {
+        if ids.contains(&signer_inbox) {
+            self.conn_owned
+                .entry(conn)
+                .or_default()
+                .insert(signer_inbox);
+        }
+        self.subscribe(conn, ids)
+    }
+
+    /// Remove `conn`'s subscription to `id`, keeping both indexes and the
+    /// hub-wide count consistent.
+    fn drop_subscription(&mut self, conn: ConnId, id: &RoutingId) {
+        let Some(subs) = self.subscribers.get_mut(id) else {
+            return;
+        };
+        if subs.remove(&conn) {
+            self.total_subscriptions = self.total_subscriptions.saturating_sub(1);
+            if let Some(ids) = self.conn_subs.get_mut(&conn) {
+                ids.remove(id);
+            }
+        }
+        if subs.is_empty() {
+            self.subscribers.remove(id);
+        }
+    }
+
+    /// Record `routing_id` as an introduction inbox (bounded; persisted).
+    fn remember_inbox(&mut self, routing_id: RoutingId) {
+        if self.known_inboxes.contains(&routing_id) {
+            return;
+        }
+        if self.known_inboxes.len() >= MAX_KNOWN_INBOXES {
+            warn!(
+                cap = MAX_KNOWN_INBOXES,
+                "hub: known-inbox set at cap; not recording a new introduction inbox"
+            );
+            return;
+        }
+        self.known_inboxes.insert(routing_id);
+        if let Some(store) = &self.durable_store
+            && let Err(e) = store.add_known_inbox(&routing_id)
+        {
+            warn!(error = %e, "hub store: add_known_inbox failed (in-memory set still consistent)");
+        }
     }
 
     /// Deliver `payload` to the given routing id. If any connections
@@ -553,6 +656,12 @@ impl HubState {
     /// logged at `warn!` and silently lost — same delivery contract as
     /// the existing "every subscriber was full" path, just bounded.
     fn enqueue_offline(&mut self, target: RoutingId, payload: Vec<u8>) {
+        self.enqueue_offline_capped(target, payload, MAX_TOTAL_QUEUED_BYTES);
+    }
+
+    /// [`Self::enqueue_offline`] with an explicit global byte budget
+    /// (tests drive it with a small ceiling).
+    fn enqueue_offline_capped(&mut self, target: RoutingId, payload: Vec<u8>, cap_bytes: usize) {
         let needed = payload.len() + QUEUE_ENTRY_OVERHEAD_BYTES; // A-3
         // Per-id depth cap is a HARD refuse: it bounds a single inbox's
         // growth, and the byte-cap eviction below is GLOBAL only — we never
@@ -565,27 +674,24 @@ impl HubState {
             );
             return;
         }
-        // H-1 (F3.2a): fair eviction under global memory pressure. Rather
-        // than dropping THIS (newest) envelope when the byte cap is hit —
-        // which lets whoever filled the queue first starve everyone else —
-        // evict the oldest entry from the LARGEST queue until there's room.
-        // A flood concentrated in one/few queues is trimmed first; the many
-        // small legitimate queues are protected. (Under-attack only: it can
-        // evict an older real message, same lossy regime as the old
-        // drop-newest, but now biased toward the biggest hog.)
-        if needed > MAX_TOTAL_QUEUED_BYTES {
+        // Global byte cap. Under pressure an inbox may only displace ITS
+        // OWN oldest mail; mail for an id with nothing queued is refused.
+        //
+        // The previous policy evicted the oldest entry of the queue with
+        // the most entries. That is trivially inverted: fill the budget
+        // with one envelope per random routing id, and every real inbox
+        // (2+ messages) becomes "the largest" — each further junk frame
+        // then deletes a real user's oldest offline message. The hub
+        // cannot tell junk from mail, so it must never destroy stored mail
+        // to admit mail for a different id. At the cap an attacker can
+        // still block NEW offline delivery, but cannot erase what is held.
+        if needed > cap_bytes {
             warn!("hub: single envelope exceeds the entire queue budget; dropping");
             return;
         }
-        let mut guard = 0usize;
-        while self.queued_bytes.saturating_add(needed) > MAX_TOTAL_QUEUED_BYTES {
-            if !self.evict_oldest_from_largest() {
-                warn!("hub: byte cap reached with nothing to evict; dropping envelope");
-                return;
-            }
-            guard += 1;
-            if guard > MAX_QUEUE_DEPTH_PER_ID.saturating_mul(8) {
-                warn!("hub: fair-eviction guard tripped; dropping envelope");
+        while self.queued_bytes.saturating_add(needed) > cap_bytes {
+            if !self.evict_own_oldest(&target) {
+                warn!("hub: offline-queue budget exhausted; dropping envelope");
                 return;
             }
         }
@@ -596,42 +702,30 @@ impl HubState {
         self.queues.entry(target).or_default().push(payload);
     }
 
-    /// H-1 (F3.2a): evict the oldest entry from the queue with the most
-    /// entries (the biggest hog under a flood), keeping the durable store
-    /// consistent. Returns `false` when there is nothing to evict.
-    fn evict_oldest_from_largest(&mut self) -> bool {
-        let victim = self
-            .queues
-            .iter()
-            .filter(|(_, q)| !q.is_empty())
-            .max_by_key(|(_, q)| q.len())
-            .map(|(rid, _)| *rid);
-        let Some(rid) = victim else {
+    /// Evict the oldest queued entry for `rid` (its own FIFO head),
+    /// keeping the durable store consistent. Returns `false` when that
+    /// inbox has nothing queued.
+    fn evict_own_oldest(&mut self, rid: &RoutingId) -> bool {
+        let Some(queue) = self.queues.get_mut(rid) else {
             return false;
         };
-        // O(n) front-removal, but only on the rare under-pressure path and
+        if queue.is_empty() {
+            return false;
+        }
+        // O(n) front-removal, but only on the under-pressure path and
         // bounded by the per-id depth cap.
-        let evicted_len = self
-            .queues
-            .get_mut(&rid)
-            .expect("victim queue exists")
-            .remove(0)
-            .len();
+        let evicted_len = queue.remove(0).len();
+        if queue.is_empty() {
+            self.queues.remove(rid);
+        }
         self.queued_bytes = self
             .queued_bytes
             .saturating_sub(evicted_len + QUEUE_ENTRY_OVERHEAD_BYTES);
-        if self.queues.get(&rid).is_some_and(Vec::is_empty) {
-            self.queues.remove(&rid);
-        }
         if let Some(store) = &self.durable_store
-            && let Err(e) = store.delete_oldest(&rid)
+            && let Err(e) = store.delete_oldest(rid)
         {
-            warn!(error = %e, "hub store: delete_oldest failed during fair eviction (in-memory queue still consistent)");
+            warn!(error = %e, "hub store: delete_oldest failed during eviction (in-memory queue still consistent)");
         }
-        warn!(
-            victim_prefix = format!("{:02x}{:02x}", rid[0], rid[1]),
-            "hub: fair-eviction trimmed oldest from the largest offline queue under memory pressure"
-        );
         true
     }
 
@@ -734,12 +828,19 @@ impl HubState {
     /// (HIGH-3). The caller invokes that with the identity in scope.
     pub fn unregister_conn(&mut self, conn: ConnId) {
         self.senders.remove(&conn);
-        self.sub_count.remove(&conn); // A-2: release the per-conn count
-        for subs in self.subscribers.values_mut() {
-            subs.remove(&conn);
+        self.conn_owned.remove(&conn);
+        // Only this connection's own ids are touched (reverse index) —
+        // no hub-wide scan under the state lock on every disconnect.
+        for id in self.conn_subs.remove(&conn).unwrap_or_default() {
+            if let Some(subs) = self.subscribers.get_mut(&id) {
+                if subs.remove(&conn) {
+                    self.total_subscriptions = self.total_subscriptions.saturating_sub(1);
+                }
+                if subs.is_empty() {
+                    self.subscribers.remove(&id);
+                }
+            }
         }
-        // Reclaim empty-set entries so subscribers doesn't grow without bound.
-        self.subscribers.retain(|_, subs| !subs.is_empty());
     }
 
     // ── KeyPackage directory (T6.1) ────────────────────────────────────────
@@ -787,6 +888,33 @@ impl HubState {
         // doesn't grow the map so this is a no-op; a net-new entry past
         // the cap evicts the oldest from memory + disk.
         self.evict_oldest_keypackages_over_cap();
+
+        // This id is now (and stays) a known introduction inbox, and only
+        // its proven owner may remain subscribed. Ownership is otherwise
+        // checked only at SUBSCRIBE time, so a connection that subscribed
+        // while the id was still unknown would keep receiving a copy of
+        // every first-contact envelope after the real owner showed up.
+        self.remember_inbox(routing_id);
+        let intruders: Vec<ConnId> = self
+            .subscribers
+            .get(&routing_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|conn| {
+                !self
+                    .conn_owned
+                    .get(conn)
+                    .is_some_and(|owned| owned.contains(&routing_id))
+            })
+            .collect();
+        for conn in intruders {
+            warn!(
+                conn,
+                "hub: dropping a non-owner subscription to an introduction inbox"
+            );
+            self.drop_subscription(conn, &routing_id);
+        }
     }
 
     /// SEC #4: while the KeyPackage directory exceeds [`MAX_KEYPACKAGES`],
@@ -828,8 +956,9 @@ impl HubState {
         self.keypackages.get(routing_id).map(|e| e.bytes.clone())
     }
 
-    /// HIGH-1: is `routing_id` a known introduction inbox? True iff a
-    /// KeyPackage has been published there. The KP-publish path
+    /// HIGH-1: is `routing_id` a known introduction inbox? True iff an
+    /// ownership-verified KeyPackage has EVER been published there (the
+    /// answer survives directory eviction — see `known_inboxes`). The KP-publish path
     /// (`handler.rs::FRAME_KP_PUBLISH`) only accepts a publish whose
     /// claimed routing id equals `introduction_inbox(fingerprint)` of
     /// the KP's own signing key, so every entry in the directory is a
@@ -840,7 +969,7 @@ impl HubState {
     /// as (high-entropy) session tokens and allowed without proof.
     #[must_use]
     pub fn is_known_intro_inbox(&self, routing_id: &RoutingId) -> bool {
-        self.keypackages.contains_key(routing_id)
+        self.known_inboxes.contains(routing_id) || self.keypackages.contains_key(routing_id)
     }
 
     /// Diagnostic: number of routing ids that currently hold a
@@ -938,51 +1067,82 @@ mod tests {
         );
     }
 
+    /// Regression ("singleton spray"): filling the budget with one
+    /// envelope per random id must NOT let further junk delete a real
+    /// inbox's stored mail. At the cap an inbox can only displace its own
+    /// oldest entry; mail for an id with nothing queued is refused.
     #[test]
-    fn fair_eviction_trims_the_largest_queue_first() {
-        // H-1 (F3.2a): under memory pressure we evict the oldest entry from
-        // the LARGEST queue, so a flood concentrated in one inbox is trimmed
-        // before a small legitimate inbox loses anything.
+    fn budget_pressure_never_evicts_another_inboxes_mail() {
         let mut state = HubState::new();
-        let big: RoutingId = [0xB1; 16];
-        let small: RoutingId = [0x59; 16];
-        // No subscribers → deliver() queues offline.
-        for _ in 0..5 {
-            state.deliver(big, b"x".to_vec());
+        let entry = 1 + QUEUE_ENTRY_OVERHEAD_BYTES;
+        let cap = 6 * entry;
+        let victim: RoutingId = [0x56; 16];
+        for body in [b"1", b"2", b"3"] {
+            state.enqueue_offline_capped(victim, body.to_vec(), cap);
         }
-        state.deliver(small, b"y".to_vec());
-        assert_eq!(state.queue_len(&big), 5);
-        assert_eq!(state.queue_len(&small), 1);
+        // Attacker fills the rest with singletons…
+        for n in 0u8..3 {
+            state.enqueue_offline_capped([n; 16], b"j".to_vec(), cap);
+        }
+        // …then keeps spraying fresh ids at the cap.
+        for n in 100u8..120 {
+            state.enqueue_offline_capped([n; 16], b"j".to_vec(), cap);
+            assert_eq!(state.queue_len(&[n; 16]), 0, "new id refused at the cap");
+        }
+        assert_eq!(state.queue_len(&victim), 3, "victim's mail is untouched");
 
-        // First eviction must hit the LARGEST queue, never the small one.
-        assert!(state.evict_oldest_from_largest());
+        // The victim's own new mail displaces only its own oldest entry.
+        state.enqueue_offline_capped(victim, b"4".to_vec(), cap);
+        let conn = state.register_conn(mpsc::channel(8).0);
+        let drained = state.subscribe(conn, &[victim]);
+        assert_eq!(drained, vec![b"2".to_vec(), b"3".to_vec(), b"4".to_vec()]);
+    }
+
+    /// Regression: "is this an introduction inbox?" must survive the
+    /// KeyPackage being evicted from the capped directory, and a
+    /// non-owner who subscribed before the owner published is dropped.
+    #[test]
+    fn intro_inbox_stays_protected_after_directory_eviction() {
+        let mut state = HubState::new();
+        let inbox: RoutingId = [0x1B; 16];
+
+        // An intruder subscribes while the id is still unknown.
+        let intruder = state.register_conn(mpsc::channel(8).0);
+        state.subscribe(intruder, &[inbox]);
+        assert_eq!(state.subscriber_count(&inbox), 1);
+
+        // The owner subscribes (proving ownership) and publishes.
+        let owner = state.register_conn(mpsc::channel(8).0);
+        state.subscribe_as(owner, inbox, &[inbox]);
+        state.publish_keypackage(inbox, b"kp".to_vec());
+        assert!(state.is_known_intro_inbox(&inbox));
         assert_eq!(
-            state.queue_len(&big),
-            4,
-            "largest queue should lose its oldest entry"
-        );
-        assert_eq!(
-            state.queue_len(&small),
+            state.subscriber_count(&inbox),
             1,
-            "small legitimate queue must be protected"
+            "only the owner remains subscribed"
         );
 
-        // Keep trimming the big queue down to a tie with the small one.
-        for _ in 0..3 {
-            assert!(state.evict_oldest_from_largest());
-        }
-        assert_eq!(state.queue_len(&big), 1);
-        assert_eq!(state.queue_len(&small), 1);
+        // Evict every KeyPackage: the id is still a known inbox.
+        state.evict_oldest_keypackages_down_to(0);
+        assert_eq!(state.keypackage_count(), 0);
+        assert!(state.is_known_intro_inbox(&inbox));
+    }
 
-        // Two more evictions clear both (tie-break order unspecified).
-        assert!(state.evict_oldest_from_largest());
-        assert!(state.evict_oldest_from_largest());
-        assert_eq!(state.queue_len(&big), 0);
-        assert_eq!(state.queue_len(&small), 0);
-        assert!(
-            !state.evict_oldest_from_largest(),
-            "no-op when all queues are empty"
-        );
+    /// Disconnecting releases exactly that connection's subscriptions and
+    /// the hub-wide count.
+    #[test]
+    fn unregister_releases_only_own_subscriptions() {
+        let mut state = HubState::new();
+        let a = state.register_conn(mpsc::channel(8).0);
+        let b = state.register_conn(mpsc::channel(8).0);
+        let shared: RoutingId = [1; 16];
+        state.subscribe(a, &[shared, [2; 16]]);
+        state.subscribe(b, &[shared]);
+        assert_eq!(state.total_subscriptions, 3);
+        state.unregister_conn(a);
+        assert_eq!(state.total_subscriptions, 1);
+        assert_eq!(state.subscriber_count(&shared), 1);
+        assert_eq!(state.subscriber_count(&[2; 16]), 0);
     }
 
     #[test]

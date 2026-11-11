@@ -26,6 +26,15 @@ use crate::state::{HubState, PER_CONN_MAILBOX, RoutingId};
 /// for a real Tor circuit while bounding the abuse window.
 const HUB_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A client connection that sends no frame at all for this long is
+/// closed. The handshake timeout only covers the handshake: without an
+/// idle bound, `MAX_CONCURRENT_CONNECTIONS` authenticated-but-silent
+/// connections held every slot forever and took the hub offline. Current
+/// clients send a `FRAME_PING` every minute; the window is wide enough
+/// that an older client (which sends nothing while idle) is merely made
+/// to reconnect now and then.
+const HUB_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// Drive the hub side of one client connection. Runs Noise XK as
 /// responder, then a `select!` loop that interleaves frames coming
 /// from the client (SUBSCRIBE / DELIVER) and frames coming from the
@@ -117,7 +126,7 @@ where
         return result;
     }
 
-    info!("hub: noise XK complete; inbound client session");
+    tracing::debug!("hub: noise XK complete; inbound client session");
     // Per-connection mailbox. The state pushes here when something
     // arrives for us; we drain in the select loop and write out.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(PER_CONN_MAILBOX);
@@ -147,7 +156,7 @@ where
         s.unregister_conn(conn_id);
         s.forget_rate_if_full(&peer_pk);
     }
-    info!(conn = conn_id, "hub: connection closed");
+    tracing::debug!(conn = conn_id, "hub: connection closed");
 
     result
 }
@@ -265,7 +274,7 @@ async fn handle_gossip_publish(
         s.publish_keypackage(frame.routing_id, frame.body.clone());
         s.keypackage_count()
     };
-    info!(
+    tracing::debug!(
         directory_size = dir_size,
         kp_bytes = frame.body.len(),
         "hub: gossiped KeyPackage accepted (ownership verified)"
@@ -334,7 +343,7 @@ async fn handle_gossip_deliver(
         let d = s.deliver(frame.routing_id, frame.body.clone());
         (d, s.gossip_mode())
     };
-    tracing::info!(
+    tracing::debug!(
         live_subscribers = delivered,
         ttl = frame.ttl,
         ?mode,
@@ -430,15 +439,46 @@ where
     // Cancellation-safe reads (see `FrameReader`): live deliveries, pacer
     // ticks and cover traffic fire while a client frame is still arriving.
     let mut frames = onyx_core::transport::FrameReader::new();
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(60));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // Idle bound: drop a connection that has gone silent.
+            _ = idle_check.tick() => {
+                if last_inbound.elapsed() > HUB_IDLE_TIMEOUT {
+                    tracing::debug!(conn = conn_id, "hub: closing idle connection");
+                    return Ok(());
+                }
+            }
             // Frame from the client.
             read_result = frames.read_frame(stream, session) => {
                 // Peer closed (or wire error mid-frame): treat as a
                 // clean disconnect — the caller will unregister us.
                 let Ok(frame) = read_result else { return Ok(()) };
+                last_inbound = tokio::time::Instant::now();
                 match frame.frame_type {
+                    onyx_core::wire::FRAME_PING => {
+                        // Client keepalive. Under constant-rate the paced
+                        // stream of frames already proves liveness, and an
+                        // off-slot PONG would break the invariant cadence.
+                        if !constant_enabled {
+                            write_frame(stream, session, &InnerFrame {
+                                frame_type: onyx_core::wire::FRAME_PONG,
+                                payload: Vec::new(),
+                            }).await
+                                .map_err(|e| anyhow::anyhow!("hub: write PONG: {e}"))?;
+                        }
+                    }
                     FRAME_SUBSCRIBE => {
+                        // SUBSCRIBE costs a signature verification, map
+                        // growth and (on drain) disk I/O, so it draws from
+                        // the same per-key budget as every other verb. It
+                        // used to be unmetered.
+                        if !state.lock().await.check_rate(peer_pk) {
+                            warn!(conn = conn_id, "hub: SUBSCRIBE rate-limited (bucket empty); dropping frame");
+                            continue;
+                        }
                         // HIGH-1: SUBSCRIBE is now signed. Verify the
                         // Ed25519 proof against this connection's Noise
                         // handshake hash (replay-binds the proof to
@@ -510,9 +550,9 @@ where
                         }
                         let drained = {
                             let mut s = state.lock().await;
-                            s.subscribe(conn_id, &ids)
+                            s.subscribe_as(conn_id, signer_inbox, &ids)
                         };
-                        info!(
+                        tracing::debug!(
                             conn = conn_id,
                             ids = ids.len(),
                             queued_drained = drained.len(),
@@ -563,7 +603,7 @@ where
                             let mut s = state.lock().await;
                             s.deliver_from_client(target, frame.payload)
                         };
-                        info!(
+                        tracing::debug!(
                             conn = conn_id,
                             live_subscribers = delivered,
                             "hub: deliver routed"
@@ -665,7 +705,7 @@ where
                             s.publish_keypackage(routing_id, kp_bytes);
                             s.keypackage_count()
                         };
-                        info!(
+                        tracing::debug!(
                             conn = conn_id,
                             kp_bytes = kp_len,
                             directory_size = dir_size,
@@ -715,7 +755,7 @@ where
                             payload: response_payload,
                         }).await
                             .map_err(|e| anyhow::anyhow!("hub: write KP_RESPONSE: {e}"))?;
-                        info!(
+                        tracing::debug!(
                             conn = conn_id,
                             found,
                             "hub: KP_FETCH answered"

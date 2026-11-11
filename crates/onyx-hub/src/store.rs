@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS keypackage (
   kp_bytes      BLOB NOT NULL,
   published_at  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS known_inbox (
+  routing_id    BLOB PRIMARY KEY
+) WITHOUT ROWID;
 ";
 
 /// SQLite-backed durable store for queue + KP-directory state.
@@ -104,11 +108,32 @@ impl Store {
     /// already exist; the hub's `main.rs` `ensure_data_dir`s before
     /// calling this.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        // The store holds routing ids, sealed envelopes and arrival
+        // times: owner-only, like the client vault. Create it 0600 before
+        // SQLite opens it, and tighten a file an older build left wider.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("creating hub store at {}", path.display()))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 on {}", path.display()))?;
+        }
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )
         .with_context(|| format!("opening hub store at {}", path.display()))?;
+        // Overwrite freed pages: a drained or GC'd envelope (routing id,
+        // ciphertext, arrival time) must not stay recoverable from the
+        // file after it has been delivered.
+        conn.pragma_update(None, "secure_delete", true)
+            .context("enabling secure_delete")?;
         conn.execute_batch(SCHEMA).context("applying hub schema")?;
         Ok(Self { conn })
     }
@@ -123,10 +148,44 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Record `routing_id` as an introduction inbox (idempotent). Kept
+    /// separately from the capped KeyPackage directory on purpose — see
+    /// `HubState::known_inboxes`.
+    pub fn add_known_inbox(&self, routing_id: &RoutingId) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO known_inbox (routing_id) VALUES (?)",
+                params![routing_id.as_slice()],
+            )
+            .context("add_known_inbox")?;
+        Ok(())
+    }
+
+    /// Every recorded introduction-inbox id.
+    pub fn load_known_inboxes(&self) -> anyhow::Result<Vec<RoutingId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT routing_id FROM known_inbox")
+            .context("load_known_inboxes: prepare")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .context("load_known_inboxes: query")?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(rid) = RoutingId::try_from(row?.as_slice()) {
+                out.push(rid);
+            }
+        }
+        Ok(out)
+    }
+
     /// Append a payload to the queue for `routing_id`. Returns the
     /// auto-assigned row id (FIFO sequence number).
     pub fn enqueue(&self, routing_id: &RoutingId, payload: &[u8]) -> anyhow::Result<i64> {
-        let now = epoch_ms();
+        // Stored to the hour only. GC works in days and the row id already
+        // gives FIFO order; a millisecond arrival time per envelope is a
+        // traffic-analysis record for whoever takes the disk.
+        let now = coarse_ms(epoch_ms());
         self.conn
             .execute(
                 "INSERT INTO queue_entry (routing_id, payload, enqueued_at) VALUES (?, ?, ?)",
@@ -315,6 +374,12 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// Round a millisecond timestamp down to the hour.
+fn coarse_ms(ms: i64) -> i64 {
+    const HOUR_MS: i64 = 3_600_000;
+    ms - ms.rem_euclid(HOUR_MS)
 }
 
 pub(crate) fn epoch_ms() -> i64 {

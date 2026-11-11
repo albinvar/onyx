@@ -70,7 +70,14 @@ pub async fn run_peer_session(
 ) -> anyhow::Result<()> {
     let mut backoff = BACKOFF_INITIAL;
     loop {
-        match run_once(&tor, &host, port, &peer_pubkey, &our_sk, &mut outbound_rx).await {
+        let attempt_start = tokio::time::Instant::now();
+        let outcome = run_once(&tor, &host, port, &peer_pubkey, &our_sk, &mut outbound_rx).await;
+        // A link that stayed up for a while was healthy: its eventual drop
+        // should reconnect promptly, not inherit the largest backoff.
+        if attempt_start.elapsed() >= BACKOFF_MAX {
+            backoff = BACKOFF_INITIAL;
+        }
+        match outcome {
             Ok(()) => {
                 // Receiver closed (hub shutting down). Exit cleanly.
                 info!(host = %host, port, "peer-hub: outbound channel closed, task exiting");
@@ -130,6 +137,13 @@ async fn run_once(
     );
 
     while let Some(frame) = outbound_rx.recv().await {
+        // A frame that cannot be encoded (too large for any bucket) is
+        // skipped, not fatal: one oversized gossip payload must not tear
+        // the federation link down.
+        if frame.bucket().is_none() {
+            warn!("peer-hub: dropping a gossip frame too large to encode");
+            continue;
+        }
         write_frame(&mut stream, &mut session, &frame)
             .await
             .context("peer-hub: write_frame")?;
