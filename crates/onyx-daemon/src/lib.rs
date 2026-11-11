@@ -4079,19 +4079,27 @@ async fn handle_hub_dm_app_frame(
     peer_pub: &[u8; 32],
     state: &Arc<DaemonState>,
 ) {
-    let plaintext = {
+    let (plaintext, sender_fp) = {
         let party = state.mls_party.lock().await;
         if let Ok(Some(mut group)) = party.load_group(group_id) {
+            // The other member of this 2-party group, by MLS leaf key —
+            // the identity the ciphertext is authenticated against, not
+            // anything the envelope claims.
+            let fp = group
+                .peer_signing_key_bytes(&party.signing_public_bytes())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .and_then(|arr| VerifyingKey::from_bytes(arr).ok())
+                .map(|vk| vk.fingerprint().to_base32_grouped());
             match group.decrypt_application(&party, ciphertext) {
-                Ok(pt) => Some(pt),
+                Ok(pt) => (Some(pt), fp),
                 Err(e) => {
                     debug!(error = %e, "hub DM: decrypt failed; dropping");
-                    None
+                    (None, None)
                 }
             }
         } else {
             debug!("hub DM: no matching DM group; dropping");
-            None
+            (None, None)
         }
     };
     let Some(plaintext) = plaintext else { return };
@@ -4124,9 +4132,20 @@ async fn handle_hub_dm_app_frame(
         // prior revision already held the party lock, self-deadlocking
         // (tokio Mutex is not reentrant). Caught by the receive test.
         let fingerprint = format!("(peer/{})", short_id_of_peer_pub(peer_pub));
-        let mut reg = state.conversations.lock().await;
-        let _ = reg.register_hub_only(*peer_pub, &peer_pub_b32, fingerprint);
-        reg.push_message_via_hub(peer_pub, onyx_core::api::MessageDirection::Incoming, text);
+        let sender_fp = sender_fp.unwrap_or_else(|| fingerprint.clone());
+        {
+            let mut reg = state.conversations.lock().await;
+            let _ = reg.register_hub_only(*peer_pub, &peer_pub_b32, fingerprint);
+            reg.push_message_via_hub(
+                peer_pub,
+                onyx_core::api::MessageDirection::Incoming,
+                text.clone(),
+            );
+        }
+        // Save it like any other DM. History is served from the vault, so
+        // without this a message relayed while we were offline showed up
+        // in a live view only: absent from `History`, gone after a restart.
+        persist_dm_message(state, peer_pub, false, &sender_fp, &text).await;
     } else {
         debug!("hub DM: non-Text RoomAppMessage on hub path; ignoring");
     }
@@ -4862,6 +4881,19 @@ mod dm_fallback_receive_tests {
             ),
             "received message must be Incoming"
         );
+
+        // And it is saved: History is read from the vault, so a relayed
+        // message that only reached the in-memory ring was invisible
+        // afterwards and lost on restart.
+        let stored = {
+            let vault = recv_state.vault.lock().await;
+            vault
+                .room_history(recv_state.identity_id, &group_id, 10)
+                .expect("room_history")
+        };
+        assert_eq!(stored.len(), 1, "hub-relayed DM must be persisted");
+        assert_eq!(stored[0].text, "delivered while you were offline");
+        assert!(!stored[0].direction_outgoing);
     }
 
     /// End-to-end through `handle_hub_delivery`: a stranger signs a

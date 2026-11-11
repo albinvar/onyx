@@ -87,6 +87,21 @@ Use this file as the single chronological view of where the project is. Implemen
   reconnected" from the startup race; a loss is reported only after a
   working link. Wording no longer says "daemon".
 
+**Fix — direct messages relayed by a hub were never saved**
+
+- Found by the two-Pi run, not by a unit test. With `--dm-hub-fallback`
+  a DM sent while the recipient is offline is relayed through the hub.
+  The recipient decrypted it and showed it in a live view, but never
+  wrote it to the vault — and history is served from the vault. So the
+  message was missing from `onyx history`, missing when the interface
+  was reopened, and gone after a restart. It is now saved like any
+  other DM, attributed by the MLS leaf key of the other group member.
+  The earlier live run passed only because that message happened to go
+  out by retry-on-reconnect instead of through the hub.
+  **Carry-forward:** saved history does not record whether a message
+  came through a hub, so the "via hub" mark is lost once a message is
+  read back from the vault.
+
 None of this changes the headline: no external audit.
 
 ---
