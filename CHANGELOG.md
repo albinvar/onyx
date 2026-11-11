@@ -95,6 +95,8 @@ THREAT_MODEL §8.6; this entry records what changed and why.
   FileMeta cannot bypass the receive budget; ratchet state is persisted per
   message; member removal persists before fan-out.
 - Room messages show their authenticated sender per line.
+- New CLI: `onyx code`, `onyx connect <code>`, `onyx peers`,
+  `onyx send`, `onyx history`.
 
 **Release chain**
 
@@ -103,6 +105,31 @@ THREAT_MODEL §8.6; this entry records what changed and why.
   unverified hub list. Signing permissions are scoped to the signing job,
   actions are pinned by commit, signed builds use no cache, the toolchain
   is an exact version.
+
+**Found by running it (live suite over real Tor, two Raspberry Pis)**
+
+- **Offline delivery through a hub never worked for DMs.** Relayed group
+  traffic went to one token per (group, epoch) that every member — the
+  sender included — subscribes to, and a hub only queues when nobody is
+  subscribed. The sender got its own envelope back and the offline
+  recipient got nothing. Now each member has its own per-epoch token
+  (`routing::member_token`); as a side effect the hub can no longer tell
+  which subscriptions belong to the same room.
+- **A message sent just after the peer vanished was accepted and lost.**
+  The sender half of delivery receipts is now wired: unacknowledged DMs
+  are re-sent on the next session with their original id, and the
+  recipient de-duplicates.
+- **Existing room members never learned a newcomer's relay key**, so
+  anyone without a direct session to the new member could not deliver to
+  them (the send still reported success). The joiner now announces its
+  own key.
+- **RESUME binding** moved from "the one recorded group id" to "a
+  two-member group with the identity pinned to this transport key", and
+  the initiator falls back to a fresh group after three refused resumes
+  (a contact who had lost the group was unreachable forever).
+- `hubs.json` lists two public hubs; `onyx-pi-1` did not answer during
+  the run (9 consecutive dial failures). The other (v0.1.26) worked with
+  the new client, including the new keepalive.
 
 **Checked against upstream source:** openmls 0.8.1 already rejects a
 Welcome that reuses an existing group id, so that suspected takeover is
