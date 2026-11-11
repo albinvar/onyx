@@ -312,6 +312,35 @@ enum Command {
         #[arg(long)]
         pubkey: String,
     },
+    /// Print this node's **connect code** — the one string a contact
+    /// needs to reach you directly over Tor, no hub involved. Share it
+    /// over a channel you trust; they run `onyx connect <code>`.
+    Code,
+    /// Connect to a contact from their connect code
+    /// (`onyx://connect/v1?onion=…&id=…`). One step: both of you just need
+    /// to be online. Equivalent to `onyx dial` with the two fields split
+    /// out for you.
+    Connect {
+        /// The contact's connect code.
+        code: String,
+    },
+    /// List conversations: who is connected, last activity, and whether
+    /// a contact's identity key is verified or has changed.
+    Peers,
+    /// Send a direct message. `peer` is the contact's short id as shown
+    /// by `onyx peers`.
+    Send {
+        peer: String,
+        /// The message text.
+        text: String,
+    },
+    /// Show recent messages with a contact (short id from `onyx peers`).
+    History {
+        peer: String,
+        /// How many of the most recent messages to show.
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
     /// Print a shareable `onyx://invite/v1?…` URL bundling our
     /// fingerprint and KEM public key. Hand it to a peer (over Signal,
     /// in person, whatever channel you trust to authenticate them) and
@@ -1446,6 +1475,45 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
             )
             .await
         }
+        Some(Command::Code) => run_code(&socket).await,
+        Some(Command::Connect { code }) => {
+            let parsed = match onyx_core::connect::ConnectCode::parse(&code) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("onyx: {e}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            one_shot_print(
+                &socket,
+                ApiRequest::DialPeer {
+                    onion: parsed.onion,
+                    pubkey_b32: parsed.identity_pub_b32,
+                },
+            )
+            .await
+        }
+        Some(Command::Peers) => one_shot_print(&socket, ApiRequest::Peers).await,
+        Some(Command::Send { peer, text }) => {
+            one_shot_print(
+                &socket,
+                ApiRequest::Send {
+                    peer_short: peer,
+                    text,
+                },
+            )
+            .await
+        }
+        Some(Command::History { peer, limit }) => {
+            one_shot_print(
+                &socket,
+                ApiRequest::History {
+                    peer_short: peer,
+                    limit,
+                },
+            )
+            .await
+        }
         Some(Command::Room { cmd }) => dispatch_room(&socket, cmd).await,
         Some(Command::Files { cmd }) => dispatch_files(&socket, cmd).await,
         Some(Command::Contact { cmd }) => dispatch_contact(&socket, cmd).await,
@@ -2271,6 +2339,35 @@ async fn run_doctor(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
 
 /// Send `req`, pretty-print the response as JSON on stdout, return
 /// `1` if the daemon returned an `Error`, `0` otherwise.
+/// `onyx code`: print this node's connect code, or say why there isn't
+/// one yet (the hidden service takes a moment to publish after start).
+async fn run_code(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
+    match client::one_shot(socket, &ApiRequest::Status).await? {
+        ApiResponse::StatusOk {
+            onion: Some(onion),
+            identity_pub_b32,
+            ..
+        } => {
+            println!(
+                "{}",
+                onyx_core::connect::ConnectCode::new(onion, identity_pub_b32).to_url()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        ApiResponse::StatusOk { .. } => {
+            eprintln!(
+                "onyx: no onion address yet — the hidden service is still publishing. \
+                 Try again in a minute (`onyx status` shows progress)."
+            );
+            Ok(ExitCode::from(1))
+        }
+        other => {
+            eprintln!("onyx: unexpected response: {other:?}");
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
 async fn one_shot_print(socket: &std::path::Path, req: ApiRequest) -> anyhow::Result<ExitCode> {
     let resp = client::one_shot(socket, &req).await?;
     let json = serde_json::to_string_pretty(&resp)?;
