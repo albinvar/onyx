@@ -555,6 +555,14 @@ enum RoomCommand {
         #[arg(long)]
         new_name: String,
     },
+    /// List room invitations waiting for your decision. An invitation
+    /// from someone who is not one of your contacts is never joined
+    /// automatically.
+    Pending,
+    /// Join the room a pending invitation is for (id from `room pending`).
+    Accept { id: i64 },
+    /// Discard a pending invitation without joining.
+    Decline { id: i64 },
     /// Leave a room cleanly (T-polish.2). Sends an MLS Remove
     /// commit informing every other current member, then drops
     /// local state. Other members will see their roster shrink
@@ -1695,6 +1703,11 @@ async fn dispatch_room(socket: &std::path::Path, cmd: RoomCommand) -> anyhow::Re
                 },
             )
             .await
+        }
+        RoomCommand::Pending => one_shot_print(socket, ApiRequest::ListPendingInvites).await,
+        RoomCommand::Accept { id } => one_shot_print(socket, ApiRequest::AcceptInvite { id }).await,
+        RoomCommand::Decline { id } => {
+            one_shot_print(socket, ApiRequest::DeclineInvite { id }).await
         }
         RoomCommand::Leave { group_id } => {
             one_shot_print(

@@ -131,6 +131,24 @@ THREAT_MODEL §8.6; this entry records what changed and why.
   the run (9 consecutive dial failures). The other (v0.1.26) worked with
   the new client, including the new keepalive.
 
+**Trust architecture**
+
+- `TRUST-ARCHITECTURE.md`: a decision record for the four remaining
+  structural gaps (shared permanent onion, no recipient-side forward
+  secrecy for envelopes, unencrypted social graph in the vault, joining
+  without consent) with options and a chosen approach for each.
+- The fourth is implemented: a room invitation from someone who is not an
+  established contact (no direct session, not verified) is held, sealed,
+  until the user accepts or declines it. Nothing is joined, created or
+  subscribed before that.
+
+**Interface**
+
+- CLI prints a readable summary at a terminal and JSON when piped or with
+  `--json`; remote text is stripped of control characters.
+- TUI: flat layout with a top status bar, unboxed panels and a compact
+  conversation list.
+
 **Checked against upstream source:** openmls 0.8.1 already rejects a
 Welcome that reuses an existing group id, so that suspected takeover is
 not exploitable.

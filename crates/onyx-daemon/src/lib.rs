@@ -3874,6 +3874,28 @@ async fn handle_hub_delivery(
             admins,
             reply_onion,
         } => {
+            // Consent: a ROOM invitation from someone who is not an
+            // established contact is held for the user's decision instead
+            // of being joined. Joining creates local state, announces a
+            // subscription and puts a stranger-chosen room name on screen;
+            // none of that should happen on a stranger's say-so. (A DM
+            // bootstrap — no room name — is a reply to an invite we
+            // issued, and is shown as an unverified conversation.)
+            if let Some(name) = room_name.as_deref()
+                && !is_established_contact(state, &sender_fingerprint, &sender_x25519).await
+            {
+                hold_room_invitation(
+                    state,
+                    welcome.as_ref(),
+                    name,
+                    member_kems,
+                    admins,
+                    &sender_x25519,
+                    sender_fingerprint,
+                )
+                .await;
+                return;
+            }
             process_hub_mls_welcome(
                 welcome.as_ref(),
                 first_message,
@@ -3902,6 +3924,103 @@ async fn handle_hub_delivery(
             .await;
         }
     }
+}
+
+/// Is the sender of a hub envelope someone the user has an established
+/// relationship with — a contact they have had a direct session with, or
+/// one they have marked verified?
+///
+/// Deliberately stricter than "is pinned": the first envelope from any
+/// stranger pins them, so a pin alone would let a stranger send one plain
+/// message and then count as known. A direct session exists only because
+/// one side handed the other a connect code; verification is an explicit
+/// user action. Fails closed (unknown) on any vault error.
+async fn is_established_contact(state: &DaemonState, fingerprint: &str, x25519: &[u8; 32]) -> bool {
+    let vault = state.vault.lock().await;
+    let has_direct_history = vault
+        .lookup_peer_group(state.identity_id, x25519)
+        .is_ok_and(|group| group.is_some());
+    let verified = vault
+        .pin_status(state.identity_id, fingerprint)
+        .is_ok_and(|status| matches!(status, Some((false, true))));
+    has_direct_history || verified
+}
+
+/// Store a room invitation from a non-contact for the user to accept or
+/// decline, and tell them it is waiting.
+async fn hold_room_invitation(
+    state: &DaemonState,
+    welcome: &[u8],
+    room_name: &str,
+    member_kems: Vec<onyx_core::routing::RoomMemberKem>,
+    admins: Vec<String>,
+    sender_x25519: &[u8; 32],
+    sender_fingerprint: String,
+) {
+    let invite = onyx_core::storage::PendingInvite {
+        welcome: serde_bytes::ByteBuf::from(welcome.to_vec()),
+        room_name: room_name.to_string(),
+        member_kems,
+        admins,
+        sender_x25519: serde_bytes::ByteBuf::from(sender_x25519.to_vec()),
+        sender_fingerprint,
+        received_at_ms: u64::try_from(now_unix_ms_i64()).unwrap_or(0),
+    };
+    let stored = {
+        let vault = state.vault.lock().await;
+        vault.add_pending_invite(state.identity_id, &invite)
+    };
+    match stored {
+        Ok(_) => state.conversations.lock().await.emit_note(
+            "info",
+            "Someone who is not one of your contacts invited you to a room. \
+             Nothing was joined — review it with `onyx room pending`.",
+        ),
+        Err(e) => warn!(error = %e, "could not store a pending room invitation; dropping it"),
+    }
+}
+
+/// Join the room a held invitation is for (the user accepted it).
+pub(crate) async fn accept_pending_invite(
+    state: &Arc<DaemonState>,
+    invite: onyx_core::storage::PendingInvite,
+) -> anyhow::Result<()> {
+    let sender_x25519: [u8; 32] = invite
+        .sender_x25519
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stored invitation has a malformed sender key"))?;
+    let sender_pub_b32 = encode_b32(&sender_x25519);
+    let group_count_before = state
+        .vault
+        .lock()
+        .await
+        .list_rooms(state.identity_id)
+        .map_or(0, |rooms| rooms.len());
+    process_hub_mls_welcome(
+        invite.welcome.as_ref(),
+        None,
+        Some(invite.room_name),
+        invite.member_kems,
+        invite.admins,
+        None,
+        sender_x25519,
+        &sender_pub_b32,
+        invite.sender_fingerprint,
+        state,
+    )
+    .await;
+    let group_count_after = state
+        .vault
+        .lock()
+        .await
+        .list_rooms(state.identity_id)
+        .map_or(0, |rooms| rooms.len());
+    anyhow::ensure!(
+        group_count_after > group_count_before,
+        "the invitation could no longer be joined (it may have expired or already been used)"
+    );
+    Ok(())
 }
 
 /// Handle a T6.3.e `BootstrapPayload::MlsApp` hub-delivery. Extracted

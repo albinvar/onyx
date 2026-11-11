@@ -578,6 +578,51 @@ async fn dispatch_one_shot(
             new_name,
         } => handle_rename_room(group_id_b32, new_name, state).await,
         ApiRequest::LeaveRoom { group_id_b32 } => handle_leave_room(group_id_b32, state).await,
+        ApiRequest::ListPendingInvites => {
+            let vault = state.vault.lock().await;
+            match vault.list_pending_invites(state.identity_id) {
+                Ok(held) => ApiResponse::PendingInvitesOk {
+                    invites: held
+                        .into_iter()
+                        .map(|(id, invite)| onyx_core::api::PendingInviteInfo {
+                            id,
+                            room_name: invite.room_name,
+                            from_fingerprint: invite.sender_fingerprint,
+                            members: u32::try_from(invite.member_kems.len()).unwrap_or(u32::MAX),
+                            received_at_ms: invite.received_at_ms,
+                        })
+                        .collect(),
+                },
+                Err(e) => ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("list pending invitations: {e}"),
+                },
+            }
+        }
+        ApiRequest::AcceptInvite { id } | ApiRequest::DeclineInvite { id } => {
+            let taken = {
+                let vault = state.vault.lock().await;
+                vault.take_pending_invite(state.identity_id, *id)
+            };
+            match (taken, req) {
+                (Err(e), _) => ApiResponse::Error {
+                    code: ApiErrorCode::Internal,
+                    message: format!("pending invitation: {e}"),
+                },
+                (Ok(None), _) => ApiResponse::Error {
+                    code: ApiErrorCode::Malformed,
+                    message: "no pending invitation with that id".into(),
+                },
+                (Ok(Some(_)), ApiRequest::DeclineInvite { .. }) => ApiResponse::RoomOpOk,
+                (Ok(Some(invite)), _) => match crate::accept_pending_invite(state, invite).await {
+                    Ok(()) => ApiResponse::RoomOpOk,
+                    Err(e) => ApiResponse::Error {
+                        code: ApiErrorCode::Malformed,
+                        message: e.to_string(),
+                    },
+                },
+            }
+        }
         ApiRequest::RemoveFromRoom {
             group_id_b32,
             peer_fingerprint,

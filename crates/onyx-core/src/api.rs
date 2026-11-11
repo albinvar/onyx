@@ -346,6 +346,14 @@ pub enum ApiRequest {
     /// Requires `--hub` (the Remove commit fans out the same way
     /// as an Add commit in [`Self::InviteToRoom`]).
     LeaveRoom { group_id_b32: String },
+    /// List room invitations that are waiting for a decision. An
+    /// invitation from someone who is not an established contact is held
+    /// rather than joined.
+    ListPendingInvites,
+    /// Join the room a held invitation is for.
+    AcceptInvite { id: i64 },
+    /// Discard a held invitation without joining.
+    DeclineInvite { id: i64 },
     /// Remove (kick) another member from a room (task 325). The
     /// daemon issues an MLS `Remove` commit evicting the member whose
     /// fingerprint is `peer_fingerprint`, fans the commit out to all
@@ -614,6 +622,8 @@ pub enum ApiResponse {
     /// [`ApiRequest::RenameRoom`] (T-polish.1). Pure-local
     /// operations; no on-the-wire side effect.
     RoomOpOk,
+    /// Reply to [`ApiRequest::ListPendingInvites`].
+    PendingInvitesOk { invites: Vec<PendingInviteInfo> },
     /// Reply to [`ApiRequest::LeaveRoom`] (T-polish.2). `members`
     /// is the pre-leave roster (the count of other members the
     /// Remove commit was fanned out to).
@@ -804,6 +814,20 @@ pub struct RoomHistoryEntry {
     pub sender_fp: String,
     pub text: String,
     pub ts_unix_ms: u64,
+}
+
+/// One held room invitation, as shown to the user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingInviteInfo {
+    /// Pass this to `AcceptInvite` / `DeclineInvite`.
+    pub id: i64,
+    /// The room name the inviter chose (untrusted text).
+    pub room_name: String,
+    /// The inviter's authenticated Ed25519 fingerprint.
+    pub from_fingerprint: String,
+    /// How many members the inviter listed.
+    pub members: u32,
+    pub received_at_ms: u64,
 }
 
 /// One row in [`ApiResponse::ListReceivedFilesOk`] (T-files.d).

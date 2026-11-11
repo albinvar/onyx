@@ -1073,12 +1073,28 @@ async fn rooms_e2e_three_party_commit_distribution() {
     );
 }
 
+/// Play the user: accept every room invitation the daemon is holding.
+/// An invitation from someone the invitee has no established relationship
+/// with is held for a decision rather than joined (see
+/// `rooms_e2e_stranger_invitation_waits_for_acceptance`); the other tests
+/// are about what happens after the user says yes.
+async fn accept_pending_invitations(socket: &Path) {
+    if let ApiResponse::PendingInvitesOk { invites } =
+        one_shot(socket, &ApiRequest::ListPendingInvites).await
+    {
+        for invite in invites {
+            let _ = one_shot(socket, &ApiRequest::AcceptInvite { id: invite.id }).await;
+        }
+    }
+}
+
 /// Poll `ListRooms` on the named daemon until the room's roster
 /// reaches at least `min_members`, or timeout. Used by the 3-party
 /// test to wait out bob's commit-merge → roster-refresh latency.
 async fn poll_room_members(socket: &Path, group_id_b32: &str, min_members: usize) -> RoomInfo {
     let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     loop {
+        accept_pending_invitations(socket).await;
         let resp = one_shot(socket, &ApiRequest::ListRooms).await;
         if let ApiResponse::ListRoomsOk { rooms } = resp
             && let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32)
@@ -1150,6 +1166,7 @@ async fn wait_for_tail_event<T>(
 async fn wait_for_room_in_list(socket: &Path, group_id_b32: &str) -> RoomInfo {
     let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     loop {
+        accept_pending_invitations(socket).await;
         let resp = one_shot(socket, &ApiRequest::ListRooms).await;
         if let ApiResponse::ListRoomsOk { rooms } = resp
             && let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32)
@@ -1169,6 +1186,7 @@ async fn wait_for_room_in_list(socket: &Path, group_id_b32: &str) -> RoomInfo {
 async fn poll_room_members_exact(socket: &Path, group_id_b32: &str, n: usize) -> RoomInfo {
     let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
     loop {
+        accept_pending_invitations(socket).await;
         if let ApiResponse::ListRoomsOk { rooms } = one_shot(socket, &ApiRequest::ListRooms).await
             && let Some(r) = rooms.into_iter().find(|r| r.group_id_b32 == group_id_b32)
             && r.members.len() == n
@@ -1304,6 +1322,111 @@ async fn rooms_e2e_remove_member_kicks_target() {
         }
         other => panic!("SendRoom post-remove: {other:?}"),
     }
+}
+
+/// Consent (TRUST-ARCHITECTURE.md T-4): a room invitation from someone
+/// the invitee has no established relationship with is HELD — no room is
+/// created — until the invitee accepts it. Declining discards it.
+#[tokio::test]
+async fn rooms_e2e_stranger_invitation_waits_for_acceptance() {
+    let (hub_addr, hub_pub_b32, _hub_dir) = spawn_hub().await;
+    let (alice_sock, _alice_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "alice").await;
+    let (bob_sock, _bob_dir) = spawn_daemon(&hub_addr, &hub_pub_b32, "bob").await;
+    one_shot_until_ok(&alice_sock, &ApiRequest::Identity, "alice ready").await;
+    let (bob_fp, bob_kem_b32) = identity_fp_kem(&bob_sock, "bob").await;
+
+    // alice invites bob to two rooms; bob has never talked to alice.
+    let mut rooms = Vec::new();
+    for name in ["first", "second"] {
+        let group_id_b32 = match one_shot(
+            &alice_sock,
+            &ApiRequest::CreateRoom {
+                name: name.to_string(),
+            },
+        )
+        .await
+        {
+            ApiResponse::CreateRoomOk { group_id_b32, .. } => group_id_b32,
+            other => panic!("CreateRoom returned {other:?}"),
+        };
+        let kp_b64 = match one_shot_until_ok(
+            &alice_sock,
+            &ApiRequest::FetchPeerKeyPackage {
+                peer_fingerprint: bob_fp.clone(),
+            },
+            "alice fetch bob KP",
+        )
+        .await
+        {
+            ApiResponse::FetchPeerKeyPackageOk { kp_b64 } => kp_b64,
+            other => panic!("FetchPeerKeyPackage returned {other:?}"),
+        };
+        match one_shot(
+            &alice_sock,
+            &ApiRequest::InviteToRoom {
+                group_id_b32: group_id_b32.clone(),
+                peer_fingerprint: bob_fp.clone(),
+                peer_kem_pub_b32: bob_kem_b32.clone(),
+                peer_kp_b64: kp_b64,
+            },
+        )
+        .await
+        {
+            ApiResponse::InviteToRoomOk { .. } => {}
+            other => panic!("InviteToRoom returned {other:?}"),
+        }
+        rooms.push(group_id_b32);
+        // The KeyPackage bob published is single-use; give his daemon a
+        // moment to republish before the next invite fetches one.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
+    // Both invitations arrive and are held; bob has joined nothing.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let held = loop {
+        if let ApiResponse::PendingInvitesOk { invites } =
+            one_shot(&bob_sock, &ApiRequest::ListPendingInvites).await
+            && !invites.is_empty()
+        {
+            break invites;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no invitation was held for bob"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    match one_shot(&bob_sock, &ApiRequest::ListRooms).await {
+        ApiResponse::ListRoomsOk { rooms } => {
+            assert!(
+                rooms.is_empty(),
+                "nothing may be joined before consent: {rooms:?}"
+            );
+        }
+        other => panic!("ListRooms returned {other:?}"),
+    }
+    let first = held
+        .iter()
+        .find(|i| i.room_name == "first")
+        .expect("first held");
+
+    // Accepting joins exactly that room.
+    match one_shot(&bob_sock, &ApiRequest::AcceptInvite { id: first.id }).await {
+        ApiResponse::RoomOpOk => {}
+        other => panic!("AcceptInvite returned {other:?}"),
+    }
+    match one_shot(&bob_sock, &ApiRequest::ListRooms).await {
+        ApiResponse::ListRoomsOk { rooms: joined } => {
+            assert_eq!(joined.len(), 1);
+            assert_eq!(joined[0].group_id_b32, rooms[0]);
+        }
+        other => panic!("ListRooms returned {other:?}"),
+    }
+    // An id that was already used is gone.
+    assert!(matches!(
+        one_shot(&bob_sock, &ApiRequest::AcceptInvite { id: first.id }).await,
+        ApiResponse::Error { .. }
+    ));
 }
 
 /// Compile-time sanity: HashMap is in scope (used implicitly via

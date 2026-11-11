@@ -207,6 +207,31 @@ pub fn render(resp: &ApiResponse, style: Style) -> Option<String> {
         ApiResponse::RoomOpOk => {
             let _ = writeln!(out, "{}", style.paint("done", GREEN));
         }
+        ApiResponse::PendingInvitesOk { invites } => {
+            if invites.is_empty() {
+                let _ = writeln!(out, "No pending invitations.");
+            }
+            for invite in invites {
+                let _ = writeln!(
+                    out,
+                    "{}  room \"{}\"  from {}  ({} listed member(s))",
+                    style.paint(&format!("#{}", invite.id), BOLD),
+                    clean(&invite.room_name),
+                    short_fp(&invite.from_fingerprint),
+                    invite.members
+                );
+            }
+            if !invites.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    style.paint(
+                        "  Join with `onyx room accept <id>`, or discard with `onyx room decline <id>`.",
+                        DIM
+                    )
+                );
+            }
+        }
         ApiResponse::ListContactsOk { contacts } => render_contacts(&mut out, contacts, style),
         ApiResponse::SetContactVerifiedOk { updated } | ApiResponse::SetNicknameOk { updated } => {
             if *updated {

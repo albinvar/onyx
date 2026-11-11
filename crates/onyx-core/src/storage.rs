@@ -320,6 +320,35 @@ CREATE TABLE IF NOT EXISTS pinned_keys (
 );
 ";
 
+/// Room invitations from non-contacts, held until the user accepts or
+/// declines. The whole invitation (Welcome bytes, room name, roster keys,
+/// admin set, who sent it) is one sealed blob: nothing about a pending
+/// invitation is readable from the file without the passphrase.
+const SCHEMA_PENDING_INVITES_ADD: &str = "
+CREATE TABLE IF NOT EXISTS pending_invites (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  identity_id  INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+  blob         BLOB NOT NULL
+);
+";
+
+/// Most invitations held at once. A stranger can send as many as they
+/// like; past this the oldest is discarded.
+pub const MAX_PENDING_INVITES: usize = 32;
+
+/// A room invitation waiting for the user's decision. See
+/// [`Vault::add_pending_invite`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingInvite {
+    pub welcome: serde_bytes::ByteBuf,
+    pub room_name: String,
+    pub member_kems: Vec<crate::routing::RoomMemberKem>,
+    pub admins: Vec<String>,
+    pub sender_x25519: serde_bytes::ByteBuf,
+    pub sender_fingerprint: String,
+    pub received_at_ms: u64,
+}
+
 /// Idempotently add a column to a table if it isn't already present. Used
 /// for additive migrations on existing vaults where `CREATE TABLE IF NOT
 /// EXISTS` can't introduce a new column. `table`/`column`/`decl` are
@@ -480,6 +509,7 @@ const SEALED_COLUMNS: &[(&str, &str)] = &[
     ("room_messages", "sfp_enc"),
     ("rooms", "name_enc"),
     ("rooms", "members_enc"),
+    ("pending_invites", "blob"),
 ];
 
 /// Re-seal every non-NULL `column` blob in `table` from `old` to `new`
@@ -638,6 +668,8 @@ impl Vault {
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
             .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PENDING_INVITES_ADD)
+            .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_KEM_ADD)
@@ -777,6 +809,8 @@ impl Vault {
         conn.execute_batch(SCHEMA_RECEIVED_FILES_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PINNED_KEYS_ADD)
+            .map_err(map_db_err)?;
+        conn.execute_batch(SCHEMA_PENDING_INVITES_ADD)
             .map_err(map_db_err)?;
         conn.execute_batch(SCHEMA_PEER_DIAL_ADD)
             .map_err(map_db_err)?;
@@ -1170,6 +1204,74 @@ impl Vault {
                 Ok(PinOutcome::Mismatch { pinned })
             }
         }
+    }
+
+    /// Hold a room invitation for the user's decision. Returns its id.
+    /// Bounded at [`MAX_PENDING_INVITES`]: the oldest is discarded first.
+    pub fn add_pending_invite(&self, identity_id: i64, invite: &PendingInvite) -> Result<i64> {
+        let mut cbor = Vec::new();
+        ciborium::into_writer(invite, &mut cbor)
+            .map_err(|_| Error::Internal("pending invite: CBOR encode failed"))?;
+        let blob = self.encrypt_blob(&cbor)?;
+        self.conn
+            .execute(
+                "INSERT INTO pending_invites (identity_id, blob) VALUES (?, ?)",
+                params![identity_id, blob],
+            )
+            .map_err(map_db_err)?;
+        let id = self.conn.last_insert_rowid();
+        #[allow(clippy::cast_possible_wrap)]
+        let keep = MAX_PENDING_INVITES as i64;
+        self.conn
+            .execute(
+                "DELETE FROM pending_invites WHERE identity_id = ?1 AND id NOT IN \
+                 (SELECT id FROM pending_invites WHERE identity_id = ?1 \
+                  ORDER BY id DESC LIMIT ?2)",
+                params![identity_id, keep],
+            )
+            .map_err(map_db_err)?;
+        Ok(id)
+    }
+
+    /// Every held invitation, oldest first, with its id.
+    pub fn list_pending_invites(&self, identity_id: i64) -> Result<Vec<(i64, PendingInvite)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, blob FROM pending_invites WHERE identity_id = ? ORDER BY id ASC")
+            .map_err(map_db_err)?;
+        let rows = stmt
+            .query_map(params![identity_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(map_db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, blob) = row.map_err(map_db_err)?;
+            let cbor = self.decrypt_blob(&blob)?;
+            let invite: PendingInvite = ciborium::from_reader(cbor.as_slice())
+                .map_err(|_| Error::InvalidEncoding("pending invite: CBOR decode failed"))?;
+            out.push((id, invite));
+        }
+        Ok(out)
+    }
+
+    /// Remove a held invitation and return it (`None` if there is no
+    /// such id). Used for both accept and decline.
+    pub fn take_pending_invite(&self, identity_id: i64, id: i64) -> Result<Option<PendingInvite>> {
+        let found = self
+            .list_pending_invites(identity_id)?
+            .into_iter()
+            .find(|(row_id, _)| *row_id == id)
+            .map(|(_, invite)| invite);
+        if found.is_some() {
+            self.conn
+                .execute(
+                    "DELETE FROM pending_invites WHERE identity_id = ? AND id = ?",
+                    params![identity_id, id],
+                )
+                .map_err(map_db_err)?;
+        }
+        Ok(found)
     }
 
     /// Reverse pin lookup: the fingerprint a given X25519 identity key is
@@ -3020,6 +3122,47 @@ mod tests {
         assert_eq!(history[0].sender_fp, "sender-fp");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pending_invites_round_trip_bounded_and_sealed() {
+        let mut v = Vault::open_memory(b"pw", &Argon2Params::FLOOR).unwrap();
+        let (id, _identity) = v.create_identity("me").unwrap();
+        let invite = |n: usize| PendingInvite {
+            welcome: serde_bytes::ByteBuf::from(vec![7u8; 16]),
+            room_name: format!("room-{n}"),
+            member_kems: Vec::new(),
+            admins: vec!["admin-fp".into()],
+            sender_x25519: serde_bytes::ByteBuf::from(vec![1u8; 32]),
+            sender_fingerprint: "sender-fp".into(),
+            received_at_ms: 42,
+        };
+        for n in 0..(MAX_PENDING_INVITES + 5) {
+            v.add_pending_invite(id, &invite(n)).unwrap();
+        }
+        let held = v.list_pending_invites(id).unwrap();
+        assert_eq!(held.len(), MAX_PENDING_INVITES, "oldest are discarded");
+        assert_eq!(held[0].1.room_name, "room-5");
+        // The room name is not readable from the stored bytes.
+        let raw: Vec<u8> = v
+            .connection()
+            .query_row("SELECT blob FROM pending_invites LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(!raw.windows(5).any(|w| w == b"room-"));
+        // Taking one removes exactly that one.
+        let first_id = held[0].0;
+        assert_eq!(
+            v.take_pending_invite(id, first_id)
+                .unwrap()
+                .unwrap()
+                .room_name,
+            "room-5"
+        );
+        assert!(v.take_pending_invite(id, first_id).unwrap().is_none());
+        assert_eq!(
+            v.list_pending_invites(id).unwrap().len(),
+            MAX_PENDING_INVITES - 1
+        );
     }
 
     #[test]
