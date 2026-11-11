@@ -3018,6 +3018,51 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
                 app.last_send_result = Some(Err("no conversation selected".to_string()));
             }
         }
+        // Room invitations from people who are not contacts are held by
+        // the daemon until answered; these three are how to answer here.
+        "invites" | "pending" => {
+            match client::one_shot(&app.socket_path, &ApiRequest::ListPendingInvites).await {
+                Ok(ApiResponse::PendingInvitesOk { invites }) => {
+                    app.last_notice = Some(describe_pending_invites(&invites));
+                }
+                Ok(ApiResponse::Error { message, .. }) => {
+                    app.last_send_result = Some(Err(message));
+                }
+                Ok(_) => app.last_send_result = Some(Err("unexpected reply".to_string())),
+                Err(e) => app.last_send_result = Some(Err(format!("{e:#}"))),
+            }
+        }
+        "join" | "decline" => match arg.trim().parse::<i64>() {
+            Ok(id) => {
+                let accept = cmd == "join";
+                let req = if accept {
+                    ApiRequest::AcceptInvite { id }
+                } else {
+                    ApiRequest::DeclineInvite { id }
+                };
+                match client::one_shot(&app.socket_path, &req).await {
+                    Ok(ApiResponse::Error { message, .. }) => {
+                        app.last_send_result = Some(Err(message));
+                    }
+                    Ok(_) => {
+                        app.last_notice = Some(
+                            if accept {
+                                "Joined. The room is in your list."
+                            } else {
+                                "Declined. The invitation was deleted."
+                            }
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => app.last_send_result = Some(Err(format!("{e:#}"))),
+                }
+            }
+            Err(_) => {
+                app.last_send_result = Some(Err(format!(
+                    "usage: /{cmd} <number> — see the numbers with /invites"
+                )));
+            }
+        },
         "retention" | "ttl" => {
             if arg.is_empty() {
                 let cur = app
@@ -3162,6 +3207,34 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
 /// inline slash commands whose follow-up state arrives on the next status
 /// tick (room list, peer list, …), so a rich per-response handler isn't
 /// needed.
+/// One line describing the room invitations waiting for an answer.
+///
+/// The room name and member count were chosen by the inviter, who is by
+/// definition not a contact: the name is shortened and stripped of
+/// control characters, and the fingerprint is what identifies them.
+fn describe_pending_invites(invites: &[onyx_core::api::PendingInviteInfo]) -> String {
+    if invites.is_empty() {
+        return "No room invitations waiting.".to_string();
+    }
+    let items: Vec<String> = invites
+        .iter()
+        .map(|i| {
+            let name: String = i
+                .room_name
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(32)
+                .collect();
+            let from: String = i.from_fingerprint.chars().take(9).collect();
+            format!("#{} \"{name}\" from {from}… ({} members)", i.id, i.members)
+        })
+        .collect();
+    format!(
+        "{}  —  /join <number> or /decline <number>",
+        items.join("   ")
+    )
+}
+
 async fn run_simple_request(app: &mut AppState, req: ApiRequest) {
     match client::one_shot(&app.socket_path, &req).await {
         Ok(ApiResponse::Error { message, .. }) => app.last_send_result = Some(Err(message)),
@@ -4473,6 +4546,10 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         head("Slash commands (type in the composer)"),
         key("/help /file", "/search · /room [name] · /verify"),
         key("/share", "show my invite link + connect code"),
+        key(
+            "/invites",
+            "room invitations waiting · /join n · /decline n",
+        ),
         key("/add <link>", "add a contact (invite OR connect — auto)"),
         key(
             "/clear",
@@ -6275,6 +6352,26 @@ mod snapshot_tests {
         assert!(out.contains("onyx://connect/v1?onion=abc.onion&id=xyz"));
         assert!(out.contains("show as plain text"));
         assert!(!out.contains(&"a".repeat(200)), "long link is shortened");
+    }
+
+    #[test]
+    fn pending_invites_line_is_safe_and_actionable() {
+        assert_eq!(
+            describe_pending_invites(&[]),
+            "No room invitations waiting."
+        );
+        let line = describe_pending_invites(&[onyx_core::api::PendingInviteInfo {
+            id: 3,
+            room_name: format!("evil\x1b[2J{}", "x".repeat(100)),
+            from_fingerprint: "abcd efgh ijkl mnop".into(),
+            members: 4,
+            received_at_ms: 0,
+        }]);
+        assert!(line.contains("#3"));
+        assert!(line.contains("abcd efgh"));
+        assert!(line.contains("/join"));
+        assert!(!line.contains('\x1b'));
+        assert!(!line.contains(&"x".repeat(40)), "name is shortened");
     }
 
     #[test]

@@ -198,7 +198,7 @@ away so strangers holding your invite link can reach you. See
 | `Esc` / `Ctrl-C` | Close the open dialog, or quit |
 
 Composer commands: `/help`, `/share`, `/add <link>`, `/room [name]`, `/file`,
-`/search`, `/verify`, `/clear`, `/q`.
+`/search`, `/verify`, `/invites`, `/join <n>`, `/decline <n>`, `/clear`, `/q`.
 
 A message that arrived through a hub is marked; a conversation shows whether
 it is direct, relayed, or has no route.

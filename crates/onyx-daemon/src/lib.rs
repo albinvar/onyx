@@ -3974,7 +3974,7 @@ async fn hold_room_invitation(
         Ok(_) => state.conversations.lock().await.emit_note(
             "info",
             "Someone who is not one of your contacts invited you to a room. \
-             Nothing was joined — review it with `onyx room pending`.",
+             Nothing was joined — review it with /invites (or `onyx room pending`).",
         ),
         Err(e) => warn!(error = %e, "could not store a pending room invitation; dropping it"),
     }

@@ -17,8 +17,7 @@ Use this file as the single chronological view of where the project is. Implemen
   `onyx room accept <n>`, `onyx room decline <n>`. Invitations from
   existing contacts join automatically as before. This is T-4 in
   `TRUST-ARCHITECTURE.md`; T-1 to T-3 are designed there, not built.
-  **Carry-forward:** the terminal interface has no screen for held
-  invitations yet — CLI only.
+  In the terminal interface: `/invites`, `/join <n>`, `/decline <n>`.
 
 **Documentation**
 

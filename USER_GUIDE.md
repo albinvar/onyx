@@ -95,12 +95,13 @@ you at that moment. With one, members who are away get it later (see below).
 The person who made the room is its admin and decides who joins.
 
 If someone you have **not** added as a friend invites you to a room, Onyx does
-not join it for you. It holds the invitation. Outside the chat screen you can
-see and answer these:
+not join it for you. It holds the invitation and tells you. To answer, type
+one of these where you would type a message:
 
-```sh
-onyx room pending
-onyx room accept 1      # or: onyx room decline 1
+```
+/invites        see what is waiting
+/join 1         join invitation number 1
+/decline 1      throw it away
 ```
 
 ## Sending files
