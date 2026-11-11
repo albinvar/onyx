@@ -67,30 +67,28 @@ ONYX_NO_VERIFY=1 curl -fsSL .../install.sh | bash
 **Catches:**
 - Transport corruption / partial downloads (SHA256 against the manifest).
 - A backdoored binary in the GitHub release tab (sigstore signature won't verify because the attacker doesn't hold an OIDC token bound to this repo's `release.yml`).
-- A fake binary on a doppelganger repo with a similar name (the `--certificate-identity-regexp` is pinned to `https://github.com/albinvar/onyx/`).
+- A fake binary on a doppelganger repo with a similar name (the `--certificate-identity` is pinned to this repo's `release.yml` at the exact release tag, so a signature from any other workflow, branch or release does not verify).
 
 **Does NOT catch:**
 - A backdoor committed to the source code before the tag was cut. Sigstore signs what CI built; it doesn't tell you the source is honest.
 - A compromise of GitHub Actions, sigstore Fulcio, or the Rekor transparency log.
-- A tampered `install.sh` if you fetch it from the mutable `raw.githubusercontent.com/.../main/` URL. **Always fetch from a release-tag URL** — `.../releases/latest/download/install.sh` redirects to an immutable tag URL.
+- **A tampered `install.sh` when you pipe it straight into a shell.** The one-liner above trusts whatever the release page serves: the installer verifies the binaries, but nothing verifies the installer for you. Someone able to replace release assets could serve a script that skips every check. (Release assets are not immutable unless the repository has GitHub's immutable-releases setting enabled.)
+- A downgrade you ask for explicitly. By default the installer refuses to replace an installed `onyx` with an older version.
 
-For the strongest threat model: download → read the script → run it.
+**Recommended: download, verify the script's signature, then run it.** Replace `<tag>` with the release you are installing (e.g. `v0.1.31`):
 
 ```sh
-curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh -o install.sh
-less install.sh                  # read it
-bash install.sh                  # run it
+base=https://github.com/albinvar/onyx/releases/download/<tag>
+curl -fsSLO "$base/install.sh" -O "$base/install.sh.cosign-bundle"
 ```
 
-The script itself is signed too — verify it with cosign first if you want:
-
 ```sh
-curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh.cosign-bundle -o install.sh.cosign-bundle
 cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/albinvar/onyx/' \
+  --certificate-identity 'https://github.com/albinvar/onyx/.github/workflows/release.yml@refs/tags/<tag>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle install.sh.cosign-bundle \
   install.sh
+ONYX_VERSION=<tag> bash install.sh
 ```
 
 ## §2 Manual download + verify
@@ -110,7 +108,7 @@ curl -LO https://github.com/albinvar/onyx/releases/download/${VERSION}/SHA256SUM
 
 # 3. Verify the SHA256SUMS manifest itself is signed by THIS repo.
 cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/albinvar/onyx/' \
+  --certificate-identity 'https://github.com/albinvar/onyx/.github/workflows/release.yml@refs/tags/<tag>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle SHA256SUMS.txt.cosign-bundle \
   SHA256SUMS.txt
@@ -121,7 +119,7 @@ sha256sum --ignore-missing -c SHA256SUMS.txt
 
 # 5. (Optional, defence-in-depth) verify the binary's own sigstore bundle.
 cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/albinvar/onyx/' \
+  --certificate-identity 'https://github.com/albinvar/onyx/.github/workflows/release.yml@refs/tags/<tag>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle onyx-${VERSION}-${TARGET}.cosign-bundle \
   onyx-${VERSION}-${TARGET}

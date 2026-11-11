@@ -46,7 +46,7 @@ Verify:
 
 ```sh
 cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/<repo>/' \
+  --certificate-identity 'https://github.com/<repo>/.github/workflows/release.yml@refs/tags/<tag>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle onyx-v0.0.1-x86_64-unknown-linux-gnu.cosign-bundle \
   onyx-v0.0.1-x86_64-unknown-linux-gnu
@@ -65,7 +65,7 @@ curl -LO https://github.com/<repo>/releases/download/v0.0.1/SHA256SUMS.txt
 curl -LO https://github.com/<repo>/releases/download/v0.0.1/SHA256SUMS.txt.cosign-bundle
 
 cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/<repo>/' \
+  --certificate-identity 'https://github.com/<repo>/.github/workflows/release.yml@refs/tags/<tag>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle SHA256SUMS.txt.cosign-bundle \
   SHA256SUMS.txt
@@ -100,7 +100,7 @@ You can inspect this with:
 
 ```sh
 cosign verify-blob \
-  --certificate-identity-regexp 'https://github.com/<repo>/' \
+  --certificate-identity 'https://github.com/<repo>/.github/workflows/release.yml@refs/tags/<tag>' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --bundle onyx-v0.0.1-x86_64-unknown-linux-gnu.cosign-bundle \
   --output text \

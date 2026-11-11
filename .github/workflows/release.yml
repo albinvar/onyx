@@ -22,13 +22,16 @@ on:
   # would refuse the OIDC issuance for a non-tag ref anyway).
   workflow_dispatch:
 
-# Permissions needed for sigstore cosign keyless signing via OIDC.
-# `id-token: write` is the magic that lets sigstore's Fulcio CA
-# issue a code-signing certificate bound to this workflow's
-# identity (repo + branch/tag + workflow file path).
+# Least privilege by default. The build jobs compile ~700 third-party
+# crates (build scripts + proc-macros run arbitrary code) and use
+# third-party actions, so they get a READ-ONLY token and NO OIDC: only the
+# `sign-and-release` job below is granted `id-token: write` (to mint the
+# sigstore signing certificate) and `contents: write` (to publish). With
+# these at workflow level, anything running in a build job could have
+# minted a certificate carrying the exact release identity and signed
+# arbitrary files.
 permissions:
-  contents: write   # to create a GitHub release + attach artifacts
-  id-token: write   # for sigstore keyless signing
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -87,7 +90,10 @@ jobs:
             runner: macos-latest
             ext: ''
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Do not leave the job token in .git/config for later steps.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: |
@@ -98,11 +104,14 @@ jobs:
       # + linker so ring's C/asm cross-compiles for aarch64-musl.
       - name: Setup cross toolchain (musl)
         if: ${{ matrix.cross }}
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1
         with:
           target: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      # Deliberately NO build cache here. A restored `target/` is trusted
+      # by cargo, so a cache written by any other run on the default
+      # branch could plant compiled code that this job would link and the
+      # next job would sign. Signed artifacts always build cold.
 
       - name: Reproducible release build
         env:
@@ -113,12 +122,16 @@ jobs:
           # uses `strip` separately.
           # `rustflags_extra` is empty for the four native targets and
           # `-C target-feature=+crt-static` for the musl target (F5.2).
-          RUSTFLAGS: >-
+          RUSTFLAGS_BASE: >-
             --remap-path-prefix ${{ github.workspace }}=/onyx
-            --remap-path-prefix ${HOME}/.cargo=/cargo
             -C link-arg=-s
             ${{ matrix.rustflags_extra }}
         run: |
+          # `$HOME` must be expanded by the shell: inside an `env:` block
+          # Actions passes `${HOME}` through literally, which made the
+          # cargo-registry remap a silent no-op (and the build differ from
+          # scripts/verify-reproducible-build.sh, which does expand it).
+          export RUSTFLAGS="--remap-path-prefix ${HOME}/.cargo=/cargo ${RUSTFLAGS_BASE}"
           # Stamp the user-facing version (git tag minus the `v`) into
           # the binaries so `--version` and the daemon's reported
           # `daemon_version` match the published artifact name + release.
@@ -126,9 +139,8 @@ jobs:
           # back to the workspace `0.0.1` on local dev builds.
           export ONYX_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
           # --locked: refuse to update Cargo.lock; same dep set as
-          # committed. --release: optimized + stripped. Every target
-          # builds natively on its own runner (no cross-compilation),
-          # so no per-target linker/CC env is needed.
+          # committed. --release: optimized + stripped. (The musl and
+          # x86_64-apple-darwin targets cross-compile; see the matrix.)
           cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip + rename binaries
@@ -164,7 +176,7 @@ jobs:
           cat SHA256SUMS-${{ matrix.target }}.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: onyx-${{ matrix.target }}
           path: artifacts/
@@ -177,18 +189,27 @@ jobs:
     # Tags only; workflow_dispatch (manual test) does not sign.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # The only job that may sign or publish. It runs no build and no
+    # third-party code beyond the pinned cosign installer and release
+    # action.
+    permissions:
+      contents: write   # create the GitHub release + attach artifacts
+      id-token: write   # sigstore keyless signing (Fulcio cert via OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Do not leave the job token in .git/config for later steps.
+          persist-credentials: false
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist/
           pattern: onyx-*
           merge-multiple: true
 
       - name: Install sigstore cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Aggregate + sign
         shell: bash
@@ -233,10 +254,10 @@ jobs:
 
       - name: Copy install script into release dir
         # T-install.b: ship the install script alongside the release so
-        # `curl .../releases/download/v0.1.0/install.sh | bash` works,
-        # and that URL is immutable (the release-tag URL doesn't change
-        # like raw.githubusercontent.com/.../main/scripts/install.sh
-        # would). The release tag in the URL also pins which version
+        # `curl .../releases/download/v0.1.0/install.sh | bash` works
+        # (a release-tag URL does not track `main` the way
+        # raw.githubusercontent.com/.../main/scripts/install.sh does).
+        # The release tag in the URL also pins which version
         # the script will install by default when invoked without
         # ONYX_VERSION set.
         run: |
@@ -265,7 +286,7 @@ jobs:
             dist/hubs.json
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         # The action intermittently hits an asset-metadata race
         # ("Not Found … present after refresh") and exits non-zero
         # AFTER uploading all assets — leaving the release as a draft.
@@ -317,7 +338,7 @@ jobs:
 
             ```
             cosign verify-blob \
-              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
+              --certificate-identity 'https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}' \
               --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
               --bundle onyx-${{ github.ref_name }}-x86_64-unknown-linux-gnu.cosign-bundle \
               onyx-${{ github.ref_name }}-x86_64-unknown-linux-gnu
@@ -327,7 +348,7 @@ jobs:
 
             ```
             cosign verify-blob \
-              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
+              --certificate-identity 'https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}' \
               --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
               --bundle SHA256SUMS.txt.cosign-bundle \
               SHA256SUMS.txt

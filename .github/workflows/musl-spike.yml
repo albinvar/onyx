@@ -15,12 +15,16 @@ on:
     branches: [fort-phase5-musl-spike]
   workflow_dispatch:
 
+# Read-only token: this workflow only builds.
+permissions:
+  contents: read
+
 jobs:
   build-aarch64-musl:
     name: build static aarch64-musl (onyx + onyxd)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust + musl target
         run: |
           rustup toolchain install stable --profile minimal
@@ -28,10 +32,10 @@ jobs:
       # Sets up the cross C toolchain + linker so ring/libcrux's C deps
       # cross-compile for the musl target (this is the part that usually
       # decides whether a C-heavy Rust tree builds for musl).
-      - uses: taiki-e/setup-cross-toolchain-action@v1
+      - uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1
         with:
           target: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build static musl binaries
         env:
           # Force a fully-static binary (no dynamic loader needed → runs on
@@ -60,7 +64,7 @@ jobs:
               fi
             fi
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: onyx-aarch64-musl-static
           path: |

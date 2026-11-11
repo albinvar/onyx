@@ -4,18 +4,27 @@
 # Usage (the boring user path):
 #   curl -fsSL https://raw.githubusercontent.com/albinvar/onyx/main/scripts/install.sh | bash
 #
-# Or, pinned to a release (RECOMMENDED — the raw.githubusercontent path
-# is mutable, whatever is on `main` today is what runs; a release tag is
-# immutable):
+# Or, pinned to a release (better — the raw.githubusercontent path follows
+# whatever is on `main` today; a release asset changes only if someone with
+# write access to the release replaces it):
 #   curl -fsSL https://github.com/albinvar/onyx/releases/download/v0.1.0/install.sh | bash
 #
-# Or download + read first (RECOMMENDED for the security-aware):
-#   curl -fsSL https://github.com/albinvar/onyx/releases/download/v0.1.0/install.sh -o install.sh
-#   less install.sh                 # read it
-#   bash install.sh                 # run it
+# Or download, VERIFY, then run (RECOMMENDED). Piping this script straight
+# into a shell trusts whatever the release page serves; the script's own
+# signature is the only thing that authenticates it, and nothing checks
+# that for you when you pipe:
+#   base=https://github.com/albinvar/onyx/releases/download/v0.1.0
+#   curl -fsSLO "$base/install.sh" -O "$base/install.sh.cosign-bundle"
+#   cosign verify-blob \
+#     --certificate-identity 'https://github.com/albinvar/onyx/.github/workflows/release.yml@refs/tags/v0.1.0' \
+#     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+#     --bundle install.sh.cosign-bundle install.sh
+#   bash install.sh
 #
 # Environment knobs (all optional):
 #   ONYX_VERSION       — pin to a specific tag (default: latest GitHub release)
+#   ONYX_ALLOW_DOWNGRADE — set to 1 to install a version older than the
+#                        one already installed (refused by default).
 #   ONYX_INSTALL_DIR   — where to put the binaries (default: ~/.local/bin)
 #   ONYX_REPO          — override github repo slug (default: albinvar/onyx)
 #   ONYX_BINS          — which binaries to install (default: "onyx")
@@ -34,11 +43,14 @@
 #     - Tampered binary in the GitHub release tab (cosign signature won't verify
 #       because the attacker doesn't have an OIDC token bound to this repo's
 #       release.yml).
-#     - Attacker who serves a fake `install.sh` (you should fetch this from a
-#       release-tag URL, not raw.githubusercontent.com — release tags are
-#       immutable, raw URLs follow whatever's on main).
+#     - A release asset swapped for one from a DIFFERENT release or a
+#       different binary: the signing identity is pinned to this exact tag
+#       and the signed manifest binds each asset name to its hash.
 #
 #   Does NOT catch:
+#     - A fake copy of THIS SCRIPT. If you pipe it into a shell unverified,
+#       an attacker who can replace release assets controls everything it
+#       does. Verify install.sh with cosign first (see the top of this file).
 #     - Backdoor committed to the source code before the tag was cut. Sigstore
 #       signs what CI built; it doesn't tell you the source is honest.
 #     - GitHub Actions / sigstore infra compromise.
@@ -192,7 +204,8 @@ resolve_version() {
   # set* and the caller sees an empty `version`. Buffering breaks
   # the pipeline so SIGPIPE cannot propagate.
   local resp tag
-  resp="$(curl -fsSL "https://api.github.com/repos/${ONYX_REPO}/releases/latest" 2>/dev/null \
+  resp="$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+          "https://api.github.com/repos/${ONYX_REPO}/releases/latest" 2>/dev/null \
           || printf '')"
   tag="$(printf '%s' "$resp" \
         | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
@@ -200,7 +213,7 @@ resolve_version() {
   # Sanity-check the shape: a real tag starts with a digit or `v`.
   # Anything else (empty, an HTML error body, a stray URL) is a
   # resolution failure, not a usable version.
-  if ! printf '%s' "$tag" | grep -qE '^v?[0-9]'; then
+  if ! is_release_tag "$tag"; then
     die "could not resolve latest release for ${ONYX_REPO} — has a non-prerelease vX.Y.Z been published? Pin a version: ONYX_VERSION=v0.1.0 $0"
   fi
   echo "$tag"
@@ -208,9 +221,33 @@ resolve_version() {
 
 # ── Download + verify a single binary ─────────────────────────────────
 
-# verify_sigstore <binary-path> <bundle-path> <repo>
+# is_release_tag <tag> — a strict vX.Y.Z[-prerelease] shape. The tag is
+# interpolated into URLs, local paths and the expected signing identity,
+# so anything looser (path separators, whitespace, shell or regex
+# metacharacters) is refused.
+is_release_tag() {
+  printf '%s' "$1" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
+}
+
+# fetch <url> <dest> — HTTPS only, including across redirects.
+fetch() {
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$1" -o "$2"
+}
+
+# verify_sigstore <file-path> <bundle-path> <repo> <version>
+#
+# Verifies that <file> was signed by THIS repo's release workflow running
+# on THIS tag. The identity is matched exactly:
+#
+#   https://github.com/<repo>/.github/workflows/release.yml@refs/tags/<version>
+#
+# A prefix match on the repo (the previous behaviour) accepted any workflow
+# on any branch of the repo, and — because a signature covers only the
+# bytes — let a genuine artifact from an OLD release be re-uploaded under a
+# new release's name and still verify. Pinning the tag closes both: a
+# signature made for v0.1.5 does not verify for v0.1.31.
 verify_sigstore() {
-  local bin="$1" bundle="$2" repo="$3"
+  local bin="$1" bundle="$2" repo="$3" version="$4"
   if [ "$ONYX_NO_VERIFY" = "1" ]; then
     warn "skipping sigstore verification (ONYX_NO_VERIFY=1) — you are on your own"
     return 0
@@ -229,16 +266,40 @@ verify_sigstore() {
     err "or accept the risk explicitly by re-running with ONYX_NO_VERIFY=1."
     die "aborting: no cosign and no ONYX_NO_VERIFY override"
   fi
+  local identity="https://github.com/${repo}/.github/workflows/release.yml@refs/tags/${version}"
   info "verifying sigstore signature with cosign..."
   if cosign verify-blob \
-       --certificate-identity-regexp "https://github.com/${repo}/" \
+       --certificate-identity "$identity" \
        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
        --bundle "$bundle" \
        "$bin" >/dev/null 2>&1; then
-    ok "sigstore signature verifies"
+    ok "sigstore signature verifies (release.yml @ ${version})"
   else
-    die "sigstore signature FAILED to verify. do NOT run this binary. report at https://github.com/${repo}/issues"
+    die "sigstore signature FAILED to verify for ${version}. do NOT run this file. report at https://github.com/${repo}/issues"
   fi
+}
+
+# fetch_manifest <version> <tmpdir>
+#
+# Downloads SHA256SUMS.txt and verifies ITS signature. The manifest is what
+# binds an artifact's NAME (binary, version, target) to its hash, so it is
+# mandatory: without it a correctly-signed `onyx-hub` could be served as
+# `onyx`. Only skippable with the explicit ONYX_NO_VERIFY=1 override.
+fetch_manifest() {
+  local version="$1" tmpdir="$2"
+  local base="https://github.com/${ONYX_REPO}/releases/download/${version}"
+  [ -f "${tmpdir}/SHA256SUMS.txt" ] && return 0
+  if [ "$ONYX_NO_VERIFY" = "1" ]; then
+    fetch "${base}/SHA256SUMS.txt" "${tmpdir}/SHA256SUMS.txt" 2>/dev/null \
+      || warn "no SHA256SUMS.txt at the release (ONYX_NO_VERIFY=1 — continuing unverified)"
+    return 0
+  fi
+  fetch "${base}/SHA256SUMS.txt" "${tmpdir}/SHA256SUMS.txt" \
+    || die "release ${version} has no SHA256SUMS.txt — refusing to install without the signed manifest."
+  fetch "${base}/SHA256SUMS.txt.cosign-bundle" "${tmpdir}/SHA256SUMS.txt.cosign-bundle" \
+    || die "release ${version} has no signature for SHA256SUMS.txt — refusing to install."
+  verify_sigstore "${tmpdir}/SHA256SUMS.txt" "${tmpdir}/SHA256SUMS.txt.cosign-bundle" \
+    "$ONYX_REPO" "$version"
 }
 
 # fetch_and_install <binary-name> <version> <target> <tmpdir>
@@ -249,40 +310,40 @@ fetch_and_install() {
   local bundle_url="${url}.cosign-bundle"
 
   info "fetching ${bin_name} from ${version}/${target}..."
-  curl -fSL --progress-bar "$url" -o "${tmpdir}/${asset}" \
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fSL --progress-bar "$url" \
+       -o "${tmpdir}/${asset}" \
     || die "download failed: ${url}"
-  curl -fsSL "$bundle_url" -o "${tmpdir}/${asset}.cosign-bundle" \
+  fetch "$bundle_url" "${tmpdir}/${asset}.cosign-bundle" 2>/dev/null \
     || warn "no .cosign-bundle for ${asset} (was the release signed?)"
 
-  # SHA verification against the combined SHA256SUMS manifest.
-  # The release workflow uploads a single SHA256SUMS.txt covering every
-  # binary in the release, so we fetch it once and check our line.
-  if [ ! -f "${tmpdir}/SHA256SUMS.txt" ]; then
-    curl -fsSL "https://github.com/${ONYX_REPO}/releases/download/${version}/SHA256SUMS.txt" \
-         -o "${tmpdir}/SHA256SUMS.txt" 2>/dev/null \
-      || warn "no SHA256SUMS.txt at the release — skipping hash verification"
-  fi
+  # 1. The signed manifest binds this exact asset name to a hash. A missing
+  #    manifest or a missing line is fatal (it used to be a warning).
+  fetch_manifest "$version" "$tmpdir"
   if [ -f "${tmpdir}/SHA256SUMS.txt" ]; then
     local expected actual
     expected="$(grep " ${asset}\$" "${tmpdir}/SHA256SUMS.txt" \
                 | awk '{print $1}' || true)"
     if [ -z "$expected" ]; then
-      warn "no hash for ${asset} in SHA256SUMS.txt — skipping hash check"
+      if [ "$ONYX_NO_VERIFY" = "1" ]; then
+        warn "no hash for ${asset} in SHA256SUMS.txt (ONYX_NO_VERIFY=1 — continuing)"
+      else
+        die "SHA256SUMS.txt has no entry for ${asset} — refusing to install."
+      fi
     else
       actual="$(cd "$tmpdir" && $SHA256_CMD "$asset" | awk '{print $1}')"
       if [ "$expected" = "$actual" ]; then
-        ok "sha256 matches manifest"
+        ok "sha256 matches the signed manifest"
       else
         die "sha256 MISMATCH for ${asset}. expected=${expected} actual=${actual}"
       fi
     fi
   fi
 
-  # Sigstore verification. Fail-closed: a binary is mandatory, so a missing
-  # signature bundle is refused (not silently skipped) unless the user has
-  # explicitly accepted the risk with ONYX_NO_VERIFY=1.
+  # 2. Sigstore verification of the binary itself. Fail-closed: a missing
+  #    signature bundle is refused (not silently skipped) unless the user
+  #    has explicitly accepted the risk with ONYX_NO_VERIFY=1.
   if [ -f "${tmpdir}/${asset}.cosign-bundle" ]; then
-    verify_sigstore "${tmpdir}/${asset}" "${tmpdir}/${asset}.cosign-bundle" "$ONYX_REPO"
+    verify_sigstore "${tmpdir}/${asset}" "${tmpdir}/${asset}.cosign-bundle" "$ONYX_REPO" "$version"
   elif [ "$ONYX_NO_VERIFY" = "1" ]; then
     warn "no signature bundle for ${asset} and ONYX_NO_VERIFY=1 — installing unverified."
   else
@@ -294,7 +355,10 @@ fetch_and_install() {
   # (We're an unsigned binary today; without removing the xattr the
   # user has to right-click → Open or run xattr themselves. We'll add
   # proper Apple Developer ID notarization in a future release.)
-  if [ "$(uname -s)" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
+  # Only for a binary we verified: never clear Gatekeeper's flag on
+  # something installed under ONYX_NO_VERIFY.
+  if [ "$ONYX_NO_VERIFY" != "1" ] && [ "$(uname -s)" = "Darwin" ] \
+     && command -v xattr >/dev/null 2>&1; then
     xattr -d com.apple.quarantine "${tmpdir}/${asset}" 2>/dev/null || true
   fi
 
@@ -319,13 +383,22 @@ fetch_public_hubs() {
   local base="https://github.com/${ONYX_REPO}/releases/download/${version}"
   local cfg_dir="${HOME}/.onyx"
 
+  # The hub list decides where first-contact traffic goes, so it is only
+  # ever installed after a real signature check. ONYX_NO_VERIFY skips
+  # verification of the binaries at the user's own risk; it must not also
+  # write an unverified hub list that the app then describes as verified.
+  if [ "$ONYX_NO_VERIFY" = "1" ]; then
+    warn "ONYX_NO_VERIFY=1 — not installing the public hub list (it cannot be verified)."
+    warn "add a hub manually in the app with ^G."
+    return 0
+  fi
+
   info "fetching public hub list (hubs.json)..."
-  if ! curl -fsSL "${base}/hubs.json" -o "${tmpdir}/hubs.json" 2>/dev/null; then
+  if ! fetch "${base}/hubs.json" "${tmpdir}/hubs.json" 2>/dev/null; then
     warn "no hubs.json in ${version} — skipping public hubs (add a hub manually with ^G)."
     return 0
   fi
-  curl -fsSL "${base}/hubs.json.cosign-bundle" \
-       -o "${tmpdir}/hubs.json.cosign-bundle" 2>/dev/null \
+  fetch "${base}/hubs.json.cosign-bundle" "${tmpdir}/hubs.json.cosign-bundle" 2>/dev/null \
     || warn "no hubs.json.cosign-bundle (was the release signed?)"
 
   # Verify the signature. If cosign is present and the signature does NOT
@@ -337,12 +410,12 @@ fetch_public_hubs() {
     warn "hubs.json has no signature bundle — refusing to install it."
     return 0
   fi
-  if [ "$ONYX_NO_VERIFY" != "1" ] && ! command -v cosign >/dev/null 2>&1; then
+  if ! command -v cosign >/dev/null 2>&1; then
     warn "cosign not installed — cannot verify hubs.json; refusing to install"
     warn "the public hub list (install cosign + re-run, or add a hub via ^G)."
     return 0
   fi
-  verify_sigstore "${tmpdir}/hubs.json" "${tmpdir}/hubs.json.cosign-bundle" "$ONYX_REPO"
+  verify_sigstore "${tmpdir}/hubs.json" "${tmpdir}/hubs.json.cosign-bundle" "$ONYX_REPO" "$version"
 
   install -d "$cfg_dir"
   install -m 0600 "${tmpdir}/hubs.json" "${cfg_dir}/public-hubs.json"
@@ -376,6 +449,41 @@ fetch_public_hubs() {
   esac
 }
 
+# ── Downgrade guard ───────────────────────────────────────────────────
+
+# version_lt <a> <b> — true when release a sorts strictly before b
+# (numeric major.minor.patch; a pre-release suffix is ignored).
+version_lt() {
+  local a="${1#v}" b="${2#v}"
+  a="${a%%-*}"; b="${b%%-*}"
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $a $b
+  [ "$1" -lt "$4" ] && return 0
+  [ "$1" -gt "$4" ] && return 1
+  [ "$2" -lt "$5" ] && return 0
+  [ "$2" -gt "$5" ] && return 1
+  [ "$3" -lt "$6" ]
+}
+
+# refuse_downgrade <version>
+#
+# "latest" is whatever the release page says it is. Every release is
+# genuinely signed, so re-pointing "latest" at an old, vulnerable version
+# would pass every signature check. If an older version than the one
+# already installed is about to go in, stop unless the user asked for it.
+refuse_downgrade() {
+  local target_version="$1" current=""
+  [ "${ONYX_ALLOW_DOWNGRADE:-0}" = "1" ] && return 0
+  [ -x "${ONYX_INSTALL_DIR}/onyx" ] || return 0
+  current="$("${ONYX_INSTALL_DIR}/onyx" --version 2>/dev/null \
+             | sed -nE 's/.*[^0-9]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | sed -n '1p')"
+  [ -n "$current" ] || return 0
+  if version_lt "$target_version" "v${current}"; then
+    die "installed onyx is v${current}; refusing to DOWNGRADE to ${target_version}. If you really want that, re-run with ONYX_ALLOW_DOWNGRADE=1."
+  fi
+}
+
 # ── PATH hint ─────────────────────────────────────────────────────────
 
 print_path_hint() {
@@ -407,6 +515,9 @@ main() {
   printf "  %starget:%s       %s\n" "$C_DIM" "$C_RESET" "$target"
 
   version="$(resolve_version)"
+  is_release_tag "$version" \
+    || die "refusing version '${version}': expected a vX.Y.Z release tag."
+  refuse_downgrade "$version"
   printf "  %sversion:%s      %s\n" "$C_DIM" "$C_RESET" "$version"
   printf "  %sinstall dir:%s  %s\n" "$C_DIM" "$C_RESET" "$ONYX_INSTALL_DIR"
   printf "  %sbinaries:%s     %s\n" "$C_DIM" "$C_RESET" "$ONYX_BINS"

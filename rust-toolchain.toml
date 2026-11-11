@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
+# Exact version, not "stable": a floating channel means the compiler is
+# whatever was current on build day, so a release cannot be reproduced
+# later (and two builders can disagree). Bump deliberately.
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
