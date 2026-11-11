@@ -191,6 +191,12 @@ struct AppState {
     /// otherwise key events route to the modal handler and the
     /// main UI is dimmed behind it.
     modal: Option<ModalState>,
+    /// Text to show on the plain terminal screen (outside the interface)
+    /// so it can be selected with the mouse as one unbroken line. Set when
+    /// a clipboard copy could not be confirmed — the usual case over SSH,
+    /// where there is no clipboard tool on the remote host. The event loop
+    /// shows it, waits for a key, and restores the interface.
+    plain_view: Option<String>,
     /// T-files.e: file-ids (b32) we've already rendered as inline
     /// `📎 received …` lines in some scrollback. Used to dedupe
     /// the periodic `ListReceivedFiles` poll: a file appears
@@ -347,7 +353,7 @@ enum ModalState {
     Share {
         invite_url: String,
         connect_code: String,
-        /// 0 = invite link, 1 = connect code.
+        /// 0 = connect code, 1 = invite link.
         selected: usize,
         /// v0.1.30: copy outcome, so we can show "copy failed — select the
         /// link above and copy manually" (the SSH/headless case where no
@@ -844,6 +850,7 @@ impl AppState {
             unread: HashMap::new(),
             last_activity_ms: HashMap::new(),
             modal: None,
+            plain_view: None,
             seen_files: HashSet::new(),
             quit_requested: false,
             retention_secs: None,
@@ -1264,6 +1271,13 @@ async fn event_loop(
     tick.tick().await;
 
     loop {
+        if let Some(text) = app.plain_view.take() {
+            show_plain(terminal, &text)?;
+            // Any key returns. Raw mode stays on, so the key is not echoed.
+            let _ = key_rx.recv().await;
+            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+            terminal.clear()?;
+        }
         terminal.draw(|frame| render(frame, app))?;
 
         tokio::select! {
@@ -1282,6 +1296,36 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+/// Leave the interface and print `text` on the ordinary terminal screen,
+/// unwrapped and unboxed, so a mouse selection yields exactly the string.
+///
+/// Inside the interface a long link is hard-wrapped and framed, so
+/// selecting it picks up line breaks and border characters. Here the
+/// terminal soft-wraps one logical line, which copies cleanly.
+fn show_plain(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    text: &str,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    let mut out = io::stdout();
+    // Raw mode is on: line breaks need an explicit carriage return.
+    write!(
+        out,
+        "\r\nSelect the line below and copy it. It is one long line.\r\n\r\n{}\r\n\r\nPress any key to return to Onyx.\r\n",
+        plain_safe(text)
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Drop control characters before writing a string straight to the
+/// terminal. The strings shown this way are our own links, but a link's
+/// placeholder can embed an error message from elsewhere.
+fn plain_safe(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Returns `true` if the loop should exit.
@@ -1925,20 +1969,25 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                 selected,
                 copy,
             },
-            KeyCode::Enter | KeyCode::Char('c'),
+            KeyCode::Enter | KeyCode::Char('c' | 'p'),
         ) => {
             let text = if *selected == 0 {
-                invite_url
-            } else {
                 connect_code
+            } else {
+                invite_url
             };
             // Don't "copy" a placeholder string (they start with '(').
             if !text.starts_with('(') {
-                *copy = if copy_to_clipboard(text) {
-                    CopyState::Ok
+                let show_plain = key.code == KeyCode::Char('p');
+                if !show_plain && copy_to_clipboard(text) {
+                    *copy = CopyState::Ok;
                 } else {
-                    CopyState::Failed
-                };
+                    // No confirmed clipboard (SSH, or a terminal without
+                    // OSC52), or the user asked: show it on the plain
+                    // screen where it can be selected as one line.
+                    *copy = CopyState::Failed;
+                    app.plain_view = Some(text.clone());
+                }
             }
             app.modal = Some(modal);
             return;
@@ -3814,7 +3863,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
         // Slice 2: short context menu — sized to its (few) entries.
         ModalState::ActionMenu { actions, .. } => u16::try_from(actions.len() + 5).unwrap_or(9),
         // "Share my contact": two rows (invite link + connect code) + hints.
-        ModalState::Share { .. } => 14,
+        ModalState::Share { .. } => 10,
         ModalState::Settings { info } => u16::try_from(info.len() + 4).unwrap_or(14),
         // UX phase 4: the log overlay takes most of the height — reading
         // logs benefits from vertical room (capped at 30).
@@ -4538,11 +4587,12 @@ fn render_share_modal(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green))
         .title(Span::styled(
-            " Share my contact  (↑↓ pick · Enter/c copy · Esc close) ",
+            " Share my contact ",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ));
+    let value_width = usize::from(rect.width).saturating_sub(8).max(16);
     let row = |idx: usize, title: &str, value: &str| -> Vec<Line<'static>> {
         let active = selected == idx;
         let marker = if active { "▶ " } else { "  " };
@@ -4553,28 +4603,37 @@ fn render_share_modal(
                     .fg(if active { Color::Yellow } else { Color::Gray })
                     .add_modifier(Modifier::BOLD),
             )),
+            // One line each: a full invite link runs to a dozen lines and
+            // pushed the other choice off the dialog. The whole string is
+            // what gets copied or shown with `p`.
             Line::from(Span::styled(
-                format!("    {value}"),
+                format!("    {}", truncate_for_display(value, value_width)),
                 Style::default().fg(Color::White),
             )),
         ]
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(row(0, "Invite link (via hub):", invite_url));
+    lines.extend(row(
+        0,
+        "Connect code — direct, both of you online",
+        connect_code,
+    ));
     lines.push(Line::from(""));
-    lines.extend(row(1, "Connect code (direct, no hub):", connect_code));
+    lines.extend(row(
+        1,
+        "Invite link — through a hub, works if you are offline",
+        invite_url,
+    ));
     lines.push(Line::from(""));
     let (status_text, status_color) = match copy {
-        CopyState::Ok => ("  ✓ copied to clipboard".to_string(), Color::Green),
+        CopyState::Ok => ("  Copied to the clipboard.".to_string(), Color::Green),
         CopyState::Idle => (
-            "  press Enter/c to copy the highlighted one".to_string(),
+            "  ↑↓ choose   Enter copy   p show as plain text   Esc close".to_string(),
             Color::DarkGray,
         ),
-        // The SSH/headless case: no clipboard tool reachable. The link is
-        // shown in full above, so tell the user to select + copy it manually.
+        // Shown after returning from the plain-text screen.
         CopyState::Failed => (
-            "  ✗ couldn't reach a clipboard (SSH?) — select the link above and copy it manually"
-                .to_string(),
+            "  No clipboard here (common over SSH). Press p to show it again.".to_string(),
             Color::Yellow,
         ),
     };
@@ -6217,6 +6276,32 @@ mod snapshot_tests {
             .parent()
             .unwrap()
             .join("target")
+    }
+
+    // A full invite link is ~900 characters. It used to fill the dialog and
+    // push the connect code out of view; both choices must stay visible,
+    // with the connect code (the direct, hub-free path) listed first.
+    #[test]
+    fn share_dialog_keeps_both_choices_visible() {
+        let mut app = AppState::new(PathBuf::from("./s.sock"));
+        app.modal = Some(ModalState::Share {
+            invite_url: format!("onyx://invite/v2?fp={}", "a".repeat(900)),
+            connect_code: "onyx://connect/v1?onion=abc.onion&id=xyz".into(),
+            selected: 0,
+            copy: CopyState::Idle,
+        });
+        let out = render_to_string(&app, 100, 30);
+        let code = out.find("Connect code").expect("connect code row shown");
+        let link = out.find("Invite link").expect("invite link row shown");
+        assert!(code < link, "connect code is listed first");
+        assert!(out.contains("onyx://connect/v1?onion=abc.onion&id=xyz"));
+        assert!(out.contains("show as plain text"));
+        assert!(!out.contains(&"a".repeat(200)), "long link is shortened");
+    }
+
+    #[test]
+    fn plain_safe_drops_control_characters() {
+        assert_eq!(plain_safe("ok\x1b]0;x\x07\r\nline"), "ok]0;xline");
     }
 
     #[test]

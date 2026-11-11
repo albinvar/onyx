@@ -59,6 +59,19 @@ Use this file as the single chronological view of where the project is. Implemen
   **Honest limit:** whether a hub answers is observable by anyone who
   can dial it; the page only avoids adding to that.
 
+**Share dialog — copying over SSH**
+
+- Reported from a real session: over SSH nothing could be copied. The
+  remote host has no clipboard tool, OSC52 is not honoured by every
+  terminal, and the ~900-character invite link filled the dialog —
+  hard-wrapped inside a border, so a mouse selection picked up line
+  breaks and box characters — and pushed the connect code out of view.
+  Now: each choice is one shortened line, the connect code (direct, no
+  hub) is listed first, and when a copy cannot be confirmed (or on `p`)
+  the interface steps aside and prints the string on the plain terminal
+  as one unbroken line; any key returns. **Note:** that line stays in the
+  terminal's scrollback.
+
 None of this changes the headline: no external audit.
 
 ---

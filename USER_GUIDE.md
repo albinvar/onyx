@@ -52,7 +52,11 @@ That's it. You are running.
 You each need the other's *connect code* once. Both of you should have Onyx
 open.
 
-**You:** press `Ctrl-E`. Copy the connect code it shows.
+**You:** press `Ctrl-E`, then `Enter` to copy the connect code.
+
+If nothing lands in your clipboard — this is normal when you run Onyx on
+another machine over SSH — press `p`. Onyx steps aside and shows the code as
+plain text you can select with the mouse. Any key brings Onyx back.
 
 **Send it to your friend** some way you already trust — in person, or in a
 chat where you are sure it is really them. Anyone who gets this code can
