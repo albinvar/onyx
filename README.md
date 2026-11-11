@@ -1,481 +1,385 @@
 # Onyx
 
-Anonymous, end-to-end-encrypted chat over Tor. Rust core, hybrid P2P + optional hub relay, MLS group encryption with a post-quantum hybrid bootstrap.
+A Tor-only, end-to-end-encrypted messenger. Every user is an onion service;
+messages are MLS ciphertext inside a Noise tunnel inside a Tor circuit.
+Optional relays ("hubs") hold sealed envelopes for people who are offline and
+never see plaintext. Written in Rust.
 
 ```
-┌─ onyx ──────────────────────────────────────────────────┐
-│ Peers           │ #peer-short                           │
-│ ─────────────── │ ──────────────────────────────────── │
-│ ● peer1   live  │  peer1: hi                           │
-│ ○ peer2   ──    │      me: hey                          │
-│                 │  peer1: [hub] sent while you were offline
-│                 │                                       │
-│                 │ ┌────────────────────────────────────┐│
-│                 │ │ > type to send_                    ││
-│                 │ └────────────────────────────────────┘│
-├─────────────────┴───────────────────────────────────────┤
-│ tor ready · ● live · you abc1 234 · 2 peers · v0.0.1   │
-└─────────────────────────────────────────────────────────┘
+ onyx   tor ready   onion published   1 hub   you 4f2a 91c3            v0.1.x
+ ─────────────────────────────────────────────────────────────────────────────
+ Direct messages             mira
+   ● mira            2m        09:14  mira   are you there?
+   ○ jonas           3d        09:15  you    yes — one sec
+ Rooms                         09:15  mira   sent while you were away   via hub
+   ◆ field-notes     1h
+                             ─────────────────────────────────────────────────
+                             > type a message, or / for commands
+ ─────────────────────────────────────────────────────────────────────────────
+ F1 help   Ctrl-K commands   Ctrl-E share   Ctrl-A add contact
 ```
 
----
-
-## 0. Status disclaimer (read this first)
-
-Onyx is **pre-1.0 research and engineering**. As of writing:
-
-- **No external security audit has been conducted.** Not by anyone. Not at any depth. An *internal* audit + red-team has been done (`THREAT_MODEL.md` §8.3) — that is not the same thing and does not replace it.
-- The codebase is ~27,000 lines of Rust written by one developer working with an AI assistant over a few weeks.
-- The cryptographic primitives are sound (Ed25519, X25519, ChaCha20-Poly1305, Argon2id, ML-KEM-768, MLS via openmls 0.8, Noise XK via snow). The way we *compose* them has had an internal review but no independent one.
-- **470+ internal tests pass**, including adversarial hub attacks and a ~36k-case decoder fuzz. They cover correctness + the attacks we knew to write — not metadata-resistance against a determined adversary, and not "proven secure."
-
-**Practical consequence:** appropriate for **learning, demos, hobby chat, and contributing to the codebase**. Not appropriate for any communication where your safety, freedom, or livelihood depends on the protocol's security. Use Signal, Briar, or other mature tools for those.
-
-This caveat is repeated in `SECURITY.md` §1 and will only be removed when an external audit confirms it can be.
+*(schematic of the terminal interface)*
 
 ---
 
-## 1. What Onyx is, in one paragraph
+## Read this first
 
-Each user runs a long-running daemon (`onyxd`) that owns their long-term identity keys (Ed25519 signing + X25519 identity + a hybrid post-quantum KEM secret) inside an Argon2id-protected SQLite vault. The daemon runs an embedded Tor client (Arti) and publishes a v3 hidden service — that's the user's inbox. To chat, the daemon dials another user's onion, completes a `Noise_XK_25519_ChaChaPoly_BLAKE2s` handshake for transport-layer mutual auth + AEAD, then bootstraps an [MLS (RFC 9420)](https://datatracker.ietf.org/doc/html/rfc9420) group for application-layer forward secrecy and post-compromise security. Messages are exchanged as MLS application messages inside the Noise tunnel. Users interact via the `onyx` CLI/TUI which connects to their local daemon over a `chmod 0600` Unix socket. An optional `onyx-hub` binary relays sealed-sender envelopes between peers who aren't online simultaneously — the hub never sees plaintext.
+Onyx is **pre-1.0** and has **not had an external security audit**.
 
----
+- One maintainer, working with an AI assistant. About 47,000 lines of Rust.
+- The primitives are standard (Ed25519, X25519, ML-KEM-768, ChaCha20-Poly1305,
+  Argon2id, MLS via `openmls`, Noise XK via `snow`, Tor via Arti). How they are
+  *composed* has only been reviewed internally.
+- Two internal audits have been done. The most recent (November 2026) found and
+  fixed real, exploitable bugs — including sender impersonation inside rooms
+  and plaintext in logs. That is evidence the code needed review, not evidence
+  that nothing is left. Known open weaknesses are listed in
+  [`THREAT_MODEL.md` §8.6](./THREAT_MODEL.md) and
+  [`ATTACKS.md`](./ATTACKS.md).
+- About 640 tests pass, including adversarial-hub tests and a decoder fuzz.
+  Tests show the attacks we thought of are blocked. They do not show the
+  design resists an adversary who thinks of something else.
 
-## 2. Project status
-
-Current release: **v0.1.3** (sigstore-signed; install via the one-liner in §3).
-
-| Binary | What it does | State |
-|---|---|---|
-| `onyx` | Single binary: run with no args = daemon **+** TUI in one process. Also the CLI. | **functional** |
-| `onyxd` | Headless daemon (vault, Tor circuit, hidden service, Noise+MLS chat, hub client) for systemd/Docker | **functional end-to-end** |
-| `onyx-hub` | Optional relay: stores sealed envelopes + KeyPackage directory | **functional** (signed-SUBSCRIBE auth + per-identity rate limit + queue caps; still no invite-only registration) |
-
-What works today (verified end-to-end):
-
-- **1:1 DM** over real Tor: Noise XK handshake → MLS bootstrap → live two-way chat.
-- **Multi-party rooms / channels** (MLS): create, invite, join, send; file sharing in rooms **and** DMs (metadata stripped by default; `Ctrl-F` or `onyx files send`/`onyx room send-file`).
-- **Sealed-sender first contact** via the hub in both `msg/v1` (per-message PFS) and `mls/v1` (full MLS PCS) tiers; post-quantum hybrid X25519+ML-KEM-768 envelopes.
-- **Invite URLs**: `onyx invite --with-kp --with-hubs` → share → `onyx accept '<url>'`.
-- **TUI**: 3-pane dashboard (Conversations │ Chat │ Details), live tail, scrollback + history backfill (DMs *and* rooms) across restart, real sender fingerprints, grouped/timestamped chat, `[hub]` tier badge + a per-conversation **transport badge** (`● direct` / `◌ via hub` / `✕ no route`), and a `/`-command composer. Keys: `F1` help · `Ctrl-K` palette · `Ctrl-E` **Share my contact** (invite link + connect code) · `Ctrl-A` **Add a contact** (paste either, auto-detected) · `Ctrl-N` room · `Ctrl-I` invite-to-room · `Ctrl-F` file picker (multi-select) · `Ctrl-G` hubs · plus message search & safety-number verify (`/search`, `/verify`). Clipboard copy uses the native OS clipboard (pbcopy/xclip/wl-copy), OSC52 fallback. Vault backup/passphrase change: `onyx vault backup` / `onyx vault rekey`.
-- **Local TCP test mode** (no Tor): `--listen-tcp`/`--dial-tcp` for DMs; `onyx-hub --listen-tcp` + `onyx --hub-tcp` for rooms/files. `scripts/local-hub-demo.sh` sets up a two-party demo.
-- **Signed releases** (`v0.1.0`–`v0.1.3`) + verified one-liner installer (`INSTALL.md`, `RELEASES.md`).
-- **MLS state persistence**: groups survive restart; reconnects resume the same epoch.
-- **Internal security audit + red-team**: 8 findings fixed, all mounted attacks blocked, ~36k-case decoder fuzz, locked as regression tests (`THREAT_MODEL.md` §8.3). **Internal only — not an external audit.**
-
-What's **not** done yet (carry-forward — see `THREAT_MODEL.md` §8.2/§8.3 and `ROADMAP.md`):
-
-- **Full idle-circuit cover traffic** (§8.2 #3) — opt-in constant-rate "high mode" (`--constant-rate-ms`) now makes the client→hub **upstream** cadence invariant; the hub-side **downstream** direction, direct peer-circuit cover, and real-Tor measurement remain.
-- **Invite-only hub registration** (§8.2 #4); session-token subscriptions are unauthenticated by design (§8.3 residual #1).
-- **A bootstrap public hub** — there's no default hub, so two parties must share/run one to chat asynchronously.
-- **External security audit** (§8.2 #7) — the single most important open item.
-- **Real-world reliability soak** — never run in production; reconnection / offline-ordering / real-Tor churn unexercised.
+**Use it for** learning, experiments, and conversations where a failure would
+be an inconvenience. **Do not use it** where your safety, freedom, or
+livelihood depends on it — use Signal, Briar, or Cwtch, which have had years of
+independent scrutiny.
 
 ---
 
-## 3. Install
+## What it does
 
-### Easy path — one-liner installer
+| | |
+|---|---|
+| **Direct messages** | Your daemon dials the other person's onion address, authenticates them with Noise XK, and runs a two-party MLS group. Delivery is acknowledged; unacknowledged messages are retried when the session returns. |
+| **Rooms** | One MLS group per room. Each line is attributed by the sender's MLS signature key, not by anything a relay or another member can claim. Admin-gated membership changes. |
+| **Files** | Sent inside the same encrypted channel, in DMs and rooms. Metadata (EXIF, filenames) is stripped unless you opt out. Received files are `0600` in a `0700` directory. |
+| **Offline delivery** | A hub stores sealed, padded envelopes addressed to opaque routing tokens. Each room member has their own token, so a hub cannot count a room's members from one token. |
+| **First contact** | A *connect code* (direct, no hub) or a signed *invite link* (via a hub). Both are meant to be handed over on a channel you already trust. |
+| **Consent** | A room invitation from someone who is not already your contact is held until you accept it. |
+| **Identity pinning** | A contact's key is pinned on first use; a changed key is flagged loudly and blocks sending until you re-verify. Safety numbers for out-of-band comparison. |
+| **Local storage** | Keys and message text are sealed in an Argon2id-protected vault. One daemon per vault (lock file). `onyx vault backup` / `onyx vault rekey`. |
+| **Releases** | Binaries are signed with sigstore; the installer verifies the exact release workflow identity, a signed checksum file, and refuses downgrades. |
+
+### What it does not do
+
+Stated plainly, because these matter more than the list above:
+
+- **It does not hide that you use Tor**, unless you configure bridges
+  ([`TOR-BRIDGES.md`](./TOR-BRIDGES.md)).
+- **It does not defeat a global passive adversary.** Someone who can watch both
+  ends of a Tor circuit can correlate timing. Optional cover traffic raises the
+  cost; it does not remove the attack.
+- **A contact can tell when you are online.** They hold your onion address and
+  delivery receipts confirm receipt. Removing a contact does not take the
+  address back. (Planned fix: Tor client authorization — see
+  [`TRUST-ARCHITECTURE.md`](./TRUST-ARCHITECTURE.md) T-1.)
+- **Envelopes relayed through a hub are sealed to a long-lived key.** A hub
+  that records traffic, plus a later compromise of your device, reveals who
+  sent each recorded envelope. (Planned: rotating key, T-2.)
+- **The vault file shows your contact list and timestamps without the
+  passphrase.** Keys and message text are sealed; the social graph is not.
+  (Planned: whole-database encryption, T-3.)
+- **It cannot protect a compromised device.** Malware or an unlocked, seized
+  machine sees what you see.
+- **No mobile app, no multi-device, no account recovery.** A forgotten
+  passphrase is unrecoverable.
+
+---
+
+## Install
 
 ```sh
 curl -fsSL https://github.com/albinvar/onyx/releases/latest/download/install.sh | bash
 ```
 
-Auto-detects your OS + CPU (macOS arm64/x86_64, Linux x86_64/aarch64), downloads the right prebuilt binary, **verifies it with sigstore cosign**, and drops `onyx` in `~/.local/bin/onyx`. Then just run `onyx` — it boots the daemon + TUI in one process and, on first run, **prompts you to set a vault passphrase** (hidden input; no recovery if forgotten). Set `ONYX_PASSPHRASE` in the environment to skip the prompt (e.g. for headless/scripted use).
+The script detects your platform (macOS arm64/x86_64, Linux x86_64/aarch64),
+downloads the binary, verifies its sigstore signature and checksum, and
+installs `onyx` to `~/.local/bin`. It requires `cosign`. Read
+[`INSTALL.md`](./INSTALL.md) for the download-read-run recipe and
+[`RELEASES.md`](./RELEASES.md) for what the signature does and does not prove.
 
-For Windows: use WSL2 + the Linux installer, or build from source below.
+Windows: use WSL2.
 
-For the security-conscious recipe (download → read → run) and all the threat-model caveats, see **[INSTALL.md](./INSTALL.md)**. For the verifier-side walkthrough of cosign and `SHA256SUMS`, see **[RELEASES.md](./RELEASES.md)**.
+### From source
 
-### Source path — for hackers / contributors
-
-You need **Rust stable** (we test on 1.95+) and a C toolchain (the Arti dep set pulls some C-backed crypto). On macOS that's just `xcode-select --install`.
+Rust 1.95 (pinned in `rust-toolchain.toml`) and a C compiler.
 
 ```sh
 git clone https://github.com/albinvar/onyx.git
 cd onyx
-cargo build --release        # ~3-5 minutes the first time; subsequent builds are seconds
-```
-
-For day-to-day use you'll want the binaries on your `$PATH`:
-
-```sh
-cargo install --path crates/onyxd   --force
-cargo install --path crates/onyx    --force
-cargo install --path crates/onyx-hub --force   # only if you want to run a hub
-```
-
-The `--force` flag matters if you've installed an older snapshot — `cargo install` refuses to overwrite by default. After this, `which onyxd` should report `~/.cargo/bin/onyxd` (assuming `rustup`'s defaults).
-
-If you'd rather not install globally, replace every `onyxd` / `onyx` in the recipes below with `./target/release/onyxd` / `./target/release/onyx`.
-
----
-
-## 4. Quick start — local TCP test mode (no Tor, ~5 seconds to chat)
-
-**This is the recommended first thing to run.** It exercises the entire Noise + MLS chat path without paying Tor's 30-60 second bootstrap cost. The mode is **test-only** — see `SECURITY.md` §6.2 for the loud caveats. Don't run it against real peers.
-
-You'll use **four terminals**: two daemons + two TUIs.
-
-### Cleanup (do this before each fresh attempt)
-
-```sh
-# kill anything still holding the test ports
-lsof -ti :7710 | xargs kill -9 2>/dev/null
-pkill -9 onyxd 2>/dev/null
-
-# wipe old vault + socket state
-rm -f demo-alice.db demo-bob.db demo-alice.sock demo-bob.sock
-```
-
-### Terminal 1 — alice (listener)
-
-```sh
-ONYX_PASSPHRASE=alice onyxd \
-  --vault ./demo-alice.db \
-  --api-socket ./demo-alice.sock \
-  --listen-tcp 127.0.0.1:7710
-```
-
-You'll see a log line like:
-
-```
-INFO onyxd: share `--dial-tcp 127.0.0.1:7710 --dial-pubkey acgilwcwkxcz...` with a peer to chat
-```
-
-**Copy that long string** (alice's `identity_pub_b32`). Leave this terminal running.
-
-### Terminal 2 — bob (dialer)
-
-```sh
-ALICE_PUB=<paste-the-string-here-no-brackets>     # e.g. acgilwcwkxcz...
-
-ONYX_PASSPHRASE=bob onyxd \
-  --vault ./demo-bob.db \
-  --api-socket ./demo-bob.sock \
-  --dial-tcp 127.0.0.1:7710 \
-  --dial-pubkey "$ALICE_PUB"
-```
-
-Within ~1 second you'll see `MLS round-trip complete (initiator)`. Leave it running.
-
-### Terminals 3 + 4 — TUIs
-
-```sh
-# Terminal 3
-onyx --socket ./demo-alice.sock tui
-
-# Terminal 4
-onyx --socket ./demo-bob.sock tui
-```
-
-In either TUI: press `↑` or `↓` to select the (single) peer, type a message, press `Enter`. The message appears in the other side's conversation pane within ~1 second.
-
-Quit each TUI with `Esc`, then `Ctrl-C` the daemons.
-
----
-
-## 5. Real chat over Tor (production-style, ~90 seconds to start)
-
-Same flow as above but with real Tor circuits + hidden services. **This is the actual anonymity-providing path** — `--listen-tcp` only exists for development.
-
-macOS users: Arti enforces strict filesystem permissions on its state directory. If you use `--tor-state-dir`, also set `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1`. Linux normally Just Works.
-
-### Terminal 1 — alice
-
-```sh
-FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
-ONYX_PASSPHRASE=alice onyxd \
-  --vault ./demo-alice.db \
-  --api-socket ./demo-alice.sock \
-  --tor-state-dir ./demo-alice-tor
-```
-
-Wait for these two log lines (~30-60 s on a cold cache):
-
-```
-INFO onyxd: vault unlocked, identity loaded fingerprint=... identity_pub_b32=ALICE_PUB
-INFO onyxd: hidden service published — onion=ALICE_ONION port=1
-```
-
-Copy `ALICE_ONION` and `ALICE_PUB`.
-
-### Terminal 2 — bob
-
-```sh
-ALICE_ONION=<paste>.onion              # no brackets
-ALICE_PUB=<paste>
-
-FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
-ONYX_PASSPHRASE=bob onyxd \
-  --vault ./demo-bob.db \
-  --api-socket ./demo-bob.sock \
-  --tor-state-dir ./demo-bob-tor \
-  --dial-onion "$ALICE_ONION:1" \
-  --dial-pubkey "$ALICE_PUB"
-```
-
-Wait for `MLS round-trip complete (initiator)`. Then open the TUIs exactly as in §4.
-
-### Cleanup
-
-```sh
-rm -f demo-*.db demo-*.sock
-rm -rf demo-*-tor
-# If you also want to wipe Arti's shared cache (forces full re-bootstrap next time):
-rm -rf ~/Library/Application\ Support/arti          # macOS
-rm -rf ~/.local/share/arti                          # Linux
+cargo build --release --locked
+# binaries: target/release/onyx, onyxd, onyx-hub
 ```
 
 ---
 
-## 6. Hub-relayed first contact (when peers aren't simultaneously online)
+## Quick start
 
-The hub is an optional relay that stores sealed envelopes + KeyPackages, sees only ciphertext, and never holds plaintext. Use it when you want "alice sends to bob even though bob is offline; bob comes online and reads it."
-
-**Five terminals**: hub + two daemons + two TUIs (or skip the second TUI if you're just testing the send path). Real Tor required for all three daemons.
-
-### Terminal 1 — hub
+### 1. Start
 
 ```sh
-FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
-ONYX_HUB_PASSPHRASE=hub-pass onyx-hub \
-  --vault ./demo-hub.db \
-  --tor-state-dir ./demo-hub-tor
+onyx
 ```
 
-Wait for:
+With no arguments, `onyx` starts the daemon and the terminal interface in one
+process. On first run it asks you to set a vault passphrase. Tor takes 30–60
+seconds to bootstrap the first time.
 
-```
-INFO onyx-hub: hub vault unlocked ... hub_pub_b32=HUB_PUB
-INFO onyx-hub: hub hidden service published — onion=HUB_ONION port=1
-```
+Everything lives in `~/.onyx/` (vault, socket, log, config, received files),
+readable only by you.
 
-Copy both.
+### 2. Add a contact
 
-### Terminals 2 + 3 — alice + bob daemons (both pointed at the hub)
+Both of you online:
 
 ```sh
-HUB_ONION=<paste>.onion
-HUB_PUB=<paste>
+# you
+onyx code                       # prints onyx://connect/v1?onion=…&id=…
 
-# Terminal 2 — alice
-FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
-ONYX_PASSPHRASE=alice onyxd \
-  --vault ./demo-alice.db \
-  --tor-state-dir ./demo-alice-tor \
-  --api-socket ./demo-alice.sock \
-  --hub-onion "$HUB_ONION:1" --hub-pubkey "$HUB_PUB"
-
-# Terminal 3 — bob (same, different vault/socket/tor-state)
-FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1 \
-ONYX_PASSPHRASE=bob onyxd \
-  --vault ./demo-bob.db \
-  --tor-state-dir ./demo-bob-tor \
-  --api-socket ./demo-bob.sock \
-  --hub-onion "$HUB_ONION:1" --hub-pubkey "$HUB_PUB"
+# them
+onyx connect 'onyx://connect/v1?…'
 ```
 
-Both will log `hub: our KeyPackage published` once they connect to the hub.
+In the terminal interface the same thing is `Ctrl-E` (share) and `Ctrl-A`
+(add). Send the code over a channel where you already know who is on the other
+end; whoever holds it can reach you.
 
-### Terminal 4 — alice sends to bob via hub
+Then **verify**: compare safety numbers (`/verify` in the interface) in person
+or over a call. Until you do, you are trusting the channel you sent the code
+over.
+
+### 3. Talk
 
 ```sh
-# Pull bob's identity
-BOB_ID=$(onyx --socket ./demo-bob.sock identity)
-BOB_FP=$(jq -r .fingerprint    <<<"$BOB_ID")
-BOB_KEM=$(jq -r .identity_kem_pub_b32 <<<"$BOB_ID")
-
-# Option A: msg/v1 (PFS only, single shot)
-onyx --socket ./demo-alice.sock send-bootstrap \
-  --peer-fingerprint "$BOB_FP" \
-  --peer-kem-pub-b32 "$BOB_KEM" \
-  --text "hi bob — sent via hub"
-
-# Option B: mls/v1 (full MLS PCS; establishes a real MLS group)
-BOB_KP=$(onyx --socket ./demo-alice.sock fetch-keypackage \
-              --peer-fingerprint "$BOB_FP" | jq -r .kp_b64)
-onyx --socket ./demo-alice.sock send-bootstrap-mls \
-  --peer-fingerprint "$BOB_FP" \
-  --peer-kem-pub-b32 "$BOB_KEM" \
-  --peer-kp-b64 "$BOB_KP"
+onyx peers                      # who is connected, verified, or changed
+onyx send <short-id> "hello"
+onyx history <short-id>
 ```
 
-### Terminal 5 — bob's TUI shows the message
+or just type in the interface.
+
+### If the other person is offline
+
+Direct contact needs both of you online. A hub removes that requirement at a
+privacy cost you opt into:
 
 ```sh
-onyx --socket ./demo-bob.sock tui
+onyx --hub '<onion>:<port>,<hub-pubkey>'            # use a hub for rooms
+onyx --hub … --first-contact-reachable              # accept first contact via it
+onyx --hub … --dm-hub-fallback                      # relay DMs when a peer is offline
 ```
 
-Bob's TUI will display alice's message with a yellow **`[hub]`** badge — visual indicator that this came via the hub path (weaker forward-secrecy than direct MLS for `msg/v1`; full MLS PCS for `mls/v1` going forward inside that group). See §8 for the tier details.
+By default a hub cannot link your connection to your identity (fresh keys per
+connection, no inbox subscription). `--first-contact-reachable` trades that
+away so strangers holding your invite link can reach you. See
+[`ANONYMITY.md`](./ANONYMITY.md) §3.2 before turning it on.
+
+`onyx doctor` explains, in plain language, why messaging is not working.
 
 ---
 
-## 7. TUI keys
+## Terminal interface
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` | Move peer selection in the left pane |
-| `Enter` | Send the composer text to the selected peer |
-| any char | Append to composer |
-| `Backspace` | Delete one char from composer |
-| `r` | Force immediate status + peers refresh (otherwise auto-refreshes every 2 s) |
-| `Esc` | Quit the TUI cleanly |
-| `Ctrl-C` | Quit the TUI cleanly |
+| `↑` `↓` | Move between conversations |
+| `Enter` | Send |
+| `PgUp` `PgDn` `Home` `End` | Scroll history / jump to oldest / back to live |
+| `F1` | Help — every binding |
+| `Ctrl-K` | Command palette |
+| `Ctrl-E` | Share my contact (connect code and invite link) |
+| `Ctrl-A` | Add a contact (paste either kind) |
+| `Ctrl-N` | New room |
+| `Ctrl-I` | Invite a contact into the selected room |
+| `Ctrl-F` | Send a file |
+| `Ctrl-G` | Hubs and reachability |
+| `Ctrl-L` | Log tail |
+| `Esc` / `Ctrl-C` | Close the open dialog, or quit |
 
-The status bar at the bottom shows: tor state · tail liveness · your fingerprint (short) · peer count · daemon version · keybinding hints.
+Composer commands: `/help`, `/share`, `/add <link>`, `/room [name]`, `/file`,
+`/search`, `/verify`, `/clear`, `/q`.
+
+A message that arrived through a hub is marked; a conversation shows whether
+it is direct, relayed, or has no route.
 
 ---
 
-## 8. CLI reference
+## Command line
 
-All `onyx` commands accept `--socket PATH` (default `./onyxd.sock`) or honor `ONYX_API_SOCKET`.
+Output is readable text at a terminal and JSON when piped or with `--json`.
+Exit status: `0` success, `1` the daemon returned an error, `2` could not
+reach the daemon.
 
-| Command | Effect |
+| Command | |
 |---|---|
-| `onyx status` | Print daemon liveness, identity, Tor state as JSON |
-| `onyx identity` | Print just identity pub + fingerprint + KEM public as JSON |
-| `onyx tui` | Open the multi-pane Ratatui interface |
-| `onyx send-bootstrap --peer-fingerprint X --peer-kem-pub-b32 Y --text Z` | First-contact send via hub, `msg/v1` tier (PFS only) |
-| `onyx send-bootstrap-mls --peer-fingerprint X --peer-kem-pub-b32 Y --peer-kp-b64 Z` | First-contact send via hub, `mls/v1` tier (full MLS PCS) |
-| `onyx fetch-keypackage --peer-fingerprint X` | Pull a peer's KP from the hub directory; daemon validates against `peer_fingerprint` before returning |
+| `onyx` | Daemon + interface in one process |
+| `onyx daemon` / `onyxd` | Headless daemon (systemd, containers) |
+| `onyx tui` | Interface only, against a daemon already running |
+| `onyx status` · `identity` · `doctor` | Health, your keys, self-diagnosis |
+| `onyx code` · `connect <code>` | Direct first contact |
+| `onyx invite [--with-kp] [--with-hubs]` · `accept <url>` | First contact through a hub (signed link) |
+| `onyx peers` · `send <id> <text>` · `history <id>` | Direct messages |
+| `onyx contact list` | Pinned identities; flags changed keys |
+| `onyx room create \| list \| invite \| send \| send-file \| rename \| leave \| remove \| delete` | Rooms |
+| `onyx room pending \| accept <n> \| decline <n>` | Invitations held for your consent |
+| `onyx files list \| send` | File transfer |
+| `onyx vault backup \| rekey` | Offline vault maintenance (stop the daemon first) |
 
-Every CLI command exits `0` on `*Ok` response, `1` on `{"kind":"Error", ...}`, `2` on socket connect failure.
+`onyx <command> --help` documents every flag.
 
-### Security tiers (which mode protects what)
+### Configuration
 
-| Mode | PFS | PCS | Anonymity | Notes |
-|---|---|---|---|---|
-| Direct-MLS over Tor | ✓ | ✓ | ✓ | The strongest path. Both peers online; full ratchet. |
-| Hub `mls/v1` | ✓ | ✓ (post-Welcome) | ✓ | Bootstraps an MLS group via hub; subsequent in-group messages have full PCS. |
-| Hub `msg/v1` | ✓ (per-message) | ✗ | ✓ | Per-envelope PFS via ephemeral hybrid KEM, but no ratchet. Use for one-off contact. |
-| `--listen-tcp` / `--dial-tcp` | ✓ | ✓ | ✗ | Same Noise + MLS encryption; no Tor → network observer sees IPs. **Test only.** |
-
-The TUI renders `[hub]` (yellow, bold) on every `via_hub: true` message so users can read the security tier at a glance. Direct-MLS messages have no badge.
-
----
-
-## 9. Configuration paths + environment variables
-
-| What | CLI flag | Env var | Default |
+| | Flag | Environment | Default |
 |---|---|---|---|
-| Vault file | `--vault PATH` | `ONYX_VAULT` | `./onyx-state.db` |
-| Vault passphrase | `--passphrase` | `ONYX_PASSPHRASE` | (required) |
-| Local API socket | `--api-socket PATH` | `ONYX_API_SOCKET` | `./onyxd.sock` |
-| Tor state dir | `--tor-state-dir PATH` | `ONYX_TOR_STATE_DIR` | platform default |
-| Hub onion | `--hub-onion HOST[:PORT]` | `ONYX_HUB_ONION` | (off) |
-| Hub pubkey | `--hub-pubkey B32` | `ONYX_HUB_PUBKEY` | (off) |
-| Local TCP listen (test) | `--listen-tcp ADDR` | `ONYX_LISTEN_TCP` | (off) |
-| Local TCP dial (test) | `--dial-tcp ADDR` | `ONYX_DIAL_TCP` | (off) |
+| Vault | `--vault` | `ONYX_VAULT` | `~/.onyx/vault.db` |
+| Passphrase | — | `ONYX_PASSPHRASE` | prompted |
+| API socket | `--socket` | `ONYX_API_SOCKET` | `~/.onyx/onyx.sock` |
+| Hub (repeatable) | `--hub onion:port,pubkey` | — | none |
+| Tor bridge (repeatable) | `--bridge` | — | none |
+| Cover traffic | `--cover-traffic-mean-secs`, `--constant-rate-ms` | `ONYX_COVER_TRAFFIC_MEAN_SECS`, `ONYX_CONSTANT_RATE_MS` | off |
+| Reachable for first contact via hub | `--first-contact-reachable` | `ONYX_FIRST_CONTACT_REACHABLE` | off |
+| Relay DMs via hub when peer offline | `--dm-hub-fallback` | `ONYX_DM_HUB_FALLBACK` | off |
 
-`ONYX_PASSPHRASE` should be set via the environment rather than as a CLI flag — flags show up in `ps` and shell history.
+Hubs added in the interface persist in `~/.onyx/config.json`.
 
-For the `onyx` CLI: `ONYX_API_SOCKET` overrides the default socket path. Useful when running multiple daemons on one machine.
+Prefer the prompt or the environment for the passphrase. `--passphrase`
+exists, but arguments are visible in `ps` and shell history.
 
----
+### Development mode (no Tor, no anonymity)
 
-## 10. Troubleshooting
-
-| Symptom | Cause / Fix |
-|---|---|
-| `error: unexpected argument '--listen-tcp'` | You're running an old installed `onyxd`. Run `cargo install --path crates/onyxd --force`, or use `./target/debug/onyxd`. |
-| `Address already in use (os error 48)` | Another daemon (yours or someone else's) holds the port. `lsof -ti :7710 \| xargs kill -9`. |
-| `vault open failed (wrong passphrase?)` | Schema bumped between commits — `rm demo-*.db` and recreate. The vault format has changed several times in early development. |
-| `daemon unreachable: connect API socket ./onyxd.sock` in TUI | The daemon isn't running, or you used the wrong `--socket` path. The TUI auto-refreshes every 2 s — start the daemon and the status bar flips to live data. |
-| `Another process has the lock` (Arti) | Two daemons sharing one Tor state dir. Each needs its own `--tor-state-dir`. |
-| `FS_MISTRUST` permissions error (macOS) | Set `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1` when using `--tor-state-dir`. |
-| Tor stuck at `bootstrapping` for >2 min | First-run cold cache. Subsequent runs are 5-10s. Don't kill it. |
-| `zsh: parse error near '\n'` | You copied a multi-line command and `<paste>` got interpreted as input redirection. The `<...>` are placeholders — type the actual value with no `<` `>` brackets. |
-| `onyx: command not found` | Binary isn't on `$PATH`. Run `cargo install --path crates/onyx`, or use `./target/release/onyx`. |
-| TUI shows "no peer to send to" | No peer has been added yet. With `--no-tor` alone, you literally can't add a peer (no transport). Use `--listen-tcp` / `--dial-tcp` (test) or real Tor (real). |
+For working on the code without waiting for Tor, the daemon can speak plain
+TCP on localhost. These modes refuse to start without `--allow-clearnet`,
+expose your IP address, and must never be used with real contacts.
+`scripts/local-hub-demo.sh` sets up a two-party local demo;
+`scripts/real_tor_smoke.sh` runs the same flow over real Tor.
 
 ---
 
-## 11. Architecture cheat-sheet
-
-```
-                          ┌──────────────────────────────────────┐
-                          │            onyxd (daemon)            │
-                          │  ┌────────────┐  ┌────────────────┐  │
-   ┌──────────┐    UDS    │  │  vault     │  │  MLS party     │  │
-   │ onyx CLI │ ────────► │  │  (SQLite + │  │  (openmls 0.8) │  │
-   │ + TUI    │  ndjson   │  │  Argon2id  │  └────────────────┘  │
-   └──────────┘   0600    │  │  + AEAD)   │  ┌────────────────┐  │
-                          │  └────────────┘  │ conversation   │  │
-                          │  ┌────────────┐  │ registry       │  │
-                          │  │ Identity:  │  │ (per peer)     │  │
-                          │  │ Ed25519,   │  └────────────────┘  │
-                          │  │ X25519,    │       │  ▲           │
-                          │  │ hybrid KEM │       │  │            │
-                          │  └────────────┘       │  │            │
-                          │                       ▼  │            │
-                          │  ┌────────────────────┴──┴─────────┐  │
-                          │  │   peer_session (per peer)        │  │
-                          │  │   Noise XK + MLS app messages    │  │
-                          │  └──────────────┬───────────────────┘  │
-                          │                 │                       │
-                          │  ┌──────────────┴───────────┐  ┌─────┐  │
-                          │  │ Tor (embedded Arti)      │  │ TCP │  │
-                          │  │ - v3 hidden service      │  │ (test only)
-                          │  │ - outbound onion dial    │  └─────┘  │
-                          │  └──────────────────────────┘           │
-                          └─────────────┬──────────────────────────┘
-                                        │
-                                        │  Noise+MLS over Tor (or TCP)
-                                        ▼
-                                  another daemon
-                                  (or onyx-hub
-                                   for offline relay)
-```
-
----
-
-## 12. Documentation index
-
-| Doc | Purpose |
-|---|---|
-| `README.md` | (this file) install, run, troubleshoot |
-| **`HOW_IT_WORKS.md`** | **"How do I know this is secure?" — plain-English walkthrough of every protection layer, with the specific tests / RFCs / audited libraries behind each claim. Start here if you want to understand or verify Onyx's security posture.** |
-| **`ANONYMITY.md`** | **"Can my adversary tell I'm talking to X?" — honest inventory of what Onyx hides and what it doesn't. Adversary model (A1–A4), defences in place today (with file pointers), gaps not yet closed, recommendations per threat model.** |
-| `FEDERATION.md` | Design doc for hub-to-hub gossip (T8.3, in design). Wire protocol, gossip semantics, loop prevention, threat-model deltas, slice plan. No code yet — review the open questions before implementation begins. |
-| `DELIVERY.md` | **Reliable-delivery & scale architecture (in design).** How offline delivery works today (sender-side fan-out to your hubs, no end-to-end ACK) + the silent-loss / N×-storage holes, and a privacy-first design — end-to-end **delivery** receipts (never *read* receipts), an encrypted sender pending-store + retry that turns silent loss into eventual delivery or a *visible* failure, quorum fan-out, and the routing-id-sharding path to large scale. Threat-model delta + phased plan. No code yet. |
-| `DISCOVERY.md` | Why Onyx does NOT have public hub discovery yet (T8.4 deferred). Bootstrapping problem, four approaches honestly compared (bundled list / online directory / DHT / invite-based), recommendation to defer, what we'd build if/when the governance question is answerable. |
-| `CHANNELS.md` | Design doc for multi-party rooms (T6.3, in design). Data model (Room { group_id, name, members }), lifecycle (create/invite/send/receive/leave), wire considerations, open questions Q1–Q5 with recommendations, six-slice plan T6.3.b–T6.3.f (+T6.3.g per-epoch session tokens follow-up). |
-| `ROTATION.md` | Structural analysis of why "subscription rotation" alone doesn't close `ANONYMITY.md §3.2`. Three independent identity leaks (Noise static key, fingerprint-derived inbox subscription, KP publication). What Onyx v0 has today (multi-hub + bidirectional cover + per-(room, epoch) session tokens + `--no-intro-inbox-subscribe` opt-out). What a full fix would require (ephemeral Noise keys + separated publish/subscribe + oblivious-recipient routing). Why each is deferred. |
-| `METRICS.md` | Threat model + field justification for **opt-in hub liveness telemetry**. Why only liveness signals are emitted (the time-series-correlation argument), what the heartbeat contains and deliberately excludes, how it travels (signed, Tor-only, fixed cadence, fail-open), and the `onyx-metrics` collector (allowlist, no history, localhost status page). Read before enabling `--metrics-report`. |
-| `RELEASES.md` | Verifier walkthrough for sigstore-signed releases (Infra.3). What sigstore cosign actually proves + what it doesn't (`§0`), step-by-step `cosign verify-blob` commands for a single binary (`§2`) or via the combined `SHA256SUMS.txt` (`§3`), reproducible-build flags (`§4`), and what to do if verification fails (`§7`). Read this before installing a binary you didn't build from source. |
-| **`ROADMAP.md`** | **"What's coming next?" — completed phases, in-flight work, prioritised next queue, long-term direction, explicit "won't do" list. Start here to see where the project is going.** |
-| `DESIGN.md` | Full protocol specification — wire formats, key derivation, frame types, group lifecycle |
-| `THREAT_MODEL.md` | Adversaries (A1-A6) + non-adversaries (N1-N7) + §8 implementation-status table with current carry-forward gaps |
-| `SECURITY.md` | Eight enforcement principles, PR review checklist, vulnerability disclosure policy, primitive table |
-| `CHANGELOG.md` | Append-only dev log, one entry per substantive session with design decisions + verification + carry-forward items |
-| Module doc-comments in `crates/onyx-core/src/*.rs` | Per-subsystem detail (crypto, identity, MLS, routing, storage, transport, wire) |
-
----
-
-## 13. Contributing + the CI gate
-
-PRs must pass the same gate CI runs:
+## Running a hub
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo deny check                # cargo install cargo-deny --locked first
+ONYX_HUB_PASSPHRASE=… onyx-hub --vault ./hub.db --tor-state-dir ./hub-tor
 ```
 
-Before submitting, please read `SECURITY.md` — every PR is reviewed against the eight enforcement principles (forward-only protocol versioning, no optional weakening, vault-sealing of persisted data, etc.) listed there.
-
-Vulnerability disclosure: use **GitHub Security Advisories** on the repo (`/security/advisories`). See `SECURITY.md` §5 for the SLA.
-
----
-
-## 14. License
-
-[AGPL-3.0-or-later](./LICENSE). Onyx is a network-deployed service; hub operators forking the code and running it for the public must publish source.
+The hub prints its onion address and public key; users pass both to `--hub`.
+A hub sees: connection timing, envelope sizes (padded to buckets), and opaque
+routing tokens. It does not see plaintext, sender identity, room names, or —
+with the private default — which long-term identity a connection belongs to.
+It can drop or delay messages; it cannot forge or read them. Details and the
+abuse limits it enforces: [`THREAT_MODEL.md`](./THREAT_MODEL.md),
+[`QUEUE-HARDENING.md`](./QUEUE-HARDENING.md).
 
 ---
 
-## 15. Where this came from
+## How it fits together
 
-This project is one developer's exploration of how to compose **Noise + MLS + Tor + post-quantum hybrid KEMs** into a complete anonymous messaging system in modern Rust, with explicit threat modeling and a discipline of "no commit without security-tier accounting." Every code change has a corresponding CHANGELOG entry covering design decisions and carry-forward gaps. Every cryptographic claim names the specific RFC and crate version that backs it. The result is a credible proof-of-concept of how an Onyx-like system can be built — not a product, not a service, and not yet trustworthy enough to bet anything important on. Watch this repo if you want to follow that journey, or contribute if you'd like to help.
+```
+ onyx (CLI / interface) ──unix socket 0600──▶ onyxd
+                                               ├─ vault      SQLite, Argon2id, per-row AEAD
+                                               ├─ identity   Ed25519 · X25519 · X25519+ML-KEM-768
+                                               ├─ MLS        one group per DM and per room
+                                               ├─ sessions   Noise XK, one per connected peer
+                                               └─ Tor (Arti) onion service in, onion dials out
+                                                     │
+                         ┌───────────────────────────┴───────────────┐
+                         ▼                                           ▼
+                 a contact's onyxd                         onyx-hub (optional)
+                 direct, both online                       sealed envelopes, offline delivery
+```
+
+Layers, outermost first: **Tor** hides network location → **Noise XK**
+authenticates the peer and encrypts the link → **MLS** gives forward secrecy
+and post-compromise security per conversation → for relayed traffic, a
+**hybrid post-quantum sealed envelope** hides sender and content from the hub.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Nothing happens when I message someone | Run `onyx doctor`. Usually the peer is offline, or Tor has not finished publishing your onion. |
+| Tor stays at "bootstrapping" | A cold first start takes up to a minute. On a censored network, configure bridges. |
+| The daemon refuses to start, saying the vault is locked | Another daemon is already running on that vault. One daemon per vault is enforced. |
+| `vault open failed (wrong passphrase?)` | Wrong passphrase. There is no recovery. |
+| "identity changed" on a contact | Their key differs from the pinned one: a reinstall, or an interception. Re-verify out of band before continuing. |
+| A room invitation never appeared | It is waiting in `onyx room pending` because the inviter is not yet a contact. |
+| The daemon refuses a plain-TCP flag | It was given without `--allow-clearnet`. That is the safeguard working. |
+| Arti permission error on macOS | The Tor state directory or a parent is group/world-writable. Fix the permissions rather than disabling the check. |
+
+Logs: `~/.onyx/onyx.log`. They are written to avoid message text,
+fingerprints and room names; if you find one that does not, that is a bug
+worth reporting.
+
+---
+
+## Documentation
+
+**Start here**
+
+| | |
+|---|---|
+| [`USER_GUIDE.md`](./USER_GUIDE.md) | A short, plain guide to installing and using Onyx |
+| [`HOW_IT_WORKS.md`](./HOW_IT_WORKS.md) | Each protection layer in plain language |
+| [`ANONYMITY.md`](./ANONYMITY.md) | What an observer can and cannot learn |
+| [`THREAT_MODEL.md`](./THREAT_MODEL.md) | Adversaries, status table, open residuals (§8.6) |
+| [`ATTACKS.md`](./ATTACKS.md) | Published attacks on messengers, Tor and release pipelines, and where Onyx stands on each |
+| [`TRUST-ARCHITECTURE.md`](./TRUST-ARCHITECTURE.md) | The four structural gaps and the chosen fix for each |
+| [`SECURITY.md`](./SECURITY.md) | Engineering rules, review checklist, how to report a vulnerability |
+
+**Using and operating**
+
+| | |
+|---|---|
+| [`INSTALL.md`](./INSTALL.md) · [`RELEASES.md`](./RELEASES.md) | Installing and verifying |
+| [`TOR-BRIDGES.md`](./TOR-BRIDGES.md) | Censored networks |
+| [`FILES.md`](./FILES.md) | File transfer and metadata stripping |
+| [`METRICS.md`](./METRICS.md) | Opt-in hub liveness telemetry |
+| [`MOBILE.md`](./MOBILE.md) | Termux status |
+
+**Design records**
+
+[`DESIGN.md`](./DESIGN.md) (protocol) ·
+[`CHANNELS.md`](./CHANNELS.md) ·
+[`ROOM-AUTHORITY.md`](./ROOM-AUTHORITY.md) ·
+[`DELIVERY.md`](./DELIVERY.md) ·
+[`ROTATION.md`](./ROTATION.md) ·
+[`OBLIVIOUS-ROUTING.md`](./OBLIVIOUS-ROUTING.md) ·
+[`FEDERATION.md`](./FEDERATION.md) ·
+[`DISCOVERY.md`](./DISCOVERY.md) ·
+[`QUEUE-HARDENING.md`](./QUEUE-HARDENING.md) ·
+[`ROADMAP.md`](./ROADMAP.md) ·
+[`CHANGELOG.md`](./CHANGELOG.md)
+
+Some design records predate the code they describe; where a record and the
+code disagree, the code and `THREAT_MODEL.md` are authoritative.
+
+---
+
+## Contributing
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny check
+```
+
+Read [`SECURITY.md`](./SECURITY.md) first: every change is reviewed against
+its rules (no optional weakening, everything persisted is sealed, no secrets
+in logs, a threat-model entry for anything that changes what a party learns).
+
+**Vulnerabilities:** report privately through GitHub Security Advisories on
+this repository. Please do not open a public issue.
+
+The most valuable contribution right now is independent review of the
+protocol composition.
+
+---
+
+## License
+
+[AGPL-3.0-or-later](./LICENSE). If you run a modified hub for other people,
+you must publish your changes.

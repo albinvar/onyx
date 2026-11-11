@@ -22,6 +22,7 @@ Whichever you pick, the install puts three things in scope:
 | macOS | x86_64 (Intel) | ✅ built + signed |
 | Linux | x86_64 | ✅ built + signed |
 | Linux | aarch64 | ✅ built + signed |
+| Linux / Termux | aarch64 (static musl) | ✅ built + signed — see `MOBILE.md` |
 | Windows | x86_64 | ❌ not built yet — use WSL2 or build from source |
 | FreeBSD / OpenBSD | * | ❌ build from source |
 
@@ -196,7 +197,7 @@ onyx invite --with-kp --with-hubs > invite.txt    # share this out-of-band
 onyx accept "$(cat invite.txt)" --text "hi"
 ```
 
-The hub address used is whatever's in `~/.onyx/config.toml` (or set via `--hub` on launch). **You need at least one hub for store-and-forward to work** — see `README.md` for the bootstrap recipe and `FEDERATION.md` for multi-hub setup.
+The hub address used is whatever's in `~/.onyx/config.json` (or set via `--hub` on launch). **You need at least one hub for store-and-forward to work** — see `README.md` for the bootstrap recipe and `FEDERATION.md` for multi-hub setup.
 
 ## §5 Uninstall
 

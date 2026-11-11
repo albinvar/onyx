@@ -6,6 +6,45 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Docs + trust — 2026-11-11 — consent gate, README rewrite, attacks catalogue, user guide
+
+**Behaviour change**
+
+- **Room invitations from non-contacts are held, not joined.** A Welcome
+  from someone who is not an established, unflagged contact is stored
+  sealed in the vault (`pending_invites`, capped at 32) and nothing is
+  joined or subscribed until the user accepts: `onyx room pending`,
+  `onyx room accept <n>`, `onyx room decline <n>`. Invitations from
+  existing contacts join automatically as before. This is T-4 in
+  `TRUST-ARCHITECTURE.md`; T-1 to T-3 are designed there, not built.
+  **Carry-forward:** the terminal interface has no screen for held
+  invitations yet — CLI only.
+
+**Documentation**
+
+- `README.md` rewritten against the current code: `~/.onyx` defaults,
+  connect codes, `--json`, held invitations, the private-by-default hub
+  flags, current key bindings. Removed the recipes that set
+  `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1` and used toy passphrases, and
+  the stale size/test/version figures. Added a "what it does not do"
+  section ahead of the install instructions.
+- `ATTACKS.md` (new): published attacks on messengers, Tor onion services
+  and release pipelines, each mapped to Addressed / Partial / Open / By
+  design / N/A for Onyx with the mechanism or residual id. Records two
+  things not written down before: **delivery acknowledgements let a
+  contact observe that your daemon is running** (no off switch yet), and
+  **only the relayed envelope is post-quantum** — the Noise link, the MLS
+  ciphersuite and Tor are classical.
+- `USER_GUIDE.md` (new): a short plain-language guide for non-specialists.
+- `TRUST-ARCHITECTURE.md` (new, previous commit): decision record for the
+  four structural gaps.
+- `INSTALL.md`: config file is `config.json`, not `config.toml`; musl
+  target listed.
+
+None of this changes the headline: no external audit.
+
+---
+
 ## Security — 2026-11-11 — full-codebase audit + remediation (internal)
 
 A read-through of the whole workspace (crypto core, daemon, hub, CLI/TUI,
