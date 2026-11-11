@@ -166,7 +166,7 @@ pub fn muted() -> Style {
     Style::default().fg(MUTED)
 }
 
-/// The onion logo — Tor brand purple, bold.
+/// The brand mark and wordmark — Tor purple, bold.
 #[must_use]
 pub fn logo() -> Style {
     Style::default().fg(PURPLE).add_modifier(Modifier::BOLD)
@@ -181,27 +181,9 @@ pub fn selection() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-// ── Brand / ASCII art ───────────────────────────────────────────────────
+// ── Brand ───────────────────────────────────────────────────────────────
 
-/// The ONYX onion logo for the left-rail top box — a layered Tor
-/// *onion* (teardrop bulb + concentric layer lines + a sprout on top),
-/// NOT a face. Five lines, designed to fit inside a box ~20 cols wide
-/// (the left rail). Caller styles it Tor-purple.
-///
-/// Kept deliberately small so it survives a short terminal; the wordmark
-/// line below the art carries the brand if the art is clipped.
-pub const ONION_ART: &[&str] = &[
-    "      \\|/      ",
-    "    .-===-.    ",
-    "   /(  (  )\\   ",
-    "   \\ )  ) (/   ",
-    "    '-===-'    ",
-];
-
-/// The wordmark shown under the onion art.
-pub const WORDMARK: &str = "O N Y X";
-
-/// One-line tagline under the wordmark (anonymous, E2E, over Tor).
+/// One-line tagline shown beside the wordmark in the top bar.
 pub const TAGLINE: &str = "anonymous · e2e · tor";
 
 #[cfg(test)]
@@ -217,18 +199,5 @@ mod tests {
         assert_eq!(error().fg, Some(RED));
         assert_eq!(room().fg, Some(CYAN));
         assert_eq!(badge().fg, Some(AMBER));
-    }
-
-    #[test]
-    fn onion_art_fits_left_rail() {
-        // The left rail is 22-24 cols; every art line must fit inside a
-        // bordered box (width - 2 for the borders, - 2 padding).
-        for line in ONION_ART {
-            assert!(
-                line.chars().count() <= 20,
-                "onion art line too wide for the left rail: {line:?} ({} chars)",
-                line.chars().count()
-            );
-        }
     }
 }

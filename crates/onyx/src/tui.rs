@@ -3458,16 +3458,15 @@ fn run_keyboard_pump(tx: &mpsc::Sender<KeyEvent>) {
 fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
     let area = frame.area();
 
-    let outer = Block::default().borders(Borders::ALL).title(Span::styled(
-        " onyx ",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    // Slice 3: a one-row info header at the very top — always-visible
-    // context for the selected conversation (transport, trust, members /
-    // last-seen) which otherwise only lives in the wide-only details pane.
+    // Layout: a flat, three-band screen with no outer frame.
+    //
+    //   top bar      brand · tor / hub / link state           (1 row)
+    //   body         conversations │ chat │ details + activity
+    //   status       warnings and key hints                   (1 row)
+    //
+    // Panels are separated by single rules rather than boxed: nested
+    // frames cost two columns and two rows per level and made the screen
+    // read as a grid of boxes instead of a conversation.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3475,64 +3474,49 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
             Constraint::Min(0),
             Constraint::Length(1),
         ])
-        .split(inner);
-    let header_area = chunks[0];
+        .split(area);
+    let topbar_area = chunks[0];
     let main_area = chunks[1];
     let status_area = chunks[2];
 
-    // UX overhaul: 3-pane layout (Conversations │ Chat │ Details)
-    // when the terminal is wide enough; gracefully falls back to the
-    // 2-pane layout on narrow terminals so nothing gets crushed.
-    let wide = main_area.width >= 92;
+    // Three columns when there is room (conversations │ chat │ details),
+    // two on a narrow terminal so nothing gets crushed.
+    let wide = main_area.width >= 100;
     let cols = if wide {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(26),
+                Constraint::Length(SIDEBAR_WIDTH),
                 Constraint::Min(0),
-                Constraint::Length(32),
+                Constraint::Length(34),
             ])
             .split(main_area)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(24), Constraint::Min(0)])
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
             .split(main_area)
     };
-    let left_rail = cols[0];
+    let peers_area = cols[0];
     let chat_col = cols[1];
     let details_area = if wide { Some(cols[2]) } else { None };
 
-    // UX overhaul phase 2: the left rail is a stack —
-    //   logo (brand)  ·  peers & rooms (flexible)  ·  daemon status.
-    // The logo box is fixed; the status box is fixed; peers takes the
-    // rest. On a very short terminal the logo is the first to yield
-    // (its Length collapses gracefully and the art clips to the box).
-    let art_lines = u16::try_from(theme::ONION_ART.len()).unwrap_or(5);
-    let logo_h: u16 = (art_lines + 4).min(left_rail.height / 2);
-    let rail = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(logo_h),
-            Constraint::Min(3),
-            Constraint::Length(4),
-        ])
-        .split(left_rail);
-    let logo_area = rail[0];
-    let peers_area = rail[1];
-    let daemon_area = rail[2];
-
+    // Chat column: who you are talking to (1 row) · messages · composer.
     let chat_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
         .split(chat_col);
-    let messages_area = chat_rows[0];
-    let composer_area = chat_rows[1];
+    let header_area = chat_rows[0];
+    let messages_area = chat_rows[1];
+    let composer_area = chat_rows[2];
 
-    render_header(frame, header_area, app);
-    render_logo(frame, logo_area);
+    render_topbar(frame, topbar_area, app);
     render_peers(frame, peers_area, app);
-    render_daemon_status(frame, daemon_area, app);
+    render_header(frame, header_area, app);
     render_messages(frame, messages_area, app);
     render_composer(frame, composer_area, app);
     if let Some(d) = details_area {
@@ -4626,9 +4610,11 @@ fn boxed(
     color: Color,
     lines: Vec<Line<'_>>,
 ) {
+    // A rule above and to the left, not a full box: the details column
+    // is a margin note beside the chat, not a window of its own.
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
+        .borders(Borders::TOP | Borders::LEFT)
+        .border_style(theme::border())
         .title(Span::styled(
             format!(" {title} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -4859,137 +4845,100 @@ fn render_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     }
 }
 
-// Linear render fn: empty-state branch + grouped DM/Channels item
-// build + visual-row mapping. Over the 100-line budget but cohesive
-// (same rationale as the other render_* helpers).
-/// UX overhaul phase 2: the brand box at the top of the left rail —
-/// the layered Tor onion in brand purple, the ONYX wordmark (also
-/// purple), and a muted tagline. Centered; clips gracefully in a short
-/// box.
-fn render_logo(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border())
-        .title(Span::styled(" onyx ", theme::header()));
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let center = |s: &str| -> Line<'static> {
-        let len = s.chars().count();
-        let pad = inner_w.saturating_sub(len) / 2;
-        Line::from(Span::styled(
-            format!("{}{}", " ".repeat(pad), s),
-            theme::logo(),
-        ))
-    };
-    let mut lines: Vec<Line<'static>> = theme::ONION_ART.iter().map(|l| center(l)).collect();
-    lines.push(center(theme::WORDMARK));
-    lines.push(Line::from(Span::styled(
-        {
-            let len = theme::TAGLINE.chars().count();
-            let pad = inner_w.saturating_sub(len) / 2;
-            format!("{}{}", " ".repeat(pad), theme::TAGLINE)
-        },
-        theme::muted(),
-    )));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+/// Width of the conversations column.
+const SIDEBAR_WIDTH: u16 = 28;
+
+/// The top bar: the brand on the left, and on the right the three things
+/// a user needs to know at a glance — is Tor up, are the hubs reachable,
+/// and is this screen actually connected to the daemon. (These used to
+/// live in a boxed "daemon" panel under an eight-row logo.)
+fn render_topbar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let mut left = vec![
+        Span::styled(" ◈ ", theme::logo()),
+        Span::styled("ONYX", theme::logo()),
+        Span::styled(format!("  {}", theme::TAGLINE), theme::muted()),
+    ];
+    let right = daemon_status_spans(app);
+    let used: usize = left
+        .iter()
+        .chain(right.iter())
+        .map(|s| s.content.chars().count())
+        .sum();
+    let gap = usize::from(area.width).saturating_sub(used);
+    left.push(Span::raw(" ".repeat(gap)));
+    left.extend(right);
+    frame.render_widget(Paragraph::new(Line::from(left)), area);
 }
 
-/// UX overhaul phase 2: the daemon-status box at the bottom of the left
-/// rail — a compact dashboard line for Tor + tail health + version, so
-/// the user can see the embedded daemon is alive at a glance (it starts
-/// automatically, so this is the only place that visibly confirms it).
-fn render_daemon_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border())
-        .title(Span::styled(" daemon ", theme::header()));
-
-    let lines: Vec<Line<'static>> = match &app.last_status {
-        None => vec![Line::from(Span::styled("◌ starting…", theme::warn()))],
-        Some(Err(_)) => vec![
-            Line::from(Span::styled("✗ unreachable", theme::error())),
-            Line::from(Span::styled("reconnecting…", theme::muted())),
-        ],
+/// Compact daemon health for the top bar: Tor state (with the bootstrap
+/// percentage while starting), hub reachability, link to the daemon, and
+/// the version.
+fn daemon_status_spans(app: &AppState) -> Vec<Span<'static>> {
+    let sep = || Span::styled("  ·  ", theme::muted());
+    match &app.last_status {
+        None => vec![Span::styled("◌ starting… ", theme::warn())],
+        Some(Err(_)) => vec![Span::styled(
+            "✗ daemon unreachable — reconnecting… ",
+            theme::error(),
+        )],
         Some(Ok(s)) => {
-            // UX phase 5: while bootstrapping, the daemon box shows a
-            // real progress bar built from arti's reported percentage
-            // instead of the binary ready/off glyph.
-            if let TorState::Bootstrapping { percent } = s.tor_state {
-                let filled = (usize::from(percent) * 10 / 100).min(10);
-                let bar: String = "█".repeat(filled) + &"░".repeat(10 - filled);
-                return frame.render_widget(
-                    Paragraph::new(vec![
-                        Line::from(vec![
-                            Span::styled("◌ ", theme::warn()),
-                            Span::styled("bootstrapping tor", theme::warn()),
-                        ]),
-                        Line::from(vec![
-                            Span::styled(bar, theme::warn()),
-                            Span::styled(format!(" {percent}%"), theme::muted()),
-                        ]),
-                    ])
-                    .block(block),
-                    area,
-                );
-            }
-            let (glyph, label, style) = match s.tor_state {
-                TorState::Ready => ("◉", "tor ready", theme::ok()),
-                TorState::Bootstrapping { .. } => ("◌", "bootstrapping", theme::warn()),
-                TorState::Disabled => ("○", "tor off (clearnet)", theme::warn()),
+            let tor = match s.tor_state {
+                TorState::Ready => Span::styled("◉ tor ready", theme::ok()),
+                TorState::Bootstrapping { percent } => {
+                    Span::styled(format!("◌ tor starting {percent}%"), theme::warn())
+                }
+                TorState::Disabled => Span::styled("○ tor OFF (clearnet)", theme::error()),
             };
-            let tail = if app.tail_active {
+            let hubs = if s.hub_count == 0 {
+                Span::styled("no hubs", theme::muted())
+            } else {
+                let style = if s.hubs_connected == s.hub_count {
+                    theme::ok()
+                } else if s.hubs_connected == 0 {
+                    theme::error()
+                } else {
+                    theme::warn()
+                };
+                Span::styled(format!("hubs {}/{}", s.hubs_connected, s.hub_count), style)
+            };
+            let link = if app.tail_active {
                 Span::styled("● live", theme::ok())
             } else {
                 Span::styled("○ reconnecting", theme::warn())
             };
             vec![
-                Line::from(vec![
-                    Span::styled(format!("{glyph} "), style),
-                    Span::styled(label.to_string(), style),
-                ]),
-                Line::from(vec![
-                    Span::styled("link ", theme::muted()),
-                    tail,
-                    Span::styled(format!("   v{}", s.daemon_version), theme::muted()),
-                ]),
+                tor,
+                sep(),
+                hubs,
+                sep(),
+                link,
+                Span::styled(format!("  v{} ", s.daemon_version), theme::muted()),
             ]
         }
-    };
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
 fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    // A single rule on the right separates the list from the chat.
     let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Peers & Rooms ");
+        .borders(Borders::RIGHT)
+        .border_style(theme::border());
     if app.peers.is_empty() && app.rooms.is_empty() {
+        let hint = |key: &str, what: &str| -> Line<'static> {
+            Line::from(vec![
+                Span::styled(format!(" {key:<3}"), theme::keychip()),
+                Span::styled(format!(" {what}"), theme::muted()),
+            ])
+        };
         let body = Paragraph::new(vec![
+            Line::from(Span::styled(" CONVERSATIONS", theme::header())),
             Line::from(""),
-            Line::from(Span::styled(
-                " (nothing yet)",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(" none yet", theme::muted())),
             Line::from(""),
-            Line::from(Span::styled(
-                " start onyxd with",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                " --dial-onion / --dial-pubkey",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                " for a DM, or",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                " `onyx room create --name X`",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                " for a multi-party room.",
-                Style::default().fg(Color::DarkGray),
-            )),
+            hint("^A", "add a contact"),
+            hint("^E", "share your code"),
+            hint("^N", "new room"),
         ])
         .block(block);
         frame.render_widget(body, area);
@@ -5001,16 +4950,11 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     // the entry index (`app.selected`, into peers++rooms) to the
     // VISUAL row index the ListState should highlight.
     let header = |t: &str| -> ListItem<'_> {
-        ListItem::new(Line::from(Span::styled(
-            t.to_string(),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        )))
+        ListItem::new(Line::from(Span::styled(format!(" {t}"), theme::header())))
     };
     let mut items: Vec<ListItem<'_>> = Vec::with_capacity(app.peers.len() + app.rooms.len() + 2);
     if !app.peers.is_empty() {
-        items.push(header("DIRECT MESSAGES"));
+        items.push(header("DIRECT"));
     }
     // v0.1.32: one line per conversation (minimal). The last-message
     // preview is dropped from the list — the chat pane shows it.
@@ -5041,12 +4985,9 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                 }),
         );
         let mut head = vec![dot, name];
-        let rel = fmt_relative(p.last_active_unix_ms);
-        if rel != "—" {
-            head.push(Span::styled(
-                format!("  {rel}"),
-                Style::default().fg(Color::DarkGray),
-            ));
+        let rel = fmt_relative_short(p.last_active_unix_ms);
+        if !rel.is_empty() {
+            head.push(Span::styled(format!("  {rel}"), theme::muted()));
         }
         // C (verify): key-change warning ⚠ (possible MITM) beats verified ✓.
         if p.key_changed {
@@ -5070,7 +5011,7 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         items.push(ListItem::new(Line::from(head)));
     }
     if !app.rooms.is_empty() {
-        items.push(header("CHANNELS"));
+        items.push(header("ROOMS"));
     }
     for r in &app.rooms {
         let room_key = format!("room/{}", short_id(&r.group_id_b32));
@@ -5080,8 +5021,8 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         ];
         if let Some(&ms) = app.last_activity_ms.get(&room_key) {
             head.push(Span::styled(
-                format!("  {}", fmt_relative(ms)),
-                Style::default().fg(Color::DarkGray),
+                format!("  {}", fmt_relative_short(ms)),
+                theme::muted(),
             ));
         }
         if let Some(&n) = app.unread.get(&room_key)
@@ -5099,8 +5040,8 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     }
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol("▶ ");
+        .highlight_style(theme::selection())
+        .highlight_symbol("▸ ");
     // Map the selected entry index to its visual row. DM section, when
     // present, is [header, peers…] = 1 + peers.len() rows; the channels
     // header adds 1 before the rooms.
@@ -5147,6 +5088,27 @@ pub(crate) fn fmt_relative(ts_unix_ms: u64) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Compact relative time for the narrow conversations list: `now`, `45s`,
+/// `12m`, `3h`, `9d` — or empty when there has been no activity. (The long
+/// form, "12m ago", was clipped mid-word in a 28-column list.)
+fn fmt_relative_short(ts_unix_ms: u64) -> String {
+    if ts_unix_ms == 0 {
+        return String::new();
+    }
+    let secs = now_unix_ms().saturating_sub(ts_unix_ms) / 1000;
+    if secs < 10 {
+        "now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
     }
 }
 
@@ -5373,21 +5335,20 @@ fn build_chat_lines(
 #[allow(clippy::too_many_lines)]
 fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     // v0.1.31: prefer a set nickname over the short-id for the peer label.
-    let (title, scrollback_key, who_label) = match app.selected_entry() {
+    let (scrollback_key, who_label) = match app.selected_entry() {
         Some(SelectedEntry::Peer(p)) => {
             let label = p
                 .nickname
                 .clone()
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| p.short_id.clone());
-            (format!(" #{label} "), p.short_id.clone(), label)
+            (p.short_id.clone(), label)
         }
         Some(SelectedEntry::Room(r)) => (
-            format!(" #{} (room, {} members) ", r.name, r.members.len()),
             format!("room/{}", short_id(&r.group_id_b32)),
             format!("#{}", r.name),
         ),
-        None => (" Conversation ".to_string(), String::new(), String::new()),
+        None => (String::new(), String::new()),
     };
     // v0.1.31: own display name (falls back to "me").
     let me_label = app.my_nickname.clone().unwrap_or_else(|| "me".to_string());
@@ -5395,7 +5356,7 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
     // v0.1.31: in selection mode, the title becomes the keybind hint.
     let block = if let Some(sel) = &app.select {
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::Yellow))
             .title(Span::styled(
                 format!(
@@ -5407,7 +5368,11 @@ fn render_messages(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
                     .add_modifier(Modifier::BOLD),
             ))
     } else {
-        Block::default().borders(Borders::ALL).title(title)
+        // No title: the context line directly above already names the
+        // conversation; repeating it on the rule was noise.
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(theme::border())
     };
     if app.selected_entry().is_none() {
         // UX overhaul: brand-new user (no peers, no rooms) gets a real
@@ -5582,7 +5547,7 @@ fn render_composer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
         ));
     }
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .border_style(Style::default().fg(border))
         .title(Line::from(title_spans));
 
@@ -6260,18 +6225,22 @@ mod snapshot_tests {
         let dir = snapshot_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("tui-snapshot.txt"), &snap).unwrap();
-        assert!(snap.contains("onyx"));
-        // T6.3.f.2: pane title is now "Peers & Rooms"; empty-state
-        // copy changed from "(no peers yet)" to "(nothing yet)".
-        assert!(snap.contains("Peers"));
-        assert!(snap.contains("(nothing yet)"));
-        // UX overhaul phase 2: the stacked left rail must render the
-        // brand box (wordmark + tagline) and the daemon-status box.
-        assert!(snap.contains("O N Y X"), "logo wordmark missing:\n{snap}");
-        assert!(snap.contains("anonymous"), "tagline missing:\n{snap}");
+        assert!(snap.contains("ONYX"));
+        // Flat layout: the conversations column carries its own heading
+        // and an empty state made of the three ways to get started.
         assert!(
-            snap.contains("daemon"),
-            "daemon status box missing:\n{snap}"
+            snap.contains("CONVERSATIONS"),
+            "list heading missing:\n{snap}"
+        );
+        assert!(snap.contains("none yet"));
+        assert!(snap.contains("add a contact"));
+        // The top bar carries the brand and the tagline; daemon health
+        // lives there too (asserted just below).
+        assert!(snap.contains("anonymous"), "tagline missing:\n{snap}");
+        // No outer frame: the first row is the top bar, not a border.
+        assert!(
+            snap.lines().next().is_some_and(|l| l.contains("ONYX")),
+            "top bar should be the first row:\n{snap}"
         );
         assert!(
             snap.contains("tor ready"),
