@@ -1125,8 +1125,10 @@ where
         let outcome = responder_exchange(&mut stream, &mut session, &party, reply_text.as_bytes())
             .await
             .map_err(|e| anyhow::anyhow!("MLS responder flow failed: {e}"))?;
+        // D-3: never log the peer's greeting — it carries their
+        // fingerprint and is otherwise peer-controlled text.
         info!(
-            peer_message = %String::from_utf8_lossy(&outcome.peer_message),
+            peer_message_bytes = outcome.peer_message.len(),
             mls_epoch = outcome.group.epoch(),
             was_bootstrap = outcome.was_bootstrap,
             "MLS round-trip complete (responder); entering chat receive loop"
@@ -1559,8 +1561,9 @@ where
         )
         .await
         .map_err(|e| anyhow::anyhow!("MLS initiator flow failed: {e}"))?;
+        // D-3: never log the peer's greeting (fingerprint + peer text).
         info!(
-            peer_reply = %String::from_utf8_lossy(&outcome.peer_message),
+            peer_reply_bytes = outcome.peer_message.len(),
             mls_epoch = outcome.group.epoch(),
             was_bootstrap = outcome.was_bootstrap,
             "MLS round-trip complete (initiator); entering interactive chat loop"
@@ -2022,7 +2025,7 @@ where
                     debug!("outbound channel closed; ending session");
                     return Ok(());
                 };
-                let (frame_payload, log_text) = match outbound {
+                let (frame_payload, log_kind) = match outbound {
                     conversations::PeerOutbound::Dm(text) => {
                         // Task 322: DM text now rides the RoomAppMessage
                         // tagged envelope (so files can share the channel).
@@ -2035,7 +2038,7 @@ where
                         // never see inside the MLS envelope.
                         let msg_id: [u8; 16] = onyx_core::crypto::random_array();
                         let cbor = onyx_core::room::RoomAppMessage::Text {
-                            text: text.clone(),
+                            text,
                             msg_id: Some(serde_bytes::ByteBuf::from(msg_id.to_vec())),
                         }
                         .to_cbor()
@@ -2046,7 +2049,7 @@ where
                                 .encrypt_application(&party, &cbor)
                                 .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
                         };
-                        (ct, text)
+                        (ct, "dm text")
                     }
                     conversations::PeerOutbound::DmFrame(msg) => {
                         // Task 322: a DM file frame (FileMeta / FileChunk).
@@ -2059,7 +2062,7 @@ where
                                 .encrypt_application(&party, &cbor)
                                 .map_err(|e| anyhow::anyhow!("encrypt failed: {e}"))?
                         };
-                        (ct, "[dm file frame]".to_string())
+                        (ct, "dm file frame")
                     }
                     conversations::PeerOutbound::RoomFrame(ct) => {
                         // Pre-encrypted in the room's MLS group state
@@ -2068,8 +2071,7 @@ where
                         // burn an extra MLS ratchet step per
                         // recipient and break the "one ciphertext for
                         // the whole group" property MLS gives us.
-                        let bytes = ct.len();
-                        (ct, format!("[room ciphertext, {bytes} B]"))
+                        (ct, "room ciphertext")
                     }
                 };
                 write_frame(
@@ -2082,7 +2084,9 @@ where
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
-                info!(text = %log_text, "chat message sent");
+                // Never log message content: the default log is a
+                // plaintext file outside the vault and its retention.
+                debug!(kind = log_kind, "chat frame sent");
             }
             // v0.1.17: adaptive keepalive. After KEEPALIVE_INTERVAL of no
             // other branch firing, send a PING. The peer answers with a
@@ -3340,21 +3344,15 @@ async fn handle_hub_delivery(
     state: &Arc<DaemonState>,
     our_kem: &onyx_core::crypto::HybridKemSecret,
 ) {
-    // 0. Replay defence (T7.3-sec.2): if we've already accepted an
-    //    envelope with identical bytes, the hub is replaying it.
-    //    Drop without spending CPU on the AEAD decapsulation. The
-    //    seen-set is in-memory only — a daemon restart resets it,
-    //    documented as a known window in `replay_guard` rustdoc.
-    {
-        let mut seen = state.seen_envelopes.lock().await;
-        if !seen.check_and_record(&target, &body) {
-            debug!(
-                target_b32 = %encode_b32(&target),
-                body_bytes = body.len(),
-                "hub: dropping replayed envelope (already accepted)"
-            );
-            return;
-        }
+    // 0. Replay defence (T7.3-sec.2): if we've already ACCEPTED an
+    //    envelope with these exact body bytes, the hub is replaying it.
+    //    Read-only check so a replay costs no decapsulation.
+    if state.seen_envelopes.lock().await.is_replay(&body) {
+        debug!(
+            body_bytes = body.len(),
+            "hub: dropping replayed envelope (already accepted)"
+        );
+        return;
     }
 
     // 1. Decapsulate + verify the envelope. Failures are expected
@@ -3369,6 +3367,14 @@ async fn handle_hub_delivery(
         );
         return;
     };
+
+    // 1b. Record ONLY now that the envelope opened and its signature
+    //     verified. Recording before this point let junk bodies evict
+    //     every real entry from the bounded seen-set (replay-guard
+    //     flush); see `replay_guard::EnvelopeReplayGuard::record`.
+    if !state.seen_envelopes.lock().await.record(&body) {
+        return;
+    }
 
     // 2. Demultiplex the inner payload by its versioned `v` tag.
     //    Unknown tags surface here as InvalidEncoding (see

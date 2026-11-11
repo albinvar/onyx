@@ -43,20 +43,24 @@
 //!     per-recipient cache. A hub that holds an envelope and delivers
 //!     it to a *different* subscriber later is a separate problem
 //!     (mostly mitigated by the recipient KEM decryption failing —
-//!     wrong recipient). Within a single recipient, replays are now
-//!     scoped per delivery target (see `check_and_record`), so the
-//!     same body re-delivered under a different one of our targets is
-//!     judged as a distinct event rather than silently coalesced.
+//!     wrong recipient).
+//!
+//! ## What is hashed, and when
+//!
+//! The hash covers the sealed **body only**. The routing target is a
+//! hub-written prefix that nothing binds to the body, so hashing it let a
+//! hostile hub replay an envelope under a flipped prefix. Entries are
+//! recorded only **after** the envelope has opened and verified
+//! ([`EnvelopeReplayGuard::record`]); the pre-open check
+//! ([`EnvelopeReplayGuard::is_replay`]) is read-only.
 //!
 //! ## Sizing
 //!
 //! The default capacity is `DEFAULT_CAPACITY = 4096`. Each entry
 //! holds a 16-byte hash, so the set costs ~64 KB at full occupancy
-//! (HashMap overhead included). At Onyx's expected first-contact
-//! rate that's *months* of unique envelopes before FIFO eviction
-//! starts to expire entries; even under denial-of-service spam, an
-//! attacker would need to deliver 4096 *unique* valid envelopes to
-//! push a real one out of the window — costly enough to flag.
+//! (HashMap overhead included). Because only verified envelopes are
+//! recorded, evicting a real entry takes 4096 *valid* sealed envelopes
+//! addressed to this recipient — junk never enters the set.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -64,6 +68,11 @@ use onyx_core::crypto::blake2b_128;
 
 /// Default number of envelope hashes to remember. ~64 KB of state.
 pub const DEFAULT_CAPACITY: usize = 4096;
+
+/// Upper bound on the capacity honoured from a persisted snapshot. Well
+/// above [`DEFAULT_CAPACITY`]; exists only so a corrupt snapshot cannot
+/// drive a huge allocation at boot.
+const MAX_RESTORE_CAPACITY: usize = 16 * DEFAULT_CAPACITY;
 
 /// Bounded FIFO seen-set of envelope-body hashes. `insert` is the
 /// only mutating operation; it returns `true` on first sight and
@@ -99,23 +108,37 @@ impl EnvelopeReplayGuard {
         Self::with_capacity(DEFAULT_CAPACITY)
     }
 
-    /// Try to record the given envelope, scoped to the routing
-    /// `target` it was delivered under. Returns `true` if this is the
-    /// first time we've seen this `(target, body)` pair (caller should
-    /// process), and `false` if it's a replay (caller should drop
-    /// silently).
+    /// Hash of an envelope body. The routing `target` is deliberately
+    /// NOT part of the hash: it is a prefix the hub writes and nothing
+    /// cryptographically binds it to the sealed body, so including it let
+    /// a hostile hub replay an accepted envelope just by flipping a bit of
+    /// the prefix. A sealed body is unique per (send, recipient) — every
+    /// `seal_bootstrap` mints a fresh KEM encapsulation — so identical
+    /// body bytes are always the same envelope, whatever target carried it.
+    fn hash_of(body: &[u8]) -> [u8; 16] {
+        blake2b_128(&[body])
+    }
+
+    /// Has this exact envelope body already been accepted? Read-only —
+    /// call before the (expensive) decapsulation so a replay costs
+    /// nothing, then [`Self::record`] once the envelope has opened and
+    /// verified.
+    #[must_use]
+    pub fn is_replay(&self, body: &[u8]) -> bool {
+        self.seen.contains(&Self::hash_of(body))
+    }
+
+    /// Record an envelope body as accepted. Returns `true` if it was new,
+    /// `false` if it was already present.
     ///
-    /// Hash is BLAKE2b-128 over `target ‖ body`. Including the target
-    /// matters because a recipient can subscribe to more than one
-    /// routing id (introduction inbox + per-epoch session tokens): a
-    /// genuinely distinct delivery that happens to share body bytes
-    /// across two of our own targets must NOT be falsely dropped as a
-    /// replay, and a hostile hub re-delivering one inbox's envelope
-    /// under a different target is a distinct event we want to judge
-    /// on its own merits. Dedup is therefore over what was actually
-    /// delivered: the target prefix plus the body.
-    pub fn check_and_record(&mut self, target: &[u8], body: &[u8]) -> bool {
-        let hash = blake2b_128(&[target, body]);
+    /// **Call only after the envelope opened and its signature verified.**
+    /// Recording junk let anyone able to DELIVER to one of our routing
+    /// ids (the hub itself, trivially) push every real entry out of the
+    /// FIFO with `capacity` garbage bodies and then replay old envelopes.
+    /// With verify-then-record, eviction costs `capacity` *valid* sealed
+    /// envelopes addressed to us.
+    pub fn record(&mut self, body: &[u8]) -> bool {
+        let hash = Self::hash_of(body);
         if !self.seen.insert(hash) {
             // Already in the set; we deliberately do NOT re-rank
             // (replay shouldn't refresh the FIFO position — that
@@ -213,15 +236,17 @@ impl EnvelopeReplayGuard {
         if bytes.len() != expected {
             return Err(());
         }
-        if count > capacity {
+        if count > capacity || count > MAX_RESTORE_CAPACITY {
             return Err(());
         }
-        let mut g = Self::with_capacity(capacity.max(1));
+        // Bound the stored capacity before it sizes an allocation: a
+        // corrupt value (up to u32::MAX) would otherwise abort at boot.
+        let mut g = Self::with_capacity(capacity.clamp(1, MAX_RESTORE_CAPACITY));
         for i in 0..count {
             let start = 12 + i * 16;
             let mut h = [0u8; 16];
             h.copy_from_slice(&bytes[start..start + 16]);
-            // Bypass check_and_record's BLAKE2b step — we're restoring
+            // Bypass record's BLAKE2b step — we're restoring
             // already-hashed entries. Insert directly; if the on-disk
             // snapshot contained a duplicate (shouldn't happen but
             // belt-and-braces), the HashSet collapses it and the
@@ -248,49 +273,46 @@ mod tests {
     fn first_sight_returns_true_replay_returns_false() {
         let mut g = EnvelopeReplayGuard::with_capacity(8);
         let body = b"sealed envelope bytes";
-        assert!(g.check_and_record(b"t", body), "first sight must accept");
-        assert!(
-            !g.check_and_record(b"t", body),
-            "exact replay must be rejected"
-        );
+        assert!(g.record(body), "first sight must accept");
+        assert!(!g.record(body), "exact replay must be rejected");
     }
 
     #[test]
     fn distinct_bodies_independent() {
         let mut g = EnvelopeReplayGuard::with_capacity(8);
-        assert!(g.check_and_record(b"t", b"envelope A"));
-        assert!(g.check_and_record(b"t", b"envelope B"));
-        assert!(g.check_and_record(b"t", b"envelope C"));
+        assert!(g.record(b"envelope A"));
+        assert!(g.record(b"envelope B"));
+        assert!(g.record(b"envelope C"));
         assert_eq!(g.len(), 3);
         // Replay A → reject; B and C still in the set.
-        assert!(!g.check_and_record(b"t", b"envelope A"));
+        assert!(!g.record(b"envelope A"));
         assert_eq!(g.len(), 3);
     }
 
     #[test]
     fn fifo_eviction_drops_oldest_at_capacity() {
         let mut g = EnvelopeReplayGuard::with_capacity(3);
-        assert!(g.check_and_record(b"t", b"1"));
-        assert!(g.check_and_record(b"t", b"2"));
-        assert!(g.check_and_record(b"t", b"3"));
+        assert!(g.record(b"1"));
+        assert!(g.record(b"2"));
+        assert!(g.record(b"3"));
         assert_eq!(g.len(), 3);
         // Fourth pushes the oldest ("1") out. State: {2, 3, 4}.
-        assert!(g.check_and_record(b"t", b"4"));
+        assert!(g.record(b"4"));
         assert_eq!(g.len(), 3, "still capped");
         // "2", "3", "4" are still in the set.
-        assert!(!g.check_and_record(b"t", b"2"));
-        assert!(!g.check_and_record(b"t", b"3"));
-        assert!(!g.check_and_record(b"t", b"4"));
+        assert!(!g.record(b"2"));
+        assert!(!g.record(b"3"));
+        assert!(!g.record(b"4"));
         // But "1" is forgotten — re-seeing it counts as first sight
         // (eviction window exposed; documented in module rustdoc).
         // This is also the moment "2" gets evicted to make room.
         assert!(
-            g.check_and_record(b"t", b"1"),
+            g.record(b"1"),
             "after FIFO eviction, oldest entry is forgotten"
         );
         // State now: {3, 4, 1}.
         assert!(
-            g.check_and_record(b"t", b"2"),
+            g.record(b"2"),
             "the next-oldest entry has now been evicted too"
         );
     }
@@ -301,18 +323,18 @@ mod tests {
         // must NOT be able to keep it alive past the FIFO window.
         // If we re-ranked on replay (LRU semantics), they could.
         let mut g = EnvelopeReplayGuard::with_capacity(3);
-        g.check_and_record(b"t", b"target"); // position: oldest
-        g.check_and_record(b"t", b"fill1");
-        g.check_and_record(b"t", b"fill2");
+        g.record(b"target"); // position: oldest
+        g.record(b"fill1");
+        g.record(b"fill2");
         // Attacker replays "target" repeatedly:
         for _ in 0..10 {
-            assert!(!g.check_and_record(b"t", b"target"));
+            assert!(!g.record(b"target"));
         }
         // A genuine new entry should evict "target" because replay
         // didn't refresh its position.
-        g.check_and_record(b"t", b"new");
+        g.record(b"new");
         assert!(
-            g.check_and_record(b"t", b"target"),
+            g.record(b"target"),
             "after eviction, target is forgotten — replay never refreshed position"
         );
     }
@@ -321,10 +343,10 @@ mod tests {
     fn zero_capacity_clamps_to_one() {
         let mut g = EnvelopeReplayGuard::with_capacity(0);
         assert_eq!(g.capacity(), 1, "zero clamped to 1");
-        assert!(g.check_and_record(b"t", b"a"));
-        assert!(g.check_and_record(b"t", b"b")); // evicts "a"
+        assert!(g.record(b"a"));
+        assert!(g.record(b"b")); // evicts "a"
         // "a" forgotten:
-        assert!(g.check_and_record(b"t", b"a"));
+        assert!(g.record(b"a"));
     }
 
     #[test]
@@ -335,29 +357,33 @@ mod tests {
         let mut g = EnvelopeReplayGuard::with_capacity(8);
         let body_a = b"sealed envelope bytes \x00";
         let body_b = b"sealed envelope bytes \x01";
-        assert!(g.check_and_record(b"t", body_a));
-        assert!(
-            g.check_and_record(b"t", body_b),
-            "one-byte difference must not collide"
-        );
+        assert!(g.record(body_a));
+        assert!(g.record(body_b), "one-byte difference must not collide");
     }
 
+    /// Regression: the target used to be hashed in, so a hub could replay
+    /// an accepted envelope by changing the (unauthenticated) routing
+    /// prefix. The body alone identifies an envelope.
     #[test]
-    fn same_body_under_distinct_targets_both_accepted() {
-        // The target-scoping property (MEDIUM fix): a recipient
-        // subscribed to two routing ids that receives the SAME body
-        // bytes under each must accept both — they're distinct
-        // deliveries, not a replay. Body-only hashing would have
-        // falsely dropped the second.
+    fn is_replay_is_read_only_and_ignores_target() {
         let mut g = EnvelopeReplayGuard::with_capacity(8);
-        assert!(g.check_and_record(b"target-A", b"identical body"));
-        assert!(
-            g.check_and_record(b"target-B", b"identical body"),
-            "same body under a different target is a distinct delivery"
-        );
-        // But a true replay (same target AND body) is still dropped.
-        assert!(!g.check_and_record(b"target-A", b"identical body"));
-        assert!(!g.check_and_record(b"target-B", b"identical body"));
+        assert!(!g.is_replay(b"identical body"));
+        // A pre-open check must not record anything.
+        assert!(g.is_empty());
+        assert!(g.record(b"identical body"));
+        assert!(g.is_replay(b"identical body"));
+        assert!(!g.record(b"identical body"));
+    }
+
+    /// Regression: a corrupt snapshot's capacity must not size a giant
+    /// allocation at boot.
+    #[test]
+    fn restore_bounds_capacity() {
+        let mut huge = b"ORG1".to_vec();
+        huge.extend_from_slice(&u32::MAX.to_be_bytes());
+        huge.extend_from_slice(&0u32.to_be_bytes());
+        let g = EnvelopeReplayGuard::restore(&huge).unwrap();
+        assert_eq!(g.capacity(), MAX_RESTORE_CAPACITY);
     }
 
     #[test]
@@ -366,16 +392,16 @@ mod tests {
         // sealed envelope decode will reject downstream; here we
         // only care that the guard handles the input without panic.
         let mut g = EnvelopeReplayGuard::with_capacity(4);
-        assert!(g.check_and_record(b"t", b""));
-        assert!(!g.check_and_record(b"t", b""), "even empty bodies dedup");
+        assert!(g.record(b""));
+        assert!(!g.record(b""), "even empty bodies dedup");
     }
 
     #[test]
     fn snapshot_then_restore_preserves_seen_set() {
         let mut original = EnvelopeReplayGuard::with_capacity(8);
-        original.check_and_record(b"t", b"alpha");
-        original.check_and_record(b"t", b"beta");
-        original.check_and_record(b"t", b"gamma");
+        original.record(b"alpha");
+        original.record(b"beta");
+        original.record(b"gamma");
         let snap = original.snapshot();
 
         let restored = EnvelopeReplayGuard::restore(&snap).expect("snapshot must round-trip");
@@ -384,11 +410,11 @@ mod tests {
 
         // Hashes that *were* in the original are still rejected:
         let mut restored = restored;
-        assert!(!restored.check_and_record(b"t", b"alpha"));
-        assert!(!restored.check_and_record(b"t", b"beta"));
-        assert!(!restored.check_and_record(b"t", b"gamma"));
+        assert!(!restored.record(b"alpha"));
+        assert!(!restored.record(b"beta"));
+        assert!(!restored.record(b"gamma"));
         // A new hash is accepted:
-        assert!(restored.check_and_record(b"t", b"delta"));
+        assert!(restored.record(b"delta"));
     }
 
     #[test]
@@ -405,9 +431,9 @@ mod tests {
         // Order matters: restoring must put the oldest hashes at the
         // FIFO front so they evict first when new entries arrive.
         let mut g = EnvelopeReplayGuard::with_capacity(3);
-        g.check_and_record(b"t", b"oldest");
-        g.check_and_record(b"t", b"middle");
-        g.check_and_record(b"t", b"newest");
+        g.record(b"oldest");
+        g.record(b"middle");
+        g.record(b"newest");
         let snap = g.snapshot();
 
         let mut restored = EnvelopeReplayGuard::restore(&snap).unwrap();
@@ -415,21 +441,18 @@ mod tests {
         // the newest — same as if we'd never snapshotted.
         // State before: [oldest, middle, newest]
         // After "fourth": [middle, newest, fourth] (oldest evicted)
-        restored.check_and_record(b"t", b"fourth");
+        restored.record(b"fourth");
         assert!(
-            !restored.check_and_record(b"t", b"middle"),
+            !restored.record(b"middle"),
             "middle survived (one slot back)"
         );
         assert!(
-            !restored.check_and_record(b"t", b"newest"),
+            !restored.record(b"newest"),
             "newest survived (two slots back)"
         );
+        assert!(!restored.record(b"fourth"), "fourth survived (just added)");
         assert!(
-            !restored.check_and_record(b"t", b"fourth"),
-            "fourth survived (just added)"
-        );
-        assert!(
-            restored.check_and_record(b"t", b"oldest"),
+            restored.record(b"oldest"),
             "oldest must have been evicted — first-sight again"
         );
     }
@@ -445,8 +468,8 @@ mod tests {
     fn restore_rejects_truncated() {
         let g = {
             let mut g = EnvelopeReplayGuard::with_capacity(8);
-            g.check_and_record(b"t", b"a");
-            g.check_and_record(b"t", b"b");
+            g.record(b"a");
+            g.record(b"b");
             g
         };
         let snap = g.snapshot();
@@ -473,8 +496,8 @@ mod tests {
         // bytes. Lets the daemon skip a vault write if nothing has
         // changed since the last snapshot (efficiency, not security).
         let mut g = EnvelopeReplayGuard::with_capacity(4);
-        g.check_and_record(b"t", b"a");
-        g.check_and_record(b"t", b"b");
+        g.record(b"a");
+        g.record(b"b");
         let s1 = g.snapshot();
         let s2 = g.snapshot();
         assert_eq!(s1, s2);
