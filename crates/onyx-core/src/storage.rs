@@ -453,13 +453,30 @@ pub(crate) fn unseal(key: &AeadKey, blob: &[u8]) -> Result<Vec<u8>> {
     key.decrypt(&nonce, b"", ct)
 }
 
-/// Re-seal every `encrypted_blob` in `table` from `old` to `new` inside an
-/// open transaction. `table` is a hardcoded constant (never user input), so
-/// the format! into SQL carries no injection risk. Decrypted plaintext is
-/// held in `Zeroizing` and scrubbed promptly.
+/// Every AEAD-sealed column in the vault, as `(table, column)`. `rekey`
+/// re-seals exactly this list, so a sealed column that is missing here is
+/// left under the OLD key and becomes unreadable after a rekey (the bug
+/// this list exists to prevent). **Add any new sealed column here**; the
+/// `rekey_preserves_every_sealed_column` test fails if history or room
+/// metadata stops surviving a rekey.
+const SEALED_COLUMNS: &[(&str, &str)] = &[
+    ("identities", "encrypted_blob"),
+    ("mls_state", "encrypted_blob"),
+    ("replay_state", "encrypted_blob"),
+    ("room_messages", "text_enc"),
+    ("room_messages", "sfp_enc"),
+    ("rooms", "name_enc"),
+    ("rooms", "members_enc"),
+];
+
+/// Re-seal every non-NULL `column` blob in `table` from `old` to `new`
+/// inside an open transaction. `table`/`column` are hardcoded constants
+/// (never user input), so the format! into SQL carries no injection risk.
+/// Decrypted plaintext is held in `Zeroizing` and scrubbed promptly.
 fn rekey_blob_column(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
+    column: &str,
     old: &AeadKey,
     new: &AeadKey,
 ) -> Result<()> {
@@ -468,7 +485,9 @@ fn rekey_blob_column(
     let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
     {
         let mut stmt = tx
-            .prepare(&format!("SELECT rowid, encrypted_blob FROM {table}"))
+            .prepare(&format!(
+                "SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL"
+            ))
             .map_err(map_db_err)?;
         let mapped = stmt
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
@@ -477,7 +496,7 @@ fn rekey_blob_column(
             rows.push(row.map_err(map_db_err)?);
         }
     }
-    let update_sql = format!("UPDATE {table} SET encrypted_blob = ?1 WHERE rowid = ?2");
+    let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
     for (rowid, blob) in rows {
         let plaintext = Zeroizing::new(unseal(old, &blob)?);
         let resealed = seal(new, &plaintext)?;
@@ -640,9 +659,9 @@ impl Vault {
     /// current one).
     ///
     /// Re-derives the vault key from `new_passphrase` under a FRESH KDF
-    /// salt, then re-encrypts every sealed blob — the canary plus the
-    /// `encrypted_blob` of `identities`, `mls_state`, and `replay_state` —
-    /// under the new key. The whole rewrite runs in ONE SQLite transaction,
+    /// salt, then re-encrypts every sealed blob — the canary plus every
+    /// column in [`SEALED_COLUMNS`] (key material, MLS/replay state, message
+    /// history, room names and rosters) — under the new key. The whole rewrite runs in ONE SQLite transaction,
     /// so it is atomic: on any error nothing changes and the old passphrase
     /// still works. KDF cost parameters are preserved.
     ///
@@ -651,7 +670,17 @@ impl Vault {
     /// open by another process (e.g. a running daemon) or SQLite returns a
     /// lock error.
     pub fn rekey(path: &Path, old_passphrase: &[u8], new_passphrase: &[u8]) -> Result<()> {
+        // Run the normal open path first: it verifies the old passphrase
+        // and applies every additive migration, so each table/column in
+        // `SEALED_COLUMNS` exists and any legacy plaintext is already
+        // sealed before we re-seal. Dropped immediately to release the file.
+        drop(Self::open(path, old_passphrase)?);
+
         let mut conn = Connection::open(path).map_err(map_db_err)?;
+        // Overwrite freed pages so blobs sealed under the OLD key (and the
+        // old salt/canary) do not linger in the file after the rekey.
+        conn.pragma_update(None, "secure_delete", true)
+            .map_err(map_db_err)?;
 
         let (schema_version, salt_bytes, mem_kib, iters, parallel, canary): (
             i32,
@@ -712,8 +741,8 @@ impl Vault {
             params![new_salt.to_vec(), new_canary],
         )
         .map_err(map_db_err)?;
-        for table in ["identities", "mls_state", "replay_state"] {
-            rekey_blob_column(&tx, table, &old_aead, &new_aead)?;
+        for (table, column) in SEALED_COLUMNS {
+            rekey_blob_column(&tx, table, column, &old_aead, &new_aead)?;
         }
         tx.commit().map_err(map_db_err)?;
         Ok(())
@@ -2909,6 +2938,46 @@ mod tests {
             mls_blob,
             "sealed blob must be readable under the new passphrase"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression: rekey used to re-seal only the three key-material
+    /// tables, leaving message history and room metadata under the old
+    /// (no longer derivable) key — i.e. `onyx vault rekey` destroyed them.
+    #[test]
+    fn rekey_preserves_every_sealed_column() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        tmp.close().unwrap();
+
+        let gid = b"group-id-for-rekey-test";
+        let identity_id;
+        {
+            let mut v = Vault::create(&path, b"old-pass", &Argon2Params::FLOOR).unwrap();
+            let (id, _identity) = v.create_identity("alice").unwrap();
+            identity_id = id;
+            v.save_replay_state(id, b"replay snapshot").unwrap();
+            v.save_room(id, gid, "secret room", "fp-a,fp-b", 1).unwrap();
+            v.append_room_message(id, gid, false, "sender-fp", "hello after rekey", 2)
+                .unwrap();
+        }
+
+        Vault::rekey(&path, b"old-pass", b"new-pass").unwrap();
+
+        let v = Vault::open(&path, b"new-pass").unwrap();
+        assert_eq!(
+            v.load_replay_state(identity_id).unwrap().unwrap(),
+            b"replay snapshot"
+        );
+        let rooms = v.list_rooms(identity_id).unwrap();
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].name, "secret room");
+        assert_eq!(rooms[0].members_b32, "fp-a,fp-b");
+        let history = v.room_history(identity_id, gid, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].text, "hello after rekey");
+        assert_eq!(history[0].sender_fp, "sender-fp");
 
         std::fs::remove_file(&path).ok();
     }
