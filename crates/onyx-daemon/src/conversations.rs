@@ -598,15 +598,23 @@ impl Default for ConversationRegistry {
     }
 }
 
+/// Maximum characters of a message shown as the peer-list preview.
+const PREVIEW_MAX_CHARS: usize = 64;
+
+/// Shorten `text` to a peer-list preview, cutting on a **character**
+/// boundary. (`String::truncate` at a fixed byte offset panics inside a
+/// multi-byte character; with `panic = "abort"` that let any peer kill
+/// the daemon with one message, and crashed on the user's own non-Latin
+/// text.)
+fn preview_of(text: &str) -> String {
+    match text.char_indices().nth(PREVIEW_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
 fn info_of(state: &ConversationState) -> PeerInfo {
-    let last_message_preview = state.ring.back().map(|line| {
-        let mut s = line.text.clone();
-        if s.len() > 64 {
-            s.truncate(64);
-            s.push('…');
-        }
-        s
-    });
+    let last_message_preview = state.ring.back().map(|line| preview_of(&line.text));
     PeerInfo {
         short_id: state.handle.short_id.clone(),
         pubkey_b32: state.handle.pubkey_b32.clone(),
@@ -1037,5 +1045,20 @@ mod tests {
             drained[OUTBOUND_MAILBOX - 1],
             PeerOutbound::Dm(format!("m{}", OUTBOUND_MAILBOX + 4))
         );
+    }
+
+    /// Regression: a preview cut at a fixed byte offset panicked inside a
+    /// multi-byte character (remote daemon kill under `panic = "abort"`).
+    #[test]
+    fn preview_never_splits_a_multibyte_character() {
+        // Byte 64 lands inside the 2-byte `é`.
+        let straddling = format!("{}é tail", "a".repeat(63));
+        assert_eq!(preview_of(&straddling), format!("{}é…", "a".repeat(63)));
+        // 3-byte characters, well past the cap.
+        let long = "അ".repeat(200);
+        let preview = preview_of(&long);
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview_of("short"), "short");
     }
 }
