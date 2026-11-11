@@ -271,6 +271,24 @@ It can drop or delay messages; it cannot forge or read them. Details and the
 abuse limits it enforces: [`THREAT_MODEL.md`](./THREAT_MODEL.md),
 [`QUEUE-HARDENING.md`](./QUEUE-HARDENING.md).
 
+### Monitoring hubs (optional)
+
+`onyx-metrics` is a small collector that shows whether enrolled hubs are up.
+It is off unless a hub operator turns it on.
+
+```sh
+onyx-metrics --allowlist ./allow.json           # prints its onion address
+onyx-hub … --metrics-report '<collector-onion>' # on each hub that opts in
+```
+
+A hub that opts in sends a signed heartbeat over Tor every few minutes:
+version, coarse uptime, whether its onion is reachable — **liveness only, no
+counts of users, messages or connections**. The collector accepts only keys
+on its allowlist, keeps the latest state per hub (no history), and serves a
+status page on `127.0.0.1:9876`. The allowlist is a JSON file of
+`{ "hubs": [ { "name": …, "sig_pub_b32": … } ] }`. Read [`METRICS.md`](./METRICS.md) before
+enabling it: even liveness data is a time series someone could correlate.
+
 ---
 
 ## How it fits together

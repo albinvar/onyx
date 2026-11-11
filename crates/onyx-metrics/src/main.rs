@@ -360,7 +360,10 @@ async fn handle_http(
     stale_after: u64,
 ) -> Result<()> {
     let mut buf = [0u8; 1024];
-    let n = sock.read(&mut buf).await?;
+    // Bound the read so an idle client cannot hold a task open forever.
+    let n = tokio::time::timeout(std::time::Duration::from_secs(10), sock.read(&mut buf))
+        .await
+        .context("status-page request timed out")??;
     let req = String::from_utf8_lossy(&buf[..n]);
     let path = req.split_whitespace().nth(1).unwrap_or("/");
 

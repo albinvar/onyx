@@ -40,6 +40,11 @@ Use this file as the single chronological view of where the project is. Implemen
   four structural gaps.
 - `INSTALL.md`: config file is `config.json`, not `config.toml`; musl
   target listed.
+- README now documents the optional hub monitor (`onyx-metrics`). Review
+  of that crate found signature, allowlist, freshness, frame-size and
+  HTML-escaping checks in place; one change: the localhost status page
+  now times out an idle request after 10 s. **Carry-forward:** ingest
+  connections are bounded per connection (30 s, 4 KiB) but not in number.
 
 None of this changes the headline: no external audit.
 
