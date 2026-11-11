@@ -52,6 +52,7 @@
 //!   * `2` — could not connect to the daemon.
 
 mod client;
+mod output;
 mod theme;
 mod tui;
 
@@ -61,6 +62,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use onyx_core::api::{ApiRequest, ApiResponse};
 
+// Independent command-line switches, one per flag — not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
     name = "onyx",
@@ -197,6 +200,11 @@ struct Args {
     /// modes so a mistyped flag can't silently expose your IP.
     #[arg(long, env = "ONYX_ALLOW_CLEARNET", global = true)]
     allow_clearnet: bool,
+    /// Print the daemon's raw JSON response instead of the readable
+    /// summary. JSON is already the default whenever the output is piped
+    /// or redirected, so scripts do not need this flag.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Option<Command>,
@@ -1337,6 +1345,7 @@ fn read_hidden_line(prompt: &str) -> anyhow::Result<String> {
 // #[allow(too_many_lines)] functions in this crate.
 #[allow(clippy::too_many_lines)]
 async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
+    FORCE_JSON.store(args.json, std::sync::atomic::Ordering::Relaxed);
     // Resolve the optional --socket once so every arm sees the same
     // path. Defaulting to `~/.onyx/onyx.sock` matches the daemon's
     // default api_socket; the parent dir is auto-created by
@@ -2368,10 +2377,24 @@ async fn run_code(socket: &std::path::Path) -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Set once from `--json` in `main`; read by [`one_shot_print`].
+static FORCE_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn one_shot_print(socket: &std::path::Path, req: ApiRequest) -> anyhow::Result<ExitCode> {
     let resp = client::one_shot(socket, &req).await?;
-    let json = serde_json::to_string_pretty(&resp)?;
-    println!("{json}");
+    // A person at a terminal gets the readable rendering; a pipe, a
+    // redirect or `--json` gets the JSON response exactly as before.
+    let to_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let want_json = FORCE_JSON.load(std::sync::atomic::Ordering::Relaxed) || !to_terminal;
+    let human = if want_json {
+        None
+    } else {
+        output::render(&resp, output::Style { color: true })
+    };
+    match human {
+        Some(text) => print!("{text}"),
+        None => println!("{}", serde_json::to_string_pretty(&resp)?),
+    }
     Ok(match resp {
         ApiResponse::Error { .. } => ExitCode::from(1),
         _ => ExitCode::SUCCESS,

@@ -5122,7 +5122,7 @@ fn render_peers(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
 }
 
 /// A2: format a unix-ms timestamp as local `HH:MM` (empty on bad input).
-fn fmt_hhmm(ts_unix_ms: u64) -> String {
+pub(crate) fn fmt_hhmm(ts_unix_ms: u64) -> String {
     use chrono::{Local, TimeZone};
     match Local.timestamp_millis_opt(i64::try_from(ts_unix_ms).unwrap_or(0)) {
         chrono::LocalResult::Single(dt) => dt.format("%H:%M").to_string(),
@@ -5132,7 +5132,7 @@ fn fmt_hhmm(ts_unix_ms: u64) -> String {
 
 /// Short relative time ("just now" / "5m ago" / "3h ago" / "2d ago"), or
 /// "—" if the timestamp is unknown (0). Used in the details pane.
-fn fmt_relative(ts_unix_ms: u64) -> String {
+pub(crate) fn fmt_relative(ts_unix_ms: u64) -> String {
     if ts_unix_ms == 0 {
         return "—".to_string();
     }
