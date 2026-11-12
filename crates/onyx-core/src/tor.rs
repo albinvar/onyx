@@ -140,10 +140,17 @@ impl TorRuntime {
     /// a clearnet hostname. Arti's `connect((host, port))` accepts
     /// anything that implements `IntoTorAddr`.
     pub async fn dial(&self, host: &str, port: u16) -> Result<TorStream> {
-        self.inner
-            .connect((host, port))
-            .await
-            .map_err(|_| Error::Internal("tor: dial failed"))
+        use arti_client::HasKind as _;
+        self.inner.connect((host, port)).await.map_err(|e| {
+            // The caller only sees an opaque error, so record Arti's reason
+            // here. The kind (e.g. "onion service descriptor not found",
+            // "introduction points unreachable") names no address and is
+            // safe at warn; the full error can name the target, so it is
+            // debug only.
+            tracing::warn!(kind = %e.kind(), "tor: dial failed");
+            tracing::debug!(error = %e, "tor: dial failed (detail)");
+            Error::Internal("tor: dial failed")
+        })
     }
 
     /// Return a clone of this client whose outbound dials form a fresh
