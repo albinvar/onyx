@@ -6,6 +6,26 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
+## Privacy + delivery — 2026-11-13 — receipts switch, docs correction
+
+**Delivery receipts can be switched off**
+
+- `/receipts off` in the interface, `--no-delivery-receipts`, or
+  `"delivery_receipts": false` in config.json. A receipt tells the sender
+  their message arrived, and therefore that you were online
+  (`ATTACKS.md` §2.2). With it off nothing is sent back; senders cannot
+  tell delivered from lost. Default stays on. Tested
+  (`delivery_receipts_switch_controls_the_acknowledgement`).
+
+**Docs correction — hub relay of direct messages is on by default in `onyx`**
+
+- The rewritten README and the user guide said relaying direct messages
+  through a hub was off by default. In `onyx` it has been on since v0.1.29
+  (it only acts when a hub is configured); it is off in `onyxd`. The docs
+  now say so and show how to turn it off. The default is unchanged.
+
+---
+
 ## Docs + trust — 2026-11-11 — consent gate, README rewrite, attacks catalogue, user guide
 
 **Behaviour change**

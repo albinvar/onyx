@@ -244,6 +244,12 @@ pub struct Config {
     /// (our own copy only — not a mutual/disappearing TTL). `None` = keep
     /// forever. Default `None`.
     pub message_retention_secs: Option<u64>,
+    /// Acknowledge direct messages we receive (default on). An
+    /// acknowledgement tells the sender their message arrived — and so
+    /// that this daemon was running at that moment. Off: nothing is sent
+    /// back; senders cannot tell delivered from lost and re-send briefly
+    /// after a reconnect (de-duplicated here by message id).
+    pub delivery_receipts: bool,
 }
 
 /// Bundle of state every handler needs.
@@ -364,6 +370,12 @@ pub struct DaemonState {
     /// task deletes persisted room messages older than `secs`. Copied from
     /// [`Config`] at construction. `None` = keep forever.
     pub message_retention_secs: Option<u64>,
+    /// Acknowledge direct messages we receive (default on). An
+    /// acknowledgement tells the sender their message arrived — and so
+    /// that this daemon was running at that moment. Off: nothing is sent
+    /// back; senders cannot tell delivered from lost and re-send briefly
+    /// after a reconnect (de-duplicated here by message id).
+    pub delivery_receipts: bool,
     /// v0.1.28 (honest health): count of configured hubs with a LIVE
     /// session right now. Incremented by each activity-role hub session
     /// once its Noise handshake completes, decremented when the session
@@ -791,6 +803,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         dm_hub_fallback: args.dm_hub_fallback,
         // Local message retention (auto-clear), copied from Config.
         message_retention_secs: args.message_retention_secs,
+        delivery_receipts: args.delivery_receipts,
         // v0.1.28: live hub-connectivity counter (honest health line).
         hubs_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
@@ -2660,7 +2673,7 @@ async fn handle_dm_app_frame(
             // a dead conversation "pending". A DeliveryReceipt carries no
             // msg_id-bearing Text, so it never triggers a receipt of its
             // own (no ack loop).
-            if let Some(msg_id) = msg_id {
+            if let Some(msg_id) = msg_id.filter(|_| state.delivery_receipts) {
                 let handle = state
                     .conversations
                     .lock()
@@ -4784,6 +4797,7 @@ mod dm_fallback_receive_tests {
             dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
+            delivery_receipts: true,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
@@ -4894,6 +4908,62 @@ mod dm_fallback_receive_tests {
         assert_eq!(stored.len(), 1, "hub-relayed DM must be persisted");
         assert_eq!(stored[0].text, "delivered while you were offline");
         assert!(!stored[0].direction_outgoing);
+    }
+
+    /// `delivery_receipts = false` must stop the acknowledgement entirely —
+    /// it is a privacy switch (a receipt tells the sender we were online),
+    /// so "mostly off" would be worse than not offering it. The message
+    /// itself must still be delivered and saved.
+    #[tokio::test]
+    async fn delivery_receipts_switch_controls_the_acknowledgement() {
+        use serde_bytes::ByteBuf;
+        for on in [true, false] {
+            let mut vault = Vault::open_memory(b"pw", &Argon2Params::FLOOR).expect("vault");
+            let (id, me) = vault.create_identity("me").expect("id");
+            let party = MlsParty::from_identity(&me).expect("party");
+            let mut state = daemon_state_for(vault, id, me, party);
+            Arc::get_mut(&mut state)
+                .expect("sole owner")
+                .delivery_receipts = on;
+
+            let peer = [7u8; 32];
+            let (_handle, mut rx) =
+                state
+                    .conversations
+                    .lock()
+                    .await
+                    .register(peer, &encode_b32(&peer), "fp".into());
+            let msg = onyx_core::room::RoomAppMessage::Text {
+                text: "are you there?".into(),
+                msg_id: Some(ByteBuf::from(vec![5u8; 16])),
+            };
+            handle_dm_app_frame(&msg.to_cbor().expect("cbor"), &peer, None, &state).await;
+
+            let sent = rx.try_recv();
+            if on {
+                assert!(
+                    matches!(
+                        sent,
+                        Ok(conversations::PeerOutbound::DmFrame(
+                            onyx_core::room::RoomAppMessage::DeliveryReceipt { .. }
+                        ))
+                    ),
+                    "receipts on: an acknowledgement is queued, got {sent:?}"
+                );
+            } else {
+                assert!(
+                    sent.is_err(),
+                    "receipts off: nothing sent back, got {sent:?}"
+                );
+            }
+            let short = short_id_of_peer_pub(&peer);
+            let hist = state.conversations.lock().await.history(&short, 5);
+            assert_eq!(
+                hist.expect("conversation").len(),
+                1,
+                "the message is still shown either way"
+            );
+        }
     }
 
     /// End-to-end through `handle_hub_delivery`: a stranger signs a

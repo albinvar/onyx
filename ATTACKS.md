@@ -204,8 +204,9 @@ that moment. Limits on the damage: acknowledgements travel only inside an
 established, mutually authenticated session, so the prober must already be a
 contact; there are no read receipts and no typing indicators; and a contact
 could already observe whether a session to you is up. It is still a signal a
-contact can collect over time, and there is currently no switch to turn it
-off.
+contact can collect over time. It can be switched off (`/receipts off`,
+`--no-delivery-receipts`, or `"delivery_receipts": false`); the cost is that
+your contacts can no longer tell a delivered message from a lost one.
 
 ### 2.3 Presence from a permanent address
 

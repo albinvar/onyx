@@ -162,13 +162,22 @@ or just type in the interface.
 ### If the other person is offline
 
 Direct contact needs both of you online. A hub removes that requirement at a
-privacy cost you opt into:
+privacy cost:
 
 ```sh
-onyx --hub '<onion>:<port>,<hub-pubkey>'            # use a hub for rooms
-onyx --hub … --first-contact-reachable              # accept first contact via it
-onyx --hub … --dm-hub-fallback                      # relay DMs when a peer is offline
+onyx --hub '<onion>:<port>,<hub-pubkey>'            # use a hub
+onyx --hub … --first-contact-reachable              # also accept first contact via it
 ```
+
+**With a hub configured, `onyx` relays a direct message through it when the
+other person is offline** (on by default since v0.1.29, so contacts met by
+invite link are reachable at all). The hub sees a sealed envelope on a
+rotating token — not the text or who it is from — but it does learn that
+*something* was sent while that person was away. To keep direct messages
+strictly peer-to-peer, set `"dm_hub_fallback": false` in
+`~/.onyx/config.json`; messages then wait on your machine until a direct
+session returns. The headless `onyxd` has it off unless you pass
+`--dm-hub-fallback`.
 
 By default a hub cannot link your connection to your identity (fresh keys per
 connection, no inbox subscription). `--first-contact-reachable` trades that
@@ -239,7 +248,8 @@ reach the daemon.
 | Tor bridge (repeatable) | `--bridge` | — | none |
 | Cover traffic | `--cover-traffic-mean-secs`, `--constant-rate-ms` | `ONYX_COVER_TRAFFIC_MEAN_SECS`, `ONYX_CONSTANT_RATE_MS` | off |
 | Reachable for first contact via hub | `--first-contact-reachable` | `ONYX_FIRST_CONTACT_REACHABLE` | off |
-| Relay DMs via hub when peer offline | `--dm-hub-fallback` | `ONYX_DM_HUB_FALLBACK` | off |
+| Relay DMs via hub when peer offline | `--dm-hub-fallback`; config `"dm_hub_fallback": false` to disable | `ONYX_DM_HUB_FALLBACK` | **on** in `onyx` (needs a hub); off in `onyxd` |
+| Tell senders their message arrived | `--no-delivery-receipts`; config `"delivery_receipts": false`; `/receipts off` | `ONYX_NO_DELIVERY_RECEIPTS` | on |
 
 Hubs added in the interface persist in `~/.onyx/config.json`.
 

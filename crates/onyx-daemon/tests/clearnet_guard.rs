@@ -47,6 +47,7 @@ fn clearnet_config(dir: &std::path::Path, set_flag: impl FnOnce(&mut Config)) ->
         allow_clearnet: false,
         dm_hub_fallback: false,
         message_retention_secs: None,
+        delivery_receipts: true,
     };
     set_flag(&mut cfg);
     cfg

@@ -3910,6 +3910,7 @@ mod tests {
             dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: false,
             message_retention_secs: None,
+            delivery_receipts: true,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         (state, encode_b32(group_id))
@@ -4095,6 +4096,7 @@ mod tests {
             dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
+            delivery_receipts: true,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 
@@ -4180,6 +4182,7 @@ mod tests {
             dial_supervised: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dm_hub_fallback: true,
             message_retention_secs: None,
+            delivery_receipts: true,
             hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
 

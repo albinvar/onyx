@@ -196,6 +196,7 @@ async fn spawn_daemon_full(
         allow_clearnet: true,
         dm_hub_fallback,
         message_retention_secs: None,
+        delivery_receipts: true,
     };
 
     tokio::spawn(async move {

@@ -181,6 +181,12 @@ struct Args {
     #[arg(long, env = "ONYX_DM_HUB_FALLBACK")]
     dm_hub_fallback: bool,
 
+    /// Do not acknowledge direct messages. An acknowledgement tells the
+    /// sender their message arrived, which also tells them this daemon
+    /// was running. Without it senders cannot tell delivered from lost.
+    #[arg(long, env = "ONYX_NO_DELIVERY_RECEIPTS")]
+    no_delivery_receipts: bool,
+
     /// **A1.2 — acknowledge clearnet (NO TOR, NO ANONYMITY).** Required
     /// to use any plain-TCP transport (`--no-tor`, `--listen-tcp`,
     /// `--dial-tcp`, `--hub-tcp`). Without it the daemon refuses to start
@@ -263,6 +269,7 @@ impl TryFrom<Args> for Config {
             allow_clearnet: a.allow_clearnet,
             dm_hub_fallback: a.dm_hub_fallback,
             message_retention_secs: None,
+            delivery_receipts: !a.no_delivery_receipts,
         })
     }
 }

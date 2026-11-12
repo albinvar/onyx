@@ -194,6 +194,13 @@ struct Args {
     #[arg(long, env = "ONYX_DM_HUB_FALLBACK", global = true)]
     dm_hub_fallback: bool,
 
+    /// Do not acknowledge direct messages you receive. An acknowledgement
+    /// tells the sender their message arrived — and so that you were
+    /// online. Also settable as `"delivery_receipts": false` in
+    /// config.json, or `/receipts off` in the interface.
+    #[arg(long, env = "ONYX_NO_DELIVERY_RECEIPTS", global = true)]
+    no_delivery_receipts: bool,
+
     /// A1.2: acknowledge clearnet (NO TOR, NO ANONYMITY). Required to
     /// use any plain-TCP transport (--no-tor / --listen-tcp /
     /// --dial-tcp / --hub-tcp); without it the daemon refuses those
@@ -757,6 +764,9 @@ struct FileConfig {
     /// hides them. `None`/absent = keep forever. Set via `/retention`.
     #[serde(default)]
     message_retention_secs: Option<u64>,
+    /// Acknowledge received direct messages. `None` (absent) → on.
+    #[serde(default)]
+    delivery_receipts: Option<bool>,
     /// v0.1.31: the user's own display name, shown instead of "me" in chat.
     /// `None`/absent = "me". Set via `/myname <name>` (≤10 chars).
     #[serde(default)]
@@ -1059,6 +1069,8 @@ fn build_daemon_config(
         dm_hub_fallback: args.dm_hub_fallback || file_cfg.dm_hub_fallback.unwrap_or(true),
         // Local message retention (auto-clear), from config.json.
         message_retention_secs: file_cfg.message_retention_secs,
+        // On unless switched off by flag or config.
+        delivery_receipts: !args.no_delivery_receipts && file_cfg.delivery_receipts.unwrap_or(true),
     })
 }
 

@@ -81,8 +81,13 @@ another way before you carry on.
 
 - `↑` `↓` to pick a conversation. Type. `Enter` to send.
 - `●` means your friend is connected right now. `○` means they are not.
-- If they are offline, your message is kept on your computer and sent when
-  they return.
+- If they are offline, your message waits on your computer and is sent when
+  they come back. If you use a hub, it is left at the hub instead (locked, so
+  the hub cannot read it), which means it arrives even if you are offline by
+  then.
+- When a message reaches your friend, their Onyx quietly tells yours. That
+  also tells them you were online. To stop sending these yourself, type
+  `/receipts off`.
 - `PgUp` / `PgDn` to scroll back. `End` to return to the newest message.
 
 ## Group chats (rooms)

@@ -2979,6 +2979,13 @@ fn set_config_retention(secs: Option<u64>) -> anyhow::Result<()> {
     crate::save_file_config(&cfg)
 }
 
+fn set_config_receipts(on: bool) -> anyhow::Result<()> {
+    let mut cfg = crate::load_file_config()?.unwrap_or_default();
+    // Absent means on; store only the opt-out.
+    cfg.delivery_receipts = if on { None } else { Some(false) };
+    crate::save_file_config(&cfg)
+}
+
 /// v0.1.31: persist the user's own display name (empty clears) to config.
 fn set_config_my_nickname(nick: &str) -> anyhow::Result<()> {
     let mut cfg = crate::load_file_config()?.unwrap_or_default();
@@ -3061,6 +3068,35 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
                 app.last_send_result = Some(Err(format!(
                     "usage: /{cmd} <number> — see the numbers with /invites"
                 )));
+            }
+        },
+        "receipts" => match arg.trim() {
+            "on" | "off" => {
+                let on = arg.trim() == "on";
+                match set_config_receipts(on) {
+                    Ok(()) => {
+                        app.last_notice = Some(if on {
+                            "Delivery receipts on — takes effect next time Onyx starts.".to_string()
+                        } else {
+                            "Delivery receipts off — contacts will no longer learn when their \
+                             messages reach you. Takes effect next time Onyx starts."
+                                .to_string()
+                        });
+                    }
+                    Err(e) => app.last_send_result = Some(Err(format!("save config: {e}"))),
+                }
+            }
+            _ => {
+                let on = crate::load_file_config()
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.delivery_receipts)
+                    .unwrap_or(true);
+                app.last_notice = Some(format!(
+                    "Delivery receipts are {}. A receipt tells the sender their message \
+                     arrived, and so that you were online. /receipts on|off",
+                    if on { "on" } else { "off" }
+                ));
             }
         },
         "retention" | "ttl" => {
@@ -4549,6 +4585,10 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         key(
             "/invites",
             "room invitations waiting · /join n · /decline n",
+        ),
+        key(
+            "/receipts on|off",
+            "tell senders when their message arrived",
         ),
         key("/add <link>", "add a contact (invite OR connect — auto)"),
         key(
