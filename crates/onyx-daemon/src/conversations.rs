@@ -183,6 +183,13 @@ impl ConversationRegistry {
     /// steps that otherwise leave the user staring at silence. Best-effort:
     /// silently dropped if there are no subscribers. `level` is
     /// `"good" | "info" | "warn" | "bad"`.
+    /// Tell `Tail` subscribers that a direct message we sent arrived.
+    pub fn emit_delivered(&self, peer_short: String, text: String) {
+        let _ = self
+            .events_tx
+            .send(ApiResponse::EventDelivered { peer_short, text });
+    }
+
     pub fn emit_note(&self, level: &str, text: impl Into<String>) {
         let _ = self.events_tx.send(ApiResponse::EventNote {
             text: text.into(),

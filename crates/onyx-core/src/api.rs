@@ -720,6 +720,11 @@ pub enum ApiResponse {
     /// `"good" | "info" | "warn" | "bad"` so the TUI can colour it; an
     /// unknown value renders as info.
     EventNote { text: String, level: String },
+    /// A direct message we sent was acknowledged by the recipient's
+    /// daemon. `text` identifies which one to the local interface (this
+    /// event never leaves the machine). There is no event for "not
+    /// delivered": a recipient may have receipts switched off.
+    EventDelivered { peer_short: String, text: String },
 
     // ── error ───────────────────────────────────────────────────────
     /// Catch-all error. The client matches on `code` for programmatic

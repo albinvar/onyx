@@ -81,6 +81,9 @@ another way before you carry on.
 
 - `↑` `↓` to pick a conversation. Type. `Enter` to send.
 - `●` means your friend is connected right now. `○` means they are not.
+- A small ✓ after your message means it reached your friend's Onyx. No ✓
+  doesn't mean it was lost — they may have receipts turned off, or it went
+  through a hub.
 - If they are offline, your message waits on your computer and is sent when
   they come back. If you use a hub, it is left at the hub instead (locked, so
   the hub cannot read it), which means it arrives even if you are offline by

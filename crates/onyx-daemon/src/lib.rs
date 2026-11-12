@@ -2273,9 +2273,11 @@ impl UnackedDms {
             .push_back((std::time::Instant::now(), msg_id, text));
     }
 
-    fn acknowledge(&mut self, msg_id: [u8; 16]) {
+    /// Drop an acknowledged message; returns its text if it was tracked.
+    fn acknowledge(&mut self, msg_id: [u8; 16]) -> Option<String> {
         self.peer_acks = true;
-        self.items.retain(|(_, id, _)| *id != msg_id);
+        let pos = self.items.iter().position(|(_, id, _)| *id == msg_id)?;
+        self.items.remove(pos).map(|(_, _, text)| text)
     }
 
     /// The messages to re-send on the next session, oldest first.
@@ -2421,8 +2423,13 @@ where
                             };
                             if let Some(acked) =
                                 handle_dm_app_frame(&plaintext, peer_pub, peer_fp, state).await
+                                && let Some(text) = unacked.acknowledge(acked)
                             {
-                                unacked.acknowledge(acked);
+                                state
+                                    .conversations
+                                    .lock()
+                                    .await
+                                    .emit_delivered(short_id_of_peer_pub(peer_pub), text);
                             }
                         } else {
                             // Room-tier (T6.3.d): load the matching room
@@ -5041,7 +5048,11 @@ mod dm_fallback_receive_tests {
         let mut unacked = UnackedDms::default();
         unacked.sent([1; 16], "one".into());
         unacked.sent([2; 16], "two".into());
-        unacked.acknowledge([1; 16]);
+        // The acknowledged text is handed back (it drives the ✓ in the
+        // interface); a second or unknown receipt yields nothing.
+        assert_eq!(unacked.acknowledge([1; 16]).as_deref(), Some("one"));
+        assert_eq!(unacked.acknowledge([1; 16]), None);
+        assert_eq!(unacked.acknowledge([9; 16]), None);
         assert_eq!(
             unacked.into_retries(),
             vec![conversations::PeerOutbound::DmRetry {

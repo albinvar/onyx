@@ -17,6 +17,15 @@ Use this file as the single chronological view of where the project is. Implemen
   tell delivered from lost. Default stays on. Tested
   (`delivery_receipts_switch_controls_the_acknowledgement`).
 
+**Delivered mark**
+
+- A direct message you sent shows ✓ once the recipient's daemon has
+  acknowledged it. No mark means "no receipt", not "lost": the
+  recipient may have receipts off, the message may have gone through a
+  hub (hub deliveries are not acknowledged), or it may still be queued.
+  New local event `EventDelivered`. **Carry-forward:** the mark is not
+  saved, so messages read back from history after a restart have none.
+
 **Network screen**
 
 - `Ctrl-T` (or `/network`, or the command palette) in the interface, and

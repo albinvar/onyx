@@ -751,6 +751,7 @@ fn push_sent_file_line(
             ts_unix_ms: now,
             via_hub: false,
             sender_fp: None,
+            delivered: false,
         });
     app.last_activity_ms.insert(key, now);
 }
@@ -837,6 +838,10 @@ struct ChatLine {
     /// Room messages: the MLS-authenticated sender fingerprint, shown as
     /// the per-line name. `None` in DMs.
     sender_fp: Option<String>,
+    /// Outgoing DMs: the recipient's daemon acknowledged it. Only ever
+    /// set to true by an `EventDelivered`; false means "no receipt (yet)",
+    /// never "lost" — the recipient may have receipts off.
+    delivered: bool,
 }
 
 impl AppState {
@@ -1118,8 +1123,23 @@ impl AppState {
                         ts_unix_ms,
                         via_hub,
                         sender_fp,
+                        delivered: false,
                     });
                 true
+            }
+            ApiResponse::EventDelivered { peer_short, text } => {
+                // Mark the newest matching outgoing line not yet marked.
+                if let Some(line) = self.scrollback.get_mut(&peer_short).and_then(|v| {
+                    v.iter_mut().rev().find(|l| {
+                        matches!(l.direction, MessageDirection::Outgoing)
+                            && !l.delivered
+                            && l.text == text
+                    })
+                }) {
+                    line.delivered = true;
+                    return true;
+                }
+                false
             }
             ApiResponse::EventPeerConnected { peer } => {
                 self.push_activity(
@@ -2380,6 +2400,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                             ts_unix_ms: now,
                             via_hub: false,
                             sender_fp: None,
+                            delivered: false,
                         });
                     app.last_activity_ms.insert(key, now);
                     app.last_send_result = Some(Ok(()));
@@ -2419,6 +2440,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
                             ts_unix_ms: now,
                             via_hub: false,
                             sender_fp: None,
+                            delivered: false,
                         });
                     app.last_activity_ms.insert(peer_short, now);
                     app.last_send_result = Some(Ok(()));
@@ -2900,6 +2922,7 @@ async fn send_composer(app: &mut AppState) {
                     ts_unix_ms: now,
                     via_hub: false,
                     sender_fp: None,
+                    delivered: false,
                 });
             // T-polish.5: bump activity so this room stays at the
             // top of the activity-sorted list.
@@ -3470,6 +3493,7 @@ fn merge_room_history(
         // Our own lines keep the "me" label; incoming ones carry the
         // sender so each line is attributed.
         sender_fp: matches!(m.direction, MessageDirection::Incoming).then_some(m.sender_fp),
+        delivered: false,
     });
     prepend_history_lines(
         app.scrollback.entry(conv_key.to_string()).or_default(),
@@ -3528,6 +3552,7 @@ fn apply_received_files(
             ts_unix_ms: f.received_at_ms,
             via_hub: false,
             sender_fp: None,
+            delivered: false,
         });
         // T-polish.5: count new files toward unread when they're
         // not in the active selection.
@@ -3563,6 +3588,7 @@ fn merge_history(app: &mut AppState, peer_short: &str, messages: Vec<HistoryEntr
         ts_unix_ms: m.ts_unix_ms,
         via_hub: m.via_hub,
         sender_fp: None,
+        delivered: false,
     });
     prepend_history_lines(
         app.scrollback.entry(peer_short.to_string()).or_default(),
@@ -5917,6 +5943,9 @@ fn build_chat_lines(
             ));
         }
         spans.push(Span::styled(line.text.clone(), body_style));
+        if line.delivered {
+            spans.push(Span::styled(" ✓", theme::muted()));
+        }
         out.push(Line::from(spans));
     }
     out
@@ -6441,6 +6470,7 @@ mod snapshot_tests {
             ts_unix_ms: 1_700_000_000_000,
             via_hub: false,
             sender_fp: Some(fp.to_string()),
+            delivered: false,
         };
         let scroll = vec![
             line("aaaa bbbb cccc dddd", "from alice"),
@@ -6466,6 +6496,7 @@ mod snapshot_tests {
                 ts_unix_ms: 1_700_000_000_000,
                 via_hub: false,
                 sender_fp: None,
+                delivered: false,
             },
             ChatLine {
                 direction: MessageDirection::Incoming,
@@ -6473,6 +6504,7 @@ mod snapshot_tests {
                 ts_unix_ms: 1_700_000_000_010, // same minute → grouped
                 via_hub: false,
                 sender_fp: None,
+                delivered: false,
             },
             ChatLine {
                 direction: MessageDirection::Outgoing,
@@ -6480,6 +6512,7 @@ mod snapshot_tests {
                 ts_unix_ms: 1_700_000_000_020, // sender change → new group
                 via_hub: false,
                 sender_fp: None,
+                delivered: false,
             },
         ];
         // v0.1.30: one line per message — 3 messages → exactly 3 lines
@@ -6512,6 +6545,7 @@ mod snapshot_tests {
                     ts_unix_ms: 1000,
                     via_hub: false,
                     sender_fp: None,
+                    delivered: false,
                 },
                 ChatLine {
                     direction: MessageDirection::Outgoing,
@@ -6519,6 +6553,7 @@ mod snapshot_tests {
                     ts_unix_ms: 2000,
                     via_hub: false,
                     sender_fp: None,
+                    delivered: false,
                 },
             ],
         );
@@ -6530,6 +6565,7 @@ mod snapshot_tests {
                 ts_unix_ms: 3000,
                 via_hub: false,
                 sender_fp: None,
+                delivered: false,
             }],
         );
 
@@ -6652,6 +6688,7 @@ mod snapshot_tests {
                     ts_unix_ms: 1_700_000_000_000,
                     via_hub: true,
                     sender_fp: None,
+                    delivered: false,
                 },
                 ChatLine {
                     direction: MessageDirection::Incoming,
@@ -6659,6 +6696,7 @@ mod snapshot_tests {
                     ts_unix_ms: 1_700_000_000_005,
                     via_hub: false,
                     sender_fp: None,
+                    delivered: false,
                 },
                 ChatLine {
                     direction: MessageDirection::Outgoing,
@@ -6666,6 +6704,7 @@ mod snapshot_tests {
                     ts_unix_ms: 1_700_000_000_010,
                     via_hub: false,
                     sender_fp: None,
+                    delivered: false,
                 },
                 ChatLine {
                     direction: MessageDirection::Incoming,
@@ -6673,6 +6712,7 @@ mod snapshot_tests {
                     ts_unix_ms: 1_700_000_000_020,
                     via_hub: false,
                     sender_fp: None,
+                    delivered: false,
                 },
             ],
         );
@@ -6842,6 +6882,49 @@ mod snapshot_tests {
         )))));
         let out = render_to_string(&app, 100, 40);
         assert!(out.contains("could not ask Onyx"), "{out}");
+    }
+
+    // A receipt marks exactly one outgoing line — the newest unmarked one
+    // with that text — and the mark is drawn. Two identical messages need
+    // two receipts.
+    #[test]
+    fn delivery_receipt_marks_one_outgoing_line() {
+        let mut app = mock_app_with_peers_and_scrollback();
+        let key = app.peers[0].short_id.clone();
+        for _ in 0..2 {
+            app.apply_event(ApiResponse::EventMessage {
+                peer_short: key.clone(),
+                direction: MessageDirection::Outgoing,
+                text: "on my way".into(),
+                ts_unix_ms: now_unix_ms(),
+                via_hub: false,
+                sender_fp: None,
+            });
+        }
+        let marked = |app: &AppState| {
+            app.scrollback[&key]
+                .iter()
+                .filter(|l| l.text == "on my way" && l.delivered)
+                .count()
+        };
+        assert!(app.apply_event(ApiResponse::EventDelivered {
+            peer_short: key.clone(),
+            text: "on my way".into(),
+        }));
+        assert_eq!(marked(&app), 1);
+        let last = app.scrollback[&key].last().unwrap();
+        assert!(last.delivered, "the newest copy is marked first");
+        app.apply_event(ApiResponse::EventDelivered {
+            peer_short: key.clone(),
+            text: "on my way".into(),
+        });
+        assert_eq!(marked(&app), 2);
+        assert!(!app.apply_event(ApiResponse::EventDelivered {
+            peer_short: key.clone(),
+            text: "never sent".into(),
+        }));
+        let out = render_to_string(&app, 100, 30);
+        assert!(out.contains("on my way ✓"), "{out}");
     }
 
     #[test]
@@ -7067,6 +7150,7 @@ mod snapshot_tests {
                 ts_unix_ms: 3_000,
                 via_hub: false,
                 sender_fp: None,
+                delivered: false,
             }],
         );
         // History returns three messages including one that matches
@@ -7131,6 +7215,7 @@ mod snapshot_tests {
                 ts_unix_ms: 2_000,
                 via_hub: false,
                 sender_fp: None,
+                delivered: false,
             }],
         );
         let f1 = onyx_core::api::ReceivedFileInfo {
