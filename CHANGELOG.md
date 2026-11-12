@@ -6,7 +6,7 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
-## Privacy + delivery — 2026-11-13 — receipts switch, docs correction
+## Privacy + delivery — 2026-11-13 — receipts switch, network screen, docs correction
 
 **Delivery receipts can be switched off**
 
@@ -16,6 +16,27 @@ Use this file as the single chronological view of where the project is. Implemen
   (`ATTACKS.md` §2.2). With it off nothing is sent back; senders cannot
   tell delivered from lost. Default stays on. Tested
   (`delivery_receipts_switch_controls_the_acknowledgement`).
+
+**Network screen**
+
+- `Ctrl-T` (or `/network`, or the command palette) in the interface, and
+  `onyx network` on the command line: Tor state, whether your address is
+  published, who can reach you, hub relay and receipts as actually in
+  force in the running daemon, every hub with connected-since or the
+  number of failed attempts and the last error, the signed public hub
+  list marked in use / not used, and local counts. Answered by the local
+  daemon from memory and the vault; opening it sends nothing over the
+  network. `r` refreshes.
+- To support it the daemon now tracks each hub link separately
+  (`HubLink`), and the top bar's `hubs n/m` is counted from those
+  records instead of a separate counter, so the two cannot disagree.
+- New API request `NetworkStatus` / `NetworkStatusOk`. Tested on both
+  sides (`network_status_reports_each_hub_and_the_settings`,
+  `network_screen_shows_each_hub_and_why`).
+- **Not included:** health of hubs you do not use. The client never
+  probes them, and the operator status page (`onyx-metrics
+  --publish-dir`) is not read; doing either would add network traffic
+  that this screen is meant not to cause.
 
 **Docs correction — hub relay of direct messages is on by default in `onyx`**
 

@@ -30,37 +30,87 @@ use onyx_core::tor::TorRuntime;
 use onyx_core::transport::{Session, handshake_initiator, write_frame};
 use onyx_core::wire::{FRAME_DELIVER, FRAME_SUBSCRIBE, InnerFrame};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// What the daemon knows about its link to one hub, for the local
+/// Network screen. Never leaves this machine.
+///
+/// `live` is 1 while a session to the hub is up (handshake done) and 0
+/// otherwise. The times are wall-clock milliseconds; 0 means "never".
+#[derive(Debug, Default)]
+pub struct HubLink {
+    /// The hub's onion host (or `host:port` for the test-only TCP mode).
+    pub label: String,
+    pub live: AtomicUsize,
+    /// When the current (or most recent) session came up.
+    pub up_since_ms: AtomicU64,
+    /// When the most recent session ended.
+    pub down_since_ms: AtomicU64,
+    /// Sessions that ended in an error since the last successful one.
+    pub failures_in_a_row: AtomicU32,
+    /// The most recent session error, shortened.
+    pub last_error: std::sync::Mutex<Option<String>>,
+}
+
+impl HubLink {
+    #[must_use]
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Record a session that ended in an error.
+    pub fn record_error(&self, error: &str) {
+        self.failures_in_a_row.fetch_add(1, Ordering::Relaxed);
+        let short: String = error.chars().take(120).collect();
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = Some(short);
+        }
+    }
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
 
 /// v0.1.28 (honest health): RAII marker that a hub session is LIVE.
 ///
 /// Constructed only *after* the Noise XK handshake completes — so a
 /// chronically-failing dial (the exact symptom we hit on a Tor-hostile
-/// network) is NOT counted as "connected". The increment is published to
-/// `DaemonState.hubs_connected` and surfaced via `StatusOk.hubs_connected`,
-/// and the matching decrement runs on `Drop` — i.e. whenever the session
-/// ends for any reason (clean close, read timeout, circuit death, error,
-/// task abort on shutdown). That symmetry is the whole point: the counter
-/// can never get stuck "up" after a session dies.
-struct ConnectedGuard(Arc<AtomicUsize>);
+/// network) is NOT counted as "connected". It marks the hub's [`HubLink`]
+/// live (which `StatusOk.hubs_connected` counts), and `Drop` marks it down
+/// again whenever the session ends for any reason (clean close, read
+/// timeout, circuit death, error, task abort on shutdown). That symmetry
+/// is the whole point: a hub can never get stuck "up" after its session
+/// dies.
+struct ConnectedGuard(Arc<HubLink>);
 
 impl ConnectedGuard {
-    /// Increment the live-session counter. Returns `None` when no counter
-    /// was supplied (the identity/reachability session and tests don't
-    /// count toward the displayed hubs-connected total).
-    fn arm(counter: Option<Arc<AtomicUsize>>) -> Option<Self> {
-        let counter = counter?;
-        counter.fetch_add(1, Ordering::Relaxed);
-        Some(Self(counter))
+    /// Mark the hub live. Returns `None` when no link was supplied (the
+    /// identity/reachability session and tests don't count).
+    fn arm(link: Option<Arc<HubLink>>) -> Option<Self> {
+        let link = link?;
+        link.live.fetch_add(1, Ordering::Relaxed);
+        link.up_since_ms.store(wall_ms(), Ordering::Relaxed);
+        link.failures_in_a_row.store(0, Ordering::Relaxed);
+        if let Ok(mut slot) = link.last_error.lock() {
+            *slot = None;
+        }
+        Some(Self(link))
     }
 }
 
 impl Drop for ConnectedGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
+        self.0.down_since_ms.store(wall_ms(), Ordering::Relaxed);
     }
 }
 
@@ -174,7 +224,7 @@ pub async fn run_hub_session<F, Fut>(
     // v0.1.28: optional live-session counter (honest health). Armed only
     // after the handshake completes; `None` for sessions that shouldn't
     // count (identity/reachability role, tests).
-    connected_counter: Option<Arc<AtomicUsize>>,
+    connected_counter: Option<Arc<HubLink>>,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,
@@ -301,7 +351,7 @@ pub async fn run_hub_session_tcp<F, Fut>(
     self_publish: Option<&SelfPublish>,
     ephemeral_noise: bool,
     // v0.1.28: see `run_hub_session` — armed after the handshake.
-    connected_counter: Option<Arc<AtomicUsize>>,
+    connected_counter: Option<Arc<HubLink>>,
 ) -> anyhow::Result<()>
 where
     F: FnMut(RoutingId, Vec<u8>) -> Fut,

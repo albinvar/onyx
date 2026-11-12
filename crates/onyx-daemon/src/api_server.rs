@@ -226,11 +226,12 @@ async fn dispatch_one_shot(
             // How many hubs we can fall back to for offline delivery.
             hub_count: u32::try_from(state.configured_hubs.len()).unwrap_or(u32::MAX),
             // v0.1.28: how many of those have a LIVE session right now.
-            hubs_connected: u32::try_from(
-                state
-                    .hubs_connected
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
+            hubs_connected: u32::try_from(state.hub_links.lock().map_or(0, |links| {
+                links
+                    .iter()
+                    .filter(|l| l.live.load(std::sync::atomic::Ordering::Relaxed) > 0)
+                    .count()
+            }))
             .unwrap_or(u32::MAX),
         },
         ApiRequest::Identity => ApiResponse::IdentityOk {
@@ -578,6 +579,7 @@ async fn dispatch_one_shot(
             new_name,
         } => handle_rename_room(group_id_b32, new_name, state).await,
         ApiRequest::LeaveRoom { group_id_b32 } => handle_leave_room(group_id_b32, state).await,
+        ApiRequest::NetworkStatus => handle_network_status(state).await,
         ApiRequest::ListPendingInvites => {
             let vault = state.vault.lock().await;
             match vault.list_pending_invites(state.identity_id) {
@@ -1584,6 +1586,58 @@ fn member_route(
     let secret = routing_secret?;
     let fp = onyx_core::crypto::Fingerprint::parse(member_fp).ok()?;
     Some(onyx_core::routing::member_token(secret, &fp))
+}
+
+/// Build the Network screen's snapshot from memory and the vault. Nothing
+/// here touches the network.
+async fn handle_network_status(state: &DaemonState) -> ApiResponse {
+    use std::sync::atomic::Ordering;
+    let at = |ms: u64| (ms > 0).then_some(ms);
+    let hubs = state.hub_links.lock().map_or_else(
+        |_| Vec::new(),
+        |links| {
+            links
+                .iter()
+                .map(|l| onyx_core::api::HubLinkInfo {
+                    label: l.label.clone(),
+                    connected: l.live.load(Ordering::Relaxed) > 0,
+                    up_since_ms: at(l.up_since_ms.load(Ordering::Relaxed)),
+                    down_since_ms: at(l.down_since_ms.load(Ordering::Relaxed)),
+                    failures_in_a_row: l.failures_in_a_row.load(Ordering::Relaxed),
+                    last_error: l.last_error.lock().ok().and_then(|e| e.clone()),
+                })
+                .collect()
+        },
+    );
+    let (contacts, contacts_connected, queued) = {
+        let reg = state.conversations.lock().await;
+        let peers = reg.list();
+        (
+            peers.len(),
+            peers.iter().filter(|p| p.connected).count(),
+            reg.queued_total(),
+        )
+    };
+    let (rooms, pending_invites) = {
+        let vault = state.vault.lock().await;
+        (
+            vault.list_rooms(state.identity_id).map_or(0, |r| r.len()),
+            vault
+                .list_pending_invites(state.identity_id)
+                .map_or(0, |p| p.len()),
+        )
+    };
+    let n = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+    ApiResponse::NetworkStatusOk {
+        hubs,
+        dm_hub_fallback: state.dm_hub_fallback,
+        delivery_receipts: state.delivery_receipts,
+        contacts: n(contacts),
+        contacts_connected: n(contacts_connected),
+        rooms: n(rooms),
+        queued_messages: n(queued),
+        pending_invites: n(pending_invites),
+    }
 }
 
 /// v0.1.18: opt-in DM hub fallback. Seal a single DM `text` to the
@@ -3911,9 +3965,65 @@ mod tests {
             dm_hub_fallback: false,
             message_retention_secs: None,
             delivery_receipts: true,
-            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hub_links: std::sync::Arc::default(),
         });
         (state, encode_b32(group_id))
+    }
+
+    /// The Network screen's data: one row per hub with its live state and
+    /// last error, the running privacy settings, and local counts; and the
+    /// top-bar `hubs_connected` agrees with the per-hub rows.
+    #[tokio::test]
+    async fn network_status_reports_each_hub_and_the_settings() {
+        use std::sync::atomic::Ordering;
+        let (state, _gid) = room_state_with_members("", &[4u8; 32]);
+        let up = Arc::new(crate::hub_client::HubLink::new("aaaa.onion"));
+        up.live.store(1, Ordering::Relaxed);
+        up.up_since_ms.store(1_700_000_000_000, Ordering::Relaxed);
+        let down = Arc::new(crate::hub_client::HubLink::new("bbbb.onion"));
+        down.record_error("hub dial failed: tor: dial failed");
+        down.record_error("hub dial failed: tor: dial failed");
+        state
+            .hub_links
+            .lock()
+            .unwrap()
+            .extend([up.clone(), down.clone()]);
+
+        let resp = dispatch_one_shot(&ApiRequest::NetworkStatus, &state, TorState::Ready).await;
+        let ApiResponse::NetworkStatusOk {
+            hubs,
+            dm_hub_fallback,
+            delivery_receipts,
+            rooms,
+            queued_messages,
+            ..
+        } = resp
+        else {
+            panic!("expected NetworkStatusOk, got {resp:?}");
+        };
+        assert_eq!(hubs.len(), 2);
+        assert!(hubs[0].connected);
+        assert_eq!(hubs[0].up_since_ms, Some(1_700_000_000_000));
+        assert!(!hubs[1].connected);
+        assert_eq!(hubs[1].failures_in_a_row, 2);
+        assert!(
+            hubs[1]
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("dial failed")
+        );
+        assert!(!dm_hub_fallback);
+        assert!(delivery_receipts);
+        assert_eq!(rooms, 1);
+        assert_eq!(queued_messages, 0);
+
+        let ApiResponse::StatusOk { hubs_connected, .. } =
+            dispatch_one_shot(&ApiRequest::Status, &state, TorState::Ready).await
+        else {
+            panic!("expected StatusOk");
+        };
+        assert_eq!(hubs_connected, 1, "the top bar counts the live hub only");
     }
 
     /// A fresh, valid-looking fingerprint string for a fictional member.
@@ -4097,7 +4207,7 @@ mod tests {
             dm_hub_fallback: true,
             message_retention_secs: None,
             delivery_receipts: true,
-            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hub_links: std::sync::Arc::default(),
         });
 
         // Independently derive the PEER's token for this group, and the
@@ -4183,7 +4293,7 @@ mod tests {
             dm_hub_fallback: true,
             message_retention_secs: None,
             delivery_receipts: true,
-            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hub_links: std::sync::Arc::default(),
         });
 
         let ok = dm_hub_fallback_send(&peer_pub, "hi", &state).await;

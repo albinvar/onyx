@@ -275,6 +275,11 @@ enum CopyState {
 
 #[derive(Debug, Clone)]
 enum ModalState {
+    /// The Network screen (Ctrl-T, /network): this device's link to Tor
+    /// and to each hub, the privacy settings in force, the signed public
+    /// hub list, and local counts. Built from the daemon's memory and
+    /// local files — opening it sends nothing over the network.
+    Network(Box<NetworkView>),
     CreateRoom {
         name: String,
     },
@@ -440,6 +445,7 @@ enum PaletteAction {
     ShareContact,
     AddContact,
     ManageHubs,
+    Network,
     ViewLogs,
     Settings,
     Help,
@@ -448,7 +454,7 @@ enum PaletteAction {
 
 impl PaletteAction {
     /// All actions, in palette display order.
-    const ALL: [PaletteAction; 12] = [
+    const ALL: [PaletteAction; 13] = [
         PaletteAction::CreateRoom,
         PaletteAction::InvitePeer,
         PaletteAction::SendFile,
@@ -457,6 +463,7 @@ impl PaletteAction {
         PaletteAction::ShareContact,
         PaletteAction::AddContact,
         PaletteAction::ManageHubs,
+        PaletteAction::Network,
         PaletteAction::ViewLogs,
         PaletteAction::Settings,
         PaletteAction::Help,
@@ -474,6 +481,7 @@ impl PaletteAction {
             PaletteAction::ShareContact => "Share my contact (invite link + connect code)",
             PaletteAction::AddContact => "Add a contact (paste invite or connect code)",
             PaletteAction::ManageHubs => "Manage hubs / dial / reachability",
+            PaletteAction::Network => "Network status — Tor, hubs, settings",
             PaletteAction::ViewLogs => "View daemon logs",
             PaletteAction::Settings => "Settings / identity",
             PaletteAction::Help => "Show keyboard help",
@@ -490,6 +498,7 @@ impl PaletteAction {
             PaletteAction::ShareContact => "^E",
             PaletteAction::AddContact => "^A",
             PaletteAction::ManageHubs => "^G",
+            PaletteAction::Network => "^T",
             PaletteAction::ViewLogs => "^L",
             PaletteAction::SearchMessages
             | PaletteAction::VerifyContact
@@ -1514,6 +1523,10 @@ async fn handle_key(app: &mut AppState, key: KeyEvent) -> bool {
             app.modal = Some(open_manage_hubs_modal());
             return false;
         }
+        (KeyCode::Char('t'), m) if m.contains(KeyModifiers::CONTROL) => {
+            open_network_modal(app).await;
+            return false;
+        }
         (KeyCode::Esc, _) => return true,
         (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => return true,
         (KeyCode::Up, _) => app.move_selection(-1),
@@ -1629,11 +1642,16 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             }
             return; // close the modal
         }
+        (ModalState::Network(_), KeyCode::Char('r')) => {
+            open_network_modal(app).await;
+            return;
+        }
         // Esc closes any modal without submitting. Help + Settings + Logs +
         // the read-only safety-number screen close on ANY (non-scroll) key.
         (_, KeyCode::Esc)
         | (
             ModalState::Help
+            | ModalState::Network(_)
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
             | ModalState::Verify { .. },
@@ -2298,6 +2316,7 @@ async fn handle_modal_key(app: &mut AppState, key: KeyEvent) {
             // These never set submit_intent (handled inline above / read-
             // only / copy-only), so they can't reach here.
             ModalState::Help
+            | ModalState::Network(_)
             | ModalState::CommandPalette { .. }
             | ModalState::Settings { .. }
             | ModalState::Logs { .. }
@@ -2551,6 +2570,7 @@ async fn run_palette_action(app: &mut AppState, action: PaletteAction) {
             });
         }
         PaletteAction::Settings => open_settings_modal(app).await,
+        PaletteAction::Network => open_network_modal(app).await,
         PaletteAction::Help => app.modal = Some(ModalState::Help),
         PaletteAction::Quit => app.quit_requested = true,
     }
@@ -3008,6 +3028,7 @@ async fn run_slash_command(app: &mut AppState, line: &str) {
             run_palette_action(app, PaletteAction::ShareContact).await;
         }
         "hubs" | "hub" => run_palette_action(app, PaletteAction::ManageHubs).await,
+        "network" | "net" | "status" => run_palette_action(app, PaletteAction::Network).await,
         "settings" | "set" => run_palette_action(app, PaletteAction::Settings).await,
         "search" | "find" => app.modal = Some(open_search_modal(app, arg)),
         "verify" | "safety" => match build_verify_modal(app) {
@@ -3981,6 +4002,9 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             u16::try_from(paths.len().min(6) + 7).unwrap_or(9)
         }
         ModalState::Help => 24,
+        ModalState::Network(view) => u16::try_from(network_lines(view).len() + 2)
+            .unwrap_or(30)
+            .min(area.height.saturating_sub(2)),
         ModalState::CommandPalette { .. } => {
             u16::try_from(PaletteAction::ALL.len() + 6).unwrap_or(12)
         }
@@ -4171,6 +4195,7 @@ fn render_modal(frame: &mut ratatui::Frame<'_>, area: Rect, modal: &ModalState) 
             error.as_deref(),
         ),
         ModalState::Help => render_help_modal(frame, rect),
+        ModalState::Network(view) => render_network_modal(frame, rect, view),
         ModalState::CommandPalette { query, selected } => {
             render_palette_modal(frame, rect, query, *selected);
         }
@@ -4500,6 +4525,312 @@ fn render_logs_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, lines: &[String
 }
 
 /// Task 324: read-only settings / identity panel.
+/// Everything the Network screen shows, gathered when it opens.
+#[derive(Debug, Clone)]
+struct NetworkView {
+    tor: Option<TorState>,
+    onion_published: bool,
+    reachable: bool,
+    /// The daemon's own report, or why it could not be fetched.
+    report: Result<NetworkReport, String>,
+    /// The signed hub list installed with Onyx: (name, onion host).
+    public_hubs: Vec<(String, String)>,
+    use_public_hubs: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NetworkReport {
+    hubs: Vec<onyx_core::api::HubLinkInfo>,
+    dm_hub_fallback: bool,
+    delivery_receipts: bool,
+    contacts: u32,
+    contacts_connected: u32,
+    rooms: u32,
+    queued_messages: u32,
+    pending_invites: u32,
+}
+
+/// Gather the Network screen's data. Talks only to the local daemon and
+/// reads local files.
+async fn open_network_modal(app: &mut AppState) {
+    let (tor, onion_published) = match &app.last_status {
+        Some(Ok(s)) => (
+            Some(s.tor_state),
+            s.onion.as_deref().is_some_and(|o| !o.is_empty()),
+        ),
+        _ => (None, false),
+    };
+    let report = match client::one_shot(&app.socket_path, &ApiRequest::NetworkStatus).await {
+        Ok(ApiResponse::NetworkStatusOk {
+            hubs,
+            dm_hub_fallback,
+            delivery_receipts,
+            contacts,
+            contacts_connected,
+            rooms,
+            queued_messages,
+            pending_invites,
+        }) => Ok(NetworkReport {
+            hubs,
+            dm_hub_fallback,
+            delivery_receipts,
+            contacts,
+            contacts_connected,
+            rooms,
+            queued_messages,
+            pending_invites,
+        }),
+        Ok(ApiResponse::Error { message, .. }) => Err(message),
+        Ok(_) => Err("this daemon is too old to report network status".to_string()),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    let public_hubs = crate::load_public_hubs()
+        .ok()
+        .flatten()
+        .map(|f| {
+            f.hubs
+                .into_iter()
+                .map(|h| (h.name, h.onion))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let use_public_hubs = crate::load_file_config()
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.use_public_hubs);
+    app.modal = Some(ModalState::Network(Box::new(NetworkView {
+        tor,
+        onion_published,
+        reachable: app.first_contact_reachable,
+        report,
+        public_hubs,
+        use_public_hubs,
+    })));
+}
+
+/// `abcdef…uvwxyz` for an onion host: enough to tell hubs apart without
+/// filling the line.
+fn short_onion(host: &str) -> String {
+    let base = host.trim_end_matches(".onion");
+    let base = base.split(':').next().unwrap_or(base);
+    if base.chars().count() <= 14 {
+        return base.to_string();
+    }
+    let head: String = base.chars().take(6).collect();
+    let tail: String = base
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
+}
+
+/// The same onion, ignoring a `:port` suffix and letter case.
+fn same_onion(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.split(':')
+            .next()
+            .unwrap_or(s)
+            .trim_end_matches(".onion")
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+#[allow(clippy::too_many_lines)]
+fn network_lines(v: &NetworkView) -> Vec<Line<'static>> {
+    let label = |k: &str| Span::styled(format!("  {k:<15}"), theme::muted());
+    let heading = |t: &str| Line::from(Span::styled(format!(" {t}"), theme::header()));
+    let mut lines = vec![heading("This device")];
+
+    let (tor_text, tor_style) = match v.tor {
+        Some(TorState::Ready) => ("● connected".to_string(), theme::ok()),
+        Some(TorState::Bootstrapping { percent }) => {
+            (format!("◌ starting ({percent}%)"), theme::warn())
+        }
+        Some(TorState::Disabled) => ("○ off — no anonymity".to_string(), theme::error()),
+        None => (
+            "unknown — Onyx is not responding".to_string(),
+            theme::error(),
+        ),
+    };
+    lines.push(Line::from(vec![
+        label("Tor"),
+        Span::styled(tor_text, tor_style),
+    ]));
+    lines.push(Line::from(vec![
+        label("Your address"),
+        if v.onion_published {
+            Span::styled("published", theme::ok())
+        } else {
+            Span::styled("not published yet", theme::warn())
+        },
+    ]));
+    lines.push(Line::from(vec![
+        label("Who can reach"),
+        Span::styled(
+            if v.reachable {
+                "people with your code, or your invite link (via hubs)"
+            } else {
+                "only people you give your code to"
+            },
+            theme::text(),
+        ),
+    ]));
+    if let Ok(r) = &v.report {
+        lines.push(Line::from(vec![
+            label("Hub relay"),
+            Span::styled(
+                if r.dm_hub_fallback && !r.hubs.is_empty() {
+                    "on — messages to an offline contact wait at a hub"
+                } else if r.dm_hub_fallback {
+                    "on, but no hub is configured"
+                } else {
+                    "off — messages wait on this device"
+                },
+                theme::text(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            label("Receipts"),
+            Span::styled(
+                if r.delivery_receipts {
+                    "on — senders learn when their message reaches you"
+                } else {
+                    "off"
+                },
+                theme::text(),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(heading("Your hubs"));
+    match &v.report {
+        Err(e) => lines.push(Line::from(Span::styled(
+            format!("  could not ask Onyx: {e}"),
+            theme::error(),
+        ))),
+        Ok(r) if r.hubs.is_empty() => lines.push(Line::from(Span::styled(
+            "  none — direct contact only, the most private setup",
+            theme::muted(),
+        ))),
+        Ok(r) => {
+            for h in &r.hubs {
+                let name = v
+                    .public_hubs
+                    .iter()
+                    .find(|(_, onion)| same_onion(onion, &h.label))
+                    .map_or_else(|| short_onion(&h.label), |(n, _)| n.clone());
+                let (mark, state, style) = if h.connected {
+                    let since = h.up_since_ms.map(fmt_relative_short).unwrap_or_default();
+                    ("●", format!("connected {since}"), theme::ok())
+                } else if h.failures_in_a_row > 0 {
+                    (
+                        "○",
+                        format!(
+                            "not connected — {} failed attempt{}",
+                            h.failures_in_a_row,
+                            if h.failures_in_a_row == 1 { "" } else { "s" }
+                        ),
+                        theme::error(),
+                    )
+                } else {
+                    ("◌", "connecting…".to_string(), theme::warn())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), style),
+                    Span::styled(format!("{name:<20}"), theme::text()),
+                    Span::styled(state, style),
+                ]));
+                if !h.connected
+                    && let Some(err) = &h.last_error
+                {
+                    let err: String = err.chars().filter(|c| !c.is_control()).collect();
+                    lines.push(Line::from(Span::styled(
+                        format!("      {err}"),
+                        theme::muted(),
+                    )));
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(heading("Public hubs"));
+    if v.public_hubs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no signed list installed",
+            theme::muted(),
+        )));
+    } else {
+        let in_use = |onion: &str| {
+            v.report
+                .as_ref()
+                .is_ok_and(|r| r.hubs.iter().any(|h| same_onion(&h.label, onion)))
+        };
+        for (name, onion) in &v.public_hubs {
+            let used = in_use(onion);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {name:<20}"), theme::text()),
+                Span::styled(format!("{:<16}", short_onion(onion)), theme::muted()),
+                if used {
+                    Span::styled("in use", theme::ok())
+                } else {
+                    Span::styled("not used", theme::muted())
+                },
+            ]));
+        }
+        if !v.use_public_hubs {
+            lines.push(Line::from(Span::styled(
+                "  The public list is off. Turn it on in Ctrl-G (Ctrl-P there).",
+                theme::muted(),
+            )));
+        }
+    }
+
+    if let Ok(r) = &v.report {
+        lines.push(Line::from(""));
+        lines.push(heading("On this device"));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} contact{} ({} connected)   {} room{}   {} waiting to send   {} invitation{}",
+                r.contacts,
+                if r.contacts == 1 { "" } else { "s" },
+                r.contacts_connected,
+                r.rooms,
+                if r.rooms == 1 { "" } else { "s" },
+                r.queued_messages,
+                r.pending_invites,
+                if r.pending_invites == 1 { "" } else { "s" },
+            ),
+            theme::text(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  r refresh   any other key closes   Nothing here is sent anywhere.",
+        theme::muted(),
+    )));
+    lines
+}
+
+fn render_network_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, view: &NetworkView) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_active())
+        .title(Span::styled(" Network ", theme::header()));
+    frame.render_widget(
+        Paragraph::new(network_lines(view))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
 fn render_settings_modal(frame: &mut ratatui::Frame<'_>, rect: Rect, info: &[(String, String)]) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4576,6 +4907,7 @@ fn render_help_modal(frame: &mut ratatui::Frame<'_>, rect: Rect) {
         key("Ctrl-I", "invite a peer into the selected room"),
         key("Ctrl-F", "send a file to the selected room"),
         key("Ctrl-E", "Share my contact (invite link + connect code)"),
+        key("Ctrl-T", "Network — Tor, each hub, privacy settings"),
         key("Ctrl-A", "Add a contact (paste invite or connect code)"),
         key("Ctrl-G", "manage hubs / dial / reachability"),
         Line::from(""),
@@ -6412,6 +6744,104 @@ mod snapshot_tests {
         assert!(line.contains("/join"));
         assert!(!line.contains('\x1b'));
         assert!(!line.contains(&"x".repeat(40)), "name is shortened");
+    }
+
+    fn network_view(report: Result<NetworkReport, String>) -> NetworkView {
+        NetworkView {
+            tor: Some(TorState::Ready),
+            onion_published: true,
+            reachable: false,
+            report,
+            public_hubs: vec![
+                (
+                    "onyx-piko-1".into(),
+                    "hz2bbeurzjzwhlb67mjws7i4qqes7hg7hsxsllbmo56wu3remwuevyad.onion".into(),
+                ),
+                (
+                    "onyx-pi-1".into(),
+                    "gqaiiwjuhvryo477zdcmoeadae7v346pbzgdp7vzm6b32f66mmwhrbqd.onion".into(),
+                ),
+            ],
+            use_public_hubs: true,
+        }
+    }
+
+    // The Network screen names each hub (from the signed list when it is
+    // on it), says which are up and why the others are not, marks which
+    // public hubs are in use, and never shows a raw control sequence that
+    // arrived in an error string.
+    #[test]
+    fn network_screen_shows_each_hub_and_why() {
+        let report = NetworkReport {
+            hubs: vec![
+                onyx_core::api::HubLinkInfo {
+                    label: "hz2bbeurzjzwhlb67mjws7i4qqes7hg7hsxsllbmo56wu3remwuevyad.onion".into(),
+                    connected: true,
+                    up_since_ms: Some(now_unix_ms() - 7_200_000),
+                    down_since_ms: None,
+                    failures_in_a_row: 0,
+                    last_error: None,
+                },
+                onyx_core::api::HubLinkInfo {
+                    label: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.onion".into(),
+                    connected: false,
+                    up_since_ms: None,
+                    down_since_ms: None,
+                    failures_in_a_row: 3,
+                    last_error: Some("hub dial failed: tor\x1b[2J: dial failed".into()),
+                },
+            ],
+            dm_hub_fallback: true,
+            delivery_receipts: false,
+            contacts: 2,
+            contacts_connected: 1,
+            rooms: 1,
+            queued_messages: 0,
+            pending_invites: 0,
+        };
+        let mut app = mock_app_with_status(TorState::Ready);
+        app.modal = Some(ModalState::Network(Box::new(network_view(Ok(report)))));
+        let out = render_to_string(&app, 100, 40);
+        let dir = snapshot_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tui-snapshot-network.txt"), &out).unwrap();
+        assert!(out.contains("onyx-piko-1"), "{out}");
+        assert!(out.contains("connected 2h"), "{out}");
+        assert!(out.contains("zzzzzz…zzzzzz"), "{out}");
+        assert!(out.contains("3 failed attempts"), "{out}");
+        assert!(out.contains("dial failed"), "{out}");
+        assert!(!out.contains('\x1b'), "control sequence leaked: {out}");
+        assert!(out.contains("in use"), "{out}");
+        assert!(out.contains("not used"), "{out}");
+        assert!(out.contains("Receipts"), "{out}");
+        assert!(out.contains("Nothing here is sent anywhere"), "{out}");
+    }
+
+    #[test]
+    fn network_screen_without_hubs_or_daemon() {
+        let mut app = mock_app_with_status(TorState::Ready);
+        let mut v = network_view(Ok(NetworkReport {
+            hubs: vec![],
+            dm_hub_fallback: true,
+            delivery_receipts: true,
+            contacts: 0,
+            contacts_connected: 0,
+            rooms: 0,
+            queued_messages: 0,
+            pending_invites: 0,
+        }));
+        v.use_public_hubs = false;
+        app.modal = Some(ModalState::Network(Box::new(v)));
+        let out = render_to_string(&app, 100, 40);
+        assert!(out.contains("most private setup"), "{out}");
+        assert!(out.contains("no hub is configured"), "{out}");
+        assert!(out.contains("public list is off"), "{out}");
+
+        app.modal = Some(ModalState::Network(Box::new(network_view(Err(
+            "connection refused".into(),
+        )))));
+        let out = render_to_string(&app, 100, 40);
+        assert!(out.contains("could not ask Onyx"), "{out}");
     }
 
     #[test]

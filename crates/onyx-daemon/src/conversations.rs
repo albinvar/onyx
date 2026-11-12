@@ -640,6 +640,12 @@ impl ConversationRegistry {
             .unwrap_or_default()
     }
 
+    /// Direct messages waiting, across all peers, for a session to open.
+    #[must_use]
+    pub fn queued_total(&self) -> usize {
+        self.by_peer.values().map(|s| s.pending.len()).sum()
+    }
+
     /// Snapshot of every peer the registry knows about, live or not.
     #[must_use]
     pub fn list(&self) -> Vec<PeerInfo> {

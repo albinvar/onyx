@@ -203,11 +203,13 @@ away so strangers holding your invite link can reach you. See
 | `Ctrl-I` | Invite a contact into the selected room |
 | `Ctrl-F` | Send a file |
 | `Ctrl-G` | Hubs and reachability |
+| `Ctrl-T` | Network: Tor, each hub's link, privacy settings in force |
 | `Ctrl-L` | Log tail |
 | `Esc` / `Ctrl-C` | Close the open dialog, or quit |
 
 Composer commands: `/help`, `/share`, `/add <link>`, `/room [name]`, `/file`,
-`/search`, `/verify`, `/invites`, `/join <n>`, `/decline <n>`, `/clear`, `/q`.
+`/search`, `/verify`, `/invites`, `/join <n>`, `/decline <n>`, `/network`,
+`/receipts on|off`, `/clear`, `/q`.
 
 A message that arrived through a hub is marked; a conversation shows whether
 it is direct, relayed, or has no route.
@@ -226,6 +228,7 @@ reach the daemon.
 | `onyx daemon` / `onyxd` | Headless daemon (systemd, containers) |
 | `onyx tui` | Interface only, against a daemon already running |
 | `onyx status` · `identity` · `doctor` | Health, your keys, self-diagnosis |
+| `onyx network` | Each hub's link, privacy settings, local counts |
 | `onyx code` · `connect <code>` | Direct first contact |
 | `onyx invite [--with-kp] [--with-hubs]` · `accept <url>` | First contact through a hub (signed link) |
 | `onyx peers` · `send <id> <text>` · `history <id>` | Direct messages |

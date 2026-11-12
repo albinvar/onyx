@@ -354,6 +354,10 @@ pub enum ApiRequest {
     AcceptInvite { id: i64 },
     /// Discard a held invitation without joining.
     DeclineInvite { id: i64 },
+    /// Everything the Network screen shows: each hub link, the privacy
+    /// settings the daemon is running with, and local counts. Answered
+    /// from memory; nothing is sent over the network to produce it.
+    NetworkStatus,
     /// Remove (kick) another member from a room (task 325). The
     /// daemon issues an MLS `Remove` commit evicting the member whose
     /// fingerprint is `peer_fingerprint`, fans the commit out to all
@@ -624,6 +628,24 @@ pub enum ApiResponse {
     RoomOpOk,
     /// Reply to [`ApiRequest::ListPendingInvites`].
     PendingInvitesOk { invites: Vec<PendingInviteInfo> },
+    /// Reply to [`ApiRequest::NetworkStatus`].
+    NetworkStatusOk {
+        hubs: Vec<HubLinkInfo>,
+        /// Direct messages are relayed through a hub when the peer is
+        /// offline.
+        dm_hub_fallback: bool,
+        /// Received direct messages are acknowledged to the sender.
+        delivery_receipts: bool,
+        /// Contacts known to this daemon, and how many have a live
+        /// direct session right now.
+        contacts: u32,
+        contacts_connected: u32,
+        rooms: u32,
+        /// Direct messages waiting for a session to the recipient.
+        queued_messages: u32,
+        /// Room invitations waiting for a decision.
+        pending_invites: u32,
+    },
     /// Reply to [`ApiRequest::LeaveRoom`] (T-polish.2). `members`
     /// is the pre-leave roster (the count of other members the
     /// Remove commit was fanned out to).
@@ -814,6 +836,20 @@ pub struct RoomHistoryEntry {
     pub sender_fp: String,
     pub text: String,
     pub ts_unix_ms: u64,
+}
+
+/// One hub link in [`ApiResponse::NetworkStatusOk`]. Times are wall-clock
+/// milliseconds; `None` means "has not happened yet".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubLinkInfo {
+    /// The hub's onion host.
+    pub label: String,
+    pub connected: bool,
+    pub up_since_ms: Option<u64>,
+    pub down_since_ms: Option<u64>,
+    /// Sessions that ended in an error since the last good one.
+    pub failures_in_a_row: u32,
+    pub last_error: Option<String>,
 }
 
 /// One held room invitation, as shown to the user.

@@ -260,6 +260,46 @@ pub fn render(resp: &ApiResponse, style: Style) -> Option<String> {
                 )
             );
         }
+        ApiResponse::NetworkStatusOk {
+            hubs,
+            dm_hub_fallback,
+            delivery_receipts,
+            contacts,
+            contacts_connected,
+            rooms,
+            queued_messages,
+            pending_invites,
+        } => {
+            if hubs.is_empty() {
+                let _ = writeln!(out, "hubs        none (direct contact only)");
+            }
+            for h in hubs {
+                let state = if h.connected {
+                    style.paint("connected", GREEN)
+                } else if h.failures_in_a_row > 0 {
+                    style.paint(
+                        &format!("not connected ({} failed attempts)", h.failures_in_a_row),
+                        RED,
+                    )
+                } else {
+                    style.paint("connecting", AMBER)
+                };
+                let _ = writeln!(out, "hub         {}  {state}", clean(&h.label));
+                if !h.connected
+                    && let Some(e) = &h.last_error
+                {
+                    let _ = writeln!(out, "            {}", style.paint(&clean(e), DIM));
+                }
+            }
+            let on_off = |b: bool| if b { "on" } else { "off" };
+            let _ = writeln!(out, "hub relay   {}", on_off(*dm_hub_fallback));
+            let _ = writeln!(out, "receipts    {}", on_off(*delivery_receipts));
+            let _ = writeln!(
+                out,
+                "contacts    {contacts} ({contacts_connected} connected)   rooms {rooms}   \
+                 waiting {queued_messages}   invitations {pending_invites}"
+            );
+        }
         _ => return None,
     }
     Some(out)

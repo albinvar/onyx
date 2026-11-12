@@ -376,16 +376,14 @@ pub struct DaemonState {
     /// back; senders cannot tell delivered from lost and re-send briefly
     /// after a reconnect (de-duplicated here by message id).
     pub delivery_receipts: bool,
-    /// v0.1.28 (honest health): count of configured hubs with a LIVE
-    /// session right now. Incremented by each activity-role hub session
-    /// once its Noise handshake completes, decremented when the session
-    /// ends (RAII guard in `hub_client`). Surfaced via `StatusOk.hubs_connected`
-    /// so the TUI/`onyx doctor` can show real reachability instead of a
-    /// misleading green "tor ready" while every hub dial is silently
-    /// failing. Only the always-on activity session bumps it (not the
-    /// optional reachability/identity session), so it tops out at the
-    /// number of configured hubs.
-    pub hubs_connected: Arc<std::sync::atomic::AtomicUsize>,
+    /// One entry per hub this daemon keeps an always-on session with,
+    /// registered when that session's supervisor starts. Each records
+    /// whether the hub is live right now (handshake done), since when, and
+    /// the last error. `StatusOk.hubs_connected` counts the live ones; the
+    /// Network screen shows them individually. Local only — never sent
+    /// anywhere. The optional identity/reachability session is not
+    /// tracked, so a hub is counted once however many sessions it has.
+    pub hub_links: Arc<std::sync::Mutex<Vec<Arc<hub_client::HubLink>>>>,
 }
 
 /// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
@@ -805,7 +803,7 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         message_retention_secs: args.message_retention_secs,
         delivery_receipts: args.delivery_receipts,
         // v0.1.28: live hub-connectivity counter (honest health line).
-        hubs_connected: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        hub_links: Arc::default(),
     });
 
     drop(args.passphrase);
@@ -3151,6 +3149,20 @@ impl HubTransport {
     }
 }
 
+/// Add a [`hub_client::HubLink`] for this hub to the daemon's list and
+/// return it, so its session can mark it live and record errors.
+fn register_hub_link(state: &DaemonState, transport: &HubTransport) -> Arc<hub_client::HubLink> {
+    let label = match transport {
+        HubTransport::Tor { host, .. } => host.clone(),
+        HubTransport::Tcp { addr } => addr.clone(),
+    };
+    let link = Arc::new(hub_client::HubLink::new(label));
+    if let Ok(mut links) = state.hub_links.lock() {
+        links.push(link.clone());
+    }
+    link
+}
+
 /// F2.1a: one supervised (reconnecting) hub session in a given role.
 /// Unifies the Tor and TCP reconnect loops behind a single body so the
 /// identity/activity split lives in exactly one place. Loops forever with
@@ -3173,6 +3185,12 @@ async fn supervise_hub_session(
     let our_sk = onyx_core::crypto::IdentitySecret::from_bytes(*our_sk_bytes);
     let our_signing = onyx_core::crypto::SigningKey::from_bytes(&our_signing_bytes);
     let mut backoff = std::time::Duration::from_millis(500);
+    // The always-on activity session is the one that represents this hub
+    // on the Network screen and in `hubs_connected`.
+    let link = match role {
+        HubRole::Activity => Some(register_hub_link(&state, &transport)),
+        HubRole::Identity => None,
+    };
     loop {
         // Role decides keys, subscriptions, and whether we publish a KP.
         let (ephemeral_noise, self_publish, subscriptions) = match role {
@@ -3224,14 +3242,7 @@ async fn supervise_hub_session(
                 }
             }
         };
-        // v0.1.28 (honest health): only the always-on activity session
-        // bumps the live-hub counter, so `hubs_connected` tops out at the
-        // number of *configured* hubs (the optional identity/reachability
-        // session would otherwise double-count a hub the user can reach).
-        let connected_counter = match role {
-            HubRole::Activity => Some(state.hubs_connected.clone()),
-            HubRole::Identity => None,
-        };
+        let connected_counter = link.clone();
         let result = match &transport {
             HubTransport::Tor { tor, host, port } => {
                 hub_client::run_hub_session(
@@ -3268,7 +3279,12 @@ async fn supervise_hub_session(
         };
         match result {
             Ok(()) => info!(?role, "hub: session ended cleanly"),
-            Err(e) => warn!(?role, error = %e, "hub: session ended with error"),
+            Err(e) => {
+                warn!(?role, error = %e, "hub: session ended with error");
+                if let Some(link) = &link {
+                    link.record_error(&format!("{e:#}"));
+                }
+            }
         }
         info!(?backoff, ?role, "hub: backing off before reconnect");
         tokio::time::sleep(backoff).await;
@@ -4798,7 +4814,7 @@ mod dm_fallback_receive_tests {
             dm_hub_fallback: true,
             message_retention_secs: None,
             delivery_receipts: true,
-            hubs_connected: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hub_links: std::sync::Arc::default(),
         })
     }
 

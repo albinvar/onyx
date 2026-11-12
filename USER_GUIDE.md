@@ -138,6 +138,11 @@ onyx doctor
 
 It checks the usual suspects and tells you in plain words what is wrong.
 
+Inside Onyx, `Ctrl-T` opens the **Network** screen: whether Tor is connected,
+each hub you use and whether it is reachable (and if not, why), and which
+privacy settings are on. It only looks at your own computer — opening it
+sends nothing anywhere.
+
 Common ones:
 
 | What you see | What it usually means |

@@ -342,6 +342,9 @@ enum Command {
     /// List conversations: who is connected, last activity, and whether
     /// a contact's identity key is verified or has changed.
     Peers,
+    /// Show this device's link to each hub, the privacy settings in
+    /// force, and local counts. Asks only the local daemon.
+    Network,
     /// Send a direct message. `peer` is the contact's short id as shown
     /// by `onyx peers`.
     Send {
@@ -1523,6 +1526,7 @@ async fn dispatch(mut args: Args) -> anyhow::Result<ExitCode> {
             .await
         }
         Some(Command::Peers) => one_shot_print(&socket, ApiRequest::Peers).await,
+        Some(Command::Network) => one_shot_print(&socket, ApiRequest::NetworkStatus).await,
         Some(Command::Send { peer, text }) => {
             one_shot_print(
                 &socket,
