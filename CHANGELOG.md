@@ -37,7 +37,9 @@ Tor Browser's public built-in bridges:
 - **Not tested:** lyrebird, webtunnel, macOS with Tor Browser's copies,
   Termux. These follow the same code path but have not been run.
 
- — receipts switch, network screen, docs correction
+---
+
+## Privacy + delivery — 2026-11-13 — receipts switch, network screen, docs correction
 
 **Delivery receipts can be switched off**
 
@@ -48,14 +50,29 @@ Tor Browser's public built-in bridges:
   tell delivered from lost. Default stays on. Tested
   (`delivery_receipts_switch_controls_the_acknowledgement`).
 
+**Marks survive a restart**
+
+- The ✓ and the hub mark are now saved with each direct message
+  (`room_messages.flags`, added to existing vaults automatically). Before,
+  history read back after a restart showed no ✓, and showed every
+  message as direct, including ones that had gone through a hub, which
+  overstated their protection (`SECURITY.md` §6.1).
+- The flags are stored in clear, like each message's direction and time;
+  the text and sender stay sealed. Someone holding the vault file can
+  see which of your messages went through a hub or were acknowledged.
+- An acknowledgement marks the newest unmarked outgoing copy of that
+  text, the same rule the interface uses. Tested
+  (`message_marks_are_saved_and_matched_like_the_interface`, extended
+  `hub_relayed_dm_is_decrypted_and_surfaced_via_hub`).
+
 **Delivered mark**
 
 - A direct message you sent shows ✓ once the recipient's daemon has
   acknowledged it. No mark means "no receipt", not "lost": the
   recipient may have receipts off, the message may have gone through a
   hub (hub deliveries are not acknowledged), or it may still be queued.
-  New local event `EventDelivered`. **Carry-forward:** the mark is not
-  saved, so messages read back from history after a restart have none.
+  New local event `EventDelivered`. The mark is saved with the message
+  (see "Marks survive a restart" above).
 
 **Network screen**
 

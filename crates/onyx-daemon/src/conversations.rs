@@ -680,6 +680,7 @@ impl ConversationRegistry {
                     text: line.text.clone(),
                     ts_unix_ms: line.ts_unix_ms,
                     via_hub: line.via_hub,
+                    delivered: false,
                 })
                 .collect(),
         )

@@ -347,7 +347,8 @@ async fn dispatch_one_shot(
                             },
                             text: r.text,
                             ts_unix_ms: u64::try_from(r.created_at_ms).unwrap_or(0),
-                            via_hub: false,
+                            via_hub: r.via_hub,
+                            delivered: r.delivered,
                         })
                         .collect();
                     return ApiResponse::HistoryOk {
@@ -434,7 +435,7 @@ async fn dispatch_one_shot(
                         MessageDirection::Outgoing,
                         text.clone(),
                     );
-                    crate::persist_dm_message(state, &peer_pub, true, &our_fp, text).await;
+                    crate::persist_dm_message(state, &peer_pub, true, &our_fp, text, true).await;
                     return ApiResponse::SendOk;
                 }
                 let mut reg = state.conversations.lock().await;
@@ -444,7 +445,7 @@ async fn dispatch_one_shot(
                 ) {
                     reg.push_message(&peer_pub, MessageDirection::Outgoing, text.clone());
                     drop(reg); // don't hold the conversations lock across the vault write
-                    crate::persist_dm_message(state, &peer_pub, true, &our_fp, text).await;
+                    crate::persist_dm_message(state, &peer_pub, true, &our_fp, text, false).await;
                     return ApiResponse::SendOk;
                 }
                 return ApiResponse::Error {
@@ -466,7 +467,8 @@ async fn dispatch_one_shot(
                         MessageDirection::Outgoing,
                         text.clone(),
                     );
-                    crate::persist_dm_message(state, &handle.peer_pub, true, &our_fp, text).await;
+                    crate::persist_dm_message(state, &handle.peer_pub, true, &our_fp, text, false)
+                        .await;
                     ApiResponse::SendOk
                 }
                 // v0.1.17: a full or just-closed live mailbox also queues
@@ -484,8 +486,15 @@ async fn dispatch_one_shot(
                             text.clone(),
                         );
                         drop(reg); // release before the vault write (lock order)
-                        crate::persist_dm_message(state, &handle.peer_pub, true, &our_fp, text)
-                            .await;
+                        crate::persist_dm_message(
+                            state,
+                            &handle.peer_pub,
+                            true,
+                            &our_fp,
+                            text,
+                            false,
+                        )
+                        .await;
                         ApiResponse::SendOk
                     } else {
                         ApiResponse::Error {

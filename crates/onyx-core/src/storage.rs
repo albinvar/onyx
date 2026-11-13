@@ -692,6 +692,13 @@ impl Vault {
         ensure_column(&conn, "rooms", "members_enc", "BLOB")?;
         // v0.1.31: optional per-contact nickname (local display label).
         ensure_column(&conn, "pinned_keys", "nickname", "TEXT")?;
+        // Per-message marks: MSG_FLAG_VIA_HUB | MSG_FLAG_DELIVERED.
+        ensure_column(
+            &conn,
+            "room_messages",
+            "flags",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         let vault = Self { conn, aead };
         vault.seal_legacy_room_messages()?;
@@ -832,6 +839,13 @@ impl Vault {
         ensure_column(&conn, "rooms", "members_enc", "BLOB")?;
         // v0.1.31: optional per-contact nickname (local display label).
         ensure_column(&conn, "pinned_keys", "nickname", "TEXT")?;
+        // Per-message marks: MSG_FLAG_VIA_HUB | MSG_FLAG_DELIVERED.
+        ensure_column(
+            &conn,
+            "room_messages",
+            "flags",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         let salt: [u8; 16] = random_array();
         let mut vault_key = Zeroizing::new([0u8; 32]);
@@ -1896,11 +1910,7 @@ impl Vault {
         Ok(())
     }
 
-    /// T-polish.3: append one room message to the persistent
-    /// scrollback. `direction_outgoing = false` for incoming
-    /// (decoded `RoomAppMessage::Text`), `true` for outgoing
-    /// (locally-typed `SendRoom` text). `sender_fp` is the
-    /// sender's fingerprint as a string.
+    /// Same as [`Self::append_room_message_with_flags`] with no marks.
     pub fn append_room_message(
         &self,
         identity_id: i64,
@@ -1909,6 +1919,94 @@ impl Vault {
         sender_fp: &str,
         text: &str,
         created_at_ms: i64,
+    ) -> Result<()> {
+        self.append_room_message_with_flags(
+            identity_id,
+            group_id,
+            direction_outgoing,
+            sender_fp,
+            text,
+            created_at_ms,
+            0,
+        )
+    }
+
+    /// Mark the newest outgoing message in `group_id` whose text is `text`
+    /// and that is not yet marked as delivered. Acknowledgements name a
+    /// message id the row does not keep, so this matches the way the
+    /// interface does: two identical messages need two acknowledgements.
+    /// Looks at the newest [`Self::DELIVERED_SCAN`] outgoing unmarked rows.
+    /// Returns whether a row was marked.
+    pub fn mark_room_message_delivered(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        text: &str,
+    ) -> Result<bool> {
+        let candidates: Vec<(i64, Option<Vec<u8>>, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, text_enc, text FROM room_messages \
+                     WHERE identity_id = ? AND group_id = ? AND direction = 1 \
+                       AND (flags & ?) = 0 \
+                     ORDER BY id DESC LIMIT ?",
+                )
+                .map_err(map_db_err)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        identity_id,
+                        group_id,
+                        MSG_FLAG_DELIVERED | MSG_FLAG_VIA_HUB,
+                        Self::DELIVERED_SCAN
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(map_db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_db_err)?
+        };
+        for (id, text_enc, legacy) in candidates {
+            let matches = match text_enc {
+                Some(blob) => self.decrypt_blob(&blob)? == text.as_bytes(),
+                None => legacy == text,
+            };
+            if matches {
+                self.conn
+                    .execute(
+                        "UPDATE room_messages SET flags = flags | ? WHERE id = ?",
+                        params![MSG_FLAG_DELIVERED, id],
+                    )
+                    .map_err(map_db_err)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// How many recent unmarked outgoing rows an acknowledgement is
+    /// matched against.
+    pub const DELIVERED_SCAN: i64 = 256;
+
+    /// T-polish.3: append one room message to the persistent
+    /// scrollback. `direction_outgoing = false` for incoming
+    /// (decoded `RoomAppMessage::Text`), `true` for outgoing
+    /// (locally-typed `SendRoom` text). `sender_fp` is the
+    /// sender's fingerprint as a string.
+    ///
+    /// `flags` is a set of `MSG_FLAG_*` marks, stored in clear like the
+    /// direction and timestamp (the text and sender stay sealed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_room_message_with_flags(
+        &self,
+        identity_id: i64,
+        group_id: &[u8],
+        direction_outgoing: bool,
+        sender_fp: &str,
+        text: &str,
+        created_at_ms: i64,
+        flags: i64,
     ) -> Result<()> {
         let dir = i64::from(direction_outgoing);
         // Audit #1: seal the message text + sender fingerprint at rest under
@@ -1920,9 +2018,9 @@ impl Vault {
         self.conn
             .execute(
                 "INSERT INTO room_messages \
-                 (identity_id, group_id, direction, sender_fp, text, text_enc, sfp_enc, created_at_ms) \
-                 VALUES (?, ?, ?, '', '', ?, ?, ?)",
-                params![identity_id, group_id, dir, text_enc, sfp_enc, created_at_ms],
+                 (identity_id, group_id, direction, sender_fp, text, text_enc, sfp_enc, created_at_ms, flags) \
+                 VALUES (?, ?, ?, '', '', ?, ?, ?, ?)",
+                params![identity_id, group_id, dir, text_enc, sfp_enc, created_at_ms, flags],
             )
             .map_err(map_db_err)?;
         Ok(())
@@ -1937,8 +2035,16 @@ impl Vault {
         group_id: &[u8],
         limit: usize,
     ) -> Result<Vec<RoomMessageRow>> {
-        // (direction, legacy_sfp, legacy_text, text_enc, sfp_enc, created_at_ms)
-        type RawRow = (i64, String, String, Option<Vec<u8>>, Option<Vec<u8>>, i64);
+        // (direction, legacy_sfp, legacy_text, text_enc, sfp_enc, created_at_ms, flags)
+        type RawRow = (
+            i64,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            i64,
+            i64,
+        );
         let i64_limit = i64::try_from(limit).unwrap_or(i64::MAX);
         // Collect raw rows first (the sealed blobs need the vault key to
         // decrypt, which we do after the statement borrow is released).
@@ -1948,7 +2054,7 @@ impl Vault {
             let mut stmt = self
                 .conn
                 .prepare(
-                    "SELECT direction, sender_fp, text, text_enc, sfp_enc, created_at_ms \
+                    "SELECT direction, sender_fp, text, text_enc, sfp_enc, created_at_ms, flags \
                      FROM room_messages \
                      WHERE identity_id = ? AND group_id = ? \
                      ORDER BY id DESC LIMIT ?",
@@ -1963,6 +2069,7 @@ impl Vault {
                         r.get::<_, Option<Vec<u8>>>(3)?,
                         r.get::<_, Option<Vec<u8>>>(4)?,
                         r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
                     ))
                 })
                 .map_err(map_db_err)?;
@@ -1970,7 +2077,7 @@ impl Vault {
                 .map_err(map_db_err)?
         };
         let mut out: Vec<RoomMessageRow> = Vec::with_capacity(raw.len());
-        for (dir, legacy_sfp, legacy_text, text_enc, sfp_enc, created_at_ms) in raw {
+        for (dir, legacy_sfp, legacy_text, text_enc, sfp_enc, created_at_ms, flags) in raw {
             let text = match text_enc {
                 Some(blob) => String::from_utf8_lossy(&self.decrypt_blob(&blob)?).into_owned(),
                 None => legacy_text,
@@ -1984,6 +2091,8 @@ impl Vault {
                 sender_fp,
                 text,
                 created_at_ms,
+                via_hub: flags & MSG_FLAG_VIA_HUB != 0,
+                delivered: flags & MSG_FLAG_DELIVERED != 0,
             });
         }
         // Query returned newest-first (DESC); reverse for oldest-
@@ -2106,7 +2215,16 @@ pub struct RoomMessageRow {
     pub sender_fp: String,
     pub text: String,
     pub created_at_ms: i64,
+    /// The message travelled through a hub rather than a direct session.
+    pub via_hub: bool,
+    /// An outgoing direct message the recipient acknowledged.
+    pub delivered: bool,
 }
+
+/// `room_messages.flags`: the message travelled through a hub.
+pub const MSG_FLAG_VIA_HUB: i64 = 1;
+/// `room_messages.flags`: the recipient acknowledged this outgoing message.
+pub const MSG_FLAG_DELIVERED: i64 = 2;
 
 /// One row of [`Vault::list_received_files`] (T-files.b). Plain
 /// data; the daemon translates this to the API-level shape.
@@ -2602,6 +2720,49 @@ mod tests {
     }
 
     // ── T-polish.3: persistent room scrollback ────────────────────
+
+    // The hub and delivered marks survive in the vault. An acknowledgement
+    // marks the newest unmarked outgoing copy of that text, never an
+    // incoming one or one that went through a hub (those are never
+    // acknowledged), and two identical messages need two.
+    #[test]
+    fn message_marks_are_saved_and_matched_like_the_interface() {
+        let mut v = fresh_vault();
+        let (id, _) = v.create_identity("alice").unwrap();
+        let g = b"dm-1";
+        v.append_room_message_with_flags(id, g, false, "fp_b", "on my way", 1, 0)
+            .unwrap();
+        v.append_room_message_with_flags(id, g, true, "fp_a", "on my way", 2, MSG_FLAG_VIA_HUB)
+            .unwrap();
+        v.append_room_message(id, g, true, "fp_a", "on my way", 3)
+            .unwrap();
+        v.append_room_message(id, g, true, "fp_a", "on my way", 4)
+            .unwrap();
+        v.append_room_message(id, b"other", true, "fp_a", "on my way", 5)
+            .unwrap();
+
+        assert!(v.mark_room_message_delivered(id, g, "on my way").unwrap());
+        let h = v.room_history(id, g, 10).unwrap();
+        let marks: Vec<(bool, bool)> = h.iter().map(|r| (r.via_hub, r.delivered)).collect();
+        assert_eq!(
+            marks,
+            vec![(false, false), (true, false), (false, false), (false, true)],
+            "newest direct outgoing copy is marked first"
+        );
+
+        assert!(v.mark_room_message_delivered(id, g, "on my way").unwrap());
+        assert!(
+            !v.mark_room_message_delivered(id, g, "on my way").unwrap(),
+            "no third direct outgoing copy to mark"
+        );
+        assert!(!v.mark_room_message_delivered(id, g, "never sent").unwrap());
+        let h = v.room_history(id, g, 10).unwrap();
+        assert!(h[2].delivered && h[3].delivered && !h[1].delivered && !h[0].delivered);
+        assert!(
+            !v.room_history(id, b"other", 10).unwrap()[0].delivered,
+            "other conversations are untouched"
+        );
+    }
 
     #[test]
     fn room_messages_append_and_history_round_trip() {

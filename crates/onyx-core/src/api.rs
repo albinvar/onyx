@@ -795,6 +795,9 @@ pub struct HistoryEntry {
     pub ts_unix_ms: u64,
     #[serde(default)]
     pub via_hub: bool,
+    /// Outgoing message the recipient acknowledged (the ✓).
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 /// One row in [`ApiResponse::ListRoomsOk`]. The daemon's
@@ -1571,12 +1574,14 @@ mod tests {
                     text: "hi".into(),
                     ts_unix_ms: 1_700_000_000_000,
                     via_hub: false,
+                    delivered: false,
                 },
                 HistoryEntry {
                     direction: MessageDirection::Outgoing,
                     text: "hey".into(),
                     ts_unix_ms: 1_700_000_000_001,
                     via_hub: true,
+                    delivered: false,
                 },
             ],
         };

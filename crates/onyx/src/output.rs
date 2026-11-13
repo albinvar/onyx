@@ -472,6 +472,7 @@ mod tests {
                 text: "hi\x1b]0;owned\x07\nme  fake line".into(),
                 ts_unix_ms: 1_700_000_000_000,
                 via_hub: true,
+                delivered: false,
             }],
         };
         let text = render(&resp, PLAIN).expect("rendered");

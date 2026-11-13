@@ -2451,6 +2451,7 @@ where
                                 handle_dm_app_frame(&plaintext, peer_pub, peer_fp, state).await
                                 && let Some(text) = unacked.acknowledge(acked)
                             {
+                                mark_dm_delivered(state, peer_pub, &text).await;
                                 state
                                     .conversations
                                     .lock()
@@ -2604,6 +2605,7 @@ pub(crate) async fn persist_dm_message(
     outgoing: bool,
     sender_fp: &str,
     text: &str,
+    via_hub: bool,
 ) {
     let now_ms = i64::try_from(
         std::time::SystemTime::now()
@@ -2614,13 +2616,18 @@ pub(crate) async fn persist_dm_message(
     let vault = state.vault.lock().await;
     match vault.lookup_peer_group(state.identity_id, peer_pub) {
         Ok(Some(group_id)) => {
-            if let Err(e) = vault.append_room_message(
+            if let Err(e) = vault.append_room_message_with_flags(
                 state.identity_id,
                 &group_id,
                 outgoing,
                 sender_fp,
                 text,
                 now_ms,
+                if via_hub {
+                    onyx_core::storage::MSG_FLAG_VIA_HUB
+                } else {
+                    0
+                },
             ) {
                 warn!(error = %e, "dm: persist to room_messages failed");
             }
@@ -2629,6 +2636,17 @@ pub(crate) async fn persist_dm_message(
         // nothing to persist against; the message stays in the ring only.
         Ok(None) => {}
         Err(e) => warn!(error = %e, "dm: lookup_peer_group failed; not persisting"),
+    }
+}
+
+/// Record a delivery receipt on the saved copy of an outgoing DM so the ✓
+/// survives a restart. Best-effort, like [`persist_dm_message`].
+async fn mark_dm_delivered(state: &DaemonState, peer_pub: &[u8; 32], text: &str) {
+    let vault = state.vault.lock().await;
+    if let Ok(Some(group_id)) = vault.lookup_peer_group(state.identity_id, peer_pub)
+        && let Err(e) = vault.mark_room_message_delivered(state.identity_id, &group_id, text)
+    {
+        warn!(error = %e, "dm: could not save the delivered mark");
     }
 }
 
@@ -2688,7 +2706,7 @@ async fn handle_dm_app_frame(
             if is_new {
                 // v0.1.30: persist (encrypted) so the chat survives a
                 // restart, then push to the in-memory ring for the TUI.
-                persist_dm_message(state, peer_pub, false, &sender_fp, &text).await;
+                persist_dm_message(state, peer_pub, false, &sender_fp, &text, false).await;
                 state.conversations.lock().await.push_message(
                     peer_pub,
                     MessageDirection::Incoming,
@@ -2781,7 +2799,7 @@ async fn handle_dm_app_frame(
                     .file_name()
                     .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned());
                 let label = format!("📎 received {fname} — saved to {}", path.display());
-                persist_dm_message(state, peer_pub, false, &sender_fp, &label).await;
+                persist_dm_message(state, peer_pub, false, &sender_fp, &label, false).await;
                 state.conversations.lock().await.push_message(
                     peer_pub,
                     MessageDirection::Incoming,
@@ -4207,7 +4225,7 @@ async fn handle_hub_dm_app_frame(
         // Save it like any other DM. History is served from the vault, so
         // without this a message relayed while we were offline showed up
         // in a live view only: absent from `History`, gone after a restart.
-        persist_dm_message(state, peer_pub, false, &sender_fp, &text).await;
+        persist_dm_message(state, peer_pub, false, &sender_fp, &text, true).await;
     } else {
         debug!("hub DM: non-Text RoomAppMessage on hub path; ignoring");
     }
@@ -4958,6 +4976,10 @@ mod dm_fallback_receive_tests {
         assert_eq!(stored.len(), 1, "hub-relayed DM must be persisted");
         assert_eq!(stored[0].text, "delivered while you were offline");
         assert!(!stored[0].direction_outgoing);
+        assert!(
+            stored[0].via_hub,
+            "the saved copy must keep the hub mark, or it reads as direct after a restart"
+        );
     }
 
     /// `delivery_receipts = false` must stop the acknowledgement entirely —

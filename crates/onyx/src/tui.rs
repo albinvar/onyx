@@ -3588,7 +3588,7 @@ fn merge_history(app: &mut AppState, peer_short: &str, messages: Vec<HistoryEntr
         ts_unix_ms: m.ts_unix_ms,
         via_hub: m.via_hub,
         sender_fp: None,
-        delivered: false,
+        delivered: m.delivered,
     });
     prepend_history_lines(
         app.scrollback.entry(peer_short.to_string()).or_default(),
@@ -7182,18 +7182,21 @@ mod snapshot_tests {
                 text: "old-1".into(),
                 ts_unix_ms: 1_000,
                 via_hub: true,
+                delivered: false,
             },
             HistoryEntry {
                 direction: MessageDirection::Outgoing,
                 text: "old-2".into(),
                 ts_unix_ms: 2_000,
                 via_hub: false,
+                delivered: false,
             },
             HistoryEntry {
                 direction: MessageDirection::Incoming,
                 text: "live-3".into(),
                 ts_unix_ms: 3_000,
                 via_hub: false,
+                delivered: false,
             },
         ];
         merge_history(&mut app, "u5lhmxps", history);
