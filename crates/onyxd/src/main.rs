@@ -48,14 +48,20 @@ struct Args {
 
     /// F2.2a: Tor **bridge** line(s). Repeatable. Connect via an unlisted
     /// relay instead of a public guard, evading IP-blocklists of public
-    /// guards (useful where Tor's public relays are blocked). Vanilla
-    /// format: `<ip:port> <fingerprint>`. Get bridges from
-    /// <https://bridges.torproject.org>. (obfs4/pluggable transports —
-    /// which also defeat DPI fingerprinting — are the planned F2.2b and
-    /// need an external PT binary.) Unset = normal public-guard selection.
-    /// See `TOR-BRIDGES.md`.
+    /// guards (useful where Tor's public relays are blocked). Plain
+    /// format: `<ip:port> <fingerprint>`; `obfs4 …`, `webtunnel …` and
+    /// `snowflake …` lines also disguise the traffic and need lyrebird or
+    /// snowflake-client installed. Get bridges from
+    /// <https://bridges.torproject.org>. Unset = normal public-guard
+    /// selection. See `TOR-BRIDGES.md`.
     #[arg(long = "bridge", action = clap::ArgAction::Append, env = "ONYX_BRIDGE")]
     bridge: Vec<String>,
+
+    /// F2.2b: program for a bridge transport, `<transport>=<absolute path>`
+    /// (e.g. `obfs4=/usr/bin/lyrebird`). Repeatable. Only needed when it
+    /// isn't found on PATH, in Homebrew, or inside Tor Browser.
+    #[arg(long = "pt-binary", action = clap::ArgAction::Append, env = "ONYX_PT_BINARY")]
+    pt_binary: Vec<String>,
 
     /// **Dial mode**: connect to a peer's onion instead of publishing
     /// our own hidden service.
@@ -254,6 +260,7 @@ impl TryFrom<Args> for Config {
             no_tor: a.no_tor,
             tor_state_dir: a.tor_state_dir,
             bridges: a.bridge,
+            pt_binaries: a.pt_binary,
             dial_onion: a.dial_onion,
             dial_pubkey: a.dial_pubkey,
             api_socket: a

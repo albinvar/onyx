@@ -198,6 +198,10 @@ pub struct Config {
     /// guards (evades IP-blocklists of public guards). Empty = default
     /// guard selection. See `TOR-BRIDGES.md`.
     pub bridges: Vec<String>,
+    /// F2.2b: pluggable-transport binaries, `<transport>=<absolute path>`
+    /// (e.g. `obfs4=/usr/bin/lyrebird`). Only needed when a bridge names a
+    /// transport and the binary isn't found automatically.
+    pub pt_binaries: Vec<String>,
     pub dial_onion: Option<String>,
     pub dial_pubkey: Option<String>,
     pub api_socket: String,
@@ -384,6 +388,10 @@ pub struct DaemonState {
     /// anywhere. The optional identity/reachability session is not
     /// tracked, so a hub is counted once however many sessions it has.
     pub hub_links: Arc<std::sync::Mutex<Vec<Arc<hub_client::HubLink>>>>,
+    /// How Tor reaches the network, one entry per configured bridge: the
+    /// transport name (`obfs4`, `snowflake`, …) or `plain`. Empty = public
+    /// guards. Never holds the bridge addresses.
+    pub tor_bridges: Vec<String>,
 }
 
 /// v0.1.17: a peer's persisted direct-dial coordinates — exactly the
@@ -804,6 +812,11 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
         delivery_receipts: args.delivery_receipts,
         // v0.1.28: live hub-connectivity counter (honest health line).
         hub_links: Arc::default(),
+        tor_bridges: args
+            .bridges
+            .iter()
+            .map(|b| onyx_core::tor::bridge_transport(b).unwrap_or_else(|| "plain".into()))
+            .collect(),
     });
 
     drop(args.passphrase);
@@ -954,11 +967,24 @@ pub async fn run(args: Config) -> anyhow::Result<()> {
                 "tor: using configured bridge(s) (F2.2a)"
             );
         }
+        // F2.2b: find the transport programs obfs4/snowflake bridges need.
+        // Missing one stops startup: connecting without the bridge would
+        // expose Tor use on exactly the networks the user wanted to hide it.
+        let transports = onyx_core::tor::resolve_transports(
+            &args.bridges,
+            &args.pt_binaries,
+            &onyx_core::tor::find_pt_binary,
+        )
+        .map_err(|e| anyhow::anyhow!("tor bridges: {e}"))?;
         // F2.2a: thread the bridge list (empty = default guard selection,
         // identical to the pre-F2.2 path).
-        TorRuntime::bootstrap_with_bridges(args.tor_state_dir.as_deref(), &args.bridges)
-            .await
-            .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
+        TorRuntime::bootstrap_with_bridges(
+            args.tor_state_dir.as_deref(),
+            &args.bridges,
+            &transports,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("tor bootstrap failed: {e}"))?
     };
     info!("Tor bootstrap complete");
     let tor = Arc::new(tor);
@@ -4822,6 +4848,7 @@ mod dm_fallback_receive_tests {
             message_retention_secs: None,
             delivery_receipts: true,
             hub_links: std::sync::Arc::default(),
+            tor_bridges: Vec::new(),
         })
     }
 

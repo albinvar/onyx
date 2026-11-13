@@ -146,13 +146,21 @@ struct Args {
     #[arg(long, env = "ONYX_COVER_TRAFFIC_MEAN_SECS", global = true)]
     cover_traffic_mean_secs: Option<u64>,
 
-    /// F2.2a: Tor **bridge** line(s). Repeatable. Connect via an unlisted
-    /// relay instead of a public guard (evades IP-blocklists of public
-    /// guards). Vanilla format `<ip:port> <fingerprint>`; get bridges from
-    /// <https://bridges.torproject.org>. Also settable as `bridges` in
-    /// config.json. See `TOR-BRIDGES.md`.
+    /// Tor **bridge** line(s). Repeatable. Connect through an unlisted
+    /// relay instead of a public one. Plain `<ip:port> <fingerprint>`, or
+    /// `obfs4 …` / `webtunnel …` / `snowflake …` lines, which also disguise
+    /// the traffic (they need lyrebird or snowflake-client installed). Get
+    /// bridges from <https://bridges.torproject.org>. Also settable as
+    /// `bridges` in config.json. See `TOR-BRIDGES.md`.
     #[arg(long = "bridge", action = clap::ArgAction::Append, global = true)]
     bridge: Vec<String>,
+
+    /// Program for a bridge transport, `<transport>=<absolute path>`
+    /// (e.g. `obfs4=/usr/bin/lyrebird`). Repeatable. Only needed when it
+    /// isn't found on PATH, in Homebrew, or inside Tor Browser. Also
+    /// settable as `pt_binaries` in config.json.
+    #[arg(long = "pt-binary", action = clap::ArgAction::Append, global = true)]
+    pt_binary: Vec<String>,
 
     /// **Opt-in, "high mode".** Slot interval (in milliseconds) for
     /// constant-rate client→hub cover traffic. When set, the daemon
@@ -741,6 +749,9 @@ struct FileConfig {
     /// F2.2a: Tor bridge line(s), same grammar as `--bridge`.
     #[serde(default)]
     bridges: Vec<String>,
+    /// F2.2b: transport programs, same grammar as `--pt-binary`.
+    #[serde(default)]
+    pt_binaries: Vec<String>,
     /// P2P direct-dial target onion (`onion` or `onion:port`).
     #[serde(default)]
     dial_onion: Option<String>,
@@ -1027,6 +1038,11 @@ fn build_daemon_config(
     } else {
         args.bridge.clone()
     };
+    let pt_binaries = if args.pt_binary.is_empty() {
+        file_cfg.pt_binaries.clone()
+    } else {
+        args.pt_binary.clone()
+    };
     // A peer dial (Tor onion or test TCP) needs the peer's identity key,
     // or the daemon would silently fall back to accept mode (lib.rs:878).
     // Fail loudly so a half-typed P2P dial doesn't look like "nothing
@@ -1050,6 +1066,7 @@ fn build_daemon_config(
             || (!args.hub_tcp.is_empty() && args.hubs.is_empty()),
         tor_state_dir: None,
         bridges,
+        pt_binaries,
         // P2P: direct onion dial needs Tor (never a no-Tor path), so it
         // doesn't appear in the `no_tor` condition above — it just wires
         // the target through to `run_dial_mode`. Resolved CLI-over-file.
@@ -2262,7 +2279,7 @@ fn diagnose(
                 log.dial_failed, log.circuit_failed, log.guard_trouble, log.hs_upload_timeout
             ),
             fix: Some(
-                "usually the network throttling/blocking Tor — try another network (e.g. phone hotspot). A vanilla `--bridge` helps only if Tor guards are IP-blocked; it does NOT defeat DPI/throttling (obfs4 isn't built yet)".into(),
+                "usually the network throttling/blocking Tor — try another network (e.g. phone hotspot). or add an obfs4 / webtunnel / snowflake bridge (`--bridge`, needs lyrebird or snowflake-client), which disguises Tor traffic. A plain bridge only helps if Tor's public relays are blocked by address".into(),
             ),
         }
     } else {

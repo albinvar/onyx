@@ -645,6 +645,11 @@ pub enum ApiResponse {
         queued_messages: u32,
         /// Room invitations waiting for a decision.
         pending_invites: u32,
+        /// How Tor reaches the network: one entry per configured bridge,
+        /// its transport (`obfs4`, `snowflake`, …) or `plain`. Empty =
+        /// public Tor relays. Never carries bridge addresses.
+        #[serde(default)]
+        tor_bridges: Vec<String>,
     },
     /// Reply to [`ApiRequest::LeaveRoom`] (T-polish.2). `members`
     /// is the pre-leave roster (the count of other members the

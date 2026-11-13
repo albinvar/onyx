@@ -4574,6 +4574,7 @@ struct NetworkReport {
     rooms: u32,
     queued_messages: u32,
     pending_invites: u32,
+    tor_bridges: Vec<String>,
 }
 
 /// Gather the Network screen's data. Talks only to the local daemon and
@@ -4596,6 +4597,7 @@ async fn open_network_modal(app: &mut AppState) {
             rooms,
             queued_messages,
             pending_invites,
+            tor_bridges,
         }) => Ok(NetworkReport {
             hubs,
             dm_hub_fallback,
@@ -4605,6 +4607,7 @@ async fn open_network_modal(app: &mut AppState) {
             rooms,
             queued_messages,
             pending_invites,
+            tor_bridges,
         }),
         Ok(ApiResponse::Error { message, .. }) => Err(message),
         Ok(_) => Err("this daemon is too old to report network status".to_string()),
@@ -4687,6 +4690,15 @@ fn network_lines(v: &NetworkView) -> Vec<Line<'static>> {
         label("Tor"),
         Span::styled(tor_text, tor_style),
     ]));
+    if let Ok(r) = &v.report {
+        lines.push(Line::from(vec![
+            label("Connects via"),
+            Span::styled(
+                crate::output::describe_tor_route(&r.tor_bridges),
+                theme::text(),
+            ),
+        ]));
+    }
     lines.push(Line::from(vec![
         label("Your address"),
         if v.onion_published {
@@ -6838,6 +6850,7 @@ mod snapshot_tests {
             rooms: 1,
             queued_messages: 0,
             pending_invites: 0,
+            tor_bridges: vec!["obfs4".into(), "obfs4".into(), "plain".into()],
         };
         let mut app = mock_app_with_status(TorState::Ready);
         app.modal = Some(ModalState::Network(Box::new(network_view(Ok(report)))));
@@ -6855,6 +6868,10 @@ mod snapshot_tests {
         assert!(out.contains("not used"), "{out}");
         assert!(out.contains("Receipts"), "{out}");
         assert!(out.contains("Nothing here is sent anywhere"), "{out}");
+        assert!(
+            out.contains("2 obfs4 bridges, 1 plain bridge (traffic disguised)"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -6869,6 +6886,7 @@ mod snapshot_tests {
             rooms: 0,
             queued_messages: 0,
             pending_invites: 0,
+            tor_bridges: Vec::new(),
         }));
         v.use_public_hubs = false;
         app.modal = Some(ModalState::Network(Box::new(v)));
@@ -6876,6 +6894,7 @@ mod snapshot_tests {
         assert!(out.contains("most private setup"), "{out}");
         assert!(out.contains("no hub is configured"), "{out}");
         assert!(out.contains("public list is off"), "{out}");
+        assert!(out.contains("public Tor relays"), "{out}");
 
         app.modal = Some(ModalState::Network(Box::new(network_view(Err(
             "connection refused".into(),

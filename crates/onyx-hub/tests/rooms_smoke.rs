@@ -178,6 +178,7 @@ async fn spawn_daemon_full(
         no_tor: false,
         tor_state_dir: None,
         bridges: Vec::new(),
+        pt_binaries: Vec::new(),
         dial_onion: None,
         dial_pubkey: None,
         api_socket: api_socket_path.to_string_lossy().into_owned(),

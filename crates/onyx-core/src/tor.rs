@@ -100,19 +100,26 @@ impl TorRuntime {
     /// via the unlisted bridge relay(s) instead of public guards, evading
     /// IP-blocklists of public guards. Empty `bridges` → default guard
     /// selection (byte-identical to the no-bridge path). See `TOR-BRIDGES.md`.
+    ///
+    /// F2.2b: `transports` are the pluggable-transport binaries for bridge
+    /// lines that name a transport (`obfs4 …`, `snowflake …`); resolve them
+    /// with [`resolve_transports`] first.
     pub async fn bootstrap_with_bridges(
         state_dir: Option<&std::path::Path>,
         bridges: &[String],
+        transports: &[PtBinary],
     ) -> Result<Self> {
-        Self::bootstrap_with(state_dir, bridges).await
+        Self::bootstrap_with_config(build_tor_config(state_dir, bridges, transports)?).await
     }
 
     async fn bootstrap_with(
         state_dir: Option<&std::path::Path>,
         bridges: &[String],
     ) -> Result<Self> {
-        let config = build_tor_config(state_dir, bridges)?;
+        Self::bootstrap_with_config(build_tor_config(state_dir, bridges, &[])?).await
+    }
 
+    async fn bootstrap_with_config(config: TorClientConfig) -> Result<Self> {
         // Surface the effective HS vanguard mode at startup. This is
         // CONFIG, not identity — safe to log per D-3. If this ever prints
         // anything other than "full" the guard-discovery defense (A1.3)
@@ -247,9 +254,11 @@ impl TorRuntime {
 fn build_tor_config(
     state_dir: Option<&std::path::Path>,
     bridges: &[String],
+    transports: &[PtBinary],
 ) -> Result<TorClientConfig> {
     use arti_client::config::BridgeConfigBuilder;
     use arti_client::config::CfgPath;
+    use arti_client::config::pt::TransportConfigBuilder;
     use arti_client::config::vanguards::VanguardConfigBuilder;
     use tor_config::ExplicitOrAuto;
     use tor_guardmgr::VanguardMode;
@@ -278,6 +287,29 @@ fn build_tor_config(
         );
     }
 
+    // F2.2b: one managed transport per binary. Arti refuses to build a
+    // config whose bridges name a transport nothing provides, so a missing
+    // binary is a hard error rather than a silent fallback to public guards.
+    for pt in transports {
+        let mut names = Vec::with_capacity(pt.protocols.len());
+        for p in &pt.protocols {
+            names.push(p.parse().map_err(|_| {
+                tracing::error!(transport = %p, "tor: invalid transport name");
+                Error::InvalidEncoding("tor: invalid transport name")
+            })?);
+        }
+        let mut t = TransportConfigBuilder::default();
+        t.protocols(names)
+            .path(CfgPath::new_literal(&pt.path))
+            .run_on_startup(false);
+        builder.bridges().transports().push(t);
+        tracing::info!(
+            transports = %pt.protocols.join(","),
+            binary = %pt.path.display(),
+            "tor: pluggable transport configured (F2.2b)"
+        );
+    }
+
     // Pin Full. `.vanguards()` returns the sub-builder (like `.storage()`);
     // `.mode()` takes `ExplicitOrAuto<VanguardMode>` — `Explicit` (not
     // `Auto`) is what makes this a hard pin rather than "inherit the
@@ -292,6 +324,161 @@ fn build_tor_config(
         tracing::error!(error = %e, "tor: config build failed");
         Error::Internal("tor: config build failed (see tracing log)")
     })
+}
+
+/// F2.2b: a pluggable-transport client binary and the transports it provides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtBinary {
+    /// Transport names, e.g. `["obfs4", "webtunnel"]`.
+    pub protocols: Vec<String>,
+    /// Absolute path to the binary (e.g. `/usr/bin/lyrebird`).
+    pub path: std::path::PathBuf,
+}
+
+/// The transport a bridge line names (`"obfs4"`, `"snowflake"`, …), or
+/// `None` for a plain bridge (`<ip:port> <fingerprint>`). Accepts the
+/// optional leading `Bridge` keyword that Tor Browser and BridgeDB print.
+#[must_use]
+pub fn bridge_transport(line: &str) -> Option<String> {
+    let mut words = line.split_whitespace();
+    let mut first = words.next()?;
+    if first.eq_ignore_ascii_case("bridge") {
+        first = words.next()?;
+    }
+    // Transport names are identifiers, so they never start with a digit;
+    // an address starts with a digit (IPv4) or `[` (IPv6).
+    if first.starts_with('[') || first.starts_with(|c: char| c.is_ascii_digit()) {
+        None
+    } else {
+        Some(first.to_ascii_lowercase())
+    }
+}
+
+/// Parse a `--pt-binary` value: `<transport>[,<transport>…]=<absolute path>`,
+/// e.g. `obfs4=/usr/bin/lyrebird` or `obfs4,webtunnel=/opt/lyrebird`.
+///
+/// # Errors
+/// A readable message if the value is malformed or the path is relative.
+pub fn parse_pt_binary(spec: &str) -> std::result::Result<PtBinary, String> {
+    let (names, path) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("expected <transport>=<path>, got {spec:?}"))?;
+    let protocols: Vec<String> = names
+        .split(',')
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if protocols.is_empty() {
+        return Err(format!("no transport name before '=' in {spec:?}"));
+    }
+    let path = std::path::PathBuf::from(path.trim());
+    if !path.is_absolute() {
+        return Err(format!(
+            "transport binary path must be absolute, got {:?}",
+            path.display()
+        ));
+    }
+    Ok(PtBinary { protocols, path })
+}
+
+/// Binaries that are known to provide each transport, best first.
+/// lyrebird is the Tor Project's maintained obfs4 client (successor to
+/// obfs4proxy, which does not speak webtunnel).
+fn known_pt_binaries(transport: &str) -> &'static [&'static str] {
+    match transport {
+        "obfs4" => &["lyrebird", "obfs4proxy"],
+        "webtunnel" | "meek_lite" => &["lyrebird"],
+        "snowflake" => &["snowflake-client", "lyrebird"],
+        _ => &[],
+    }
+}
+
+/// Where to look for a transport binary that is not on `PATH`: the usual
+/// package locations plus the copies Tor Browser ships with.
+const PT_SEARCH_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/Applications/Tor Browser.app/Contents/MacOS/Tor/PluggableTransports",
+];
+
+/// Find an executable named `name` on `PATH` or in [`PT_SEARCH_DIRS`].
+#[must_use]
+pub fn find_pt_binary(name: &str) -> Option<std::path::PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    path_dirs
+        .into_iter()
+        .chain(PT_SEARCH_DIRS.iter().map(std::path::PathBuf::from))
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| is_executable_file(p))
+}
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// F2.2b: work out which transport binaries the configured bridges need.
+///
+/// Explicit `--pt-binary` entries win. Any transport a bridge names that
+/// they don't cover is looked up with `find` (normally [`find_pt_binary`])
+/// among the binaries known to provide it. Transports served by the same
+/// binary are grouped so it runs once.
+///
+/// # Errors
+/// A message naming the transport if a bridge needs one that can't be found,
+/// so the daemon stops instead of connecting without the bridge.
+pub fn resolve_transports(
+    bridges: &[String],
+    explicit: &[String],
+    find: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> std::result::Result<Vec<PtBinary>, String> {
+    let mut out: Vec<PtBinary> = Vec::new();
+    for spec in explicit {
+        out.push(parse_pt_binary(spec)?);
+    }
+    let mut needed: Vec<String> = bridges.iter().filter_map(|b| bridge_transport(b)).collect();
+    needed.sort();
+    needed.dedup();
+    for transport in needed {
+        if out.iter().any(|b| b.protocols.contains(&transport)) {
+            continue;
+        }
+        let candidates = known_pt_binaries(&transport);
+        let Some(path) = candidates.iter().find_map(|name| find(name)) else {
+            let hint = if candidates.is_empty() {
+                String::new()
+            } else {
+                format!(" (install {})", candidates.join(" or "))
+            };
+            return Err(format!(
+                "a bridge uses the {transport} transport but no program for it was found{hint}; \
+                 or set pt_binaries / --pt-binary {transport}=/path/to/program"
+            ));
+        };
+        if let Some(existing) = out.iter_mut().find(|b| b.path == path) {
+            existing.protocols.push(transport);
+        } else {
+            out.push(PtBinary {
+                protocols: vec![transport],
+                path,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// A1.3: the effective vanguard mode the daemon will run with. Used by the
@@ -453,7 +640,7 @@ mod tests {
     /// regressed to inheriting the consensus default.
     #[test]
     fn tor_config_pins_full_vanguards() {
-        let config = build_tor_config(None, &[]).expect("config build");
+        let config = build_tor_config(None, &[], &[]).expect("config build");
         assert_eq!(
             effective_vanguard_mode(&config),
             tor_guardmgr::VanguardMode::Full,
@@ -463,7 +650,7 @@ mod tests {
         // Also hold under the multi-daemon state-dir path (what the
         // daemon actually uses via bootstrap_with_state_dir).
         let tmp = std::env::temp_dir();
-        let config2 = build_tor_config(Some(&tmp), &[]).expect("config build (state dir)");
+        let config2 = build_tor_config(Some(&tmp), &[], &[]).expect("config build (state dir)");
         assert_eq!(
             effective_vanguard_mode(&config2),
             tor_guardmgr::VanguardMode::Full,
@@ -478,7 +665,7 @@ mod tests {
         // bootstrap — just assert the bridge plumbing + that vanguards are
         // still pinned alongside bridges.
         let bridges = vec!["192.0.2.10:443 0123456789ABCDEF0123456789ABCDEF01234567".to_string()];
-        let cfg = build_tor_config(None, &bridges).expect("bridge config should build");
+        let cfg = build_tor_config(None, &bridges, &[]).expect("bridge config should build");
         assert_eq!(
             effective_vanguard_mode(&cfg),
             tor_guardmgr::VanguardMode::Full,
@@ -493,8 +680,92 @@ mod tests {
         // you're bridged).
         let bridges = vec!["definitely not a bridge line".to_string()];
         assert!(
-            build_tor_config(None, &bridges).is_err(),
+            build_tor_config(None, &bridges, &[]).is_err(),
             "a malformed bridge line must fail config build"
+        );
+    }
+
+    // Made-up obfs4 bridge from Arti's own docs; never dialled in tests.
+    const OBFS4_LINE: &str = "obfs4 192.0.2.55:38114 316E643333645F6D79216558614D3931657A5F5F \
+        cert=YXJlIGZyZXF1ZW50bHkgZnVsbCBvZiBsaXR0bGUgbWVzc2FnZXMgeW91IGNhbiBmaW5kLg iat-mode=0";
+
+    #[test]
+    fn bridge_transport_reads_the_first_word() {
+        assert_eq!(bridge_transport(OBFS4_LINE).as_deref(), Some("obfs4"));
+        assert_eq!(
+            bridge_transport(&format!("Bridge {OBFS4_LINE}")).as_deref(),
+            Some("obfs4")
+        );
+        assert_eq!(
+            bridge_transport("192.0.2.10:443 0123456789ABCDEF0123456789ABCDEF01234567"),
+            None
+        );
+        assert_eq!(bridge_transport("[2001:db8::1]:443 0123456789ABCDEF"), None);
+        assert_eq!(bridge_transport("   "), None);
+    }
+
+    #[test]
+    fn pt_binary_spec_needs_names_and_an_absolute_path() {
+        let b = parse_pt_binary("obfs4,WebTunnel=/usr/bin/lyrebird").unwrap();
+        assert_eq!(b.protocols, vec!["obfs4", "webtunnel"]);
+        assert_eq!(b.path, std::path::PathBuf::from("/usr/bin/lyrebird"));
+        assert!(parse_pt_binary("/usr/bin/lyrebird").is_err());
+        assert!(parse_pt_binary("=/usr/bin/lyrebird").is_err());
+        assert!(parse_pt_binary("obfs4=lyrebird").is_err(), "relative path");
+    }
+
+    #[test]
+    fn resolve_transports_finds_groups_and_refuses_missing() {
+        let lyrebird = std::path::PathBuf::from("/x/lyrebird");
+        let find = |name: &str| (name == "lyrebird").then(|| lyrebird.clone());
+        let bridges = vec![
+            OBFS4_LINE.to_string(),
+            "webtunnel 192.0.2.3:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://e.example/x"
+                .to_string(),
+            "192.0.2.10:443 0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+        ];
+        let got = resolve_transports(&bridges, &[], &find).unwrap();
+        assert_eq!(
+            got,
+            vec![PtBinary {
+                protocols: vec!["obfs4".into(), "webtunnel".into()],
+                path: lyrebird.clone()
+            }],
+            "one process for both transports"
+        );
+
+        // Plain bridges need nothing.
+        assert!(
+            resolve_transports(&bridges[2..], &[], &find)
+                .unwrap()
+                .is_empty()
+        );
+
+        // An explicit entry wins over the search.
+        let got = resolve_transports(&bridges[..1], &["obfs4=/opt/o4".into()], &|_| None).unwrap();
+        assert_eq!(got[0].path, std::path::PathBuf::from("/opt/o4"));
+
+        // Nothing found: a clear error naming the transport.
+        let err = resolve_transports(&bridges[..1], &[], &|_| None).unwrap_err();
+        assert!(err.contains("obfs4") && err.contains("lyrebird"), "{err}");
+    }
+
+    #[test]
+    fn obfs4_bridge_builds_only_with_its_transport() {
+        let bridges = vec![OBFS4_LINE.to_string()];
+        let pt = vec![PtBinary {
+            protocols: vec!["obfs4".into()],
+            path: "/usr/bin/lyrebird".into(),
+        }];
+        let cfg = build_tor_config(None, &bridges, &pt).expect("obfs4 config should build");
+        assert_eq!(
+            effective_vanguard_mode(&cfg),
+            tor_guardmgr::VanguardMode::Full,
+            "vanguards must still be pinned with a pluggable transport"
+        );
+        assert!(
+            build_tor_config(None, &bridges, &[]).is_err(),
+            "an obfs4 bridge with no transport must not silently build"
         );
     }
 

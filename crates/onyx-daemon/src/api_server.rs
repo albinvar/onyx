@@ -1637,6 +1637,7 @@ async fn handle_network_status(state: &DaemonState) -> ApiResponse {
         rooms: n(rooms),
         queued_messages: n(queued),
         pending_invites: n(pending_invites),
+        tor_bridges: state.tor_bridges.clone(),
     }
 }
 
@@ -3966,6 +3967,7 @@ mod tests {
             message_retention_secs: None,
             delivery_receipts: true,
             hub_links: std::sync::Arc::default(),
+            tor_bridges: Vec::new(),
         });
         (state, encode_b32(group_id))
     }
@@ -4208,6 +4210,7 @@ mod tests {
             message_retention_secs: None,
             delivery_receipts: true,
             hub_links: std::sync::Arc::default(),
+            tor_bridges: Vec::new(),
         });
 
         // Independently derive the PEER's token for this group, and the
@@ -4294,6 +4297,7 @@ mod tests {
             message_retention_secs: None,
             delivery_receipts: true,
             hub_links: std::sync::Arc::default(),
+            tor_bridges: Vec::new(),
         });
 
         let ok = dm_hub_fallback_send(&peer_pub, "hi", &state).await;

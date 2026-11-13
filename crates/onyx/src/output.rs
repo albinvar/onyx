@@ -269,7 +269,9 @@ pub fn render(resp: &ApiResponse, style: Style) -> Option<String> {
             rooms,
             queued_messages,
             pending_invites,
+            tor_bridges,
         } => {
+            let _ = writeln!(out, "tor via     {}", describe_tor_route(tor_bridges));
             if hubs.is_empty() {
                 let _ = writeln!(out, "hubs        none (direct contact only)");
             }
@@ -422,6 +424,37 @@ fn render_contacts(out: &mut String, contacts: &[ContactInfo], style: Style) {
         };
         let _ = writeln!(out, "{}  {flag}", contact.fingerprint);
     }
+}
+
+/// How Tor reaches the network, in words: "public Tor relays", or the
+/// configured bridges grouped by transport ("2 obfs4 bridges"). Disguised
+/// transports are marked, because that is what the user chose them for.
+pub(crate) fn describe_tor_route(bridges: &[String]) -> String {
+    if bridges.is_empty() {
+        return "public Tor relays".to_string();
+    }
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    for b in bridges {
+        let b = clean(b);
+        match kinds.iter_mut().find(|(k, _)| *k == b) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((b, 1)),
+        }
+    }
+    let parts: Vec<String> = kinds
+        .iter()
+        .map(|(k, n)| format!("{n} {k} bridge{}", if *n == 1 { "" } else { "s" }))
+        .collect();
+    let disguised = bridges.iter().any(|b| b != "plain");
+    format!(
+        "{}{}",
+        parts.join(", "),
+        if disguised {
+            " (traffic disguised)"
+        } else {
+            ""
+        }
+    )
 }
 
 #[cfg(test)]
