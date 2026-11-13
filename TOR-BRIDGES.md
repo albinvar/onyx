@@ -1,7 +1,65 @@
-# F2.2 design — Tor bridges & pluggable transports
+# Tor bridges & pluggable transports
 
-**Status:** design doc for review (fortification Phase 2, F2.2). **No code
-yet.** Researched against arti-client 0.42's actual API before any change.
+**Status:** plain bridges (F2.2a) and obfs4 / webtunnel / snowflake
+(F2.2b) are built. The design notes below are kept for the record.
+
+## Using a bridge
+
+Use one when Tor is blocked or slow where you are, or when you don't want
+your network to see that you use Tor.
+
+1. **Install a transport program** (not needed for plain bridges):
+
+   | System | Command |
+   |---|---|
+   | Debian / Ubuntu / Raspberry Pi OS | `sudo apt install obfs4proxy snowflake-client` (or `lyrebird` where packaged) |
+   | macOS | Install Tor Browser. Onyx uses the copies inside it. |
+   | Termux | `pkg install obfs4proxy` |
+
+   Onyx looks on `PATH`, in `/usr/bin`, `/usr/local/bin`, Homebrew, and
+   inside Tor Browser. If yours is elsewhere, tell it:
+   `--pt-binary obfs4=/full/path/to/lyrebird`.
+
+2. **Get bridge lines.** From <https://bridges.torproject.org>, by email
+   to `bridges@torproject.org`, or from Tor Browser's settings. They look
+   like this:
+
+   ```
+   obfs4 192.0.2.55:38114 316E6433…5F5F cert=YXJl…ZmluZC4 iat-mode=0
+   ```
+
+3. **Give them to Onyx**, either on the command line
+   (`onyx --bridge "obfs4 …" --bridge "obfs4 …"`) or in
+   `~/.onyx/config.json`:
+
+   ```json
+   { "bridges": ["obfs4 …", "obfs4 …"] }
+   ```
+
+   Then restart Onyx. `Ctrl-T` shows **Connects via: 2 obfs4 bridges
+   (traffic disguised)**.
+
+If a bridge needs a program Onyx cannot find, Onyx refuses to start and
+says which one. It never quietly connects without the bridge.
+
+Tested on Linux with `obfs4proxy` (obfs4) and `snowflake-client`
+(snowflake). lyrebird, webtunnel and macOS have not been tested yet.
+
+| Kind | Hides | Program |
+|---|---|---|
+| plain | which relay you use (beats address blocklists) | none |
+| `obfs4` | that the traffic is Tor | lyrebird or obfs4proxy |
+| `webtunnel` | that the traffic is Tor; looks like HTTPS to a website | lyrebird |
+| `snowflake` | that the traffic is Tor; goes through volunteer browser proxies; slow | snowflake-client |
+
+What bridges do **not** do: they change whether your network can see or
+block Tor, not your anonymity once connected. The bridge operator sees
+your IP address and that you use Tor, as your first relay always does.
+Bridge lines you got from a public source may also be known to a censor.
+
+---
+
+# Design notes (F2.2)
 
 Goal: let a user **hide that they use Tor at all** — the highest-leverage
 opsec Onyx could ship. Today Onyx connects to public Tor guard relays whose
@@ -117,10 +175,15 @@ layers on top — verify they compose, they should).
    `tor_config_accepts_vanilla_bridge_and_keeps_vanguards`,
    `tor_config_rejects_garbage_bridge_line`. Ships the IP-blocklist-evasion
    tier.
-2. **F2.2b — pluggable transports / obfs4 (`pt-client`).** Add the managed
-   `TransportConfigBuilder` + `--pt-binary` config + **per-platform docs**
-   for installing lyrebird/snowflake. The real censorship-resistance tier;
-   bigger because of the external-binary dependency + docs.
+2. **F2.2b — pluggable transports (`pt-client`).** ✅ **DONE.** Enabled
+   `pt-client`. `onyx_core::tor::resolve_transports` reads the transport
+   each bridge line names and finds its program (PATH, the usual package
+   directories, Homebrew, Tor Browser on macOS); `--pt-binary` /
+   `pt_binaries` override. One managed transport per program, launched
+   on demand. A missing program is a startup error. The Network screen
+   and `onyx network` show the transports in use, never addresses.
+   Answers to §7: always on (adds one crate, `tor-ptmgr`); CLI + config
+   only, no bridge manager screen yet; no built-in bridge list.
 3. **Defer / document:** bundling a PT binary; automatic bridge fetching
    (moat/BridgeDB client) — both their own efforts.
 

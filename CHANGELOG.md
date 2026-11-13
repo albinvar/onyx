@@ -6,7 +6,38 @@ Use this file as the single chronological view of where the project is. Implemen
 
 ---
 
-## Privacy + delivery — 2026-11-13 — receipts switch, network screen, docs correction
+## Censorship — 2026-11-13 — obfs4, webtunnel and snowflake bridges
+
+**Bridges that disguise Tor (F2.2b)**
+
+- Bridge lines that name a transport (`obfs4 …`, `webtunnel …`,
+  `snowflake …`) now work. Arti launches the transport program and the
+  traffic no longer looks like Tor to the network. Plain bridges (F2.2a)
+  only hid which relay you used.
+- Onyx finds the program itself (PATH, `/usr/bin`, `/usr/local/bin`,
+  Homebrew, Tor Browser's copies on macOS); `--pt-binary obfs4=/path` or
+  `"pt_binaries"` in config.json overrides. If a bridge's program is
+  missing, Onyx stops at startup and names it: connecting without the
+  bridge would expose Tor use on exactly the network the user wanted to
+  hide it from.
+- `Ctrl-T` and `onyx network` show **Connects via**: public Tor relays,
+  or the bridges by kind. Bridge addresses are never shown or logged.
+- No transport bridge configured: nothing new is launched.
+- Adds one crate (`tor-ptmgr`, Arti's own).
+
+**Tested over real Tor on a Raspberry Pi (Debian 13, aarch64),** using
+Tor Browser's public built-in bridges:
+
+- obfs4 via `obfs4proxy`: address published in 20 s; the daemon's only
+  connection was to the local transport, which alone talked to the
+  bridges; a direct session to another user formed and a message
+  arrived (first connect 207 s, ordinary onion-service slowness).
+- snowflake via `snowflake-client`: address published in 45 s; same
+  connection check passed.
+- **Not tested:** lyrebird, webtunnel, macOS with Tor Browser's copies,
+  Termux. These follow the same code path but have not been run.
+
+ — receipts switch, network screen, docs correction
 
 **Delivery receipts can be switched off**
 

@@ -151,11 +151,26 @@ Common ones:
 | What you see | What it usually means |
 |---|---|
 | Friend stays `○` | They are offline, or Tor is having a slow moment. Give it a couple of minutes. |
-| "Tor starting" for a long time | Slow network. If Tor is blocked where you are, see `TOR-BRIDGES.md`. |
+| "Tor starting" for a long time | Slow network. If Tor is blocked where you are, use a bridge (below). |
 | Onyx will not start, says the vault is locked | It is already running in another window. |
 | Wrong passphrase | It cannot be recovered. Sorry — that is the price of nobody else being able to open it either. |
 
 Press `F1` in the chat screen any time to see every key.
+
+### If Tor is blocked, or you don't want your network to see it
+
+A **bridge** is a private entrance to Tor. An `obfs4` bridge also makes
+your traffic not look like Tor.
+
+1. Install the helper: `sudo apt install obfs4proxy` on Linux, or install
+   Tor Browser on a Mac (Onyx borrows its copy).
+2. Get two or three bridge lines from <https://bridges.torproject.org>.
+3. Put them in `~/.onyx/config.json`:
+   `{ "bridges": ["obfs4 …", "obfs4 …"] }` and restart Onyx.
+
+`Ctrl-T` then says **Connects via: obfs4 bridges (traffic disguised)**.
+If the helper is missing, Onyx tells you and does not start, rather than
+connecting without the bridge. Details: `TOR-BRIDGES.md`.
 
 ## Keeping yourself safe
 

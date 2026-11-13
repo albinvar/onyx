@@ -65,8 +65,8 @@ independent scrutiny.
 
 Stated plainly, because these matter more than the list above:
 
-- **It does not hide that you use Tor**, unless you configure bridges
-  ([`TOR-BRIDGES.md`](./TOR-BRIDGES.md)).
+- **It does not hide that you use Tor**, unless you configure an obfs4,
+  webtunnel or snowflake bridge ([`TOR-BRIDGES.md`](./TOR-BRIDGES.md)).
 - **It does not defeat a global passive adversary.** Someone who can watch both
   ends of a Tor circuit can correlate timing. Optional cover traffic raises the
   cost; it does not remove the attack.
@@ -248,7 +248,8 @@ reach the daemon.
 | Passphrase | — | `ONYX_PASSPHRASE` | prompted |
 | API socket | `--socket` | `ONYX_API_SOCKET` | `~/.onyx/onyx.sock` |
 | Hub (repeatable) | `--hub onion:port,pubkey` | — | none |
-| Tor bridge (repeatable) | `--bridge` | — | none |
+| Tor bridge (repeatable); `obfs4`, `webtunnel`, `snowflake` or plain | `--bridge`; config `"bridges"` | — | none |
+| Program for a bridge transport, if not found automatically | `--pt-binary obfs4=/path`; config `"pt_binaries"` | — | searched |
 | Cover traffic | `--cover-traffic-mean-secs`, `--constant-rate-ms` | `ONYX_COVER_TRAFFIC_MEAN_SECS`, `ONYX_CONSTANT_RATE_MS` | off |
 | Reachable for first contact via hub | `--first-contact-reachable` | `ONYX_FIRST_CONTACT_REACHABLE` | off |
 | Relay DMs via hub when peer offline | `--dm-hub-fallback`; config `"dm_hub_fallback": false` to disable | `ONYX_DM_HUB_FALLBACK` | **on** in `onyx` (needs a hub); off in `onyxd` |
@@ -334,7 +335,7 @@ and post-compromise security per conversation → for relayed traffic, a
 | Symptom | Likely cause |
 |---|---|
 | Nothing happens when I message someone | Run `onyx doctor`. Usually the peer is offline, or Tor has not finished publishing your onion. |
-| Tor stays at "bootstrapping" | A cold first start takes up to a minute. On a censored network, configure bridges. |
+| Tor stays at "bootstrapping" | A cold first start takes up to a minute. On a censored network, add an obfs4 or snowflake bridge (`TOR-BRIDGES.md`). |
 | The daemon refuses to start, saying the vault is locked | Another daemon is already running on that vault. One daemon per vault is enforced. |
 | `vault open failed (wrong passphrase?)` | Wrong passphrase. There is no recovery. |
 | "identity changed" on a contact | Their key differs from the pinned one: a reinstall, or an interception. Re-verify out of band before continuing. |

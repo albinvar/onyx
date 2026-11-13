@@ -339,8 +339,10 @@ fingerprinting research shows traffic patterns can identify destinations.
 
 **Onyx: Open / inherited.** A local network observer can likely tell that you
 run an onion service, and with effort that it behaves like a messenger. Tor's
-circuit padding reduces but does not remove this. Bridges hide Tor use from a
-casual observer, not from this analysis.
+circuit padding reduces but does not remove this. An obfs4, webtunnel or
+snowflake bridge hides that the traffic is Tor from a network that
+fingerprints Tor itself; it does not stop this analysis of what the
+traffic does.
 
 ### 3.7 Leaks outside Tor
 
